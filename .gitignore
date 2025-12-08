@@ -1,0 +1,11 @@
+# Ignore large data files that are easily reproducible
+*.xlsx
+
+# Ignore RStudio / R files
+.Rproj
+.Rhistory
+.Rdata
+
+# Ignore log/temporary files
+/data/
+/output/
