@@ -1,203 +1,200 @@
+# ======= Nechako Basin ERA data Retrieval workflow using a LOCAL shapefile =======
+# Packages
 library(terra)
-library(ecmwfr)
-
 library(sf)
 library(dplyr)
+library(ecmwfr)
 
-# 1) Read WATERSHED GROUPS (to discover correct group codes)
-wfs_groups <- paste0(
-  "https://openmaps.gov.bc.ca/geo/pub/WHSE_BASEMAPPING.FWA_WATERSHED_GROUPS_POLY/ows?",
-  "service=WFS&version=2.0.0&request=GetFeature&",
-  "typeNames=pub:WHSE_BASEMAPPING.FWA_WATERSHED_GROUPS_POLY&",
-  "srsName=EPSG:3005&outputFormat=application/json"
-)
-fwa_groups <- st_read(wfs_groups, quiet = TRUE)
-stopifnot(!is.na(st_crs(fwa_groups)))  # 3005
+# 0) READ LOCAL BASIN SHAPEFILE (MULTIPOLYGON -> SINGLE OUTLINE)
+# --------------------------------------------------------------
+basin_shp <- "Nechako.shp"   
+stopifnot(file.exists(basin_shp))
+nechako_raw <- st_read(basin_shp, quiet = TRUE)
+stopifnot(!is.na(st_geometry(nechako_raw)))
 
-# Find all watershed groups whose names mention your study area keywords
-nechako_groups <- fwa_groups %>%
-  filter(
-    grepl("Nechako",  WATERSHED_GROUP_NAME, ignore.case = TRUE) |
-      grepl("Stuart",   WATERSHED_GROUP_NAME, ignore.case = TRUE) |
-      grepl("Stellako", WATERSHED_GROUP_NAME, ignore.case = TRUE) |
-      grepl("Endako",   WATERSHED_GROUP_NAME, ignore.case = TRUE) |
-      grepl("Chilako",  WATERSHED_GROUP_NAME, ignore.case = TRUE) |
-      grepl("Nautley",  WATERSHED_GROUP_NAME, ignore.case = TRUE) |
-      grepl("Cheslatta",WATERSHED_GROUP_NAME, ignore.case = TRUE)
-  )
-
-# Capture the group codes (these are consistent across FWA layers)
-codes <- sort(unique(nechako_groups$WATERSHED_GROUP_CODE))
-print(codes)   # sanity check: expect codes for Nechako + tributaries
-
-# Build a mask geometry for spatial QC (optional but useful)
-nechako_mask <- nechako_groups %>% summarise() %>% st_make_valid()
-
-# 2) Read **ASSESSMENT WATERSHEDS** (20k mesoscale polygons, target 2k–10k ha)
-wfs_aw <- paste0(
-  "https://openmaps.gov.bc.ca/geo/pub/WHSE_BASEMAPPING.FWA_ASSESSMENT_WATERSHEDS_POLY/ows?",
-  "service=WFS&version=2.0.0&request=GetFeature&",
-  "typeNames=pub:WHSE_BASEMAPPING.FWA_ASSESSMENT_WATERSHEDS_POLY&",
-  "srsName=EPSG:3005&outputFormat=application/json"
-)
-aw20k <- st_read(wfs_aw, quiet = TRUE)
-stopifnot(!is.na(st_crs(aw20k)))  # 3005
-
-# Sanity: AREA_HA should cluster around thousands (not single digits)
-summary(aw20k$AREA_HA)
-
-# 3) Filter by watershed group code (attribute filter) and intersect with the mask (spatial)
-nechako_aw <- aw20k %>%
-  filter(WATERSHED_GROUP_CODE %in% codes) %>%
-  st_filter(nechako_mask) %>%     # keeps only polygons inside the group mask
+# If the shapefile contains multiple parts, dissolve to one polygon
+# st_make_valid helps avoid topology errors before union
+nechako_basin <- nechako_raw %>%
+  st_make_valid() %>%
+  dplyr::summarise(.groups = "drop") %>%   # dissolve
   st_make_valid()
 
-cat("Assessment watersheds selected:", nrow(nechako_aw), "\n")
-# Expect **hundreds**, not 28; and AREA_HA median should be thousands.
+# If CRS is unknown, set it to BC Albers (EPSG:3005) or WGS84 as appropriate.
+# st_crs(nechako_basin) <- 3005     # if your local SHP is in BC Albers
+# st_crs(nechako_basin) <- 4326     # if your local SHP is already lon/lat
 
-# 4) Dissolve to one basin outline, then transform to WGS84
-nechako_basin <- nechako_aw %>% summarise() %>% st_make_valid()
+stopifnot(!is.na(st_crs(nechako_basin)))   # we need a known CRS
+
+# Prepare WGS84 version for bbox/plot/export
 nechako_basin_ll <- st_transform(nechako_basin, 4326)
 
 plot(st_geometry(nechako_basin_ll), col = "lightblue", border = "black", lwd = 1.5)
-title("Nechako Basin (Assessment Watersheds → dissolved, WGS84)")
+title("Nechako Basin (Local SHP → dissolved, WGS84)")
 
-
-
-
-# 5) Write outputs safely
-#    (A) Shapefile: write to a directory (dsn) and use a layer name
+# 1) WRITE OUTPUTS (clean WGS84 shapefile + preview)
+# --------------------------------------------------
 out_dir   <- "out"
-out_layer <- "Nechako_FWA_Group_EPSG4326"
+out_layer <- "Nechako_Basin_EPSG4326"
 dir.create(out_dir, showWarnings = FALSE)
 
-# Remove old files if present (optional)
+# Remove old files (optional)
 unlink(file.path(out_dir, paste0(out_layer, c(".shp",".shx",".dbf",".prj",".cpg"))))
 
-st_write(nechako_basin_ll, dsn = "out", layer = "Nechako_NRBlike_EPSG4326",
+st_write(nechako_basin_ll, dsn = out_dir, layer = out_layer,
          driver = "ESRI Shapefile", delete_layer = TRUE)
 
+# Quick PNG preview
+png_filename <- file.path(out_dir, "Nechako_Basin_preview.png")
+png(png_filename, width = 1200, height = 900, res = 120)
+plot(nechako_basin_ll, border = "blue", lwd = 2,
+     main = "Nechako River Basin – EPSG:4326")
+dev.off()
+message("Preview map saved: ", png_filename)
 
-# 2. INSPECT THE SHAPEFILE ON CONSOLE & PLOT
-# -------------------------------------------
-
-# -------------------------------------------
-# 6) QUICK QA: PRINT SUMMARY, BBOX, AREA, AND PLOT
-# -------------------------------------------
-
-message("\n=== Nechako FWA Watershed Group: Summary ===")
-
-# A) Basic sf summary (geometry type, CRS)
+# 2) QA SUMMARY: bbox, area, validity
+# -----------------------------------
+message("\n=== Nechako Basin: Summary ===")
 print(nechako_basin_ll)
 message("CRS (EPSG): ", st_crs(nechako_basin_ll)$epsg)
 
-# B) Geographic bounding box (WGS84) — useful for ERA5-Land requests
-bbox_ll <- st_bbox(nechako_basin_ll)  # returns xmin, ymin, xmax, ymax in lon/lat
+bbox_ll <- st_bbox(nechako_basin_ll)
 print(bbox_ll)
 
-# Optional: pad the ERA5 bbox a bit (e.g., 0.05 degrees) to ensure full coverage
 pad_deg <- 0.1
 era5_bbox_padded <- bbox_ll
 era5_bbox_padded["xmin"] <- era5_bbox_padded["xmin"] - pad_deg
 era5_bbox_padded["ymin"] <- era5_bbox_padded["ymin"] - pad_deg
 era5_bbox_padded["xmax"] <- era5_bbox_padded["xmax"] + pad_deg
 era5_bbox_padded["ymax"] <- era5_bbox_padded["ymax"] + pad_deg
-
 message("\nERA5-Land padded bbox (deg): ",
         paste0("lon:[", round(era5_bbox_padded["xmin"], 4), ", ",
                round(era5_bbox_padded["xmax"], 4), "]  "),
         paste0("lat:[", round(era5_bbox_padded["ymin"], 4), ", ",
                round(era5_bbox_padded["ymax"], 4), "]"))
 
-# C) Extent via terra (if you prefer terra::ext)
-#    Note: ext() expects a Spat* object; convert sf -> SpatVector first.
+# Area in BC Albers (m^2 -> km^2)
+nechako_basin_bc <- st_transform(nechako_basin_ll, 3005)
+area_km2 <- as.numeric(st_area(nechako_basin_bc)) / 1e6
+message("Area (BC Albers): ", format(round(area_km2, 1), big.mark = ","), " km^2")
+
+# Valid?
+is_valid <- sf::st_is_valid(nechako_basin_ll)
+message("Geometry valid? ", is_valid)
+
+# 3) PREP EXTENTS FOR RASTER WORK AND ERA5 REQUEST
+# ------------------------------------------------
+# terra::ext() expects a Spat*; convert sf -> SpatVector
 nechako_vect <- terra::vect(nechako_basin_ll)
 era5_ext <- terra::ext(nechako_vect)
 print(era5_ext)
 
-# D) Area (km^2) computed in BC Albers (EPSG:3005) for accuracy
-nechako_basin_bc <- st_transform(nechako_basin_ll, 3005)
-area_m2 <- as.numeric(st_area(nechako_basin_bc))
-area_km2 <- area_m2 / 1e6
-message("Area (BC Albers): ", format(round(area_km2, 1), big.mark = ","), " km^2")
-
-# E) Validity check
-is_valid <- sf::st_is_valid(nechako_basin_ll)
-message("Geometry valid? ", is_valid)
-
-# F) Quick plot
-plot(nechako_basin_ll, border = "blue", lwd = 2,
-     main = "Nechako Watershed Group (FWA) – EPSG:4326")
-
-# Optional: also save a small PNG preview
-png_filename <- file.path("out", "Nechako_FWA_Group_preview.png")
-png(png_filename, width = 1200, height = 900, res = 120)
-plot(nechako_basin_ll, border = "blue", lwd = 2,
-     main = "Nechako Watershed Group (FWA) – EPSG:4326")
-dev.off()
-message("Preview map saved: ", png_filename)
-
-# 3. CONFIGURE AND DOWNLOAD ERA5-LAND DAILY DATA
-# ----------------------------------------------
-# Use the basin's extent for the download area to minimize file size
-basin_ext <- ext(nechako_basin)
-# Format as North, West, South, East for the CDS request
-area_for_request <- c(era5_bbox_padded["ymax"], era5_bbox_padded["xmin"],
-                      era5_bbox_padded["ymin"], era5_bbox_padded["xmax"])
-
-# --1) Use the cross-platform encrypted file backend to avoid Windows wincred issues
-options(keyring_backend = "file")
-
-# --2) Read the .cdsapirc from the current working directory
-conf_path <- file.path(getwd(), ".cdsapirc")
-stopifnot(file.exists(conf_path))
-lines    <- readLines(conf_path)
-key_line <- grep("^\\s*key\\s*:", lines, value = TRUE)
-token    <- trimws(sub("^\\s*key\\s*:\\s*", "", key_line))
-
-# --3) Register the token with ecmwfr and verify
-wf_set_key(key = token)
-
-request <- list(
-  format = "netcdf",
-  variable = c("2m_temperature", "total_precipitation"),
-  product_type = "reanalysis",
-  year = "2022", # Example year; modify your list of years as needed
-  month = sprintf("%02d", 1:12),
-  day = sprintf("%02d", 1:31),
-  time = "00:00",
-  statistic = "daily_mean", # Key parameter for daily data
-  area = area_for_request,   # Use the dynamic basin extent
-  dataset_short_name = "reanalysis-era5-land"
+# CDS expects area vector: [North, West, South, East]
+area_for_request <- c(
+  as.numeric(era5_bbox_padded["ymax"]),
+  as.numeric(era5_bbox_padded["xmin"]),
+  as.numeric(era5_bbox_padded["ymin"]),
+  as.numeric(era5_bbox_padded["xmax"])
 )
 
-wf_request(request, transfer = TRUE, path = "out") # Uncomment and run with your credentials
-nc_file <- "path_to_your_downloaded.nc" # Define this after download
+# 4) ECMWF CDS AUTH + ERA5-LAND HOURLY REQUEST (robust)
+# -----------------------------------------------------
+options(keyring_backend = "file")
 
-# 4. LOAD ERA5 DATA, CROP, AND MASK TO BASIN
-# -------------------------------------------
-# Load the downloaded NetCDF as a SpatRaster
-era5_rast <- rast(nc_file)
+conf_path <- file.path(getwd(), ".cdsapirc")
+stopifnot(file.exists(conf_path))
+lines <- readLines(conf_path)
+
+# Parse `url:` and `key: uid:token`
+url_line <- grep("^\\s*url\\s*:", lines, value = TRUE)
+key_line <- grep("^\\s*key\\s*:", lines, value = TRUE)
+stopifnot(length(url_line) == 1, length(key_line) == 1)
+
+cds_url <- trimws(sub("^\\s*url\\s*:\\s*", "", url_line))
+uid_token <- trimws(sub("^\\s*key\\s*:\\s*", "", key_line))
+parts <- strsplit(uid_token, ":", fixed = TRUE)[[1]]
+stopifnot(length(parts) == 2)
+cds_uid   <- parts[1]
+cds_token <- parts[2]
+
+# Register credentials
+wf_set_key(user = cds_uid, key = cds_token, overwrite = TRUE)
+wf_set_url(cds_url)
+
+# ERA5-Land hourly (recommended; aggregate to daily locally)
+request <- list(
+  dataset_short_name = "reanalysis-era5-land",
+  product_type = "reanalysis",
+  format = "netcdf",
+  variable = c("2m_temperature", "total_precipitation"),
+  year = "2022",                             # <-- adjust years
+  month = sprintf("%02d", 1:12),
+  day = sprintf("%02d", 1:31),
+  time = sprintf("%02d:00", 0:23),           # all 24 hours
+  area = area_for_request
+)
+
+# Uncomment to download (requires valid credentials & CDS availability):
+# nc_file <- wf_request(
+#   user = cds_uid,
+#   request = request,
+#   transfer = TRUE,
+#   path = out_dir
+# )
+# message("Downloaded NetCDF: ", nc_file)
+
+# If you've already downloaded: set path explicitly
+nc_file <- "path_to_your_downloaded.nc"   # <-- replace after download
+stopifnot(file.exists(nc_file))
+
+# 5) LOAD ERA5, CROP & MASK TO BASIN
+# ----------------------------------
+era5_rast <- terra::rast(nc_file)
 print(era5_rast)
-crs(era5_rast)        # check projection
-time(era5_rast)       # if available, shows time stamps (terra >= 1.6)
-# If crs(era5_rast) is empty but the data are lon/lat, set it:
-crs(era5_rast) <- "EPSG:4326"
-# Crop to the basin extent first (faster)
-era5_crop <- crop(era5_rast, nechako_vect, snap = "out")
-# Crop and mask the raster to the basin polygon in one step
-era5_nechako <- crop(era5_rast, nechako_basin, mask = TRUE)
-# Verify
+
+# Set CRS if missing (ERA5-Land is in lon/lat WGS84)
+if (is.na(terra::crs(era5_rast))) {
+  terra::crs(era5_rast) <- "EPSG:4326"
+}
+
+# Fast crop to the vector extent, then mask
+era5_crop <- terra::crop(era5_rast, nechako_vect, snap = "out")
+era5_nechako <- terra::mask(era5_crop, nechako_vect)
+
 print(era5_nechako)
-plot(era5_nechako[[1]], main = "ERA5 layer (first time slice)")
+plot(era5_nechako[[1]], main = "ERA5-Land (first layer)")
 plot(nechako_vect, add = TRUE, border = "blue", lwd = 2)
 
+# 6) OPTIONAL: DAILY AGGREGATION (mean for T2m, sum for precip)
+# -------------------------------------------------------------
+# Extract POSIXct time stamps from the raster
+ts <- terra::time(era5_nechako)  # one per layer
+stopifnot(!is.null(ts) && length(ts) == terra::nlyr(era5_nechako))
+day_index <- as.Date(ts)
+
+# Split variables by name (depends on CDS variable naming)
+vnames <- names(era5_nechako)
+is_t2m  <- grepl("2m_temperature", vnames, ignore.case = TRUE)
+is_tp   <- grepl("total_precipitation", vnames, ignore.case = TRUE)
+
+era5_t2m <- era5_nechako[[which(is_t2m)]]
+era5_tp  <- era5_nechako[[which(is_tp)]]
+
+# Daily mean temperature
+t2m_daily <- terra::tapp(era5_t2m, index = day_index, fun = mean, na.rm = TRUE)
+# Daily precipitation sum (hourly accumulation to daily total)
+tp_daily  <- terra::tapp(era5_tp,  index = day_index, fun = sum,  na.rm = TRUE)
+
+# Save daily products (GeoTIFFs)
+t2m_tif <- file.path(out_dir, "ERA5L_T2m_daily_mean_Nechako.tif")
+tp_tif  <- file.path(out_dir, "ERA5L_TP_daily_sum_Nechako.tif")
+terra::writeRaster(t2m_daily, t2m_tif, overwrite = TRUE)
+terra::writeRaster(tp_daily,  tp_tif,  overwrite = TRUE)
+message("Daily T2m saved: ", t2m_tif)
+message
 
 # 5. VERIFY THE RESULT
 # ---------------------
-# Print information about the cropped raster
 print(era5_nechako)
-
 # Plot the first layer (e.g., Day 1 temperature) with the basin outline
 # plot(era5_nechako[[1]], main = "ERA5-Land Data Cropped to Nechako Basin")
 # lines(nechako_basin, col = "red", lwd = 2)
