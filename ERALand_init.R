@@ -5,8 +5,8 @@ library(lubridate) # Robust date handling (Handles leap years correctly)
 
 # ---- 1. Credentials ----
 # Prefer environment variables:
-user_uid <- "mehdi.bateni@iusspavia.it"
-user_key <- "f0b6de88-c627-4f98-98b4-22453fb77cac"
+user_uid <- "***"
+user_key <- "***"
 
 
 if (is.na(user_uid) || is.na(user_key) || !nzchar(user_uid) || !nzchar(user_key)) {
@@ -331,5 +331,6 @@ if (!merge_done) {
 }
 
 message("🎉 All done.")
+
 
   
