@@ -1,0 +1,55 @@
+PRECIPITATION DATA DIAGNOSIS
+Generated: 2026-01-27 12:18:44 
+
+--- TERRA RASTER INFORMATION ---
+Number of layers: 912 
+Spatial extent: -127.85 -122.65 52.85 56.25 
+CRS: GEOGCRS["WGS 84 (CRS84)",
+    DATUM["World Geodetic System 1984",
+        ELLIPSOID["WGS 84",6378137,298.257223563,
+            LENGTHUNIT["metre",1]]],
+    PRIMEM["Greenwich",0,
+        ANGLEUNIT["degree",0.0174532925199433]],
+    CS[ellipsoidal,2],
+        AXIS["geodetic longitude (Lon)",east,
+            ORDER[1],
+            ANGLEUNIT["degree",0.0174532925199433]],
+        AXIS["geodetic latitude (Lat)",north,
+            ORDER[2],
+            ANGLEUNIT["degree",0.0174532925199433]],
+    USAGE[
+        SCOPE["unknown"],
+        AREA["World"],
+        BBOX[-90,-180,90,180]],
+    ID["OGC","CRS84"]] 
+Resolution: 0.1 0.1 
+
+--- TIME DIMENSION CHECK ---
+❌ Time dimension: NOT FOUND (all NA)
+   This is the PRIMARY issue - terra::writeCDF did not preserve time
+
+--- DATA VALUE STATISTICS ---
+First layer statistics:
+  Min: 0.000232665 
+  Max: 0.002473002 
+  Mean: 0.000676755 
+  Median: 0.0005609525 
+
+--- EXPECTED VALUES ---
+Nechako Basin typical monthly precipitation: 30-100 mm
+Winter months (Nov-Mar): 40-100 mm
+Summer months (Jun-Aug): 30-60 mm
+
+--- NETCDF4 STRUCTURE (via ncdf4) ---
+Dimensions:
+  valid_time: length = 912
+  latitude: length = 34
+  longitude: length = 52
+
+Variables:
+  number: dims = 
+    units: 1
+  expver: dims = 
+    units: 0
+  tp: dims = 
+    units: m

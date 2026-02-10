@@ -1,0 +1,21 @@
+SPEI-8 SUMMARY (Variance-Aware Approach)
+Calculation date: 2026-02-09 16:12:43.967378
+
+Grid dimensions: 43 x 47
+Basin pixels: 863
+Time period: 1950-01-01 to 2025-12-01 (912 months)
+
+Variance Handling:
+  • True zero variance (var < 2.2e-16): SPEI = 0 (neutral)
+  • Very low variance (0 < var < 0.01 mm²): Empirical ranking
+  • Sufficient variance (var ≥ 0.01 mm²): Empirical ranking
+
+NA Analysis:
+  Total NA values in basin: 0.768%
+  MSPEI compatibility: ⚠ CAUTION (>0.5% NAs)
+
+Drought frequency by severity (last 12 months):
+  Exceptional (SPEI < -2.0):  0.0%
+  Extreme     (SPEI < -1.6):  4.8%
+  Severe      (SPEI < -1.3):  8.8%
+  Moderate    (SPEI < -0.8):  27.0%

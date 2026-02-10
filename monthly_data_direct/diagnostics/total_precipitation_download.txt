@@ -1,0 +1,22 @@
+Download Diagnostics
+===================
+
+Variable: total_precipitation 
+Downloaded: 2026-01-27 12:16:19 
+Source file: downloads/\ecmwfr_5abc3a31cce.nc 
+Output file: monthly_data_direct/total_precipitation_monthly.nc 
+
+Layers: 912 
+Time range: 1950-01-01 2025-12-01 
+
+Value statistics (first layer):
+                             mean      min      max        sd
+tp_valid_time=-631152000 0.676755 0.232665 2.473002 0.3854414
+
+Value statistics (middle layer):
+                           mean       min      max       sd
+tp_valid_time=565315200 1.66015 0.5986886 10.91023 1.347595
+
+Value statistics (last layer):
+                             mean      min      max       sd
+tp_valid_time=1764547200 5.513545 2.075511 29.69663 4.252757

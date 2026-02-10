@@ -1,0 +1,86 @@
+Monthly PET Processing Log (Vectorized)
+Processing started: 2026-02-09 16:08:23.953185 
+2026-02-09 16:08:23 | Loading ERA5-Land data files...
+2026-02-09 16:08:25 | Successfully loaded all inputs.
+2026-02-09 16:08:25 | Average basin elevation: 1052.2 m
+2026-02-09 16:08:25 | Processing time information...
+2026-02-09 16:08:25 |   Trying ncdf4 for Temperature...
+2026-02-09 16:08:25 |   ncdf4 failed for Temperature: could not find function "nc_open"
+2026-02-09 16:08:25 |   Reconstructing time for Temperature (912 layers)...
+2026-02-09 16:08:25 |     Assuming 1950-01 to 2025-12
+2026-02-09 16:08:25 |   ✓ Time sequence reconstructed
+2026-02-09 16:08:25 | Processing 912 time steps.
+2026-02-09 16:08:25 | Time range: 1950-01-01 to 2025-12-01
+2026-02-09 16:08:25 | Calculating Ra (Extraterrestrial Radiation)...
+2026-02-09 16:08:26 | Ra climatology statistics:
+2026-02-09 16:08:26 |   Month  1: min=5.39, max=7.28, mean=6.33 MJ/m²/day
+2026-02-09 16:08:26 |   Month  2: min=10.66, max=12.68, mean=11.67 MJ/m²/day
+2026-02-09 16:08:26 |   Month  3: min=19.12, max=20.97, mean=20.05 MJ/m²/day
+2026-02-09 16:08:26 |   Month  4: min=29.14, max=30.45, mean=29.80 MJ/m²/day
+2026-02-09 16:08:26 |   Month  5: min=37.40, max=38.01, mean=37.71 MJ/m²/day
+2026-02-09 16:08:26 |   Month  6: min=41.40, max=41.58, mean=41.49 MJ/m²/day
+2026-02-09 16:08:26 |   Month  7: min=39.56, max=39.93, mean=39.75 MJ/m²/day
+2026-02-09 16:08:26 |   Month  8: min=32.50, max=33.51, mean=33.01 MJ/m²/day
+2026-02-09 16:08:26 |   Month  9: min=22.54, max=24.20, mean=23.38 MJ/m²/day
+2026-02-09 16:08:26 |   Month 10: min=13.13, max=15.12, mean=14.13 MJ/m²/day
+2026-02-09 16:08:26 |   Month 11: min=6.50, max=8.43, mean=7.46 MJ/m²/day
+2026-02-09 16:08:26 |   Month 12: min=4.04, max=5.84, mean=4.93 MJ/m²/day
+2026-02-09 16:08:26 | Ra stack generated.
+2026-02-09 16:08:26 | Executing vectorized Penman-Monteith calculation...
+2026-02-09 16:08:26 | ... Temperature and Pressure
+2026-02-09 16:08:26 | Temperature range: -34.01 to 20.17 °C (mean: 0.84)
+2026-02-09 16:08:26 | ... Vapor Pressure
+2026-02-09 16:08:27 | VPD range: 0.011 to 1.379 kPa (mean: 0.236)
+2026-02-09 16:08:27 | ... Wind Speed
+2026-02-09 16:08:28 | Wind speed (2m) range: 0.00 to 2.06 m/s (mean: 0.54)
+2026-02-09 16:08:28 | ... Net Radiation
+2026-02-09 16:08:28 | ... Converting SSRD from J/m²/day to MJ/m²/day
+2026-02-09 16:08:28 | SSRD conversion check:
+2026-02-09 16:08:28 |   Rs range: 0.22 to 27.37 MJ/m²/day (mean: 11.80)
+2026-02-09 16:08:28 |   ✓ Rs values in expected range for Nechako Basin
+2026-02-09 16:08:28 |   January Rs: 3.78, July Rs: 21.40 MJ/m²/day
+2026-02-09 16:08:28 | Rs range: 0.22 to 27.37 MJ/m²/day (mean: 11.80)
+2026-02-09 16:08:28 | Rn range (before constraint): -1.98 to 15.72 MJ/m²/day (mean: 5.55)
+2026-02-09 16:08:28 | Layers with negative Rn pixels: 227 of 912
+2026-02-09 16:08:28 | ... Soil Heat Flux (G)
+2026-02-09 16:08:28 | G range: -4.76 to 3.34 MJ/m²/day (mean: -0.00)
+2026-02-09 16:08:28 | ... Final ET0 calculation
+2026-02-09 16:08:29 | === NEGATIVE ET0 DIAGNOSTIC ===
+2026-02-09 16:08:29 |   Layer 1 (t2m_valid_time=-631152000): 0.0% pixels negative
+2026-02-09 16:08:29 |   Layer 2 (t2m_valid_time=-628473600): 91.2% pixels negative
+2026-02-09 16:08:29 |   Layer 3 (t2m_valid_time=-626054400): 0.0% pixels negative
+2026-02-09 16:08:29 |   Layer 4 (t2m_valid_time=-623376000): 0.0% pixels negative
+2026-02-09 16:08:29 |   Layer 5 (t2m_valid_time=-620784000): 0.0% pixels negative
+2026-02-09 16:08:29 |   Layer 6 (t2m_valid_time=-618105600): 0.0% pixels negative
+2026-02-09 16:08:29 |   Layer 7 (t2m_valid_time=-615513600): 0.0% pixels negative
+2026-02-09 16:08:29 |   Layer 8 (t2m_valid_time=-612835200): 0.0% pixels negative
+2026-02-09 16:08:29 |   Layer 9 (t2m_valid_time=-610156800): 0.0% pixels negative
+2026-02-09 16:08:29 |   Layer 10 (t2m_valid_time=-607564800): 0.0% pixels negative
+2026-02-09 16:08:29 |   Layer 11 (t2m_valid_time=-604886400): 0.0% pixels negative
+2026-02-09 16:08:29 |   Layer 12 (t2m_valid_time=-602294400): 13.6% pixels negative
+2026-02-09 16:08:29 | Layers with >5% negative pixels: 51 of 912
+2026-02-09 16:08:29 | Final ET0 range: 0.000 to 4.519 mm/day (mean: 1.316)
+2026-02-09 16:08:29 | Calculation complete. Generating statistics and writing files...
+2026-02-09 16:08:29 | Writing NetCDF...
+2026-02-09 16:08:30 | Calculating calendar month climatology...
+2026-02-09 16:08:30 | Generating diagnostic plots...
+2026-02-09 16:08:30 | ... Time series plot
+2026-02-09 16:08:30 | ... Seasonal cycle
+2026-02-09 16:08:30 | ... Range validation
+2026-02-09 16:08:30 | All PET values within expected range (0-8 mm/day)
+2026-02-09 16:08:30 | ... Monthly climatology comparison
+2026-02-09 16:08:30 | ... Inter-annual variability
+2026-02-09 16:08:30 | ... Calculating Sen's slope
+2026-02-09 16:08:30 | Sen's slope: 0.000789 mm/day/year (MK p=0.042)
+2026-02-09 16:08:30 | ... Sample monthly maps
+2026-02-09 16:08:30 | ... PET distribution histogram
+2026-02-09 16:08:30 | ... Quality control summary
+2026-02-09 16:08:30 | Main diagnostic PDF closed and saved.
+2026-02-09 16:08:30 | Diagnostics complete. Check 'diagnostics/' folder.
+2026-02-09 16:08:30 | Main diagnostic PDF: diagnostics/PET_diagnostics.pdf
+2026-02-09 16:08:30 | ==========================================
+2026-02-09 16:08:30 | Total months processed: 912
+2026-02-09 16:08:30 | Overall mean PET: 1.32 mm/day
+2026-02-09 16:08:30 | Months with >5% negative pixels: 51
+2026-02-09 16:08:30 | PROCESSING COMPLETE
+2026-02-09 16:08:30 | Processing finished: 2026-02-09 16:08:30.465727
