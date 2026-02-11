@@ -583,16 +583,13 @@ log_event(sprintf("Creating matrices with %d VALID basin cells (out of %d total 
                   n_basin_pixels, n_bbox_cells))
 
 # Create reduced matrices containing ONLY basin cells
-precip_vals <- values(precip)
-pet_vals <- values(pet)
+# CRITICAL FIX: values() returns [cells x time], need to transpose for [time x cells]
+precip_vals <- values(precip)  # Returns [n_cells x n_time]
+pet_vals <- values(pet)        # Returns [n_cells x n_time]
 
-precip_matrix <- matrix(NA, nrow = n_time, ncol = n_basin_pixels)
-pet_matrix <- matrix(NA, nrow = n_time, ncol = n_basin_pixels)
-
-for (t in 1:n_time) {
-  precip_matrix[t, ] <- precip_vals[t, ][valid_mask]
-  pet_matrix[t, ] <- pet_vals[t, ][valid_mask]
-}
+# Extract only valid basin cells and transpose to get [time x cells]
+precip_matrix <- t(precip_vals[valid_mask, ])  # Now [n_time x n_basin_pixels]
+pet_matrix <- t(pet_vals[valid_mask, ])        # Now [n_time x n_basin_pixels]
 
 # Store coordinates ONLY for valid basin cells
 # FIX: Use xyFromCell to get correct coordinates directly from cell indices
