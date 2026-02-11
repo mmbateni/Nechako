@@ -636,25 +636,48 @@ compare_vc_tfpw <- function(vc_results, tfpw_results, index_name, output_dir) {
          cex = 0.8, bg = "white")
   
   # Diagnostic 3: Variance inflation
-  vc_corrected_idx <- which(vc_valid$vc_corrected)
-  if (length(vc_corrected_idx) > 0) {
     # Calculate variance inflation factor
     # This would require storing varS before and after correction
     # For now, plot autocorrelation vs significance
+  vc_corrected_idx <- which(vc_valid$vc_corrected)
+  if (length(vc_corrected_idx) > 0) {
+    # Check if we have valid data to plot
+    valid_plot_data <- !is.na(vc_valid$rho1_vc) & !is.na(vc_valid$p_value_vc) & 
+      vc_valid$p_value_vc > 0
     
-    plot(vc_valid$rho1_vc, -log10(vc_valid$p_value_vc), 
-         pch = 16, col = alpha("darkblue", 0.3), cex = 0.6,
-         xlab = "Autocorrelation (ρ₁)", ylab = "-log10(p-value)",
-         main = "VC Method: Autocorrelation Impact on Significance")
-    abline(h = -log10(0.05), col = "red", lty = 2, lwd = 2)
-    abline(v = c(-0.1, 0.1), col = "orange", lty = 3)
-    
-    text(0.5, par("usr")[4] * 0.9, 
-         sprintf("Pixels with |ρ₁| > 0.1: %d (%.1f%%)\nVC correction applied: %d",
-                 sum(abs(vc_valid$rho1_vc) > 0.1, na.rm = TRUE),
-                 sum(abs(vc_valid$rho1_vc) > 0.1, na.rm = TRUE) / nrow(vc_valid) * 100,
-                 sum(vc_valid$vc_corrected, na.rm = TRUE)),
-         pos = 2, cex = 0.8)
+    if (sum(valid_plot_data) > 10) {
+      # We have enough valid data to create the plot
+      plot(vc_valid$rho1_vc[valid_plot_data], 
+           -log10(vc_valid$p_value_vc[valid_plot_data]), 
+           pch = 16, col = alpha("darkblue", 0.3), cex = 0.6,
+           xlab = "Autocorrelation (ρ₁)", ylab = "-log10(p-value)",
+           main = "VC Method: Autocorrelation Impact on Significance")
+      abline(h = -log10(0.05), col = "red", lty = 2, lwd = 2)
+      abline(v = c(-0.1, 0.1), col = "orange", lty = 3)
+      
+      text(0.5, par("usr")[4] * 0.9, 
+           sprintf("Pixels with |ρ₁| > 0.1: %d (%.1f%%)\nVC correction applied: %d",
+                   sum(abs(vc_valid$rho1_vc) > 0.1, na.rm = TRUE),
+                   sum(abs(vc_valid$rho1_vc) > 0.1, na.rm = TRUE) / nrow(vc_valid) * 100,
+                   sum(vc_valid$vc_corrected, na.rm = TRUE)),
+           pos = 2, cex = 0.8)
+    } else {
+      # Not enough valid data - create empty plot with message
+      plot.new()
+      plot.window(xlim = c(0, 1), ylim = c(0, 1))
+      text(0.5, 0.5, 
+           "Insufficient valid autocorrelation data\nfor visualization", 
+           cex = 1.2, col = "red")
+      title("VC Method: Autocorrelation Impact (No Data)")
+    }
+  } else {
+    # No VC correction was applied - create empty plot with message
+    plot.new()
+    plot.window(xlim = c(0, 1), ylim = c(0, 1))
+    text(0.5, 0.5, 
+         "No variance correction was applied\n(|ρ₁| ≤ 0.1 for all pixels)", 
+         cex = 1.2, col = "gray50")
+    title("VC Method: Autocorrelation Impact (Not Applied)")
   }
   
   dev.off()
