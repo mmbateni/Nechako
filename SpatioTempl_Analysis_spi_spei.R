@@ -810,12 +810,20 @@ analyze_runs_dispersion <- function(runs_results, index_matrix, index_name, outp
   
   # 5. Clustering classification
   clust_counts <- table(runs_valid$clustering)
-  barplot(clust_counts, main = "Temporal Pattern Classification",
+  
+  # Create a full vector with all three categories, filling missing ones with 0
+  clust_full <- c("0" = 0, "-1" = 0, "1" = 0)
+  clust_full[names(clust_counts)] <- clust_counts
+  
+  # Reorder to match the names.arg order: 0 (Not Sig), -1 (Clustering), 1 (Dispersion)
+  clust_ordered <- clust_full[c("0", "-1", "1")]
+  
+  barplot(clust_ordered, main = "Temporal Pattern Classification",
           names.arg = c("Not Significant", "Clustering", "Dispersion"),
           col = c("gray", "red", "blue"), border = "white",
           ylab = "Number of Pixels")
-  text(1:3, clust_counts + max(clust_counts) * 0.05,
-       sprintf("n=%d\n(%.1f%%)", clust_counts, clust_counts/sum(clust_counts)*100),
+  text(1:3, clust_ordered + max(clust_ordered) * 0.05,
+       sprintf("n=%d\n(%.1f%%)", clust_ordered, clust_ordered/sum(clust_ordered)*100),
        pos = 3)
   
   # 6. Example time series
