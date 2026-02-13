@@ -26,6 +26,8 @@ end_date <- "2025-12-31"
 
 # Variables needed for SPI and SPEI
 variables <- c(
+  "snow_cover",
+  "snow_depth_water_equivalent"
   # "surface_solar_radiation_downwards",
   # "10m_u_component_of_wind",
   # "10m_v_component_of_wind",
@@ -36,10 +38,10 @@ variables <- c(
   # "2m_temperature",
   # "2m_dewpoint_temperature",
   # "skin_reservoir_content",
-  "volumetric_soil_water_layer_1",
-  "volumetric_soil_water_layer_2",
-  "volumetric_soil_water_layer_3",
-  "volumetric_soil_water_layer_4"
+  # "volumetric_soil_water_layer_1",
+  # "volumetric_soil_water_layer_2",
+  # "volumetric_soil_water_layer_3",
+  # "volumetric_soil_water_layer_4"
 )
 
 # Create output directories
