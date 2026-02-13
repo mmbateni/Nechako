@@ -1,9 +1,9 @@
 ####################################################################################
-# Trend Analysis Data Processing
-# Purpose: Perform comprehensive trend analysis and save results efficiently
-# Output: Binary data files for fast reloading by visualization script
+# Trend Analysis Data Processing with Basin Averages
+# Purpose: Perform comprehensive trend analysis for pixels AND basin averages
+# Output: Binary data files including basin-averaged time series and statistics
 ####################################################################################
-####################################################################################
+
 library(ncdf4)
 library(terra)
 library(data.table)
@@ -12,19 +12,18 @@ library(future.apply)
 library(zoo)
 library(sf)
 
+# ================= USER / ENV =================
 setwd("D:/Nechako_Drought/Nechako/")
 
 # ===== LOGGING SETUP =====
 out_dir <- "trend_analysis_pr_pet"
 if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 LOG_FILE <- file.path(out_dir, "data_processing.log")
-
 log_event <- function(msg) {
   timestamp <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
-  cat(paste0(timestamp, " | ", msg, "\n"), file = LOG_FILE, append = TRUE)
-  message(paste0(timestamp, " | ", msg))
+  cat(paste0(timestamp, "  ", msg, "\n"), file = LOG_FILE, append = TRUE)
+  message(paste0(timestamp, "  ", msg))
 }
-
 cat("Trend Analysis Data Processing - Started\n", file = LOG_FILE)
 cat(paste("Timestamp:", Sys.time(), "\n"), file = LOG_FILE, append = TRUE)
 cat("==========================================\n", file = LOG_FILE, append = TRUE)
@@ -37,12 +36,11 @@ basin_files <- c(
   "../nechako_basin.shp", "data/nechako_basin.shp",
   "D:/Nechako_Drought/Nechako/Spatial/nechakoBound_dissolve.shp"
 )
-
 for (bf in basin_files) {
   if (file.exists(bf)) {
     tryCatch({
       basin_boundary <- st_read(bf, quiet = TRUE)
-      target_crs <- "EPSG:3005"  # BC Albers
+      target_crs <- "EPSG:3005" # BC Albers
       basin_boundary <- st_transform(basin_boundary, target_crs)
       log_event(paste("✓ Loaded Nechako Basin boundary from:", bf))
       log_event(paste("  Basin area:", round(as.numeric(st_area(basin_boundary))/1e6, 2), "km²"))
@@ -52,11 +50,9 @@ for (bf in basin_files) {
     })
   }
 }
-
 if (is.null(basin_boundary)) {
   stop("CRITICAL: Nechako Basin boundary NOT FOUND. Required for clipping.\nPlease place shapefile in working directory.")
 }
-
 # Save basin boundary for visualization script
 saveRDS(basin_boundary, file.path(out_dir, "basin_boundary.rds"))
 log_event("Basin boundary saved for visualization script")
@@ -70,77 +66,276 @@ alpha <- 0.05
 n_sim_spectral <- 500
 max_tie_percent <- 50
 max_min_value_pct_precip <- 80
-max_min_value_pct_pet <- 50
+max_min_value_pct_pet    <- 50
 min_positive_value <- 0.01
+
+# Parallel setup
 num_cores <- min(parallel::detectCores() - 1, 8)
 if (num_cores < 1) num_cores <- 1
 plan(multisession, workers = num_cores)
 log_event(paste("Using", num_cores, "cores for parallel processing"))
 
 # ===== HELPER FUNCTIONS =====
-check_min_value_threshold <- function(ts_clean, min_val_threshold = 0.01, max_pct = 50, var_name = "Unknown", is_precip = FALSE) {
+check_min_value_threshold <- function(ts_clean, min_val_threshold = 0.01, max_pct = 50,
+                                      var_name = "Unknown", is_precip = FALSE) {
   n_total <- length(ts_clean)
   n_min_vals <- sum(ts_clean <= min_val_threshold, na.rm = TRUE)
   pct_min_vals <- (n_min_vals / n_total) * 100
   max_allowed <- if (is_precip) max_min_value_pct_precip else max_min_value_pct_pet
   exceeds_threshold <- pct_min_vals > max_allowed
-  return(list(exceeds_threshold = exceeds_threshold, pct_min_vals = pct_min_vals))
+  list(exceeds_threshold = exceeds_threshold, pct_min_vals = pct_min_vals)
 }
 
 calculate_sens_slope_manual <- function(x) {
   n <- length(x)
-  if (n < 2) return(NA)
+  if (n < 2) return(NA_real_)
   slopes <- numeric()
   for (i in 1:(n-1)) {
+    xi <- x[i]
+    if (is.na(xi)) next
     for (j in (i+1):n) {
-      if (!is.na(x[i]) && !is.na(x[j])) {
-        slope <- (x[j] - x[i]) / (j - i)
-        slopes <- c(slopes, slope)
+      xj <- x[j]
+      if (!is.na(xj)) {
+        slopes <- c(slopes, (xj - xi) / (j - i))
       }
     }
   }
-  if (length(slopes) == 0) return(NA)
-  return(median(slopes, na.rm = TRUE))
+  if (!length(slopes)) return(NA_real_)
+  median(slopes, na.rm = TRUE)
 }
 
 calculate_variance_with_ties <- function(S, n, x) {
-  tie_table <- table(x)
+  tie_table  <- table(x)
   tie_counts <- tie_table[tie_table > 1]
-  if (length(tie_counts) == 0) {
-    var_s <- n * (n - 1) * (2 * n + 5) / 18
-  } else {
-    var_s <- n * (n - 1) * (2 * n + 5) / 18
+  var_s <- n * (n - 1) * (2 * n + 5) / 18
+  if (length(tie_counts)) {
     tie_adjustment <- sum(tie_counts * (tie_counts - 1) * (2 * tie_counts + 5)) / 18
     var_s <- var_s - tie_adjustment
   }
-  return(var_s)
+  var_s
+}
+
+aggregate_to_annual_fast <- function(monthly_matrix, years, method = "sum") {
+  y_levels <- unique(years)
+  yfac <- match(years, y_levels)
+  count_by_year <- rowsum((!is.na(monthly_matrix)) * 1L, group = yfac, reorder = FALSE)
+  m0 <- monthly_matrix
+  m0[is.na(m0)] <- 0
+  sum_by_year <- rowsum(m0, group = yfac, reorder = FALSE)
+  if (identical(method, "sum")) {
+    res <- sum_by_year
+  } else {
+    res <- sum_by_year / pmax(count_by_year, 1)
+  }
+  res[count_by_year < 6] <- NA_real_
+  rownames(res) <- y_levels
+  res
+}
+
+compute_month_index <- function(months) {
+  split(seq_along(months), months)
+}
+
+mk_tfpw_spectral_for_series <- function(ts_vec, is_precip, alpha, max_tie_pct,
+                                        n_sim_spectral, conf_cache_env) {
+  ts_clean <- na.omit(ts_vec)
+  n <- length(ts_clean)
+  
+  if (n < 10) {
+    return(list(
+      vc = list(tau = NA_real_, p = NA_real_, sl = NA_real_, S = NA_real_, varS = NA_real_,
+                n = n, rho1 = NA_real_, vc_corrected = FALSE, n_ties = 0, percent_ties = 0,
+                n_min_vals = 0, percent_min_vals = 0, tau_b_adjusted = FALSE,
+                filtered = TRUE, reason = "low_n"),
+      tf = list(tau = NA_real_, p = NA_real_, sl = NA_real_, S = NA_real_, varS = NA_real_,
+                n = n, rho1 = NA_real_, tfpw_applied = FALSE, n_ties = 0, percent_ties = 0,
+                n_min_vals = 0, percent_min_vals = 0, tau_b_adjusted = FALSE,
+                filtered = TRUE, reason = "low_n"),
+      spec = list(n_peaks = 0L, dominant_period = NA_real_, conf = NA_real_)
+    ))
+  }
+  
+  min_val_threshold <- if (is_precip) 0.0 else min_positive_value
+  min_check <- check_min_value_threshold(
+    ts_clean, min_val_threshold,
+    max_pct = if (is_precip) max_min_value_pct_precip else max_min_value_pct_pet,
+    is_precip = is_precip
+  )
+  if (min_check$exceeds_threshold) {
+    return(list(
+      vc = list(tau = NA_real_, p = NA_real_, sl = NA_real_, S = NA_real_, varS = NA_real_,
+                n = n, rho1 = NA_real_, vc_corrected = FALSE, n_ties = 0, percent_ties = 0,
+                n_min_vals = 0, percent_min_vals = min_check$pct_min_vals, tau_b_adjusted = FALSE,
+                filtered = TRUE, reason = "excessive_min_vals"),
+      tf = list(tau = NA_real_, p = NA_real_, sl = NA_real_, S = NA_real_, varS = NA_real_,
+                n = n, rho1 = NA_real_, tfpw_applied = FALSE, n_ties = 0, percent_ties = 0,
+                n_min_vals = 0, percent_min_vals = min_check$pct_min_vals, tau_b_adjusted = FALSE,
+                filtered = TRUE, reason = "excessive_min_vals"),
+      spec = list(n_peaks = 0L, dominant_period = NA_real_, conf = NA_real_)
+    ))
+  }
+  
+  n_unique <- length(unique(ts_clean))
+  n_ties <- n - n_unique
+  percent_ties <- (n_ties / n) * 100
+  if (percent_ties > max_tie_pct) {
+    return(list(
+      vc = list(tau = NA_real_, p = NA_real_, sl = NA_real_, S = NA_real_, varS = NA_real_,
+                n = n, rho1 = NA_real_, vc_corrected = FALSE, n_ties = n_ties, percent_ties = percent_ties,
+                n_min_vals = 0, percent_min_vals = min_check$pct_min_vals, tau_b_adjusted = FALSE,
+                filtered = TRUE, reason = "excessive_ties"),
+      tf = list(tau = NA_real_, p = NA_real_, sl = NA_real_, S = NA_real_, varS = NA_real_,
+                n = n, rho1 = NA_real_, tfpw_applied = FALSE, n_ties = n_ties, percent_ties = percent_ties,
+                n_min_vals = 0, percent_min_vals = min_check$pct_min_vals, tau_b_adjusted = FALSE,
+                filtered = TRUE, reason = "excessive_ties"),
+      spec = list(n_peaks = 0L, dominant_period = NA_real_, conf = NA_real_)
+    ))
+  }
+  
+  sen_slope <- calculate_sens_slope_manual(ts_clean)
+  if (is.na(sen_slope) || is.infinite(sen_slope)) {
+    return(list(
+      vc = list(tau = NA_real_, p = NA_real_, sl = NA_real_, S = NA_real_, varS = NA_real_,
+                n = n, rho1 = NA_real_, vc_corrected = FALSE, n_ties = n_ties, percent_ties = percent_ties,
+                n_min_vals = 0, percent_min_vals = min_check$pct_min_vals, tau_b_adjusted = FALSE,
+                filtered = TRUE, reason = "sens_slope_fail"),
+      tf = list(tau = NA_real_, p = NA_real_, sl = NA_real_, S = NA_real_, varS = NA_real_,
+                n = n, rho1 = NA_real_, tfpw_applied = FALSE, n_ties = n_ties, percent_ties = percent_ties,
+                n_min_vals = 0, percent_min_vals = min_check$pct_min_vals, tau_b_adjusted = FALSE,
+                filtered = TRUE, reason = "sens_slope_fail"),
+      spec = list(n_peaks = 0L, dominant_period = NA_real_, conf = NA_real_)
+    ))
+  }
+  
+  time_index <- seq_len(n)
+  trend_line <- sen_slope * time_index
+  detrended <- ts_clean - trend_line
+  
+  acf_result <- tryCatch(acf(detrended, lag.max = 1, plot = FALSE, na.action = na.pass),
+                         error = function(e) NULL, warning = function(w) NULL)
+  rho1 <- if (!is.null(acf_result)) acf_result$acf[2] else NA_real_
+  
+  # Variance-corrected MK (VC)
+  s_mat <- sign(outer(ts_clean, ts_clean, `-`))
+  S_vc <- sum(s_mat[upper.tri(s_mat)], na.rm = TRUE)
+  varS_taub <- calculate_variance_with_ties(S_vc, n, ts_clean)
+  n_pairs <- n * (n - 1) / 2
+  tau_vc <- S_vc / n_pairs
+  tau_b_adjusted <- (percent_ties > 5)
+  
+  vc_corrected <- FALSE
+  varS_final <- varS_taub
+  if (!is.na(rho1) && abs(rho1) > 0.1) {
+    correction_factor <- 1 + (2 * rho1 * (n - 1 - 2 * (n - 1) * rho1 + 3 * rho1 * rho1)) /
+      ((n - 1) * (1 - rho1) * (1 - rho1))
+    varS_final <- varS_taub * correction_factor
+    vc_corrected <- TRUE
+  }
+  p_vc <- if (varS_final <= 0) NA_real_ else {
+    z_stat <- S_vc / sqrt(varS_final)
+    2 * pnorm(-abs(z_stat))
+  }
+  
+  vc_list <- list(
+    tau = tau_vc, p = p_vc, sl = sen_slope, S = S_vc, varS = varS_final,
+    n = n, rho1 = rho1, vc_corrected = vc_corrected,
+    n_ties = n_ties, percent_ties = percent_ties,
+    n_min_vals = 0, percent_min_vals = min_check$pct_min_vals,
+    tau_b_adjusted = tau_b_adjusted, filtered = FALSE, reason = "none"
+  )
+  
+  # TFPW MK
+  tfpw_applied <- FALSE
+  if (!is.na(rho1) && abs(rho1) > 0.1) {
+    pw <- numeric(n)
+    pw[1] <- detrended[1]
+    for (j in 2:n) pw[j] <- detrended[j] - rho1 * detrended[j-1]
+    corrected <- pw + trend_line
+    tfpw_applied <- TRUE
+  } else {
+    corrected <- ts_clean
+  }
+  
+  s_mat_tf <- sign(outer(corrected, corrected, `-`))
+  S_tf <- sum(s_mat_tf[upper.tri(s_mat_tf)], na.rm = TRUE)
+  varS_tf <- calculate_variance_with_ties(S_tf, n, corrected)
+  tau_tf <- S_tf / n_pairs
+  p_tf <- if (varS_tf <= 0) NA_real_ else {
+    z_stat <- S_tf / sqrt(varS_tf)
+    2 * pnorm(-abs(z_stat))
+  }
+  
+  tf_list <- list(
+    tau = tau_tf, p = p_tf, sl = sen_slope, S = S_tf, varS = varS_tf,
+    n = n, rho1 = rho1, tfpw_applied = tfpw_applied,
+    n_ties = n_ties, percent_ties = percent_ties,
+    n_min_vals = 0, percent_min_vals = min_check$pct_min_vals,
+    tau_b_adjusted = tau_b_adjusted, filtered = FALSE, reason = "none"
+  )
+  
+  # Spectral analysis
+  dstd <- detrended - mean(detrended)
+  sd_d <- stats::sd(dstd)
+  if (!is.finite(sd_d) || sd_d == 0) sd_d <- 1
+  dstd <- dstd / sd_d
+  
+  key <- paste0("n_", n)
+  if (!exists(key, envir = conf_cache_env, inherits = FALSE)) {
+    max_spectra <- numeric(n_sim_spectral)
+    half <- floor(n / 2)
+    for (jj in seq_len(n_sim_spectral)) {
+      r <- rnorm(n, 0, 1)
+      fr <- fft(r - mean(r))
+      sp <- Mod(fr[1:half])^2 / n
+      max_spectra[jj] <- max(sp, na.rm = TRUE)
+    }
+    assign(key, stats::quantile(max_spectra, 1 - alpha, na.rm = TRUE), envir = conf_cache_env)
+  }
+  conf_limit <- get(key, envir = conf_cache_env, inherits = FALSE)
+  
+  half <- floor(n / 2)
+  ff <- fft(dstd)
+  spectral_density <- Mod(ff[1:half])^2 / n
+  freqs <- seq(0, 0.5, length.out = half)
+  significant <- spectral_density > conf_limit
+  peak_idx <- which(significant & !is.na(significant))
+  peak_periods <- if (length(peak_idx)) {
+    pf <- freqs[peak_idx]
+    pp <- ifelse(pf > 0, 1/pf, NA_real_)
+    ord <- order(spectral_density[peak_idx], decreasing = TRUE)
+    pp[ord]
+  } else numeric(0)
+  
+  spec_list <- list(
+    n_peaks = length(peak_periods),
+    dominant_period = if (length(peak_periods)) peak_periods[1] else NA_real_,
+    conf = conf_limit
+  )
+  
+  list(vc = vc_list, tf = tf_list, spec = spec_list)
 }
 
 # ===== DATA LOADING & PREPROCESSING =====
 log_event("Loading precipitation and PET data...")
 precip_full <- rast(precip_path)
-pet_full <- rast(pet_path)
+pet_full    <- rast(pet_path)
 
-# CRITICAL FIX: Save ORIGINAL raster template BEFORE clipping (for proper output extent)
 original_template <- rast(precip_full, nlyrs = 1)
 saveRDS(original_template, file.path(out_dir, "original_template.rds"))
 log_event(sprintf("✓ Saved ORIGINAL raster template (full extent: %d x %d cells, res: %.1f m)",
                   nrow(original_template), ncol(original_template), res(original_template)[1]))
 
-# Reproject to BC Albers
 log_event("Reprojecting to BC Albers (EPSG:3005)...")
 precip_full <- project(precip_full, "EPSG:3005", method = "bilinear")
-pet_full <- project(pet_full, "EPSG:3005", method = "bilinear")
+pet_full    <- project(pet_full, "EPSG:3005", method = "bilinear")
 
-# Clip to basin extent FOR PROCESSING ONLY (speed optimization)
 log_event("Clipping to Nechako Basin extent for processing...")
 basin_extent <- ext(basin_boundary)
 precip_clipped <- crop(precip_full, basin_extent)
-pet_clipped <- crop(pet_full, basin_extent)
+pet_clipped    <- crop(pet_full, basin_extent)
 precip_clipped <- mask(precip_clipped, vect(basin_boundary))
-pet_clipped <- mask(pet_clipped, vect(basin_boundary))
+pet_clipped    <- mask(pet_clipped, vect(basin_boundary))
 
-# Diagnostic: Cell reduction
 n_bbox_cells <- ncell(precip_clipped)
 first_layer_vals <- values(precip_clipped[[1]], mat = FALSE)
 valid_mask <- !is.na(first_layer_vals)
@@ -148,12 +343,8 @@ n_basin_pixels <- sum(valid_mask)
 reduction_pct <- 100 * (1 - n_basin_pixels / n_bbox_cells)
 log_event(sprintf("✓ BASIN CLIPPING: %d bbox cells → %d basin pixels (%.1f%% reduction)",
                   n_bbox_cells, n_basin_pixels, reduction_pct))
+if (n_basin_pixels == 0) stop("CRITICAL ERROR: No valid cells after basin clipping. Check CRS alignment.")
 
-if (n_basin_pixels == 0) {
-  stop("CRITICAL ERROR: No valid cells after basin clipping. Check CRS alignment.")
-}
-
-# Extract time dimension
 log_event("Extracting time dimension...")
 dates <- NULL
 tryCatch({
@@ -169,13 +360,47 @@ if (is.null(dates) || length(dates) == 0 || all(is.na(dates))) {
   dates <- seq(as.Date(paste0(start_year, "-01-01")), by = "month", length.out = n_layers)
   log_event(paste("Generated", n_layers, "monthly dates from", start_year))
 }
-years <- as.integer(format(dates, "%Y"))
+years  <- as.integer(format(dates, "%Y"))
 months <- as.integer(format(dates, "%m"))
 
-# Unit conversion (m → mm)
+# ===== BASIN AVERAGE TIME SERIES COMPUTATION =====
+log_event("Computing basin-averaged monthly time series...")
+precip_monthly_avg <- as.vector(global(precip_clipped, fun = "mean", na.rm = TRUE)[, 1])
+pet_monthly_avg <- as.vector(global(pet_clipped, fun = "mean", na.rm = TRUE)[, 1])
+
+if (length(precip_monthly_avg) != length(dates)) stop("Length mismatch in basin average Pr")
+if (length(pet_monthly_avg) != length(dates)) stop("Length mismatch in basin average PET")
+
+log_event(sprintf("  Basin-averaged monthly Pr: %d values, range: %.1f to %.1f mm/month", 
+                  length(precip_monthly_avg), 
+                  min(precip_monthly_avg, na.rm = TRUE), 
+                  max(precip_monthly_avg, na.rm = TRUE)))
+log_event(sprintf("  Basin-averaged monthly PET: %d values, range: %.1f to %.1f mm/month", 
+                  length(pet_monthly_avg), 
+                  min(pet_monthly_avg, na.rm = TRUE), 
+                  max(pet_monthly_avg, na.rm = TRUE)))
+
+# Annual aggregation for basin averages
+log_event("Aggregating basin averages to annual...")
+precip_annual_avg_matrix <- aggregate_to_annual_fast(matrix(precip_monthly_avg, ncol = 1), years, method = "sum")
+pet_annual_avg_matrix <- aggregate_to_annual_fast(matrix(pet_monthly_avg, ncol = 1), years, method = "mean")
+precip_annual_avg <- precip_annual_avg_matrix[, 1]
+pet_annual_avg <- pet_annual_avg_matrix[, 1]
+annual_years <- as.integer(rownames(precip_annual_avg_matrix))
+
+log_event(sprintf("  Basin-averaged annual Pr: %d values, range: %.1f to %.1f mm/year", 
+                  length(precip_annual_avg), 
+                  min(precip_annual_avg, na.rm = TRUE), 
+                  max(precip_annual_avg, na.rm = TRUE)))
+log_event(sprintf("  Basin-averaged annual PET: %d values, range: %.1f to %.1f mm/year", 
+                  length(pet_annual_avg), 
+                  min(pet_annual_avg, na.rm = TRUE), 
+                  max(pet_annual_avg, na.rm = TRUE)))
+
+# Unit conversion (m → mm) - ALREADY DONE IN ORIGINAL CODE BELOW
 log_event("Converting units from m to mm...")
 precip_clipped <- precip_clipped * 1000
-pet_clipped <- pet_clipped * 1000
+pet_clipped    <- pet_clipped * 1000
 
 # Pre-process PET: Replace zeros
 log_event(paste("Replacing PET zeros with", min_positive_value, "mm..."))
@@ -193,413 +418,310 @@ valid_cell_indices <- which(valid_mask)
 valid_xy <- xyFromCell(precip_clipped, valid_cell_indices)
 
 precip_vals <- values(precip_clipped)
-pet_vals <- values(pet_clipped)
-precip_matrix <- t(precip_vals[valid_mask, ])
-pet_matrix <- t(pet_vals[valid_mask, ])
+pet_vals    <- values(pet_clipped)
+precip_matrix <- t(precip_vals[valid_mask, , drop = FALSE])
+pet_matrix    <- t(pet_vals[valid_mask,    , drop = FALSE])
 
 coords_dt <- data.table(
-  space_idx = 1:n_basin_pixels,
+  space_idx = seq_len(n_basin_pixels),
   x = valid_xy[, 1],
-  y = valid_xy[, 2]
+  y = valid_xy[, 2],
+  is_basin_average = FALSE  # Flag for pixel data
 )
 log_event(paste("Data reshaped to", n_time, "×", n_basin_pixels, "matrix"))
 
-# ===== AGGREGATION FUNCTIONS =====
-aggregate_to_annual <- function(monthly_matrix, years, method = "sum") {
-  n_years <- length(unique(years))
-  n_space <- ncol(monthly_matrix)
-  annual_matrix <- matrix(NA, nrow = n_years, ncol = n_space)
-  for (i in 1:n_years) {
-    year_indices <- which(years == unique(years)[i])
-    if (method == "sum") {
-      year_data <- colSums(monthly_matrix[year_indices, , drop = FALSE], na.rm = TRUE)
+month_index_list <- compute_month_index(months)
+
+# ===== PROCESS BASIN AVERAGES =====
+log_event("Processing basin-averaged time series through trend tests...")
+
+process_basin_series <- function(ts_monthly, ts_annual, var_name, is_precip) {
+  conf_cache_env_basin <- new.env(parent = emptyenv())
+  
+  # Annual analysis
+  res_annual <- mk_tfpw_spectral_for_series(ts_annual, is_precip, alpha, max_tie_percent,
+                                            n_sim_spectral, conf_cache_env_basin)
+  
+  # Monthly analysis (by calendar month)
+  monthly_results <- vector("list", 12)
+  for (m in 1:12) {
+    mi <- month_index_list[[as.character(m)]]
+    if (length(mi) == 0 || all(is.na(ts_monthly[mi]))) {
+      monthly_results[[m]] <- list(
+        vc = list(tau = NA_real_, p = NA_real_, sl = NA_real_, S = NA_real_, varS = NA_real_,
+                  n = 0, rho1 = NA_real_, vc_corrected = FALSE, n_ties = 0, percent_ties = 0,
+                  n_min_vals = 0, percent_min_vals = 0, tau_b_adjusted = FALSE,
+                  filtered = TRUE, reason = "no_data"),
+        tf = list(tau = NA_real_, p = NA_real_, sl = NA_real_, S = NA_real_, varS = NA_real_,
+                  n = 0, rho1 = NA_real_, tfpw_applied = FALSE, n_ties = 0, percent_ties = 0,
+                  n_min_vals = 0, percent_min_vals = 0, tau_b_adjusted = FALSE,
+                  filtered = TRUE, reason = "no_data"),
+        spec = list(n_peaks = 0L, dominant_period = NA_real_, conf = NA_real_)
+      )
     } else {
-      year_data <- colMeans(monthly_matrix[year_indices, , drop = FALSE], na.rm = TRUE)
+      ts_vec <- ts_monthly[mi]
+      monthly_results[[m]] <- mk_tfpw_spectral_for_series(ts_vec, is_precip, alpha, max_tie_percent,
+                                                          n_sim_spectral, conf_cache_env_basin)
     }
-    n_valid <- colSums(!is.na(monthly_matrix[year_indices, , drop = FALSE]))
-    year_data[n_valid < 6] <- NA
-    annual_matrix[i, ] <- year_data
   }
-  return(annual_matrix)
-}
-
-extract_monthly_subset <- function(monthly_matrix, months, target_month) {
-  month_indices <- which(months == target_month)
-  return(monthly_matrix[month_indices, , drop = FALSE])
-}
-
-# ===== TRENDS ANALYSIS FUNCTIONS (same as original code) =====
-modified_mann_kendall_taub <- function(ts_matrix, alpha = 0.05, max_tie_pct = 50,
-                                       var_name = "Unknown", is_precip = FALSE) {
-  n_time <- nrow(ts_matrix)
-  n_basin_pixels <- ncol(ts_matrix)
-  results <- data.frame(
-    tau = numeric(n_basin_pixels),
-    p.value = numeric(n_basin_pixels),
-    sl = numeric(n_basin_pixels),
-    S = numeric(n_basin_pixels),
-    varS = numeric(n_basin_pixels),
-    n = integer(n_basin_pixels),
-    rho1 = numeric(n_basin_pixels),
-    vc_corrected = logical(n_basin_pixels),
-    n_ties = integer(n_basin_pixels),
-    percent_ties = numeric(n_basin_pixels),
-    n_min_vals = integer(n_basin_pixels),
-    percent_min_vals = numeric(n_basin_pixels),
-    tau_b_adjusted = logical(n_basin_pixels),
-    filtered = logical(n_basin_pixels),
-    filter_reason = character(n_basin_pixels),
-    stringsAsFactors = FALSE
+  
+  # Create annual result row
+  vc_a <- res_annual$vc
+  tf_a <- res_annual$tf
+  spec_a <- res_annual$spec
+  annual_dt <- data.table(
+    space_idx = -1L,
+    x = NA_real_, y = NA_real_,
+    variable = var_name,
+    period = "annual",
+    month = NA_integer_,
+    tau_vc = vc_a$tau, p_value_vc = vc_a$p, sl_vc = vc_a$sl,
+    vc_corrected = vc_a$vc_corrected, n_ties_vc = vc_a$n_ties,
+    percent_ties_vc = vc_a$percent_ties, n_min_vals_vc = vc_a$n_min_vals,
+    percent_min_vals_vc = vc_a$percent_min_vals, tau_b_adjusted_vc = vc_a$tau_b_adjusted,
+    filtered_vc = vc_a$filtered, filter_reason_vc = vc_a$reason,
+    tau_tfpw = tf_a$tau, p_value_tfpw = tf_a$p, sl_tfpw = tf_a$sl,
+    tfpw_applied = tf_a$tfpw_applied, n_ties_tfpw = tf_a$n_ties,
+    percent_ties_tfpw = tf_a$percent_ties, n_min_vals_tfpw = tf_a$n_min_vals,
+    percent_min_vals_tfpw = tf_a$percent_min_vals, tau_b_adjusted_tfpw = tf_a$tau_b_adjusted,
+    filtered_tfpw = tf_a$filtered, filter_reason_tfpw = tf_a$reason,
+    n = vc_a$n, rho1 = vc_a$rho1,
+    n_spectral_peaks = spec_a$n_peaks,
+    dominant_period = spec_a$dominant_period,
+    spectral_confidence = spec_a$conf,
+    same_significance = (vc_a$p < alpha) == (tf_a$p < alpha),
+    same_direction = sign(vc_a$tau) == sign(tf_a$tau),
+    is_basin_average = TRUE
   )
   
-  for (i in 1:n_basin_pixels) {
-    ts_clean <- na.omit(ts_matrix[, i])
-    n <- length(ts_clean)
-    if (n < 10) {
-      results[i, ] <- list(NA, NA, NA, NA, NA, n, NA, FALSE, 0, 0, 0, 0, FALSE, TRUE, "low_n")
-      next
-    }
-    
-    min_val_threshold <- if (is_precip) 0.0 else min_positive_value
-    min_check <- check_min_value_threshold(ts_clean, min_val_threshold, 
-                                           max_pct = if(is_precip) max_min_value_pct_precip else max_min_value_pct_pet,
-                                           var_name = var_name, is_precip = is_precip)
-    if (min_check$exceeds_threshold) {
-      results[i, ] <- list(NA, NA, NA, NA, NA, n, NA, FALSE, 0, 0, 0, min_check$pct_min_vals, 
-                           FALSE, TRUE, "excessive_min_vals")
-      next
-    }
-    
-    n_unique <- length(unique(ts_clean))
-    n_ties <- n - n_unique
-    percent_ties <- (n_ties / n) * 100
-    if (percent_ties > max_tie_pct) {
-      results[i, ] <- list(NA, NA, NA, NA, NA, n, NA, FALSE, n_ties, percent_ties, 0, 0, 
-                           FALSE, TRUE, "excessive_ties")
-      next
-    }
-    
-    sen_slope <- calculate_sens_slope_manual(ts_clean)
-    if (is.na(sen_slope) || is.infinite(sen_slope)) {
-      results[i, ] <- list(NA, NA, NA, NA, NA, n, NA, FALSE, n_ties, percent_ties, 0, 0, 
-                           FALSE, TRUE, "sens_slope_fail")
-      next
-    }
-    
-    S <- 0
-    for (j in 1:(n-1)) {
-      for (k in (j+1):n) {
-        S <- S + sign(ts_clean[k] - ts_clean[j])
-      }
-    }
-    
-    varS_taub <- calculate_variance_with_ties(S, n, ts_clean)
-    tau_b_adjusted <- (percent_ties > 5)
-    n_pairs <- n * (n - 1) / 2
-    tau <- S / n_pairs
-    
-    vc_corrected <- FALSE
-    varS_final <- varS_taub
-    rho1 <- NA
-    acf_result <- tryCatch({
-      acf(ts_clean, lag.max = 1, plot = FALSE, na.action = na.pass)
-    }, error = function(e) NULL, warning = function(w) NULL)
-    rho1 <- if (!is.null(acf_result)) acf_result$acf[2] else NA
-    
-    if (!is.na(rho1) && abs(rho1) > 0.1) {
-      correction_factor <- 1 + (2 * rho1 * (n - 1 - 2 * (n - 1) * rho1 + 3 * rho1 * rho1)) /
-        ((n - 1) * (1 - rho1) * (1 - rho1))
-      varS_final <- varS_taub * correction_factor
-      vc_corrected <- TRUE
-    }
-    
-    if (varS_final <= 0) {
-      p_value <- NA
-    } else {
-      z_stat <- S / sqrt(varS_final)
-      p_value <- 2 * pnorm(-abs(z_stat))
-    }
-    
-    results[i, ] <- list(
-      tau = tau, p.value = p_value, sl = sen_slope, S = S, varS = varS_final, n = n,
-      rho1 = rho1, vc_corrected = vc_corrected, n_ties = n_ties, percent_ties = percent_ties,
-      n_min_vals = 0, percent_min_vals = min_check$pct_min_vals,
-      tau_b_adjusted = tau_b_adjusted, filtered = FALSE, filter_reason = "none"
+  # Create monthly result rows
+  monthly_dts <- list()
+  for (m in 1:12) {
+    vc_m <- monthly_results[[m]]$vc
+    tf_m <- monthly_results[[m]]$tf
+    spec_m <- monthly_results[[m]]$spec
+    monthly_dts[[m]] <- data.table(
+      space_idx = -1L,
+      x = NA_real_, y = NA_real_,
+      variable = var_name,
+      period = "monthly",
+      month = m,
+      tau_vc = vc_m$tau, p_value_vc = vc_m$p, sl_vc = vc_m$sl,
+      vc_corrected = FALSE,
+      n_ties_vc = vc_m$n_ties, percent_ties_vc = vc_m$percent_ties,
+      n_min_vals_vc = vc_m$n_min_vals, percent_min_vals_vc = vc_m$percent_min_vals,
+      tau_b_adjusted_vc = vc_m$tau_b_adjusted, filtered_vc = vc_m$filtered,
+      filter_reason_vc = vc_m$reason,
+      tau_tfpw = tf_m$tau, p_value_tfpw = tf_m$p, sl_tfpw = tf_m$sl,
+      tfpw_applied = FALSE,
+      n_ties_tfpw = tf_m$n_ties, percent_ties_tfpw = tf_m$percent_ties,
+      n_min_vals_tfpw = tf_m$n_min_vals, percent_min_vals_tfpw = tf_m$percent_min_vals,
+      tau_b_adjusted_tfpw = tf_m$tau_b_adjusted, filtered_tfpw = tf_m$filtered,
+      filter_reason_tfpw = tf_m$reason,
+      n = NA_integer_, rho1 = NA_real_,
+      n_spectral_peaks = spec_m$n_peaks,
+      dominant_period = spec_m$dominant_period,
+      spectral_confidence = spec_m$conf,
+      same_significance = (vc_m$p < alpha) == (tf_m$p < alpha),
+      same_direction = sign(vc_m$tau) == sign(tf_m$tau),
+      is_basin_average = TRUE
     )
   }
-  return(results)
-}
-
-perform_tfpw_mk_taub <- function(ts_matrix, alpha = 0.05, max_tie_pct = 50,
-                                 var_name = "Unknown", is_precip = FALSE) {
-  n_time <- nrow(ts_matrix)
-  n_basin_pixels <- ncol(ts_matrix)
-  results <- data.frame(
-    tau = numeric(n_basin_pixels),
-    p.value = numeric(n_basin_pixels),
-    sl = numeric(n_basin_pixels),
-    S = numeric(n_basin_pixels),
-    varS = numeric(n_basin_pixels),
-    n = integer(n_basin_pixels),
-    rho1 = numeric(n_basin_pixels),
-    tfpw_applied = logical(n_basin_pixels),
-    n_ties = integer(n_basin_pixels),
-    percent_ties = numeric(n_basin_pixels),
-    n_min_vals = integer(n_basin_pixels),
-    percent_min_vals = numeric(n_basin_pixels),
-    tau_b_adjusted = logical(n_basin_pixels),
-    filtered = logical(n_basin_pixels),
-    filter_reason = character(n_basin_pixels),
-    stringsAsFactors = FALSE
-  )
+  monthly_dt <- rbindlist(monthly_dts)
   
-  for (i in 1:n_basin_pixels) {
-    ts_clean <- na.omit(ts_matrix[, i])
-    n <- length(ts_clean)
-    if (n < 10) {
-      results[i, ] <- list(NA, NA, NA, NA, NA, n, NA, FALSE, 0, 0, 0, 0, FALSE, TRUE, "low_n")
-      next
-    }
-    
-    min_val_threshold <- if (is_precip) 0.0 else min_positive_value
-    min_check <- check_min_value_threshold(ts_clean, min_val_threshold, 
-                                           max_pct = if(is_precip) max_min_value_pct_precip else max_min_value_pct_pet,
-                                           var_name = var_name, is_precip = is_precip)
-    if (min_check$exceeds_threshold) {
-      results[i, ] <- list(NA, NA, NA, NA, NA, n, NA, FALSE, 0, 0, 0, min_check$pct_min_vals, 
-                           FALSE, TRUE, "excessive_min_vals")
-      next
-    }
-    
-    n_unique <- length(unique(ts_clean))
-    n_ties <- n - n_unique
-    percent_ties <- (n_ties / n) * 100
-    if (percent_ties > max_tie_pct) {
-      results[i, ] <- list(NA, NA, NA, NA, NA, n, NA, FALSE, n_ties, percent_ties, 0, 0, 
-                           FALSE, TRUE, "excessive_ties")
-      next
-    }
-    
-    sen_slope <- calculate_sens_slope_manual(ts_clean)
-    if (is.na(sen_slope) || is.infinite(sen_slope)) {
-      results[i, ] <- list(NA, NA, NA, NA, NA, n, NA, FALSE, n_ties, percent_ties, 0, 0, 
-                           FALSE, TRUE, "sens_slope_fail")
-      next
-    }
-    
-    time_index <- 1:n
-    trend_line <- sen_slope * time_index
-    detrended_series <- ts_clean - trend_line
-    
-    acf_result <- tryCatch({
-      acf(detrended_series, lag.max = 1, plot = FALSE, na.action = na.pass)
-    }, error = function(e) NULL, warning = function(w) NULL)
-    rho1 <- if (!is.null(acf_result)) acf_result$acf[2] else NA
-    
-    tfpw_applied <- FALSE
-    if (!is.na(rho1) && abs(rho1) > 0.1) {
-      prewhitened_detrended <- numeric(n)
-      prewhitened_detrended[1] <- detrended_series[1]
-      for (j in 2:n) {
-        prewhitened_detrended[j] <- detrended_series[j] - rho1 * detrended_series[j-1]
-      }
-      corrected_series <- prewhitened_detrended + trend_line
-      tfpw_applied <- TRUE
-    } else {
-      corrected_series <- ts_clean
-    }
-    
-    S <- 0
-    for (j in 1:(n-1)) {
-      for (k in (j+1):n) {
-        S <- S + sign(corrected_series[k] - corrected_series[j])
-      }
-    }
-    
-    varS_taub <- calculate_variance_with_ties(S, n, corrected_series)
-    tau_b_adjusted <- (percent_ties > 5)
-    n_pairs <- n * (n - 1) / 2
-    tau <- S / n_pairs
-    
-    if (varS_taub <= 0) {
-      p_value <- NA
-    } else {
-      z_stat <- S / sqrt(varS_taub)
-      p_value <- 2 * pnorm(-abs(z_stat))
-    }
-    
-    results[i, ] <- list(
-      tau = tau, p.value = p_value, sl = sen_slope, S = S, varS = varS_taub, n = n,
-      rho1 = rho1, tfpw_applied = tfpw_applied, n_ties = n_ties, percent_ties = percent_ties,
-      n_min_vals = 0, percent_min_vals = min_check$pct_min_vals,
-      tau_b_adjusted = tau_b_adjusted, filtered = FALSE, filter_reason = "none"
-    )
-  }
-  return(results)
+  rbindlist(list(annual_dt, monthly_dt))
 }
 
-perform_spectral_analysis_vectorized <- function(ts_matrix, n_sim = 500, alpha = 0.05) {
-  n_time <- nrow(ts_matrix)
-  n_space <- ncol(ts_matrix)
-  results <- vector("list", n_space)
-  
-  for (i in 1:n_space) {
-    ts_clean <- na.omit(ts_matrix[, i])
-    n <- length(ts_clean)
-    if (n < 20) {
-      results[[i]] <- list(n_peaks = 0, dominant_period = NA, confidence_limit = NA)
-      next
-    }
-    
-    sen_slope <- tryCatch(sens.slope(ts_clean)$estimates, error = function(e) 0)
-    detrended_series <- ts_clean - sen_slope * (1:n)
-    fft_result <- fft(detrended_series - mean(detrended_series))
-    spectral_density <- Mod(fft_result[1:(n/2)])^2 / n
-    frequencies <- seq(0, 0.5, length.out = n/2)
-    
-    max_spectra <- numeric(n_sim)
-    for (j in 1:n_sim) {
-      random_series <- rnorm(n, mean = mean(detrended_series), sd = sd(detrended_series))
-      fft_rand <- fft(random_series - mean(random_series))
-      spectral_rand <- Mod(fft_rand[1:(n/2)])^2 / n
-      max_spectra[j] <- max(spectral_rand, na.rm = TRUE)
-    }
-    
-    conf_limit <- quantile(max_spectra, 1 - alpha, na.rm = TRUE)
-    significant_peaks <- spectral_density > conf_limit
-    peak_indices <- which(significant_peaks & !is.na(significant_peaks))
-    peak_frequencies <- frequencies[peak_indices]
-    peak_periods <- ifelse(peak_frequencies > 0, 1/peak_frequencies, NA)
-    
-    if (length(peak_periods) > 0) {
-      sorted_indices <- order(spectral_density[peak_indices], decreasing = TRUE)
-      peak_periods <- peak_periods[sorted_indices]
-    }
-    
-    results[[i]] <- list(
-      n_peaks = length(peak_periods),
-      dominant_period = if (length(peak_periods) > 0) peak_periods[1] else NA,
-      confidence_limit = conf_limit
-    )
-  }
-  return(results)
-}
+basin_precip_results <- process_basin_series(precip_monthly_avg, precip_annual_avg, "Precipitation", is_precip = TRUE)
+basin_pet_results <- process_basin_series(pet_monthly_avg, pet_annual_avg, "PET", is_precip = FALSE)
 
-# ===== MAIN PROCESSING FUNCTION =====
+# ===== MAIN PROCESSING (PIXELS) =====
 process_variable_final <- function(data_matrix, var_name, coords_dt, is_precip = FALSE) {
   log_event(paste("Processing", var_name, "..."))
+  
   agg_method <- if (is_precip) "sum" else "mean"
-  
-  # Annual processing
   log_event(paste("  Aggregating to annual", agg_method, "..."))
-  annual_matrix <- aggregate_to_annual(data_matrix, years, method = agg_method)
   
-  log_event("  Running VC Mann-Kendall...")
-  vc_annual <- modified_mann_kendall_taub(annual_matrix, alpha, max_tie_percent,
-                                          var_name = var_name, is_precip = is_precip)
+  annual_matrix <- aggregate_to_annual_fast(data_matrix, years, method = agg_method)
   
-  log_event("  Running TFPW Mann-Kendall...")
-  tfpw_annual <- perform_tfpw_mk_taub(annual_matrix, alpha, max_tie_percent,
-                                      var_name = var_name, is_precip = is_precip)
+  conf_cache_env <- new.env(parent = emptyenv())
   
-  log_event("  Running spectral analysis...")
-  spectral_annual <- perform_spectral_analysis_vectorized(annual_matrix, n_sim_spectral)
-  spectral_df <- data.table(
-    n_spectral_peaks = sapply(spectral_annual, function(x) x$n_peaks),
-    dominant_period = sapply(spectral_annual, function(x) x$dominant_period),
-    spectral_confidence = sapply(spectral_annual, function(x) x$confidence_limit)
+  log_event("  Running VC + TFPW MK + Spectral (annual, parallel)...")
+  future.seed <- TRUE
+  res_annual <- future_lapply(
+    seq_len(ncol(annual_matrix)),
+    function(i) {
+      mk_tfpw_spectral_for_series(
+        annual_matrix[, i], is_precip, alpha, max_tie_percent,
+        n_sim_spectral, conf_cache_env
+      )
+    },
+    future.seed = TRUE
   )
+  
+  unpack_mk <- function(which = c("vc", "tf")) {
+    which <- match.arg(which)
+    r <- lapply(res_annual, `[[`, which)
+    
+    DT <- data.table(
+      tau      = vapply(r, function(z) z$tau,      numeric(1)),
+      p        = vapply(r, function(z) z$p,        numeric(1)),
+      sl       = vapply(r, function(z) z$sl,       numeric(1)),
+      S        = vapply(r, function(z) z$S,        numeric(1)),
+      varS     = vapply(r, function(z) z$varS,     numeric(1)),
+      n        = vapply(r, function(z) z$n,        numeric(1)),
+      rho1     = vapply(r, function(z) z$rho1,     numeric(1)),
+      n_ties   = vapply(r, function(z) z$n_ties,   numeric(1)),
+      pct_ties = vapply(r, function(z) z$percent_ties, numeric(1)),
+      n_min    = vapply(r, function(z) z$n_min_vals,   numeric(1)),
+      pct_min  = vapply(r, function(z) z$percent_min_vals, numeric(1)),
+      tau_b_adj= vapply(r, function(z) z$tau_b_adjusted,   logical(1)),
+      filtered = vapply(r, function(z) z$filtered,         logical(1)),
+      reason   = vapply(r, function(z) z$reason,           character(1))
+    )
+    
+    if (which == "vc") {
+      DT[, vc_corrected := vapply(r, function(z) z$vc_corrected, logical(1))]
+    } else {
+      DT[, tfpw_applied := vapply(r, function(z) z$tfpw_applied, logical(1))]
+    }
+    DT
+  }
+  vc_annual   <- unpack_mk("vc")
+  tfpw_annual <- unpack_mk("tf")
+  spec_annual <- {
+    r <- lapply(res_annual, `[[`, "spec")
+    data.table(
+      n_spectral_peaks = vapply(r, `[[`, integer(1), "n_peaks"),
+      dominant_period  = vapply(r, `[[`, numeric(1),  "dominant_period"),
+      spectral_confidence = vapply(r, `[[`, numeric(1), "conf")
+    )
+  }
   
   annual_results <- cbind(
     coords_dt,
     variable = var_name,
     period = "annual",
     month = NA_integer_,
-    setDT(vc_annual)[, .(tau_vc = tau, p_value_vc = p.value, sl_vc = sl,
-                         vc_corrected = vc_corrected, n_ties_vc = n_ties,
-                         percent_ties_vc = percent_ties, n_min_vals_vc = n_min_vals,
-                         percent_min_vals_vc = percent_min_vals,
-                         tau_b_adjusted_vc = tau_b_adjusted,
-                         filtered_vc = filtered, filter_reason_vc = filter_reason)],
-    setDT(tfpw_annual)[, .(tau_tfpw = tau, p_value_tfpw = p.value, sl_tfpw = sl,
-                           tfpw_applied = tfpw_applied, n_ties_tfpw = n_ties,
-                           percent_ties_tfpw = percent_ties, n_min_vals_tfpw = n_min_vals,
-                           percent_min_vals_tfpw = percent_min_vals,
-                           tau_b_adjusted_tfpw = tau_b_adjusted,
-                           filtered_tfpw = filtered, filter_reason_tfpw = filter_reason)],
+    data.table(
+      tau_vc = vc_annual$tau, p_value_vc = vc_annual$p, sl_vc = vc_annual$sl,
+      vc_corrected = vc_annual$vc_corrected, n_ties_vc = vc_annual$n_ties,
+      percent_ties_vc = vc_annual$pct_ties, n_min_vals_vc = vc_annual$n_min,
+      percent_min_vals_vc = vc_annual$pct_min, tau_b_adjusted_vc = vc_annual$tau_b_adj,
+      filtered_vc = vc_annual$filtered, filter_reason_vc = vc_annual$reason
+    ),
+    data.table(
+      tau_tfpw = tfpw_annual$tau, p_value_tfpw = tfpw_annual$p, sl_tfpw = tfpw_annual$sl,
+      tfpw_applied = tfpw_annual$tfpw_applied, n_ties_tfpw = tfpw_annual$n_ties,
+      percent_ties_tfpw = tfpw_annual$pct_ties, n_min_vals_tfpw = tfpw_annual$n_min,
+      percent_min_vals_tfpw = tfpw_annual$pct_min, tau_b_adjusted_tfpw = tfpw_annual$tau_b_adj,
+      filtered_tfpw = tfpw_annual$filtered, filter_reason_tfpw = tfpw_annual$reason
+    ),
     n = vc_annual$n,
     rho1 = vc_annual$rho1,
-    spectral_df,
-    same_significance = (vc_annual$p.value < alpha) == (tfpw_annual$p.value < alpha),
-    same_direction = sign(vc_annual$tau) == sign(tfpw_annual$tau)
+    spec_annual,
+    same_significance = (vc_annual$p < alpha) == (tfpw_annual$p < alpha),
+    same_direction    = sign(vc_annual$tau) == sign(tfpw_annual$tau)
   )
   
-  # Monthly processing
-  log_event("  Processing monthly data (12 calendar months)...")
-  monthly_results_list <- vector("list", 12)
+  log_event("  Processing monthly data (12 calendar months, parallel)...")
+  monthly_results_list <- vector("list", 12L)
   for (m in 1:12) {
-    log_event(paste("    Month", m, "..."))
-    monthly_subset <- extract_monthly_subset(data_matrix, months, m)
+    mi <- month_index_list[[as.character(m)]]
+    monthly_subset <- if (length(mi)) data_matrix[mi, , drop = FALSE] else matrix(NA_real_, 0, ncol(data_matrix))
     
-    vc_monthly <- modified_mann_kendall_taub(monthly_subset, alpha, max_tie_percent,
-                                             var_name = paste(var_name, "month", m),
-                                             is_precip = is_precip)
-    tfpw_monthly <- perform_tfpw_mk_taub(monthly_subset, alpha, max_tie_percent,
-                                         var_name = paste(var_name, "month", m),
-                                         is_precip = is_precip)
-    spectral_monthly <- perform_spectral_analysis_vectorized(monthly_subset, n_sim_spectral)
-    
-    spectral_df_m <- data.table(
-      n_spectral_peaks = sapply(spectral_monthly, function(x) x$n_peaks),
-      dominant_period = sapply(spectral_monthly, function(x) x$dominant_period),
-      spectral_confidence = sapply(spectral_monthly, function(x) x$confidence_limit)
+    res_month <- future_lapply(
+      seq_len(ncol(monthly_subset)),
+      function(i) {
+        mk_tfpw_spectral_for_series(
+          monthly_subset[, i], is_precip, alpha, max_tie_percent,
+          n_sim_spectral, conf_cache_env
+        )
+      },
+      future.seed = TRUE
     )
+    
+    unpack_month <- function(which = c("vc","tf")) {
+      which <- match.arg(which)
+      r <- lapply(res_month, `[[`, which)
+      data.table(
+        tau   = vapply(r, `[[`, numeric(1), "tau"),
+        p     = vapply(r, `[[`, numeric(1), "p"),
+        sl    = vapply(r, `[[`, numeric(1), "sl"),
+        n_ties= vapply(r, `[[`, numeric(1), "n_ties"),
+        pct_ties = vapply(r, `[[`, numeric(1), "percent_ties"),
+        n_min = vapply(r, `[[`, numeric(1), "n_min_vals"),
+        pct_min = vapply(r, `[[`, numeric(1), "percent_min_vals"),
+        tau_b_adj = vapply(r, `[[`, logical(1), "tau_b_adjusted"),
+        filtered  = vapply(r, `[[`, logical(1), "filtered"),
+        reason    = vapply(r, `[[`, character(1), "reason")
+      )
+    }
+    vc_m   <- unpack_month("vc")
+    tf_m   <- unpack_month("tf")
+    spec_m <- {
+      r <- lapply(res_month, `[[`, "spec")
+      data.table(
+        n_spectral_peaks = vapply(r, `[[`, integer(1), "n_peaks"),
+        dominant_period  = vapply(r, `[[`, numeric(1),  "dominant_period"),
+        spectral_confidence = vapply(r, `[[`, numeric(1), "conf")
+      )
+    }
     
     monthly_results_list[[m]] <- cbind(
       coords_dt,
       variable = var_name,
       period = "monthly",
       month = m,
-      setDT(vc_monthly)[, .(tau_vc = tau, p_value_vc = p.value, sl_vc = sl,
-                            vc_corrected = vc_corrected, n_ties_vc = n_ties,
-                            percent_ties_vc = percent_ties, n_min_vals_vc = n_min_vals,
-                            percent_min_vals_vc = percent_min_vals,
-                            tau_b_adjusted_vc = tau_b_adjusted,
-                            filtered_vc = filtered, filter_reason_vc = filter_reason)],
-      setDT(tfpw_monthly)[, .(tau_tfpw = tau, p_value_tfpw = p.value, sl_tfpw = sl,
-                              tfpw_applied = tfpw_applied, n_ties_tfpw = n_ties,
-                              percent_ties_tfpw = percent_ties, n_min_vals_tfpw = n_min_vals,
-                              percent_min_vals_tfpw = percent_min_vals,
-                              tau_b_adjusted_tfpw = tau_b_adjusted,
-                              filtered_tfpw = filtered, filter_reason_tfpw = filter_reason)],
-      n = vc_monthly$n,
-      rho1 = vc_monthly$rho1,
-      spectral_df_m,
-      same_significance = (vc_monthly$p.value < alpha) == (tfpw_monthly$p.value < alpha),
-      same_direction = sign(vc_monthly$tau) == sign(tfpw_monthly$tau)
+      data.table(
+        tau_vc = vc_m$tau, p_value_vc = vc_m$p, sl_vc = vc_m$sl,
+        vc_corrected = FALSE,
+        n_ties_vc = vc_m$n_ties, percent_ties_vc = vc_m$pct_ties,
+        n_min_vals_vc = vc_m$n_min, percent_min_vals_vc = vc_m$pct_min,
+        tau_b_adjusted_vc = vc_m$tau_b_adj, filtered_vc = vc_m$filtered,
+        filter_reason_vc = vc_m$reason
+      ),
+      data.table(
+        tau_tfpw = tf_m$tau, p_value_tfpw = tf_m$p, sl_tfpw = tf_m$sl,
+        tfpw_applied = FALSE,
+        n_ties_tfpw = tf_m$n_ties, percent_ties_tfpw = tf_m$pct_ties,
+        n_min_vals_tfpw = tf_m$n_min, percent_min_vals_tfpw = tf_m$pct_min,
+        tau_b_adjusted_tfpw = tf_m$tau_b_adj, filtered_tfpw = tf_m$filtered,
+        filter_reason_tfpw = tf_m$reason
+      ),
+      n = NA_integer_, rho1 = NA_real_,
+      spec_m,
+      same_significance = (vc_m$p < alpha) == (tf_m$p < alpha),
+      same_direction    = sign(vc_m$tau) == sign(tf_m$tau)
     )
   }
+  monthly_results <- rbindlist(monthly_results_list, use.names = TRUE, fill = TRUE)
   
-  monthly_results <- rbindlist(monthly_results_list)
-  all_results <- rbindlist(list(annual_results, monthly_results))
-  return(all_results)
+  all_results <- rbindlist(list(annual_results, monthly_results), use.names = TRUE, fill = TRUE)
+  all_results
 }
 
-# ===== EXECUTE PROCESSING =====
 log_event("=== STARTING PRECIPITATION ANALYSIS ===")
 precip_results <- process_variable_final(precip_matrix, "Precipitation", coords_dt, is_precip = TRUE)
+
 log_event("=== STARTING PET ANALYSIS ===")
 pet_results <- process_variable_final(pet_matrix, "PET", coords_dt, is_precip = FALSE)
 
-# ===== EFFICIENT STORAGE (NO fst REQUIRED) =====
-log_event("Saving results in RDS format (base R, no external packages)...")
-all_results <- rbindlist(list(precip_results, pet_results))
+# ===== COMBINE PIXEL AND BASIN RESULTS =====
+log_event("Combining pixel-level and basin-averaged results...")
+all_results <- rbindlist(list(precip_results, pet_results, basin_precip_results, basin_pet_results), 
+                         use.names = TRUE, fill = TRUE)
 
-# Save full results with compression
+# ===== EFFICIENT STORAGE =====
+log_event("Saving results in RDS format (base R, no external packages)...")
 saveRDS(all_results, file.path(out_dir, "all_results.rds"), compress = "gzip")
+
+# Save comprehensive metadata including raw time series
 saveRDS(list(
   precip_results = precip_results,
   pet_results = pet_results,
+  basin_precip_results = basin_precip_results,
+  basin_pet_results = basin_pet_results,
   basin_pixels = n_basin_pixels,
   bbox_cells = n_bbox_cells,
   reduction_pct = reduction_pct,
@@ -618,6 +740,17 @@ saveRDS(list(
     nrows = nrow(original_template),
     ncols = ncol(original_template),
     res = res(original_template)
+  ),
+  # CRITICAL: Store raw basin-averaged time series for visualization
+  basin_avg_monthly = data.frame(
+    date = dates,
+    precip_mm_month = precip_monthly_avg,
+    pet_mm_month = pet_monthly_avg
+  ),
+  basin_avg_annual = data.frame(
+    year = annual_years,
+    precip_mm_year = precip_annual_avg,
+    pet_mm_year = pet_annual_avg
   )
 ), file.path(out_dir, "analysis_metadata.rds"))
 
@@ -628,22 +761,23 @@ summary_stats <- all_results[, .(
   n_significant_vc = sum(!filtered_vc & p_value_vc < 0.05, na.rm = TRUE),
   n_valid_tfpw = sum(!filtered_tfpw & !is.na(p_value_tfpw)),
   n_significant_tfpw = sum(!filtered_tfpw & p_value_tfpw < 0.05, na.rm = TRUE)
-), by = .(variable, period, month)]
-
+), by = .(variable, period, month, is_basin_average)]
 fwrite(summary_stats, file.path(out_dir, "summary_statistics.csv"))
 
 log_event("==========================================")
 log_event("DATA PROCESSING COMPLETE")
 log_event("==========================================")
 log_event(sprintf("Results saved to: %s", out_dir))
-log_event("  - all_results.rds (compressed base R format)")
-log_event("  - analysis_metadata.rds (full context)")
-log_event("  - summary_statistics.csv (quick overview)")
-log_event("  - original_template.rds (FULL raster extent for proper outputs)")
-log_event("  - basin_boundary.rds (for mapping)")
+log_event(" - all_results.rds (compressed base R format)")
+log_event(" - analysis_metadata.rds (includes basin-averaged time series)")
+log_event(" - summary_statistics.csv (quick overview)")
+log_event(" - original_template.rds (FULL raster extent for proper outputs)")
+log_event(" - basin_boundary.rds (for mapping)")
 log_event("==========================================")
+
 cat("\n✓ DATA PROCESSING COMPLETED SUCCESSFULLY\n")
 cat(sprintf("  Basin pixels processed: %d (from %d bbox cells)\n", n_basin_pixels, n_bbox_cells))
-cat(sprintf("  Processing time reduction: %.1f%%\n", reduction_pct))
+cat(sprintf("  Basin-averaged time series computed and analyzed\n"))
 cat(sprintf("  Results stored in: %s\n", out_dir))
+
 plan(sequential)
