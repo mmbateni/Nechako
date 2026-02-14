@@ -1,0 +1,71 @@
+SCF TIMESCALE DECISION ALGORITHM - SUMMARY REPORT
+==================================================
+
+Analysis date: 2026-02-13 16:57:01.769483
+
+DATA SOURCES:
+  SCF: monthly_data_direct/snow_cover_monthly.nc
+  SWE: monthly_data_direct/snow_depth_water_equivalent_monthly.nc
+  Period: 1950-01-01 to 2025-12-01
+
+SNOW-CAPABLE DOMAIN:
+  Defined as pixels with ≥5% long-term mean SCF
+  Represents 99.9% of total domain pixels
+
+METRICS REPORTED:
+  Absolute retained fraction: retained pixels / total domain pixels
+  Relative retained fraction: retained pixels / snow-capable pixels (≥5%% SCF)
+  → Scoring uses ABSOLUTE fraction to preserve spatial context
+  → RELATIVE fraction reported for transparency only
+
+TIE-BREAKING RULE:
+  When multiple thresholds yield identical scores (within 0.001 tolerance),
+  the SMALLER threshold is selected to ensure conservative inclusion of
+  hydrologically relevant marginal snow zones.
+
+SCORING TARGETS:
+  Median nonzero years: 20
+  Zero fraction: 0.30
+  Stability percentage: 50%
+
+FINAL RECOMMENDATIONS:
+======================
+
+Timescale: 1-month
+  Chosen threshold: 0.010
+  Absolute retained: 80.8% of total domain
+  Relative retained: 80.8% of snow-capable pixels
+  Zero fraction (median): 0.000
+  Median nonzero years: 76.0
+  Stability: 100.0%
+
+Timescale: 2-month
+  Chosen threshold: 0.010
+  Absolute retained: 85.9% of total domain
+  Relative retained: 85.9% of snow-capable pixels
+  Zero fraction (median): 0.000
+  Median nonzero years: 76.0
+  Stability: 100.0%
+
+Timescale: 3-month
+  Chosen threshold: 0.010
+  Absolute retained: 91.4% of total domain
+  Relative retained: 91.4% of snow-capable pixels
+  Zero fraction (median): 0.000
+  Median nonzero years: 76.0
+  Stability: 100.0%
+
+INTERPRETATION:
+===============
+✓ Absolute fraction reflects spatial extent of snow relevance across ENTIRE basin
+✓ Relative fraction shows efficiency within climatologically relevant snow zones
+✓ Smaller thresholds preferred when scores tie (conservative inclusion principle)
+
+FILES GENERATED:
+================
+  1. scf_timescale_threshold_summary.csv - All candidates (with both metrics)
+  2. scf_timescale_final_recommendations.csv - Best choices (with both metrics)
+  3. scf_threshold_scores.png - Score comparison
+  4. scf_diagnostic_nonzero_years.png - Persistence diagnostic
+  5. scf_retained_fraction.png - Absolute retained fraction
+  6. scf_mask_k*.nc - NetCDF masks for each timescale

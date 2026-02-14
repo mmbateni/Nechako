@@ -1,0 +1,4 @@
+"timescale","chosen_threshold","mean_retained_abs","mean_retained_rel","zero_frac_median","median_nonzero_years","stability_pct"
+1,0.01,0.808116515837104,0.808243727598566,0,76,100
+2,0.01,0.858691553544495,0.858847387285418,0,76,100
+3,0.01,0.914121417797888,0.914308621014903,0,76,100
