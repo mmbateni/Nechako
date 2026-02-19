@@ -1,0 +1,381 @@
+SPEI SUMMARY FOR ALL TIMESCALES (Variance-Aware Approach)
+Generated: 2026-02-18 23:32:55.341642
+============================================================
+
+
+---------- SPEI-1 SUMMARY ----------
+Calculation date: 2026-02-18 23:33:58.07232
+
+Grid dimensions: 43 x 47
+Basin pixels: 863
+Time period: 1950-01-01 to 2025-12-01 (912 months)
+
+Variance Handling:
+  • True zero variance  (var < 2.2e-16):      SPEI = 0 (neutral)
+  • Very low variance   (0 < var < 0.001 mm²): Gringorten empirical ranking
+  • Sufficient variance (var ≥ 0.001 mm²):    Parametric (best of GLO/PE3/GEV),
+                                                Gringorten fallback if KS p ≤ 0.05
+
+NA Analysis:
+  Total NA values in basin: 0.000%
+  MSPEI compatibility: ✓ READY (<0.5% NAs)
+
+Method Distribution:
+  Parametric (GLO/PE3/GEV): 863 pixels (100.0%)
+  Gringorten fallback: 0 pixels (0.0%)
+  Zero variance: 0 pixels (0.0%)
+
+Drought frequency by severity (first 12 months):
+  Exceptional (SPEI < -2.0):  3.3%
+  Extreme     (SPEI < -1.6):  7.3%
+  Severe      (SPEI < -1.3):  13.5%
+  Moderate    (SPEI < -0.8):  33.1%
+
+
+---------- SPEI-2 SUMMARY ----------
+Calculation date: 2026-02-18 23:34:57.490092
+
+Grid dimensions: 43 x 47
+Basin pixels: 863
+Time period: 1950-01-01 to 2025-12-01 (912 months)
+
+Variance Handling:
+  • True zero variance  (var < 2.2e-16):      SPEI = 0 (neutral)
+  • Very low variance   (0 < var < 0.001 mm²): Gringorten empirical ranking
+  • Sufficient variance (var ≥ 0.001 mm²):    Parametric (best of GLO/PE3/GEV),
+                                                Gringorten fallback if KS p ≤ 0.05
+
+NA Analysis:
+  Total NA values in basin: 0.110%
+  MSPEI compatibility: ✓ READY (<0.5% NAs)
+
+Method Distribution:
+  Parametric (GLO/PE3/GEV): 0 pixels (NaN%)
+  Gringorten fallback: 0 pixels (NaN%)
+  Zero variance: 0 pixels (NaN%)
+
+Drought frequency by severity (first 12 months):
+  Exceptional (SPEI < -2.0):  0.9%
+  Extreme     (SPEI < -1.6):  4.3%
+  Severe      (SPEI < -1.3):  13.7%
+  Moderate    (SPEI < -0.8):  32.5%
+
+
+---------- SPEI-3 SUMMARY ----------
+Calculation date: 2026-02-18 23:35:57.567352
+
+Grid dimensions: 43 x 47
+Basin pixels: 863
+Time period: 1950-01-01 to 2025-12-01 (912 months)
+
+Variance Handling:
+  • True zero variance  (var < 2.2e-16):      SPEI = 0 (neutral)
+  • Very low variance   (0 < var < 0.001 mm²): Gringorten empirical ranking
+  • Sufficient variance (var ≥ 0.001 mm²):    Parametric (best of GLO/PE3/GEV),
+                                                Gringorten fallback if KS p ≤ 0.05
+
+NA Analysis:
+  Total NA values in basin: 0.219%
+  MSPEI compatibility: ✓ READY (<0.5% NAs)
+
+Method Distribution:
+  Parametric (GLO/PE3/GEV): 0 pixels (NaN%)
+  Gringorten fallback: 0 pixels (NaN%)
+  Zero variance: 0 pixels (NaN%)
+
+Drought frequency by severity (first 12 months):
+  Exceptional (SPEI < -2.0):  0.4%
+  Extreme     (SPEI < -1.6):  1.6%
+  Severe      (SPEI < -1.3):  7.1%
+  Moderate    (SPEI < -0.8):  38.8%
+
+
+---------- SPEI-4 SUMMARY ----------
+Calculation date: 2026-02-18 23:36:58.449215
+
+Grid dimensions: 43 x 47
+Basin pixels: 863
+Time period: 1950-01-01 to 2025-12-01 (912 months)
+
+Variance Handling:
+  • True zero variance  (var < 2.2e-16):      SPEI = 0 (neutral)
+  • Very low variance   (0 < var < 0.001 mm²): Gringorten empirical ranking
+  • Sufficient variance (var ≥ 0.001 mm²):    Parametric (best of GLO/PE3/GEV),
+                                                Gringorten fallback if KS p ≤ 0.05
+
+NA Analysis:
+  Total NA values in basin: 0.329%
+  MSPEI compatibility: ✓ READY (<0.5% NAs)
+
+Method Distribution:
+  Parametric (GLO/PE3/GEV): 0 pixels (NaN%)
+  Gringorten fallback: 0 pixels (NaN%)
+  Zero variance: 0 pixels (NaN%)
+
+Drought frequency by severity (first 12 months):
+  Exceptional (SPEI < -2.0):  0.0%
+  Extreme     (SPEI < -1.6):  1.8%
+  Severe      (SPEI < -1.3):  12.8%
+  Moderate    (SPEI < -0.8):  45.5%
+
+
+---------- SPEI-5 SUMMARY ----------
+Calculation date: 2026-02-18 23:37:57.940332
+
+Grid dimensions: 43 x 47
+Basin pixels: 863
+Time period: 1950-01-01 to 2025-12-01 (912 months)
+
+Variance Handling:
+  • True zero variance  (var < 2.2e-16):      SPEI = 0 (neutral)
+  • Very low variance   (0 < var < 0.001 mm²): Gringorten empirical ranking
+  • Sufficient variance (var ≥ 0.001 mm²):    Parametric (best of GLO/PE3/GEV),
+                                                Gringorten fallback if KS p ≤ 0.05
+
+NA Analysis:
+  Total NA values in basin: 0.439%
+  MSPEI compatibility: ✓ READY (<0.5% NAs)
+
+Method Distribution:
+  Parametric (GLO/PE3/GEV): 0 pixels (NaN%)
+  Gringorten fallback: 0 pixels (NaN%)
+  Zero variance: 0 pixels (NaN%)
+
+Drought frequency by severity (first 12 months):
+  Exceptional (SPEI < -2.0):  0.0%
+  Extreme     (SPEI < -1.6):  5.1%
+  Severe      (SPEI < -1.3):  20.2%
+  Moderate    (SPEI < -0.8):  50.4%
+
+
+---------- SPEI-6 SUMMARY ----------
+Calculation date: 2026-02-18 23:38:57.736038
+
+Grid dimensions: 43 x 47
+Basin pixels: 863
+Time period: 1950-01-01 to 2025-12-01 (912 months)
+
+Variance Handling:
+  • True zero variance  (var < 2.2e-16):      SPEI = 0 (neutral)
+  • Very low variance   (0 < var < 0.001 mm²): Gringorten empirical ranking
+  • Sufficient variance (var ≥ 0.001 mm²):    Parametric (best of GLO/PE3/GEV),
+                                                Gringorten fallback if KS p ≤ 0.05
+
+NA Analysis:
+  Total NA values in basin: 0.548%
+  MSPEI compatibility: ⚠ CAUTION (>0.5% NAs)
+
+Method Distribution:
+  Parametric (GLO/PE3/GEV): 0 pixels (NaN%)
+  Gringorten fallback: 0 pixels (NaN%)
+  Zero variance: 0 pixels (NaN%)
+
+Drought frequency by severity (first 12 months):
+  Exceptional (SPEI < -2.0):  0.0%
+  Extreme     (SPEI < -1.6):  4.2%
+  Severe      (SPEI < -1.3):  15.7%
+  Moderate    (SPEI < -0.8):  55.2%
+
+
+---------- SPEI-7 SUMMARY ----------
+Calculation date: 2026-02-18 23:39:59.113791
+
+Grid dimensions: 43 x 47
+Basin pixels: 863
+Time period: 1950-01-01 to 2025-12-01 (912 months)
+
+Variance Handling:
+  • True zero variance  (var < 2.2e-16):      SPEI = 0 (neutral)
+  • Very low variance   (0 < var < 0.001 mm²): Gringorten empirical ranking
+  • Sufficient variance (var ≥ 0.001 mm²):    Parametric (best of GLO/PE3/GEV),
+                                                Gringorten fallback if KS p ≤ 0.05
+
+NA Analysis:
+  Total NA values in basin: 0.658%
+  MSPEI compatibility: ⚠ CAUTION (>0.5% NAs)
+
+Method Distribution:
+  Parametric (GLO/PE3/GEV): 0 pixels (NaN%)
+  Gringorten fallback: 0 pixels (NaN%)
+  Zero variance: 0 pixels (NaN%)
+
+Drought frequency by severity (first 12 months):
+  Exceptional (SPEI < -2.0):  0.0%
+  Extreme     (SPEI < -1.6):  3.3%
+  Severe      (SPEI < -1.3):  20.7%
+  Moderate    (SPEI < -0.8):  61.8%
+
+
+---------- SPEI-8 SUMMARY ----------
+Calculation date: 2026-02-18 23:41:00.044476
+
+Grid dimensions: 43 x 47
+Basin pixels: 863
+Time period: 1950-01-01 to 2025-12-01 (912 months)
+
+Variance Handling:
+  • True zero variance  (var < 2.2e-16):      SPEI = 0 (neutral)
+  • Very low variance   (0 < var < 0.001 mm²): Gringorten empirical ranking
+  • Sufficient variance (var ≥ 0.001 mm²):    Parametric (best of GLO/PE3/GEV),
+                                                Gringorten fallback if KS p ≤ 0.05
+
+NA Analysis:
+  Total NA values in basin: 0.768%
+  MSPEI compatibility: ⚠ CAUTION (>0.5% NAs)
+
+Method Distribution:
+  Parametric (GLO/PE3/GEV): 0 pixels (NaN%)
+  Gringorten fallback: 0 pixels (NaN%)
+  Zero variance: 0 pixels (NaN%)
+
+Drought frequency by severity (first 12 months):
+  Exceptional (SPEI < -2.0):  0.0%
+  Extreme     (SPEI < -1.6):  5.6%
+  Severe      (SPEI < -1.3):  20.0%
+  Moderate    (SPEI < -0.8):  62.2%
+
+
+---------- SPEI-9 SUMMARY ----------
+Calculation date: 2026-02-18 23:42:02.979453
+
+Grid dimensions: 43 x 47
+Basin pixels: 863
+Time period: 1950-01-01 to 2025-12-01 (912 months)
+
+Variance Handling:
+  • True zero variance  (var < 2.2e-16):      SPEI = 0 (neutral)
+  • Very low variance   (0 < var < 0.001 mm²): Gringorten empirical ranking
+  • Sufficient variance (var ≥ 0.001 mm²):    Parametric (best of GLO/PE3/GEV),
+                                                Gringorten fallback if KS p ≤ 0.05
+
+NA Analysis:
+  Total NA values in basin: 0.877%
+  MSPEI compatibility: ⚠ CAUTION (>0.5% NAs)
+
+Method Distribution:
+  Parametric (GLO/PE3/GEV): 0 pixels (NaN%)
+  Gringorten fallback: 0 pixels (NaN%)
+  Zero variance: 0 pixels (NaN%)
+
+Drought frequency by severity (first 12 months):
+  Exceptional (SPEI < -2.0):  0.0%
+  Extreme     (SPEI < -1.6):  4.5%
+  Severe      (SPEI < -1.3):  22.5%
+  Moderate    (SPEI < -0.8):  65.2%
+
+
+---------- SPEI-10 SUMMARY ----------
+Calculation date: 2026-02-18 23:43:02.969222
+
+Grid dimensions: 43 x 47
+Basin pixels: 863
+Time period: 1950-01-01 to 2025-12-01 (912 months)
+
+Variance Handling:
+  • True zero variance  (var < 2.2e-16):      SPEI = 0 (neutral)
+  • Very low variance   (0 < var < 0.001 mm²): Gringorten empirical ranking
+  • Sufficient variance (var ≥ 0.001 mm²):    Parametric (best of GLO/PE3/GEV),
+                                                Gringorten fallback if KS p ≤ 0.05
+
+NA Analysis:
+  Total NA values in basin: 0.987%
+  MSPEI compatibility: ⚠ CAUTION (>0.5% NAs)
+
+Method Distribution:
+  Parametric (GLO/PE3/GEV): 0 pixels (NaN%)
+  Gringorten fallback: 0 pixels (NaN%)
+  Zero variance: 0 pixels (NaN%)
+
+Drought frequency by severity (first 12 months):
+  Exceptional (SPEI < -2.0):  0.0%
+  Extreme     (SPEI < -1.6):  6.0%
+  Severe      (SPEI < -1.3):  26.3%
+  Moderate    (SPEI < -0.8):  64.5%
+
+
+---------- SPEI-11 SUMMARY ----------
+Calculation date: 2026-02-18 23:44:02.841462
+
+Grid dimensions: 43 x 47
+Basin pixels: 863
+Time period: 1950-01-01 to 2025-12-01 (912 months)
+
+Variance Handling:
+  • True zero variance  (var < 2.2e-16):      SPEI = 0 (neutral)
+  • Very low variance   (0 < var < 0.001 mm²): Gringorten empirical ranking
+  • Sufficient variance (var ≥ 0.001 mm²):    Parametric (best of GLO/PE3/GEV),
+                                                Gringorten fallback if KS p ≤ 0.05
+
+NA Analysis:
+  Total NA values in basin: 1.096%
+  MSPEI compatibility: ⚠ CAUTION (>0.5% NAs)
+
+Method Distribution:
+  Parametric (GLO/PE3/GEV): 0 pixels (NaN%)
+  Gringorten fallback: 0 pixels (NaN%)
+  Zero variance: 0 pixels (NaN%)
+
+Drought frequency by severity (first 12 months):
+  Exceptional (SPEI < -2.0):  0.0%
+  Extreme     (SPEI < -1.6):  4.5%
+  Severe      (SPEI < -1.3):  25.5%
+  Moderate    (SPEI < -0.8):  63.8%
+
+
+---------- SPEI-12 SUMMARY ----------
+Calculation date: 2026-02-18 23:45:02.226198
+
+Grid dimensions: 43 x 47
+Basin pixels: 863
+Time period: 1950-01-01 to 2025-12-01 (912 months)
+
+Variance Handling:
+  • True zero variance  (var < 2.2e-16):      SPEI = 0 (neutral)
+  • Very low variance   (0 < var < 0.001 mm²): Gringorten empirical ranking
+  • Sufficient variance (var ≥ 0.001 mm²):    Parametric (best of GLO/PE3/GEV),
+                                                Gringorten fallback if KS p ≤ 0.05
+
+NA Analysis:
+  Total NA values in basin: 1.206%
+  MSPEI compatibility: ⚠ CAUTION (>0.5% NAs)
+
+Method Distribution:
+  Parametric (GLO/PE3/GEV): 0 pixels (NaN%)
+  Gringorten fallback: 0 pixels (NaN%)
+  Zero variance: 0 pixels (NaN%)
+
+Drought frequency by severity (first 12 months):
+  Exceptional (SPEI < -2.0):  0.0%
+  Extreme     (SPEI < -1.6):  4.9%
+  Severe      (SPEI < -1.3):  26.8%
+  Moderate    (SPEI < -0.8):  65.9%
+
+
+---------- SPEI-24 SUMMARY ----------
+Calculation date: 2026-02-18 23:46:02.362571
+
+Grid dimensions: 43 x 47
+Basin pixels: 863
+Time period: 1950-01-01 to 2025-12-01 (912 months)
+
+Variance Handling:
+  • True zero variance  (var < 2.2e-16):      SPEI = 0 (neutral)
+  • Very low variance   (0 < var < 0.001 mm²): Gringorten empirical ranking
+  • Sufficient variance (var ≥ 0.001 mm²):    Parametric (best of GLO/PE3/GEV),
+                                                Gringorten fallback if KS p ≤ 0.05
+
+NA Analysis:
+  Total NA values in basin: 2.522%
+  MSPEI compatibility: ⚠ CAUTION (>0.5% NAs)
+
+Method Distribution:
+  Parametric (GLO/PE3/GEV): 0 pixels (NaN%)
+  Gringorten fallback: 0 pixels (NaN%)
+  Zero variance: 0 pixels (NaN%)
+
+Drought frequency by severity (first 12 months):
+  Exceptional (SPEI < -2.0):  0.0%
+  Extreme     (SPEI < -1.6):  15.8%
+  Severe      (SPEI < -1.3):  44.9%
+  Moderate    (SPEI < -0.8):  99.8%
+

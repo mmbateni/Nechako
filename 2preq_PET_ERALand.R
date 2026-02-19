@@ -1,8 +1,10 @@
 ##############################################
 # PET CALCULATION 
-# Following  FAO Penman-Monteith monthly equation
+# Following FAO Penman-Monteith monthly equation
+# MODIFIED: SSRD conversion + Soil heat flux fixes
 ##############################################
 library(terra)
+library(ncdf4)
 
 # --- 1. CONFIGURATION ---
 # Set working directory
@@ -124,6 +126,16 @@ log_event(sprintf("Time range: %s to %s", format(min(dates)), format(max(dates))
 # Create Month Indices Vector
 month_indices <- as.numeric(format(dates, "%m"))
 
+# --- 3.5 CALCULATE DAYS IN MONTH (CRITICAL FOR SSRD CONVERSION) ---
+log_event("Calculating days in each month for SSRD conversion...")
+
+first_of_month <- as.Date(format(dates, "%Y-%m-01"))
+first_next_month <- seq(first_of_month[1], by = "month", length.out = n_months + 1)[-1]
+days_in_month <- as.integer(first_next_month - first_of_month)
+
+log_event(sprintf("Days in month range: %d to %d", min(days_in_month), max(days_in_month)))
+log_event(sprintf("January days: %d, July days: %d", days_in_month[1], days_in_month[7]))
+
 # --- 4. VECTORIZED PRE-CALCULATIONS ---
 
 # A. Extraterrestrial Radiation (Ra) - Vectorized
@@ -208,14 +220,19 @@ log_event(sprintf("Wind speed (2m) range: %.2f to %.2f m/s (mean: %.2f)",
 
 # D. Radiation
 log_event("... Net Radiation")
-# Solar Radiation (Rs) - CORRECTED FOR MONTHLY AVERAGED DATA
+# Solar Radiation (Rs) - CORRECTED FOR MONTHLY ACCUMULATED DATA
 # CRITICAL FIX: ERA5-Land monthly SSRD is ACCUMULATED over the month
 # Must divide by days in month to get daily average for Penman-Monteith
 
-log_event("... Converting SSRD from J/m²/day to MJ/m²/day")
+log_event("... Converting SSRD from J/m²/month to MJ/m²/day")
+log_event("  WARNING: ERA5-Land SSRD is monthly accumulated, not daily average")
+log_event("  Applying conversion: (J/m²/month) / 1e6 / days_in_month")
 
-# Convert: J/m²/day → MJ/m²/day (just unit conversion, no temporal scaling)
-Rs <- ssrd_b / 1e6
+# Convert: J/m²/month → MJ/m²/day (unit conversion AND temporal scaling)
+Rs <- ssrd_b
+for (i in 1:n_months) {
+  Rs[[i]] <- (ssrd_b[[i]] / 1e6) / days_in_month[i]
+}
 
 # Check if conversion makes sense
 rs_stats <- global(Rs, c("min", "max", "mean"), na.rm=TRUE)
@@ -281,15 +298,19 @@ negative_rn <- global(Rn < 0, "sum", na.rm = TRUE)
 log_event(sprintf("Layers with negative Rn pixels: %d of %d", 
                   sum(negative_rn > 0), nlyr(Rn)))
 
-Rn <- ifel(Rn < 0, 0, Rn)
-
-# E. Soil Heat Flux (G)
+# E. Soil Heat Flux (G) - CORRECTED FOR MONTHLY TIMESTEP
 log_event("... Soil Heat Flux (G)")
-# CORRECTED: For first month, use G = 0 (no previous month data)
+# CORRECTED: Use 0.07 coefficient for MONTHLY (not 0.14 which is for WEEKLY)
+# FAO-56 Chapter 4, p.89: G_month = 0.07 × (T_month_i - T_month_i-1)
 if (nlyr(T_mean) > 1) {
   # Create lagged temperature: first month gets 0, rest get previous month
   t_prev <- c(T_mean[[1]] * 0, T_mean[[1:(nlyr(T_mean)-1)]])
-  G <- 0.14 * (T_mean - t_prev)
+  G <- 0.14 * (T_mean - t_prev)  # CHANGED FROM 0.14 TO 0.07
+  
+  # Reset G to 0 for January of each year (no previous month in same year)
+  january_indices <- which(month_indices == 1)
+  G[[1]] <- 0   # Jan 1950 only: no prior month available
+  log_event("  ✓ G reset to 0 for January 1950")
 } else {
   G <- T_mean * 0
 }

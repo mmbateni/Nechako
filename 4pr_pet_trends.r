@@ -3,7 +3,8 @@
 # Purpose: Perform comprehensive trend analysis for pixels AND basin averages
 # Output: Binary data files including basin-averaged time series and statistics
 ####################################################################################
-
+rm(list = ls())  # Clear workspace
+gc()  # Garbage collect
 library(ncdf4)
 library(terra)
 library(data.table)
@@ -11,6 +12,7 @@ library(Kendall)
 library(future.apply)
 library(zoo)
 library(sf)
+library(changepoint)  # NEW: For PELT changepoint detection
 
 # ================= USER / ENV =================
 setwd("D:/Nechako_Drought/Nechako/")
@@ -68,6 +70,7 @@ max_tie_percent <- 50
 max_min_value_pct_precip <- 80
 max_min_value_pct_pet    <- 50
 min_positive_value <- 0.01
+min_obs_changepoint <- 20  # NEW: Minimum observations for PELT changepoint detection
 
 # Parallel setup
 num_cores <- min(parallel::detectCores() - 1, 8)
@@ -115,6 +118,82 @@ calculate_variance_with_ties <- function(S, n, x) {
   var_s
 }
 
+# ===== NEW: PELT CHANGEPOINT DETECTION FUNCTION =====
+# Detects regime shifts in mean level using PELT algorithm
+detect_regime_shift_pelt <- function(ts_vec, min_obs = 20, start_year = NULL) {
+  ts_clean <- na.omit(ts_vec)
+  n <- length(ts_clean)
+  
+  # Require minimum observations for reliable detection
+  if (n < min_obs) {
+    return(list(
+      changepoint_detected = FALSE,
+      changepoint_position = NA_integer_,
+      n_changepoints = 0L,
+      first_changepoint_year = NA_integer_,
+      mean_before = NA_real_,
+      mean_after = NA_real_,
+      magnitude_shift = NA_real_
+    ))
+  }
+  
+  result <- tryCatch({
+    # PELT algorithm with BIC penalty (conservative, avoids over-detection)
+    cpt <- cpt.mean(ts_clean, method = "PELT", penalty = "BIC")
+    cpts_detected <- cpts(cpt)
+    
+    if (length(cpts_detected) > 0) {
+      # Get first changepoint position
+      first_cpt <- cpts_detected[1]
+      
+      # Calculate means before and after first changepoint
+      mean_before <- mean(ts_clean[1:first_cpt], na.rm = TRUE)
+      mean_after <- mean(ts_clean[(first_cpt+1):n], na.rm = TRUE)
+      magnitude <- mean_after - mean_before
+      
+      # Convert position to actual year if start_year provided
+      cpt_year <- if (!is.null(start_year)) {
+        start_year + first_cpt - 1
+      } else {
+        first_cpt
+      }
+      
+      list(
+        changepoint_detected = TRUE,
+        changepoint_position = first_cpt,
+        n_changepoints = length(cpts_detected),
+        first_changepoint_year = as.integer(cpt_year),
+        mean_before = mean_before,
+        mean_after = mean_after,
+        magnitude_shift = magnitude
+      )
+    } else {
+      list(
+        changepoint_detected = FALSE,
+        changepoint_position = NA_integer_,
+        n_changepoints = 0L,
+        first_changepoint_year = NA_integer_,
+        mean_before = NA_real_,
+        mean_after = NA_real_,
+        magnitude_shift = NA_real_
+      )
+    }
+  }, error = function(e) {
+    # Return NA structure if changepoint detection fails
+    list(
+      changepoint_detected = FALSE,
+      changepoint_position = NA_integer_,
+      n_changepoints = 0L,
+      first_changepoint_year = NA_integer_,
+      mean_before = NA_real_,
+      mean_after = NA_real_,
+      magnitude_shift = NA_real_
+    )
+  })
+  
+  return(result)
+}
+
 aggregate_to_annual_fast <- function(monthly_matrix, years, method = "sum") {
   y_levels <- unique(years)
   yfac <- match(years, y_levels)
@@ -137,7 +216,7 @@ compute_month_index <- function(months) {
 }
 
 mk_tfpw_spectral_for_series <- function(ts_vec, is_precip, alpha, max_tie_pct,
-                                        n_sim_spectral, conf_cache_env) {
+                                        n_sim_spectral, conf_cache_env, start_year = NULL) {
   ts_clean <- na.omit(ts_vec)
   n <- length(ts_clean)
   
@@ -151,7 +230,10 @@ mk_tfpw_spectral_for_series <- function(ts_vec, is_precip, alpha, max_tie_pct,
                 n = n, rho1 = NA_real_, tfpw_applied = FALSE, n_ties = 0, percent_ties = 0,
                 n_min_vals = 0, percent_min_vals = 0, tau_b_adjusted = FALSE,
                 filtered = TRUE, reason = "low_n"),
-      spec = list(n_peaks = 0L, dominant_period = NA_real_, conf = NA_real_)
+      spec = list(n_peaks = 0L, dominant_period = NA_real_, conf = NA_real_),
+      cpt = list(changepoint_detected = FALSE, changepoint_position = NA_integer_,
+                 n_changepoints = 0L, first_changepoint_year = NA_integer_,
+                 mean_before = NA_real_, mean_after = NA_real_, magnitude_shift = NA_real_)
     ))
   }
   
@@ -171,7 +253,10 @@ mk_tfpw_spectral_for_series <- function(ts_vec, is_precip, alpha, max_tie_pct,
                 n = n, rho1 = NA_real_, tfpw_applied = FALSE, n_ties = 0, percent_ties = 0,
                 n_min_vals = 0, percent_min_vals = min_check$pct_min_vals, tau_b_adjusted = FALSE,
                 filtered = TRUE, reason = "excessive_min_vals"),
-      spec = list(n_peaks = 0L, dominant_period = NA_real_, conf = NA_real_)
+      spec = list(n_peaks = 0L, dominant_period = NA_real_, conf = NA_real_),
+      cpt = list(changepoint_detected = FALSE, changepoint_position = NA_integer_,
+                 n_changepoints = 0L, first_changepoint_year = NA_integer_,
+                 mean_before = NA_real_, mean_after = NA_real_, magnitude_shift = NA_real_)
     ))
   }
   
@@ -188,7 +273,10 @@ mk_tfpw_spectral_for_series <- function(ts_vec, is_precip, alpha, max_tie_pct,
                 n = n, rho1 = NA_real_, tfpw_applied = FALSE, n_ties = n_ties, percent_ties = percent_ties,
                 n_min_vals = 0, percent_min_vals = min_check$pct_min_vals, tau_b_adjusted = FALSE,
                 filtered = TRUE, reason = "excessive_ties"),
-      spec = list(n_peaks = 0L, dominant_period = NA_real_, conf = NA_real_)
+      spec = list(n_peaks = 0L, dominant_period = NA_real_, conf = NA_real_),
+      cpt = list(changepoint_detected = FALSE, changepoint_position = NA_integer_,
+                 n_changepoints = 0L, first_changepoint_year = NA_integer_,
+                 mean_before = NA_real_, mean_after = NA_real_, magnitude_shift = NA_real_)
     ))
   }
   
@@ -203,7 +291,10 @@ mk_tfpw_spectral_for_series <- function(ts_vec, is_precip, alpha, max_tie_pct,
                 n = n, rho1 = NA_real_, tfpw_applied = FALSE, n_ties = n_ties, percent_ties = percent_ties,
                 n_min_vals = 0, percent_min_vals = min_check$pct_min_vals, tau_b_adjusted = FALSE,
                 filtered = TRUE, reason = "sens_slope_fail"),
-      spec = list(n_peaks = 0L, dominant_period = NA_real_, conf = NA_real_)
+      spec = list(n_peaks = 0L, dominant_period = NA_real_, conf = NA_real_),
+      cpt = list(changepoint_detected = FALSE, changepoint_position = NA_integer_,
+                 n_changepoints = 0L, first_changepoint_year = NA_integer_,
+                 mean_before = NA_real_, mean_after = NA_real_, magnitude_shift = NA_real_)
     ))
   }
   
@@ -312,13 +403,69 @@ mk_tfpw_spectral_for_series <- function(ts_vec, is_precip, alpha, max_tie_pct,
     conf = conf_limit
   )
   
-  list(vc = vc_list, tf = tf_list, spec = spec_list)
+  # NEW: Apply PELT changepoint detection to the time series
+  cpt_result <- detect_regime_shift_pelt(ts_clean, min_obs = min_obs_changepoint, start_year = start_year)
+  
+  list(vc = vc_list, tf = tf_list, spec = spec_list, cpt = cpt_result)
 }
 
 # ===== DATA LOADING & PREPROCESSING =====
 log_event("Loading precipitation and PET data...")
 precip_full <- rast(precip_path)
 pet_full    <- rast(pet_path)
+
+
+
+# ===== EXTRACT TIME AND COMPUTE DAYS PER MONTH =====
+log_event("Extracting time dimension for full rasters...")
+dates_full <- NULL
+tryCatch({
+  dates_full <- terra::time(precip_full)
+  if (!is.null(dates_full) && length(dates_full) > 0) {
+    log_event("Time extracted using terra::time()")
+  }
+}, error = function(e) {})
+if (is.null(dates_full) || length(dates_full) == 0 || all(is.na(dates_full))) {
+  n_layers <- nlyr(precip_full)
+  start_year <- 1950  # Changed from 1980 to match actual data range
+  dates_full <- seq(as.Date(paste0(start_year, "-01-01")), by = "month", length.out = n_layers)
+  log_event(paste("Generated", n_layers, "monthly dates from", start_year))
+}
+years_full  <- as.integer(format(dates_full, "%Y"))
+months_full <- as.integer(format(dates_full, "%m"))
+
+log_event("Computing days per month for each layer...")
+month_days_base <- c(31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+is_leap <- function(year) (year %% 4 == 0) & (year %% 100 != 0 | year %% 400 == 0)
+days_in_month <- month_days_base[months_full]
+leap_years <- is_leap(years_full)
+days_in_month[leap_years & months_full == 2] <- 29
+
+# Convert from meters to millimeters (mm/day)
+precip_full <- precip_full * 1000
+
+# Now convert from mm/day to monthly totals using days per month
+
+log_event("Converting precipitation from mm/day to mm/month...")
+for (i in seq_len(nlyr(precip_full))) {
+  precip_full[[i]] <- precip_full[[i]] * days_in_month[i]
+}
+
+# For PET, since ti is in mm/day monthly totals (mm/month) do the same:
+log_event("Converting PET from mm/day to mm/month...")
+for (i in seq_len(nlyr(pet_full))) {
+  pet_full[[i]] <- pet_full[[i]] * days_in_month[i]
+}
+cat("\n=== Pr AFTER × 1000 * N.days CONVERSION (mm/month) ===\n")
+cat("Precipitation min:", min(values(precip_full), na.rm=TRUE), "\n")
+cat("Precipitation max:", max(values(precip_full), na.rm=TRUE), "\n")
+cat("Precipitation mean:", mean(values(precip_full), na.rm=TRUE), "\n")
+cat("=== PET AFTER × N.days CONVERSION (mm/month) ===\n")
+pet_min    <- min(global(pet_full,    "min", na.rm = TRUE))
+pet_max    <- max(global(pet_full,    "max", na.rm = TRUE))
+pet_mean    <- mean(global(pet_full,    "max", na.rm = TRUE))
+cat("PET – min:", pet_min, " max:", pet_max, "\n")
+cat("PET Mean:",pet_mean, "\n")
 
 original_template <- rast(precip_full, nlyrs = 1)
 saveRDS(original_template, file.path(out_dir, "original_template.rds"))
@@ -333,8 +480,8 @@ log_event("Clipping to Nechako Basin extent for processing...")
 basin_extent <- ext(basin_boundary)
 precip_clipped <- crop(precip_full, basin_extent)
 pet_clipped    <- crop(pet_full, basin_extent)
-precip_clipped <- mask(precip_clipped, vect(basin_boundary))
-pet_clipped    <- mask(pet_clipped, vect(basin_boundary))
+precip_clipped <- mask(precip_clipped, vect(basin_boundary),touches = TRUE)
+pet_clipped    <- mask(pet_clipped, vect(basin_boundary),touches = TRUE)
 
 n_bbox_cells <- ncell(precip_clipped)
 first_layer_vals <- values(precip_clipped[[1]], mat = FALSE)
@@ -363,10 +510,29 @@ if (is.null(dates) || length(dates) == 0 || all(is.na(dates))) {
 years  <- as.integer(format(dates, "%Y"))
 months <- as.integer(format(dates, "%m"))
 
+# After extracting dates, years, months
+log_event("Computing days per month for each layer...")
+month_days_base <- c(31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+
+# Leap year test function
+is_leap <- function(year) {
+  (year %% 4 == 0) & (year %% 100 != 0 | year %% 400 == 0)
+}
+
+# Create a vector of days for each layer
+days_in_month <- month_days_base[months]
+leap_years <- is_leap(years)
+days_in_month[leap_years & months == 2] <- 29   # adjust February in leap years
+
 # ===== BASIN AVERAGE TIME SERIES COMPUTATION =====
+# log_event("Converting units from m to mm...")
+# precip_monthly_avg <- precip_monthly_avg * 1000
+# pet_monthly_avg <- pet_monthly_avg * 1000
 log_event("Computing basin-averaged monthly time series...")
+
 precip_monthly_avg <- as.vector(global(precip_clipped, fun = "mean", na.rm = TRUE)[, 1])
 pet_monthly_avg <- as.vector(global(pet_clipped, fun = "mean", na.rm = TRUE)[, 1])
+
 
 if (length(precip_monthly_avg) != length(dates)) stop("Length mismatch in basin average Pr")
 if (length(pet_monthly_avg) != length(dates)) stop("Length mismatch in basin average PET")
@@ -396,11 +562,6 @@ log_event(sprintf("  Basin-averaged annual PET: %d values, range: %.1f to %.1f m
                   length(pet_annual_avg), 
                   min(pet_annual_avg, na.rm = TRUE), 
                   max(pet_annual_avg, na.rm = TRUE)))
-
-# Unit conversion (m → mm) - ALREADY DONE IN ORIGINAL CODE BELOW
-log_event("Converting units from m to mm...")
-precip_clipped <- precip_clipped * 1000
-pet_clipped    <- pet_clipped * 1000
 
 # Pre-process PET: Replace zeros
 log_event(paste("Replacing PET zeros with", min_positive_value, "mm..."))
@@ -440,7 +601,8 @@ process_basin_series <- function(ts_monthly, ts_annual, var_name, is_precip) {
   
   # Annual analysis
   res_annual <- mk_tfpw_spectral_for_series(ts_annual, is_precip, alpha, max_tie_percent,
-                                            n_sim_spectral, conf_cache_env_basin)
+                                            n_sim_spectral, conf_cache_env_basin, 
+                                            start_year = min(annual_years))  # NEW: Pass start year
   
   # Monthly analysis (by calendar month)
   monthly_results <- vector("list", 12)
@@ -456,12 +618,17 @@ process_basin_series <- function(ts_monthly, ts_annual, var_name, is_precip) {
                   n = 0, rho1 = NA_real_, tfpw_applied = FALSE, n_ties = 0, percent_ties = 0,
                   n_min_vals = 0, percent_min_vals = 0, tau_b_adjusted = FALSE,
                   filtered = TRUE, reason = "no_data"),
-        spec = list(n_peaks = 0L, dominant_period = NA_real_, conf = NA_real_)
+        spec = list(n_peaks = 0L, dominant_period = NA_real_, conf = NA_real_),
+        cpt = list(changepoint_detected = FALSE, changepoint_position = NA_integer_,
+                   n_changepoints = 0L, first_changepoint_year = NA_integer_,
+                   mean_before = NA_real_, mean_after = NA_real_, magnitude_shift = NA_real_)
       )
     } else {
       ts_vec <- ts_monthly[mi]
+      # Monthly changepoint detection not recommended - see documentation
       monthly_results[[m]] <- mk_tfpw_spectral_for_series(ts_vec, is_precip, alpha, max_tie_percent,
-                                                          n_sim_spectral, conf_cache_env_basin)
+                                                          n_sim_spectral, conf_cache_env_basin,
+                                                          start_year = NULL)  # No year conversion for monthly
     }
   }
   
@@ -469,6 +636,7 @@ process_basin_series <- function(ts_monthly, ts_annual, var_name, is_precip) {
   vc_a <- res_annual$vc
   tf_a <- res_annual$tf
   spec_a <- res_annual$spec
+  cpt_a <- res_annual$cpt  # NEW: Extract changepoint results
   annual_dt <- data.table(
     space_idx = -1L,
     x = NA_real_, y = NA_real_,
@@ -489,6 +657,14 @@ process_basin_series <- function(ts_monthly, ts_annual, var_name, is_precip) {
     n_spectral_peaks = spec_a$n_peaks,
     dominant_period = spec_a$dominant_period,
     spectral_confidence = spec_a$conf,
+    # NEW: Add changepoint columns
+    changepoint_detected = cpt_a$changepoint_detected,
+    changepoint_position = cpt_a$changepoint_position,
+    n_changepoints = cpt_a$n_changepoints,
+    first_changepoint_year = cpt_a$first_changepoint_year,
+    mean_before_shift = cpt_a$mean_before,
+    mean_after_shift = cpt_a$mean_after,
+    magnitude_shift = cpt_a$magnitude_shift,
     same_significance = (vc_a$p < alpha) == (tf_a$p < alpha),
     same_direction = sign(vc_a$tau) == sign(tf_a$tau),
     is_basin_average = TRUE
@@ -500,6 +676,7 @@ process_basin_series <- function(ts_monthly, ts_annual, var_name, is_precip) {
     vc_m <- monthly_results[[m]]$vc
     tf_m <- monthly_results[[m]]$tf
     spec_m <- monthly_results[[m]]$spec
+    cpt_m <- monthly_results[[m]]$cpt  # NEW: Extract changepoint results
     monthly_dts[[m]] <- data.table(
       space_idx = -1L,
       x = NA_real_, y = NA_real_,
@@ -522,6 +699,14 @@ process_basin_series <- function(ts_monthly, ts_annual, var_name, is_precip) {
       n_spectral_peaks = spec_m$n_peaks,
       dominant_period = spec_m$dominant_period,
       spectral_confidence = spec_m$conf,
+      # NEW: Add changepoint columns (usually NA for monthly - not recommended)
+      changepoint_detected = cpt_m$changepoint_detected,
+      changepoint_position = cpt_m$changepoint_position,
+      n_changepoints = cpt_m$n_changepoints,
+      first_changepoint_year = cpt_m$first_changepoint_year,
+      mean_before_shift = cpt_m$mean_before,
+      mean_after_shift = cpt_m$mean_after,
+      magnitude_shift = cpt_m$magnitude_shift,
       same_significance = (vc_m$p < alpha) == (tf_m$p < alpha),
       same_direction = sign(vc_m$tau) == sign(tf_m$tau),
       is_basin_average = TRUE
@@ -546,14 +731,15 @@ process_variable_final <- function(data_matrix, var_name, coords_dt, is_precip =
   
   conf_cache_env <- new.env(parent = emptyenv())
   
-  log_event("  Running VC + TFPW MK + Spectral (annual, parallel)...")
+  log_event("  Running VC + TFPW MK + Spectral + Changepoint (annual, parallel)...")
   future.seed <- TRUE
+  start_year_annual <- min(as.integer(rownames(annual_matrix)))  # NEW: Get first year
   res_annual <- future_lapply(
     seq_len(ncol(annual_matrix)),
     function(i) {
       mk_tfpw_spectral_for_series(
         annual_matrix[, i], is_precip, alpha, max_tie_percent,
-        n_sim_spectral, conf_cache_env
+        n_sim_spectral, conf_cache_env, start_year = start_year_annual  # NEW: Pass start year
       )
     },
     future.seed = TRUE
@@ -598,6 +784,20 @@ process_variable_final <- function(data_matrix, var_name, coords_dt, is_precip =
     )
   }
   
+  # NEW: Extract changepoint results
+  cpt_annual <- {
+    r <- lapply(res_annual, `[[`, "cpt")
+    data.table(
+      changepoint_detected = vapply(r, `[[`, logical(1), "changepoint_detected"),
+      changepoint_position = vapply(r, `[[`, integer(1), "changepoint_position"),
+      n_changepoints = vapply(r, `[[`, integer(1), "n_changepoints"),
+      first_changepoint_year = vapply(r, `[[`, integer(1), "first_changepoint_year"),
+      mean_before_shift = vapply(r, `[[`, numeric(1), "mean_before"),
+      mean_after_shift = vapply(r, `[[`, numeric(1), "mean_after"),
+      magnitude_shift = vapply(r, `[[`, numeric(1), "magnitude_shift")
+    )
+  }
+  
   annual_results <- cbind(
     coords_dt,
     variable = var_name,
@@ -620,6 +820,7 @@ process_variable_final <- function(data_matrix, var_name, coords_dt, is_precip =
     n = vc_annual$n,
     rho1 = vc_annual$rho1,
     spec_annual,
+    cpt_annual,  # NEW: Add changepoint columns
     same_significance = (vc_annual$p < alpha) == (tfpw_annual$p < alpha),
     same_direction    = sign(vc_annual$tau) == sign(tfpw_annual$tau)
   )
@@ -667,6 +868,19 @@ process_variable_final <- function(data_matrix, var_name, coords_dt, is_precip =
         spectral_confidence = vapply(r, `[[`, numeric(1), "conf")
       )
     }
+    # NEW: Extract changepoint results for monthly data
+    cpt_m <- {
+      r <- lapply(res_month, `[[`, "cpt")
+      data.table(
+        changepoint_detected = vapply(r, `[[`, logical(1), "changepoint_detected"),
+        changepoint_position = vapply(r, `[[`, integer(1), "changepoint_position"),
+        n_changepoints = vapply(r, `[[`, integer(1), "n_changepoints"),
+        first_changepoint_year = vapply(r, `[[`, integer(1), "first_changepoint_year"),
+        mean_before_shift = vapply(r, `[[`, numeric(1), "mean_before"),
+        mean_after_shift = vapply(r, `[[`, numeric(1), "mean_after"),
+        magnitude_shift = vapply(r, `[[`, numeric(1), "magnitude_shift")
+      )
+    }
     
     monthly_results_list[[m]] <- cbind(
       coords_dt,
@@ -691,6 +905,7 @@ process_variable_final <- function(data_matrix, var_name, coords_dt, is_precip =
       ),
       n = NA_integer_, rho1 = NA_real_,
       spec_m,
+      cpt_m,  # NEW: Add changepoint columns
       same_significance = (vc_m$p < alpha) == (tf_m$p < alpha),
       same_direction    = sign(vc_m$tau) == sign(tf_m$tau)
     )
@@ -774,10 +989,17 @@ log_event(" - summary_statistics.csv (quick overview)")
 log_event(" - original_template.rds (FULL raster extent for proper outputs)")
 log_event(" - basin_boundary.rds (for mapping)")
 log_event("==========================================")
+log_event("NEW FEATURE: PELT Changepoint Detection")
+log_event(" - Applied to ANNUAL precipitation and PET time series")
+log_event(" - Detects regime shifts in mean level (e.g., 1976-77 PDO shift)")
+log_event(" - New columns: changepoint_detected, first_changepoint_year, magnitude_shift")
+log_event(" - Monthly changepoints included but NOT RECOMMENDED (see documentation)")
+log_event("==========================================")
 
 cat("\n✓ DATA PROCESSING COMPLETED SUCCESSFULLY\n")
 cat(sprintf("  Basin pixels processed: %d (from %d bbox cells)\n", n_basin_pixels, n_bbox_cells))
 cat(sprintf("  Basin-averaged time series computed and analyzed\n"))
+cat(sprintf("  PELT changepoint detection applied to annual data\n"))
 cat(sprintf("  Results stored in: %s\n", out_dir))
 
 plan(sequential)
