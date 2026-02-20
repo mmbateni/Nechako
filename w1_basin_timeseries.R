@@ -2,81 +2,67 @@
 # 01_basin_timeseries.R  ·  BASIN-AVERAGED TIME SERIES FOR ALL INDICES
 # ####################################################################################
 source("DROUGHT_ANALYSIS_utils.R")
-utils_load_packages(c("terra", "ncdf4", "ggplot2", "lubridate",
-                      "future", "future.apply", "dplyr", "data.table", "patchwork"))
+utils_load_packages(c("terra", "ggplot2", "lubridate",
+                      "dplyr", "data.table", "patchwork"))
 if (!dir.exists(WD_PATH)) stop("Working directory not found: ", WD_PATH)
 setwd(WD_PATH)
 BASIN_PLOT_DIR <- file.path(WD_PATH, "temporal_drought", "basin_averaged_plots")   
 dir.create(BASIN_PLOT_DIR, showWarnings = FALSE, recursive = TRUE)
 dir.create(CACHE_DIR, showWarnings = FALSE, recursive = TRUE)
-n_cores <- max(1L, parallel::detectCores() - 1L)
-future::plan(future::multisession, workers = n_cores)
-cat(sprintf("✓ Parallel: %d workers\n", n_cores))
-basin_shp <- terra::vect(BASIN_SHP)
+basin_shp  <- terra::vect(BASIN_SHP)
 basin_proj <- terra::project(basin_shp, EQUAL_AREA_CRS)
 cat(sprintf("✓ Basin: %.1f km²\n", terra::expanse(basin_proj, unit = "km")))
-# ── Extraction Function ──────────────────────────────────────────────
-# find_swei_seasonal_files takes 2 args; wrap to unified 3-arg interface
-find_swei_nc_wrapper <- function(data_dir, index_type, scale) {
-  find_swei_seasonal_files(data_dir, scale)
-}
-extract_basin_mean <- function(data_dir, index_type, scale, find_files_fn) {
+
+# ── Basin-averaged time series loader ───────────────────────────────
+# Uses pre-computed *_basin_averaged_by_month.csv files.
+# These indices were computed FROM basin-averaged climate inputs — the
+# correct approach for basin-level analysis.  Spatially averaging
+# per-pixel standardised indices would be methodologically incorrect.
+load_basin_index <- function(index_type, scale) {
   label <- sprintf("%s%d", toupper(index_type), scale)
-  cache_path <- file.path(CACHE_DIR, paste0(label, "_basin_timeseries.rds"))
-  if (file.exists(cache_path)) {
-    cat(sprintf("  [cache] %s\n", label))
-    return(readRDS(cache_path))
+  df    <- tryCatch(
+    load_basin_avg_csv(index_type, scale),
+    error = function(e) { cat(sprintf("  ❌ %s: %s\n", label, e$message)); NULL })
+  if (is.null(df) || !nrow(df)) {
+    cat(sprintf("  ⚠ No data for %s\n", label)); return(NULL)
   }
-  files <- find_files_fn(data_dir, index_type, scale)
-  if (!length(files)) return(NULL)
-  geom <- precompute_basin_geometry(BASIN_SHP, files[1], EQUAL_AREA_CRS)
-  all_records <- vector("list", length(files))
-  for (fi in seq_along(files)) {
-    f <- files[fi]
-    n_lyrs <- terra::nlyr(terra::rast(f))
-    dates <- extract_dates_from_nc(f, n_lyrs)
-    stats_list <- future.apply::future_lapply(
-      seq_len(n_lyrs), compute_layer_statistics,
-      raster_file = f, basin_geom = geom,
-      threshold = DROUGHT_THRESHOLD, future.seed = TRUE)
-    
-    all_records[[fi]] <- data.frame(
-      Date = dates,
-      Index = label,
-      Mean_Value = sapply(stats_list, `[[`, "mean_value"),
-      Drought_Fraction = sapply(stats_list, `[[`, "drought_fraction"),
-      stringsAsFactors = FALSE)
-  }
-  result <- dplyr::bind_rows(all_records)
-  result <- result[order(result$Date), ]
-  saveRDS(result, cache_path)
-  cat(sprintf("  ✓ %s: %d time steps\n", label, nrow(result)))
-  result
+  # Reshape to the same structure expected by downstream code:
+  # Date, Index, Mean_Value, Drought_Fraction
+  data.frame(
+    Date             = df$date,
+    Index            = label,
+    Mean_Value       = df$value,
+    Drought_Fraction = as.numeric(df$value <= DROUGHT_THRESHOLD),
+    stringsAsFactors = FALSE)
 }
+
 # ── Process All Indices ──────────────────────────────────────────────
+cat("\n── SPI (basin-averaged by month CSVs) ──\n")
 all_data <- list()
-# SPI
-cat("\n── SPI ──\n")
 for (sc in SPI_SCALES) {
-  ts <- tryCatch(
-    extract_basin_mean(SPI_SEAS_DIR, "spi", sc, find_seasonal_nc_files),
-    error = function(e) { cat(sprintf("  ❌ SPI%d: %s\n", sc, e$message)); NULL })
-  if (!is.null(ts)) all_data[[sprintf("SPI%d", sc)]] <- ts
+  ts <- load_basin_index("spi", sc)
+  if (!is.null(ts)) {
+    all_data[[sprintf("SPI%d", sc)]] <- ts
+    cat(sprintf("  ✓ SPI%d: %d time steps\n", sc, nrow(ts)))
+  }
 }
-# SPEI
-cat("\n── SPEI ──\n")
+
+cat("\n── SPEI (basin-averaged by month CSVs) ──\n")
 for (sc in SPEI_SCALES) {
-  ts <- tryCatch(
-    extract_basin_mean(SPEI_SEAS_DIR, "spei", sc, find_seasonal_nc_files),
-    error = function(e) { cat(sprintf("  ❌ SPEI%d: %s\n", sc, e$message)); NULL })
-  if (!is.null(ts)) all_data[[sprintf("SPEI%d", sc)]] <- ts
+  ts <- load_basin_index("spei", sc)
+  if (!is.null(ts)) {
+    all_data[[sprintf("SPEI%d", sc)]] <- ts
+    cat(sprintf("  ✓ SPEI%d: %d time steps\n", sc, nrow(ts)))
+  }
 }
-# SWEI
-cat("\n── SWEI ──\n")
-ts <- tryCatch(
-  extract_basin_mean(SWEI_SEAS_DIR, "swei", SWEI_SCALE, find_swei_nc_wrapper),
-  error = function(e) { cat(sprintf("  ❌ SWEI%d: %s\n", SWEI_SCALE, e$message)); NULL })
-if (!is.null(ts)) all_data[[sprintf("SWEI%d", SWEI_SCALE)]] <- ts
+
+cat("\n── SWEI (basin-averaged by month CSV) ──\n")
+ts <- load_basin_index("swei", SWEI_SCALE)
+if (!is.null(ts)) {
+  all_data[[sprintf("SWEI%d", SWEI_SCALE)]] <- ts
+  cat(sprintf("  ✓ SWEI%d: %d time steps\n", SWEI_SCALE, nrow(ts)))
+}
+
 all_basin_data <- dplyr::bind_rows(all_data)
 # ── Save CSV ─────────────────────────────────────────────────────────
 if (nrow(all_basin_data) > 0) {
@@ -114,5 +100,4 @@ if (nrow(all_basin_data) > 0) {
                        ts_loader_fn = load_ts,
                        output_file = file.path(BASIN_PLOT_DIR, "Drought_Summary.xlsx"))
 }
-future::plan(future::sequential)
 cat("\n✓ 01_basin_timeseries.R complete\n")

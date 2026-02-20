@@ -35,7 +35,60 @@ TIMESCALES_SPATIAL  <- SPI_SCALES          # used by w4 for spatial figures
 MONTH_NAMES    <- c("Jan", "Feb", "Mar", "Apr", "May", "Jun",
                     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
-## B. PACKAGE BOOTSTRAP ──────────────────────────────────────────────
+## B. BASIN-AVERAGED CSV LOADER ─────────────────────────────────────
+#' Load a pre-computed basin-averaged drought index CSV and return a tidy
+#' long-format data.frame(date, value).
+#'
+#' These CSVs are produced by the SPI / SPEI / SWEI calculation scripts with
+#' the naming convention  {index}_{scale:02d}_basin_averaged_by_month.csv
+#' and have the structure:
+#'   Year | Jan | Feb | Mar | … | Dec
+#'   1950 | -1.88 |  NA | …
+#'
+#' This is the CORRECT source for any basin-level time series analysis because
+#' the indices were computed from basin-averaged climate inputs (correct), NOT
+#' by spatially averaging per-pixel indices (incorrect for standardised indices).
+#'
+#' @param index_type  "spi", "spei", or "swei"
+#' @param scale       Integer timescale (e.g. 1, 3, 6, 12)
+#' @param data_dir    Directory containing the CSV; if NULL, the index-specific
+#'                    seasonal directory from section A is used automatically.
+#' @return data.frame with columns \code{date} (Date) and \code{value} (numeric),
+#'         sorted by date with NA rows removed.  Returns NULL with a warning if
+#'         the file is not found.
+load_basin_avg_csv <- function(index_type, scale, data_dir = NULL) {
+  dir_map <- list(spi = SPI_SEAS_DIR, spei = SPEI_SEAS_DIR, swei = SWEI_SEAS_DIR)
+  dir     <- if (!is.null(data_dir)) data_dir else {
+    d <- dir_map[[tolower(index_type)]]
+    if (is.null(d)) stop("Unknown index_type: ", index_type)
+    d
+  }
+  f <- file.path(dir, sprintf("%s_%02d_basin_averaged_by_month.csv",
+                              tolower(index_type), as.integer(scale)))
+  if (!file.exists(f)) {
+    warning(sprintf("Basin-averaged CSV not found: %s", f))
+    return(NULL)
+  }
+  df <- utils::read.csv(f, stringsAsFactors = FALSE)
+  if (!"Year" %in% names(df))
+    stop("Expected 'Year' column in ", basename(f))
+  mon_cols <- intersect(MONTH_NAMES, names(df))
+  if (!length(mon_cols))
+    stop("No month name columns found in ", basename(f),
+         ".  Expected: ", paste(MONTH_NAMES, collapse = ", "))
+  long <- do.call(rbind, lapply(seq_along(mon_cols), function(mi) {
+    data.frame(
+      date  = as.Date(paste(df$Year, mi, "01", sep = "-")),
+      value = as.numeric(df[[mon_cols[mi]]]),
+      stringsAsFactors = FALSE)
+  }))
+  long <- long[order(long$date), ]
+  long <- long[!is.na(long$value) & is.finite(long$value), ]
+  rownames(long) <- NULL
+  long
+}
+
+## B2. PACKAGE BOOTSTRAP ──────────────────────────────────────────────
 utils_load_packages <- function(pkgs) {
   missing <- pkgs[!sapply(pkgs, requireNamespace, quietly = TRUE)]
   if (length(missing)) {
@@ -46,7 +99,9 @@ utils_load_packages <- function(pkgs) {
   cat("✓ Packages loaded:", paste(pkgs, collapse = ", "), "\n")
 }
 
-## C. NETCDF FILE FINDERS ────────────────────────────────────────────
+####################################################################################
+# C. NETCDF FILE FINDERS ────────────────────────────────────────────
+####################################################################################
 find_seasonal_nc_files <- function(data_dir, index_type, scale) {
   idx <- tolower(index_type)
   pattern <- sprintf("^%s_%02d_month\\d{2}_[A-Za-z]+\\.nc$", idx, scale)
@@ -62,7 +117,7 @@ find_seasonal_nc_files <- function(data_dir, index_type, scale) {
   files[order(mon_nums)]
 }
 
-find_swei_seasonal_files <- function(data_dir, scale) {
+find_swei_seasonal_files <- function(data_dir, index_type, scale) {  # ← CHANGED
   pattern <- sprintf("^swei_%02d_month\\d{2}_[A-Za-z]+\\.nc$", scale)
   files <- list.files(data_dir, pattern = pattern,
                       full.names = TRUE, ignore.case = TRUE, recursive = TRUE)

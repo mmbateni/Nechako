@@ -508,7 +508,8 @@ cat("→ Saved plot: scf_retained_fraction.png\n")
 # ==============================================================================
 
 cat("\n===== SAVING MASK NETCDF FILES =====\n")
-
+# Define domain mask (valid pixels, not NA)
+domain_mask <- !is.na(values(scf_mean))
 for (k in names(results_all)) {
   best_th <- results_all[[k]]$best_threshold
   diag <- results_all[[k]]$candidates[[as.character(best_th)]]$diag
