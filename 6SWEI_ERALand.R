@@ -328,7 +328,7 @@ for (sc in timescales) {
   swei_indices <- do.call(rbind, lapply(pixel_list, `[[`, "swei"))
   method_matrix <- do.call(rbind, lapply(pixel_list, `[[`, "method"))
   
-  Diagnostics
+  # Diagnostics
   clipped_low   <- sum(swei_indices < -4.7, na.rm = TRUE)
   clipped_high  <- sum(swei_indices >  4.7, na.rm = TRUE)
   cat(sprintf("  Clipping: %d dry, %d wet\n", clipped_low, clipped_high))
