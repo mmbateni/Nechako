@@ -1,20 +1,28 @@
-##############################################
+# ##############################################
 # SPEI CALCULATION FOR NECHAKO RIVER BASIN
 # Following Kao & Govindaraju (2010) methodology
 # Seasonal Approach with Variance-Aware Fallback
-# Handles low-variance winter months via empirical ranking when needed
-##############################################
+# Case 1: True zero variance         → SPEI = 0
+# Case 2: Low variance (< 0.001 mm²) → Gringorten empirical ranking
+# Case 3: Sufficient variance        → Parametric (GLO/PE3/GEV via L-moments),
+# Gringorten fallback if KS test fails
+# ##############################################
 
 # ---- Libraries ----
 library(terra)
 library(zoo)
 library(writexl)
+library(lmomco)  # Parametric distribution fitting via L-moments
+library(parallel) # Parallel processing
 
 # ---- Paths ----
 setwd("D:/Nechako_Drought/Nechako/")
 out_dir <- "spei_results_seasonal"
 basin_path <- "Spatial/nechakoBound_dissolve.shp"
 if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+# Suppress terra progress bars for clean console output
+terraOptions(progress = 0)
 
 # ---- Load Basin Boundary ----
 basin <- vect(basin_path)
@@ -24,7 +32,7 @@ cat("✓ Basin boundary loaded\n")
 cat("\n===== LOADING INPUT DATA =====\n")
 precip <- rast("monthly_data_direct/total_precipitation_monthly.nc")
 pet    <- rast("monthly_data_direct/potential_evapotranspiration_monthly.nc")
-
+precip <- precip * 1000  # m → mm
 
 # Align PET to precipitation grid
 if (!same.crs(precip, pet)) pet <- project(pet, precip, method = "bilinear")
@@ -46,7 +54,6 @@ if (!same.crs(basin, target_crs)) {
   basin <- project(basin, target_crs)
 }
 
-
 # Robust time extraction
 dates <- as.Date(time(precip))
 if (is.null(dates) || all(is.na(dates)) || length(dates) != nlyr(precip)) {
@@ -62,15 +69,36 @@ cat("\n===== BASIN MASKING =====\n")
 if (!same.crs(basin, precip)) basin <- project(basin, crs(precip))
 precip <- mask(precip, basin, inverse = FALSE, touches = TRUE)
 pet    <- mask(pet, basin, inverse = FALSE, touches = TRUE)
+
 # TERRA-NATIVE BASIN PIXEL COUNT
 basin_pixels <- sum(!is.na(values(precip[[1]])))
 total_pixels <- ncell(precip)
-cat(sprintf("✓ Basin boundary applied (%.1f%% of raster: %d/%d pixels)\n", 
+cat(sprintf("✓ Basin boundary applied (%.1f%% of raster: %d/%d pixels)\n",
             100 * basin_pixels / total_pixels, basin_pixels, total_pixels))
 
-# Water balance (ONLY within basin)
+# Water balance with days-in-month correction
+cat("\n===== WATER BALANCE CALCULATION =====\n")
 wb <- precip - pet
+
+# Get number of days in each month
+days_in_month <- as.integer(format(seq(dates[1], by = "month", length.out = length(dates)) + 31, "%d"))
+
+# Alternative using a lookup table
+month_nums <- as.integer(format(dates, "%m"))
+year_nums <- as.integer(format(dates, "%Y"))
+days_in_month <- c(31,28,31,30,31,30,31,31,30,31,30,31)[month_nums]
+
+# Adjust for leap years
+leap_years <- (year_nums %% 4 == 0 & year_nums %% 100 != 0) | (year_nums %% 400 == 0)
+days_in_month[month_nums == 2 & leap_years] <- 29
+
+cat("✓ Converting from mm/day to mm/month (multiplying by days in month)...\n")
+for (i in 1:nlyr(wb)) {
+  wb[[i]] <- wb[[i]] * days_in_month[i]
+}
 terra::time(wb) <- dates
+cat(sprintf("✓ Water balance now in mm/month (range: %d-%d days per month)\n",
+            min(days_in_month), max(days_in_month)))
 
 # Verify basin data quality
 wb_mat <- values(wb, mat = TRUE)
@@ -78,14 +106,94 @@ basin_mask <- !is.na(wb_mat[, 1])
 wb_basin <- wb_mat[basin_mask, , drop = FALSE]
 cat(sprintf("✓ Basin pixels for calculation: %d (100%% valid data)\n", nrow(wb_basin)))
 
-# Pre-compute month indices
-month_numbers <- as.integer(format(dates, "%m"))
-month_names <- c("Jan", "Feb", "Mar", "Apr", "May", "Jun", 
-                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+# ==============================================================================
+#   ADDED: WATER BALANCE ZERO DIAGNOSTICS
+# Counts exact zeros in the basin water balance matrix (all pixels × months)
+# ==============================================================================
+cat("\n===== WATER BALANCE ZERO DIAGNOSTICS =====\n")
+total_vals <- length(wb_basin) - sum(is.na(wb_basin))
+zero_count <- sum(wb_basin == 0, na.rm = TRUE)
+zero_pct <- 100 * zero_count / total_vals
+cat(sprintf("Total basin water balance values: %d\n", total_vals))
+cat(sprintf("Zero values count: %d (%.4f%%)\n", zero_count, zero_pct))
+if (zero_pct > 1) cat("⚠ High proportion of zeros detected!\n")
+
+# Per-month zero counts
+month_numbers  <- as.integer(format(dates, "%m"))
+month_names  <- c("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+cat("\nZero counts by month:\n")
+for (m in 1:12) {
+  month_idx <- which(month_numbers == m)
+  if (length(month_idx) == 0) next
+  month_vals <- wb_basin[, month_idx, drop = FALSE]
+  total_month <- length(month_vals) - sum(is.na(month_vals))
+  zero_month <- sum(month_vals == 0, na.rm = TRUE)
+  pct_month <- 100 * zero_month / total_month
+  cat(sprintf("  %s: %d / %d (%.2f%%)\n", month_names[m], zero_month, total_month, pct_month))
+}
+cat("=========================================\n\n")
 
 # ==============================================================================
-# VARIANCE-AWARE SPEI (Empirical ranking for low-variance months)
-# Critical threshold: var < 0.01 mm² → use empirical ranking (L-moments unstable)
+#   PREPARE COMBINED SUMMARY FILE (single file for all scales)
+# ==============================================================================
+summary_file <- file.path(out_dir, "spei_all_scales_summary.txt")
+cat("SPEI SUMMARY FOR ALL TIMESCALES (Variance-Aware Approach)\n",
+    paste("Generated:", Sys.time()), "\n",
+    "============================================================\n\n",
+    file = summary_file, sep = "")
+
+# ==============================================================================
+#   PARAMETRIC FITTING HELPER
+# Tries Log-Logistic (GLO), Pearson III (PE3), and GEV distributions via L-moments.
+# Returns CDF probabilities from best-fitting distribution if KS p-value > 0.05,
+# otherwise returns NULL to trigger Gringorten fallback.
+# ==============================================================================
+try_parametric <- function(values_m) {
+  lmom <- tryCatch(lmoms(values_m, nmom = 4), error = function(e) NULL)
+  if (is.null(lmom) || !are.lmom.valid(lmom)) return(NULL)
+  
+  dists <- list(
+    GLO = list(par = tryCatch(parglo(lmom), error = function(e) NULL),
+               cdf = cdfglo),
+    PE3 = list(par = tryCatch(parpe3(lmom), error = function(e) NULL),
+               cdf = cdfpe3),
+    GEV = list(par = tryCatch(pargev(lmom), error = function(e) NULL),
+               cdf = cdfgev)
+  )
+  
+  best_p    <- -1
+  best_prob <- NULL
+  best_dist <- NULL
+  
+  for (d in names(dists)) {
+    par <- dists[[d]]$par
+    if (is.null(par)) next
+    
+    p_fitted <- tryCatch(dists[[d]]$cdf(values_m, par), error = function(e) NULL)
+    if (is.null(p_fitted) || any(!is.finite(p_fitted))) next
+    
+    # KS goodness-of-fit test
+    ks <- tryCatch(ks.test(values_m, function(q) dists[[d]]$cdf(q, par))$p.value,
+                   error = function(e) 0)
+    
+    if (ks > 0.05 && ks > best_p) {   # satisfactory AND better than previous
+      best_p    <- ks
+      best_prob <- p_fitted
+      best_dist <- d
+    }
+  }
+  
+  # Return list(prob, dist) if a distribution passed KS test, else NULL
+  if (is.null(best_prob)) NULL else list(prob = best_prob, dist = best_dist)
+}
+
+# ==============================================================================
+#   VARIANCE-AWARE SPEI (Parametric-first with Gringorten fallback)
+# Case 1: True zero variance         → SPEI = 0
+# Case 2: Low variance (< 0.001 mm²) → Gringorten (L-moments unstable here)
+# Case 3: Sufficient variance        → Parametric (best of GLO/PE3/GEV),
+# Gringorten fallback if KS p ≤ 0.05
 # ==============================================================================
 variance_aware_spei <- function(x, month_numbers, scale = 1) {
   # Aggregate water balance if needed
@@ -100,6 +208,8 @@ variance_aware_spei <- function(x, month_numbers, scale = 1) {
   
   n <- length(x_agg)
   z <- rep(NA_real_, n)
+  method <- rep(NA_integer_, n)  # Track method: 1=GLO, 2=PE3, 3=GEV, 4=Gringorten, 5=Zero Var
+  dist_code <- c(GLO = 1L, PE3 = 2L, GEV = 3L)
   
   # Process each calendar month separately
   for (m in 1:12) {
@@ -108,69 +218,163 @@ variance_aware_spei <- function(x, month_numbers, scale = 1) {
     # Skip if insufficient data (<5 valid observations)
     if (length(idx) < 5) next
     
-    values_m <- x_agg[idx]
-    v0 <- var(values_m, na.rm = TRUE)
+    values_m  <- x_agg[idx]
+    v0  <- var(values_m, na.rm = TRUE)
     
     # CASE 1: True zero variance → neutral SPEI=0 (mathematically necessary)
     if (!is.finite(v0) || v0 < .Machine$double.eps) {
       z[idx] <- 0
+      method[idx] <- 5L  # Zero variance
       next
     }
     
-    # CASE 2: Very low variance (< 0.01 mm²) → empirical ranking (L-moments unstable)
-    # Scientific justification: L-moment estimation requires var > ~0.01 mm² for stability
-    # Nechako winter variance: 0.0013–0.0063 mm² → below stability threshold
-    if (v0 < 0.01) {
-      p <- rank(values_m, ties.method = "average") / (length(values_m) + 1)
+    # CASE 2: Very low variance (< 0.001 mm²) → Gringorten directly (L-moments unstable)
+    # Scientific justification: Water balance variance in cold climates can be 0.0001-0.005 mm²
+    if (v0 < 0.001) {
+      p <- (rank(values_m, ties.method = "average") - 0.44) / (length(values_m) + 0.12)
       p <- pmax(pmin(p, 1 - 1e-6), 1e-6)
       z[idx] <- qnorm(p)
+      method[idx] <- 4L  # Gringorten (low variance)
       next
     }
     
-    # CASE 3: Sufficient variance → empirical ranking (primary method for cold climates)
-    # Note: Distribution fitting omitted intentionally for cold-climate robustness
-    p <- rank(values_m, ties.method = "average") / (length(values_m) + 1)
+    # CASE 3: Sufficient variance → try parametric (GLO, PE3, GEV); fall back to Gringorten
+    fit <- try_parametric(values_m)
+    if (is.null(fit)) {
+      # Fallback: Gringorten empirical ranking
+      p <- (rank(values_m, ties.method = "average") - 0.44) / (length(values_m) + 0.12)
+      method[idx] <- 4L  # Gringorten fallback
+    } else {
+      p <- fit$prob
+      method[idx] <- dist_code[fit$dist]  # 1=GLO, 2=PE3, 3=GEV
+    }
     p <- pmax(pmin(p, 1 - 1e-6), 1e-6)
     z[idx] <- qnorm(p)
   }
   
-  # Symmetric extreme value clipping
-  z[z < -4.75] <- -4.75
-  z[z >  4.75] <-  4.75
+  # Hard clip removed: tails are bounded naturally by sample size (Gringorten)
+  # or by the fitted parametric distribution tail behaviour
   
-  z
+  list(z = z, method = method)  # Return both Z-scores and method
 }
 
 # ==============================================================================
-# MAIN CALCULATION LOOP (All Timescales)
+#   MAIN CALCULATION LOOP (All Timescales) - PARALLEL VERSION
 # ==============================================================================
-scales <- c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 24)
 
+# ---- Set up parallel cluster ----
+n_cores <- max(1L, detectCores() - 1L)   # leave 1 core for the OS
+cat(sprintf("\n✓ Starting parallel cluster with %d cores\n", n_cores))
+dir.create(tempdir(), recursive = TRUE, showWarnings = FALSE)  # fix Windows temp-dir issue
+cl <- makeCluster(n_cores)
+
+# Export everything the worker function needs
+clusterExport(cl, varlist = c("variance_aware_spei", "try_parametric",
+                              "wb_basin", "month_numbers"),
+              envir = environment())
+clusterEvalQ(cl, { library(zoo); library(lmomco) })
+
+scales <- c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 24)
 for (scale in scales) {
   cat(sprintf("\n===== SPEI-%d (Variance-Aware Calculation) =====\n", scale))
   
-  # Calculate SPEI for all basin pixels
-  res_basin <- matrix(NA_real_, nrow = nrow(wb_basin), ncol = ncol(wb_basin))
-  for (i in 1:nrow(wb_basin)) {
-    res_basin[i, ] <- variance_aware_spei(wb_basin[i, ], month_numbers, scale)
-  }
+  # Calculate SPEI for all basin pixels - PARALLEL
+  clusterExport(cl, varlist = "scale", envir = environment())
+  
+  start_time <- Sys.time()
+  pixel_list <- parLapply(cl, seq_len(nrow(wb_basin)), function(i) {
+    variance_aware_spei(wb_basin[i, ], month_numbers, scale)
+  })
+  end_time <- Sys.time()
+  cat(sprintf("  Parallel processing done (%.1f min)\n",
+              as.numeric(difftime(end_time, start_time, units = "mins"))))
+  
+  res_basin    <- do.call(rbind, lapply(pixel_list, `[[`, "z"))
+  method_basin <- do.call(rbind, lapply(pixel_list, `[[`, "method"))
+  storage.mode(method_basin) <- "integer" 
   
   # Basin NA diagnostic
   na_rate_basin <- 100 * mean(is.na(res_basin))
   cat(sprintf("NA rate (basin pixels): %.3f%%\n", na_rate_basin))
   
-  # Reconstruct full raster matrix
+  # Method diagnostic
+  cat(sprintf("Variance threshold: 0.001 mm² (low-var → Gringorten; sufficient → Parametric/Gringorten)\n"))
+  
+  # ==============================================================================
+  # PARAMETRIC FIT DIAGNOSTIC (representative pixel 1, all 12 calendar months)
+  # Shows which distribution won (GLO/PE3/GEV) or whether Gringorten fallback was used
+  # ==============================================================================
+  cat("  Parametric fit check (representative basin pixel):\n")
+  dist_fns <- list(
+    GLO = list(par_fn = parglo, cdf_fn = cdfglo),
+    PE3 = list(par_fn = parpe3, cdf_fn = cdfpe3),
+    GEV = list(par_fn = pargev, cdf_fn = cdfgev)
+  )
+  for (m_diag in 1:12) {
+    idx_diag <- which(month_numbers == m_diag & is.finite(wb_basin[1, ]))
+    if (length(idx_diag) < 5) next
+    if (scale > 1) {
+      x_agg_diag <- zoo::rollapply(wb_basin[1, ], scale, sum,
+                                   align = "right", fill = NA, na.rm = FALSE)
+      vals_diag <- x_agg_diag[idx_diag]
+    } else {
+      vals_diag <- wb_basin[1, idx_diag]
+    }
+    vals_diag <- vals_diag[is.finite(vals_diag)]
+    if (length(vals_diag) < 5) next
+    v_diag <- var(vals_diag, na.rm = TRUE)
+    if (!is.finite(v_diag) || v_diag < .Machine$double.eps) {
+      cat(sprintf("    %s: zero variance → SPEI=0\n", month_names[m_diag]))
+      next
+    }
+    if (v_diag < 0.001) {
+      cat(sprintf("    %s: low variance → Gringorten\n", month_names[m_diag]))
+      next
+    }
+    lmom_diag <- tryCatch(lmoms(vals_diag, nmom = 4), error = function(e) NULL)
+    if (is.null(lmom_diag) || !are.lmom.valid(lmom_diag)) {
+      cat(sprintf("    %s: L-moments invalid → Gringorten\n", month_names[m_diag]))
+      next
+    }
+    ks_results <- sapply(names(dist_fns), function(d) {
+      par <- tryCatch(dist_fns[[d]]$par_fn(lmom_diag), error = function(e) NULL)
+      if (is.null(par)) return(0)
+      tryCatch(
+        ks.test(vals_diag, function(q) dist_fns[[d]]$cdf_fn(q, par))$p.value,
+        error = function(e) 0
+      )
+    })
+    best_dist <- names(which.max(ks_results))
+    best_p    <- max(ks_results)
+    if (best_p > 0.05) {
+      cat(sprintf("    %s: %s (KS p=%.3f) ✓ parametric\n",
+                  month_names[m_diag], best_dist, best_p))
+    } else {
+      cat(sprintf("    %s: best=%s (KS p=%.3f) → Gringorten fallback\n",
+                  month_names[m_diag], best_dist, best_p))
+    }
+  }
+  
+  # Reconstruct full raster matrices
   res_full <- matrix(NA_real_, nrow = nrow(wb_mat), ncol = ncol(wb_mat))
   res_full[basin_mask, ] <- res_basin
   
+  method_full <- rep(NA_integer_, nrow(wb_mat))
+  # Use modal (most frequent) method across all calendar months per pixel
+  # This better represents the dominant distribution spatially
+  method_first <- apply(method_basin, 1, function(x) {
+    vals <- x[!is.na(x)]
+    if (length(vals) == 0) return(NA_integer_)
+    as.integer(names(which.max(table(vals))))
+  })
+  method_full[basin_mask] <- method_first  
   # ==============================================================================
-  # OUTPUT 1: CSV FILES (one per calendar month)
+  #   OUTPUT 1: CSV FILES (one per calendar month)
   # ==============================================================================
   cat("  -> Saving CSV files (one per month)...\n")
   for (m in 1:12) {
     idx_m <- which(month_numbers == m)
     if (length(idx_m) == 0) next
-    
     spei_subset <- res_full[, idx_m, drop = FALSE]
     dates_subset <- dates[idx_m]
     
@@ -186,15 +390,13 @@ for (scale in scales) {
   cat(sprintf("  ✓ Saved 12 CSV files for SPEI-%d\n", scale))
   
   # ==============================================================================
-  # OUTPUT 2: EXCEL WORKBOOK (all months as sheets)
+  #   OUTPUT 2: EXCEL WORKBOOK (all months as sheets)
   # ==============================================================================
   cat("  -> Saving Excel workbook (all months)...\n")
   excel_data <- list()
-  
   for (m in 1:12) {
     idx_m <- which(month_numbers == m)
     if (length(idx_m) == 0) next
-    
     spei_subset <- res_full[, idx_m, drop = FALSE]
     dates_subset <- dates[idx_m]
     
@@ -206,7 +408,6 @@ for (scale in scales) {
     
     excel_data[[month_names[m]]] <- df
   }
-  
   xlsx_file <- file.path(out_dir, sprintf("spei_%02d_all_months.xlsx", scale))
   if (file.exists(xlsx_file)) file.remove(xlsx_file)
   Sys.sleep(0.3)
@@ -214,112 +415,244 @@ for (scale in scales) {
   cat(sprintf("  ✓ Saved Excel file: %s\n", xlsx_file))
   
   # ==============================================================================
-  # OUTPUT 3: METHOD MAP (PNG with color legend)
-  # Shows empirical ranking usage (scientifically honest for cold climates)
+  #   OUTPUT 3: DISTRIBUTION MAP (PNG) — shows which distribution dominated each pixel
+  # 1=GLO (Log-Logistic), 2=PE3 (Pearson III), 3=GEV, 4=Gringorten, 5=Zero Var
+  # Modal method across all 12 calendar months is shown per pixel
   # ==============================================================================
-  cat("  -> Creating SPEI method map with color legend...\n")
+  cat("  -> Creating SPEI distribution map with color legend...\n")
   
-  method_raster <- rast(wb[[1]])
-  values(method_raster) <- ifelse(basin_mask, 1, 2)  # 1=Empirical, 2=Non-basin
+  # Create method raster
+  spei_dist_raster <- rast(wb[[1]])
+  values(spei_dist_raster) <- method_full
   
-  png_file <- file.path(out_dir, sprintf("spei_%02d_method_map.png", scale))
-  png(png_file, width = 1200, height = 800, res = 150)
+  # Define distribution mapping — one entry per method code
+  spei_dist_mapping <- data.frame(
+    code  = c(1,         2,         3,         4,            5),
+    name  = c("GLO",     "PE3",     "GEV",     "Gringorten", "Zero Var"),
+    color = c("#1a9641", "#a6d96a", "#fdae61",  "#d7191c",   "#b0b0b0"),
+    stringsAsFactors = FALSE
+  )
   
-  plot(method_raster,
-       col = c("#4575b4", "gray90"),
-       breaks = c(0.5, 1.5, 2.5),
+  valid_pixels  <- sum(!is.na(method_full))
+  empirical_pct <- 100 * sum(method_full == 4, na.rm = TRUE) / valid_pixels
+  
+  png_file <- file.path(out_dir, sprintf("spei_%02d_distribution_map.png", scale))
+  png(png_file, width = 2000, height = 1000, res = 150)
+  
+  # Split canvas: 75% map | 25% legend (wider panel prevents legend trimming)
+  layout(matrix(c(1, 2), nrow = 1), widths = c(3, 1))
+  
+  # ── Panel 1: Map ──────────────────────────────────────────
+  par(mar = c(3, 2, 3, 1))
+  plot(spei_dist_raster,
+       col    = spei_dist_mapping$color,
+       breaks = c(0.5, 1.5, 2.5, 3.5, 4.5, 5.5),
        legend = FALSE,
-       main = sprintf("SPEI-%d: Calculation Method (Variance-Aware)", scale),
-       axes = FALSE,
-       box = FALSE)
+       main   = sprintf("SPEI-%d: Dominant Parametric Distribution (modal across months)", scale),
+       axes   = FALSE, box = FALSE)
   
   if (!is.null(basin)) plot(basin, add = TRUE, border = "darkgray", lwd = 1.5)
   
-  basin_count <- sum(basin_mask)
-  non_basin_count <- ncell(wb) - basin_count
-  legend_entries <- c(
-    sprintf("Empirical Ranking (%d pixels)", basin_count),
-    sprintf("Non-basin (%d pixels)", non_basin_count)
-  )
+  mtext(sprintf("Valid pixels: %d | Gringorten (empirical): %.1f%%", valid_pixels, empirical_pct),
+        side = 1, line = 1, cex = 0.75, col = "gray30")
   
-  legend("bottomright",
+  # ── Panel 2: Legend ────────────────────────────────────────
+  par(mar = c(3, 1, 3, 2))
+  plot.new()
+  
+  dist_counts    <- table(factor(method_full[!is.na(method_full)],
+                                 levels = spei_dist_mapping$code,
+                                 labels = spei_dist_mapping$name))
+  legend_entries <- sprintf("%s\n(%d px)", names(dist_counts), as.integer(dist_counts))
+  
+  legend("center",
          legend = legend_entries,
-         fill = c("#4575b4", "gray90"),
-         title = "Calculation Method",
-         cex = 0.85,
-         bg = "white",
-         bty = "o",
-         border = "gray50")
-  
-  mtext(sprintf("Basin coverage: %.1f%% (%d/%d pixels)", 
-                100 * basin_count / ncell(wb), basin_count, ncell(wb)),
-        side = 1, line = 0.5, cex = 0.75, col = "gray30")
+         fill   = spei_dist_mapping$color,
+         title  = "Distribution\n(modal)",
+         cex    = 0.90,
+         y.intersp = 1.6,
+         bg     = "white",
+         bty    = "o",
+         border = "gray50",
+         xpd    = TRUE)
   
   dev.off()
-  cat(sprintf("  ✓ Saved SPEI method map: %s\n", png_file))
+  layout(1)   # reset layout
+  cat(sprintf("  ✓ Saved SPEI distribution map: %s\n", png_file))
   
   # ==============================================================================
-  # OUTPUT 4: SUMMARY STATISTICS
+  #   OUTPUT 3b: PER-MONTH METHOD MAPS (12 PNGs per scale)
+  # Shows which distribution was selected for each calendar month separately,
+  # allowing spatial comparison of fitting method across seasons.
   # ==============================================================================
-  cat("  -> Generating summary statistics...\n")
-  summary_file <- file.path(out_dir, sprintf("spei_%02d_summary.txt", scale))
+  cat("  -> Creating per-month method maps (12 PNGs)...\n")
   
-  sink(summary_file)
-  cat(sprintf("SPEI-%d SUMMARY (Variance-Aware Approach)\n", scale))
-  cat(sprintf("Calculation date: %s\n\n", Sys.time()))
-  cat(sprintf("Grid dimensions: %d x %d\n", ncol(wb), nrow(wb)))
-  cat(sprintf("Basin pixels: %d\n", sum(basin_mask)))
-  cat(sprintf("Time period: %s to %s (%d months)\n", 
-              min(dates), max(dates), length(dates)))
-  cat(sprintf("\nVariance Handling:\n"))
-  cat("  • True zero variance (var < 2.2e-16): SPEI = 0 (neutral)\n")
-  cat("  • Very low variance (0 < var < 0.01 mm²): Empirical ranking\n")
-  cat("  • Sufficient variance (var ≥ 0.01 mm²): Empirical ranking\n")
-  cat(sprintf("\nNA Analysis:\n"))
-  cat(sprintf("  Total NA values in basin: %.3f%%\n", na_rate_basin))
-  cat(sprintf("  MSPEI compatibility: %s\n", 
-              ifelse(na_rate_basin < 0.5, "✓ READY (<0.5% NAs)", "⚠ CAUTION (>0.5% NAs)")))
-  
-  # Drought frequency (last 12 months)
-  recent_idx <- tail(which(!is.na(res_basin[1, ])), 12)
-  if (length(recent_idx) >= 12) {
-    recent_spei <- res_basin[, recent_idx]
-    cat(sprintf("\nDrought frequency by severity (last 12 months):\n"))
-    cat(sprintf("  Exceptional (SPEI < -2.0):  %.1f%%\n", 100 * mean(recent_spei < -2.0, na.rm = TRUE)))
-    cat(sprintf("  Extreme     (SPEI < -1.6):  %.1f%%\n", 100 * mean(recent_spei < -1.6, na.rm = TRUE)))
-    cat(sprintf("  Severe      (SPEI < -1.3):  %.1f%%\n", 100 * mean(recent_spei < -1.3, na.rm = TRUE)))
-    cat(sprintf("  Moderate    (SPEI < -0.8):  %.1f%%\n", 100 * mean(recent_spei < -0.8, na.rm = TRUE)))
+  for (m in 1:12) {
+    # Extract method codes for this calendar month across all basin pixels
+    idx_m <- which(month_numbers == m)
+    if (length(idx_m) == 0) next
+    
+    # method_basin columns for this calendar month — all years share the same code per pixel
+    method_month_basin <- method_basin[, idx_m, drop = FALSE]
+    # Take first non-NA value per pixel (all cols are identical within a calendar month)
+    method_month_vec <- apply(method_month_basin, 1, function(x) {
+      v <- x[!is.na(x)]
+      if (length(v) == 0) NA_integer_ else v[1L]
+    })
+    
+    # Reconstruct full raster vector
+    method_month_full <- rep(NA_integer_, nrow(wb_mat))
+    method_month_full[basin_mask] <- method_month_vec
+    
+    # Build raster
+    method_month_rast <- rast(wb[[1]])
+    values(method_month_rast) <- method_month_full
+    
+    # Pixel counts for this month's legend
+    m_counts <- table(factor(method_month_full[!is.na(method_month_full)],
+                             levels = spei_dist_mapping$code,
+                             labels = spei_dist_mapping$name))
+    # Only keep categories that are actually present
+    present   <- as.integer(m_counts) > 0
+    m_colors  <- spei_dist_mapping$color[present]
+    m_entries <- sprintf("%s\n(%d px)", names(m_counts)[present], as.integer(m_counts)[present])
+    m_breaks  <- c(spei_dist_mapping$code[present] - 0.5,
+                   max(spei_dist_mapping$code[present]) + 0.5)
+    
+    png_method <- file.path(out_dir,
+                            sprintf("spei_%02d_method_map_month%02d_%s.png",
+                                    scale, m, month_names[m]))
+    png(png_method, width = 2000, height = 1000, res = 150)
+    
+    # Split canvas: 75% map | 25% legend
+    layout(matrix(c(1, 2), nrow = 1), widths = c(3, 1))
+    
+    # ── Panel 1: Map ────────────────────────────────────────
+    par(mar = c(3, 2, 3, 1))
+    plot(method_month_rast,
+         col    = m_colors,
+         breaks = m_breaks,
+         legend = FALSE,
+         main   = sprintf("SPEI-%d: Fitting Method — %s",
+                          scale, month_names[m]),
+         axes   = FALSE, box = FALSE)
+    
+    if (!is.null(basin)) plot(basin, add = TRUE, border = "darkgray", lwd = 1.5)
+    
+    valid_m   <- sum(!is.na(method_month_full))
+    empir_m   <- 100 * sum(method_month_full == 4, na.rm = TRUE) / max(valid_m, 1)
+    mtext(sprintf("Valid pixels: %d | Gringorten: %.1f%%", valid_m, empir_m),
+          side = 1, line = 1, cex = 0.75, col = "gray30")
+    
+    # ── Panel 2: Legend ────────────────────────────────────
+    par(mar = c(3, 1, 3, 2))
+    plot.new()
+    
+    legend("center",
+           legend  = m_entries,
+           fill    = m_colors,
+           title   = "Distribution",
+           cex     = 0.90,
+           y.intersp = 1.6,
+           bg      = "white",
+           bty     = "o",
+           border  = "gray50",
+           xpd     = TRUE)
+    
+    dev.off()
+    layout(1)
   }
-  sink()
-  cat(sprintf("  ✓ Summary saved: %s\n", summary_file))
+  cat(sprintf("  ✓ Saved 12 per-month method maps for SPEI-%d\n", scale))
   
   # ==============================================================================
-  # OUTPUT 5: NETCDF FILES (FOR MSPEI INPUT)
+  #   OUTPUT 4: SUMMARY STATISTICS (APPENDED TO SINGLE FILE)
+  # ==============================================================================
+  cat("  -> Appending summary statistics to combined file...\n")
+  
+  # Capture summary text as if printed to console
+  summary_text <- capture.output({
+    cat(sprintf("\n---------- SPEI-%d SUMMARY ----------\n", scale))
+    cat(sprintf("Calculation date: %s\n\n", Sys.time()))
+    cat(sprintf("Grid dimensions: %d x %d\n", ncol(wb), nrow(wb)))
+    cat(sprintf("Basin pixels: %d\n", sum(basin_mask)))
+    cat(sprintf("Time period: %s to %s (%d months)\n",
+                min(dates), max(dates), length(dates)))
+    cat(sprintf("\nVariance Handling:\n"))
+    cat("  • True zero variance  (var < 2.2e-16):      SPEI = 0 (neutral)\n")
+    cat("  • Very low variance   (0 < var < 0.001 mm²): Gringorten empirical ranking\n")
+    cat("  • Sufficient variance (var ≥ 0.001 mm²):    Parametric (best of GLO/PE3/GEV),\n")
+    cat("                                                Gringorten fallback if KS p ≤ 0.05\n")
+    cat(sprintf("\nNA Analysis:\n"))
+    cat(sprintf("  Total NA values in basin: %.3f%%\n", na_rate_basin))
+    cat(sprintf("  MSPEI compatibility: %s\n",
+                ifelse(na_rate_basin < 0.5, "✓ READY (<0.5% NAs)", "⚠ CAUTION (>0.5% NAs)")))
+    
+    # Method Distribution
+    cat(sprintf("\nMethod Distribution (modal across calendar months per pixel):\n"))
+    cat(sprintf("  GLO (Log-Logistic):  %d pixels (%.1f%%)\n",
+                sum(method_full == 1, na.rm = TRUE),
+                100 * sum(method_full == 1, na.rm = TRUE) / valid_pixels))
+    cat(sprintf("  PE3 (Pearson III):   %d pixels (%.1f%%)\n",
+                sum(method_full == 2, na.rm = TRUE),
+                100 * sum(method_full == 2, na.rm = TRUE) / valid_pixels))
+    cat(sprintf("  GEV:                 %d pixels (%.1f%%)\n",
+                sum(method_full == 3, na.rm = TRUE),
+                100 * sum(method_full == 3, na.rm = TRUE) / valid_pixels))
+    cat(sprintf("  Gringorten fallback: %d pixels (%.1f%%)\n",
+                sum(method_full == 4, na.rm = TRUE),
+                100 * sum(method_full == 4, na.rm = TRUE) / valid_pixels))
+    cat(sprintf("  Zero variance:       %d pixels (%.1f%%)\n",
+                sum(method_full == 5, na.rm = TRUE),
+                100 * sum(method_full == 5, na.rm = TRUE) / valid_pixels))
+    
+    # Drought frequency (first 12 months)
+    first_idx <- head(which(!is.na(res_basin[1, ])), 12)
+    if (length(first_idx) >= 12) {
+      first_spei <- res_basin[, first_idx]
+      cat(sprintf("\nDrought frequency by severity (first 12 months):\n"))
+      cat(sprintf("  Exceptional (SPEI < -2.0):  %.1f%%\n", 100 * mean(first_spei < -2.0, na.rm = TRUE)))
+      cat(sprintf("  Extreme     (SPEI < -1.6):  %.1f%%\n", 100 * mean(first_spei < -1.6, na.rm = TRUE)))
+      cat(sprintf("  Severe      (SPEI < -1.3):  %.1f%%\n", 100 * mean(first_spei < -1.3, na.rm = TRUE)))
+      cat(sprintf("  Moderate    (SPEI < -0.8):  %.1f%%\n", 100 * mean(first_spei < -0.8, na.rm = TRUE)))
+    }
+    cat("\n")
+  })
+  
+  # Append to the combined summary file
+  cat(summary_text, file = summary_file, append = TRUE, sep = "\n")
+  
+  # ==============================================================================
+  #   OUTPUT 5: NETCDF FILES (FOR MSPEI INPUT)
   # ==============================================================================
   cat("  -> Saving NetCDF files (for MSPEI input)...\n")
   for (m in 1:12) {
     idx_m <- which(month_numbers == m)
     if (length(idx_m) == 0) next
-    
     spei_rast <- rast(wb[[1]])
     spei_rast <- rep(spei_rast, length(idx_m))
     values(spei_rast) <- res_full[, idx_m, drop = FALSE]
     terra::time(spei_rast) <- dates[idx_m]
     
     nc_file <- file.path(out_dir, sprintf("spei_%02d_month%02d_%s.nc", scale, m, month_names[m]))
-    writeCDF(spei_rast, nc_file,
-             varname = "spei",
-             longname = sprintf("Standardized Precipitation Evapotranspiration Index (SPEI-%d)", scale),
-             unit = "standardized_index",
-             missval = -9999,
-             overwrite = TRUE)
+    suppressMessages(
+      writeCDF(spei_rast, nc_file,
+               varname = "spei",
+               longname = sprintf("Standardized Precipitation Evapotranspiration Index (SPEI-%d)", scale),
+               unit = "standardized_index",
+               missval = -9999,
+               overwrite = TRUE)
+    )
   }
   cat(sprintf("  ✓ Saved 12 NetCDF files for SPEI-%d\n", scale))
 }
+
+# ---- Shut down parallel cluster ----
+stopCluster(cl)
+cat("\n✓ Parallel cluster stopped\n")
 
 cat("\n============================================================\n")
 cat("SPEI CALCULATION COMPLETE!\n")
 cat("============================================================\n")
 cat(sprintf("\nOutput directory: %s\n", normalizePath(out_dir)))
-cat("\n✓✓✓ READY FOR MSPEI CALCULATION ✓✓✓\n")
-cat("Variance-aware approach handles low-variance winter months via empirical ranking.\n")
+cat(sprintf("\nCombined summary file: %s\n", summary_file))
+cat("Variance-aware approach: Parametric (GLO/PE3/GEV) with Gringorten fallback.\n")
