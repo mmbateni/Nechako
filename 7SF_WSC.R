@@ -334,6 +334,7 @@ calculate_variable_threshold <- function(data, window_size = 31,
 # SECTION 7: DROUGHT EVENT IDENTIFICATION
 # ============================================================================
 
+
 identify_droughts <- function(data, thresholds, min_duration = 30, 
                               station_id = NULL) {
   
@@ -371,13 +372,13 @@ identify_droughts <- function(data, thresholds, min_duration = 30,
       discharge_min = min(discharge, na.rm = TRUE),
       discharge_mean = mean(discharge, na.rm = TRUE),
       threshold_mean = mean(threshold_smooth, na.rm = TRUE),
+      deficit_volume = sum(threshold_smooth - discharge, na.rm = TRUE),
+      deficit_mean = mean(threshold_smooth - discharge, na.rm = TRUE),
       .groups = "drop"
     ) %>%
-    filter(duration >= min_duration) %>%  # Minimum 30 days as per paper
+    filter(duration >= min_duration) %>%
     mutate(
       event_id_new = row_number(),
-      deficit_volume = sum(threshold_smooth - discharge),  # Total deficit
-      deficit_mean = mean(threshold_smooth - discharge),   # Mean daily deficit
       year = year(start_date),
       month = month(start_date),
       season = case_when(
@@ -394,8 +395,9 @@ identify_droughts <- function(data, thresholds, min_duration = 30,
   }
   
   # Merge event info back to daily data
+  # FIXED: Use dplyr::select() explicitly to avoid MASS::select() conflict
   data <- data %>%
-    left_join(event_info %>% select(event_id, event_id_new), by = "event_id")
+    left_join(event_info %>% dplyr::select(event_id, event_id_new), by = "event_id")
   
   cat(sprintf("  Drought events identified: %d (min duration: %d days)\n", 
               nrow(event_info), min_duration))
