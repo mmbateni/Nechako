@@ -1,0 +1,2 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<metadata xml:lang="en"><Esri><CreaDate>20250818</CreaDate><CreaTime>19533000</CreaTime><ArcGISFormat>1.0</ArcGISFormat><SyncOnce>TRUE</SyncOnce><DataProperties><lineage><Process ToolSource="c:\program files (x86)\arcgis\desktop10.5\ArcToolbox\Toolboxes\Spatial Analyst Tools.tbx\ExtractByMask" Date="20250818" Time="195330">ExtractByMask n50w130_dem.tif 7050177760 "C:\Users\Persian\Desktop\dem extract\nechako-dem"</Process></lineage></DataProperties></Esri></metadata>

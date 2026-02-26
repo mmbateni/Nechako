@@ -1,0 +1,31 @@
+============================================================
+COMBINED SWEI SUMMARY FOR ALL TIMESCALES
+Seasonal Approach (3-month Smoothed SWE + k=3 SCF Mask)
+============================================================
+
+
+
+========== SWEI-1 ==========
+Calculation date: 2026-02-24 10:00:59.757982
+Grid dimensions: 52 x 34
+Basin pixels: 798
+Time period: 1950-01-01 to 2025-12-01 (912 months)
+
+Methodology:
+  • 3-month centered moving average applied to RAW SWE
+  • SCF mask derived from 3-month climatology (k=3)
+  • Gringorten plotting position (non-parametric)
+
+Method Distribution:
+  Gringorten fitting: 100.0%
+  Masked/NA: 0.0%
+
+NA Analysis:
+  Total NA values in basin: 60.087%
+  Compatibility: ⚠ CAUTION (>0.5% NAs)
+
+Drought frequency (first 12 months):
+  Exceptional (SWEI < -2.0): 0.5%
+  Extreme     (SWEI < -1.6): 1.0%
+  Severe      (SWEI < -1.3): 2.4%
+  Moderate    (SWEI < -0.8): 11.1%

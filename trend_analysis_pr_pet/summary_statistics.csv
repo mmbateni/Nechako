@@ -1,3 +1,3 @@
 variable,period,N_Pixels,N_Valid,Pct_Sig_VC,Pct_Sig_TFPW,Median_Tau_VC,Median_Tau_TFPW,Median_Slope_VC,Median_Slope_TFPW,Mean_Autocorr_VC,Mean_Autocorr_TFPW
 Precipitation,annual,854,854,0.0%,0.0%,0.036,0.039,-0.224,-0.224,,
-PET,annual,854,854,86.3%,86.3%,-0.182,-0.182,0.029,0.029,,
+PET,annual,854,854,73.3%,72.1%,-0.184,-0.184,0.014,0.014,,

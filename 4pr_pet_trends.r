@@ -503,7 +503,7 @@ tryCatch({
 }, error = function(e) {})
 if (is.null(dates) || length(dates) == 0 || all(is.na(dates))) {
   n_layers <- nlyr(precip_clipped)
-  start_year <- 1980
+  start_year <- 1950
   dates <- seq(as.Date(paste0(start_year, "-01-01")), by = "month", length.out = n_layers)
   log_event(paste("Generated", n_layers, "monthly dates from", start_year))
 }

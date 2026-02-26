@@ -1,9 +1,12 @@
 ============================================================
+COMBINED SPI SUMMARY FOR ALL TIMESCALES
+Variance-Aware Approach (Gamma/Empirical fallback)
+============================================================
 
 
 
 ========== SPI-1 ==========
-Calculation date: 2026-02-18 23:00:44.363186
+Calculation date: 2026-02-22 14:56:34.29878
 Grid dimensions: 43 x 47
 Basin pixels: 863
 Time period: 1950-01-01 to 2025-12-01 (912 months)
@@ -19,18 +22,18 @@ Method Distribution:
   Zero-variance: 0.0%
 
 NA Analysis:
-  Total NA values in basin: 0.000%
-  MSPEI compatibility: ✓ READY (<0.5% NAs)
+  Total NA values in basin: 57.298%
+  MSPEI compatibility: ⚠ CAUTION (>0.5% NAs)
 
 Drought frequency (first 12 months):
-  Exceptional (SPI < -2.0): 7.6%
-  Extreme     (SPI < -1.6): 13.2%
-  Severe      (SPI < -1.3): 17.7%
-  Moderate    (SPI < -0.8): 30.1%
+  Exceptional (SPI  < -2.0): 7.6%
+  Extreme     (SPI  < -1.6): 13.2%
+  Severe      (SPI  < -1.3): 17.7%
+  Moderate    (SPI  < -0.8): 30.1%
 
 
 ========== SPI-2 ==========
-Calculation date: 2026-02-18 23:02:34.803319
+Calculation date: 2026-02-22 14:58:21.460087
 Grid dimensions: 43 x 47
 Basin pixels: 863
 Time period: 1950-01-01 to 2025-12-01 (912 months)
@@ -46,18 +49,18 @@ Method Distribution:
   Zero-variance: 0.0%
 
 NA Analysis:
-  Total NA values in basin: 0.110%
-  MSPEI compatibility: ✓ READY (<0.5% NAs)
+  Total NA values in basin: 57.345%
+  MSPEI compatibility: ⚠ CAUTION (>0.5% NAs)
 
 Drought frequency (first 12 months):
-  Exceptional (SPI < -2.0): 4.0%
-  Extreme     (SPI < -1.6): 10.2%
-  Severe      (SPI < -1.3): 17.3%
-  Moderate    (SPI < -0.8): 29.3%
+  Exceptional (SPI  < -2.0): 4.0%
+  Extreme     (SPI  < -1.6): 10.2%
+  Severe      (SPI  < -1.3): 17.3%
+  Moderate    (SPI  < -0.8): 29.3%
 
 
 ========== SPI-3 ==========
-Calculation date: 2026-02-18 23:04:05.638705
+Calculation date: 2026-02-22 14:59:47.021782
 Grid dimensions: 43 x 47
 Basin pixels: 863
 Time period: 1950-01-01 to 2025-12-01 (912 months)
@@ -73,18 +76,18 @@ Method Distribution:
   Zero-variance: 0.0%
 
 NA Analysis:
-  Total NA values in basin: 0.219%
-  MSPEI compatibility: ✓ READY (<0.5% NAs)
+  Total NA values in basin: 57.392%
+  MSPEI compatibility: ⚠ CAUTION (>0.5% NAs)
 
 Drought frequency (first 12 months):
-  Exceptional (SPI < -2.0): 1.3%
-  Extreme     (SPI < -1.6): 2.7%
-  Severe      (SPI < -1.3): 11.8%
-  Moderate    (SPI < -0.8): 42.5%
+  Exceptional (SPI  < -2.0): 1.3%
+  Extreme     (SPI  < -1.6): 2.7%
+  Severe      (SPI  < -1.3): 11.8%
+  Moderate    (SPI  < -0.8): 42.5%
 
 
 ========== SPI-4 ==========
-Calculation date: 2026-02-18 23:05:36.790416
+Calculation date: 2026-02-22 15:00:50.135147
 Grid dimensions: 43 x 47
 Basin pixels: 863
 Time period: 1950-01-01 to 2025-12-01 (912 months)
@@ -100,18 +103,18 @@ Method Distribution:
   Zero-variance: 0.0%
 
 NA Analysis:
-  Total NA values in basin: 0.329%
-  MSPEI compatibility: ✓ READY (<0.5% NAs)
+  Total NA values in basin: 57.439%
+  MSPEI compatibility: ⚠ CAUTION (>0.5% NAs)
 
 Drought frequency (first 12 months):
-  Exceptional (SPI < -2.0): 0.7%
-  Extreme     (SPI < -1.6): 6.8%
-  Severe      (SPI < -1.3): 22.7%
-  Moderate    (SPI < -0.8): 53.4%
+  Exceptional (SPI  < -2.0): 0.7%
+  Extreme     (SPI  < -1.6): 6.8%
+  Severe      (SPI  < -1.3): 22.7%
+  Moderate    (SPI  < -0.8): 53.4%
 
 
 ========== SPI-5 ==========
-Calculation date: 2026-02-18 23:07:06.037924
+Calculation date: 2026-02-22 15:01:55.246272
 Grid dimensions: 43 x 47
 Basin pixels: 863
 Time period: 1950-01-01 to 2025-12-01 (912 months)
@@ -127,18 +130,18 @@ Method Distribution:
   Zero-variance: 0.0%
 
 NA Analysis:
-  Total NA values in basin: 0.439%
-  MSPEI compatibility: ✓ READY (<0.5% NAs)
+  Total NA values in basin: 57.486%
+  MSPEI compatibility: ⚠ CAUTION (>0.5% NAs)
 
 Drought frequency (first 12 months):
-  Exceptional (SPI < -2.0): 4.2%
-  Extreme     (SPI < -1.6): 16.0%
-  Severe      (SPI < -1.3): 27.7%
-  Moderate    (SPI < -0.8): 52.6%
+  Exceptional (SPI  < -2.0): 4.2%
+  Extreme     (SPI  < -1.6): 16.0%
+  Severe      (SPI  < -1.3): 27.7%
+  Moderate    (SPI  < -0.8): 52.6%
 
 
 ========== SPI-6 ==========
-Calculation date: 2026-02-18 23:08:35.994266
+Calculation date: 2026-02-22 15:03:00.874233
 Grid dimensions: 43 x 47
 Basin pixels: 863
 Time period: 1950-01-01 to 2025-12-01 (912 months)
@@ -154,18 +157,18 @@ Method Distribution:
   Zero-variance: 0.0%
 
 NA Analysis:
-  Total NA values in basin: 0.548%
+  Total NA values in basin: 57.532%
   MSPEI compatibility: ⚠ CAUTION (>0.5% NAs)
 
 Drought frequency (first 12 months):
-  Exceptional (SPI < -2.0): 4.9%
-  Extreme     (SPI < -1.6): 17.3%
-  Severe      (SPI < -1.3): 34.9%
-  Moderate    (SPI < -0.8): 68.5%
+  Exceptional (SPI  < -2.0): 4.9%
+  Extreme     (SPI  < -1.6): 17.3%
+  Severe      (SPI  < -1.3): 34.9%
+  Moderate    (SPI  < -0.8): 68.5%
 
 
 ========== SPI-7 ==========
-Calculation date: 2026-02-18 23:10:03.577345
+Calculation date: 2026-02-22 15:04:09.76966
 Grid dimensions: 43 x 47
 Basin pixels: 863
 Time period: 1950-01-01 to 2025-12-01 (912 months)
@@ -181,18 +184,18 @@ Method Distribution:
   Zero-variance: 0.0%
 
 NA Analysis:
-  Total NA values in basin: 0.658%
+  Total NA values in basin: 57.579%
   MSPEI compatibility: ⚠ CAUTION (>0.5% NAs)
 
 Drought frequency (first 12 months):
-  Exceptional (SPI < -2.0): 2.9%
-  Extreme     (SPI < -1.6): 22.8%
-  Severe      (SPI < -1.3): 43.1%
-  Moderate    (SPI < -0.8): 71.2%
+  Exceptional (SPI  < -2.0): 2.9%
+  Extreme     (SPI  < -1.6): 22.8%
+  Severe      (SPI  < -1.3): 43.1%
+  Moderate    (SPI  < -0.8): 71.2%
 
 
 ========== SPI-8 ==========
-Calculation date: 2026-02-18 23:11:34.236241
+Calculation date: 2026-02-22 15:05:19.124686
 Grid dimensions: 43 x 47
 Basin pixels: 863
 Time period: 1950-01-01 to 2025-12-01 (912 months)
@@ -208,18 +211,18 @@ Method Distribution:
   Zero-variance: 0.0%
 
 NA Analysis:
-  Total NA values in basin: 0.768%
+  Total NA values in basin: 57.626%
   MSPEI compatibility: ⚠ CAUTION (>0.5% NAs)
 
 Drought frequency (first 12 months):
-  Exceptional (SPI < -2.0): 4.9%
-  Extreme     (SPI < -1.6): 21.5%
-  Severe      (SPI < -1.3): 37.5%
-  Moderate    (SPI < -0.8): 74.6%
+  Exceptional (SPI  < -2.0): 4.9%
+  Extreme     (SPI  < -1.6): 21.5%
+  Severe      (SPI  < -1.3): 37.5%
+  Moderate    (SPI  < -0.8): 74.6%
 
 
 ========== SPI-9 ==========
-Calculation date: 2026-02-18 23:13:41.517709
+Calculation date: 2026-02-22 15:06:28.502692
 Grid dimensions: 43 x 47
 Basin pixels: 863
 Time period: 1950-01-01 to 2025-12-01 (912 months)
@@ -235,18 +238,18 @@ Method Distribution:
   Zero-variance: 0.0%
 
 NA Analysis:
-  Total NA values in basin: 0.877%
+  Total NA values in basin: 57.673%
   MSPEI compatibility: ⚠ CAUTION (>0.5% NAs)
 
 Drought frequency (first 12 months):
-  Exceptional (SPI < -2.0): 0.3%
-  Extreme     (SPI < -1.6): 21.3%
-  Severe      (SPI < -1.3): 47.9%
-  Moderate    (SPI < -0.8): 76.9%
+  Exceptional (SPI  < -2.0): 0.3%
+  Extreme     (SPI  < -1.6): 21.3%
+  Severe      (SPI  < -1.3): 47.9%
+  Moderate    (SPI  < -0.8): 76.9%
 
 
 ========== SPI-10 ==========
-Calculation date: 2026-02-18 23:15:31.980813
+Calculation date: 2026-02-22 15:07:39.809985
 Grid dimensions: 43 x 47
 Basin pixels: 863
 Time period: 1950-01-01 to 2025-12-01 (912 months)
@@ -262,18 +265,18 @@ Method Distribution:
   Zero-variance: 0.0%
 
 NA Analysis:
-  Total NA values in basin: 0.987%
+  Total NA values in basin: 57.720%
   MSPEI compatibility: ⚠ CAUTION (>0.5% NAs)
 
 Drought frequency (first 12 months):
-  Exceptional (SPI < -2.0): 3.5%
-  Extreme     (SPI < -1.6): 25.4%
-  Severe      (SPI < -1.3): 43.3%
-  Moderate    (SPI < -0.8): 74.2%
+  Exceptional (SPI  < -2.0): 3.5%
+  Extreme     (SPI  < -1.6): 25.4%
+  Severe      (SPI  < -1.3): 43.3%
+  Moderate    (SPI  < -0.8): 74.2%
 
 
 ========== SPI-11 ==========
-Calculation date: 2026-02-18 23:16:59.896494
+Calculation date: 2026-02-22 15:08:51.365101
 Grid dimensions: 43 x 47
 Basin pixels: 863
 Time period: 1950-01-01 to 2025-12-01 (912 months)
@@ -289,18 +292,18 @@ Method Distribution:
   Zero-variance: 0.0%
 
 NA Analysis:
-  Total NA values in basin: 1.096%
+  Total NA values in basin: 57.767%
   MSPEI compatibility: ⚠ CAUTION (>0.5% NAs)
 
 Drought frequency (first 12 months):
-  Exceptional (SPI < -2.0): 0.8%
-  Extreme     (SPI < -1.6): 10.3%
-  Severe      (SPI < -1.3): 28.8%
-  Moderate    (SPI < -0.8): 70.2%
+  Exceptional (SPI  < -2.0): 0.8%
+  Extreme     (SPI  < -1.6): 10.3%
+  Severe      (SPI  < -1.3): 28.8%
+  Moderate    (SPI  < -0.8): 70.2%
 
 
 ========== SPI-12 ==========
-Calculation date: 2026-02-18 23:18:47.7981
+Calculation date: 2026-02-22 15:10:02.940731
 Grid dimensions: 43 x 47
 Basin pixels: 863
 Time period: 1950-01-01 to 2025-12-01 (912 months)
@@ -316,18 +319,18 @@ Method Distribution:
   Zero-variance: 0.0%
 
 NA Analysis:
-  Total NA values in basin: 1.206%
+  Total NA values in basin: 57.813%
   MSPEI compatibility: ⚠ CAUTION (>0.5% NAs)
 
 Drought frequency (first 12 months):
-  Exceptional (SPI < -2.0): 0.6%
-  Extreme     (SPI < -1.6): 22.5%
-  Severe      (SPI < -1.3): 46.1%
-  Moderate    (SPI < -0.8): 77.3%
+  Exceptional (SPI  < -2.0): 0.6%
+  Extreme     (SPI  < -1.6): 22.5%
+  Severe      (SPI  < -1.3): 46.1%
+  Moderate    (SPI  < -0.8): 77.3%
 
 
 ========== SPI-24 ==========
-Calculation date: 2026-02-18 23:20:24.250638
+Calculation date: 2026-02-22 15:11:14.514215
 Grid dimensions: 43 x 47
 Basin pixels: 863
 Time period: 1950-01-01 to 2025-12-01 (912 months)
@@ -343,11 +346,11 @@ Method Distribution:
   Zero-variance: 0.0%
 
 NA Analysis:
-  Total NA values in basin: 2.522%
+  Total NA values in basin: 58.375%
   MSPEI compatibility: ⚠ CAUTION (>0.5% NAs)
 
 Drought frequency (first 12 months):
-  Exceptional (SPI < -2.0): NaN%
-  Extreme     (SPI < -1.6): NaN%
-  Severe      (SPI < -1.3): NaN%
-  Moderate    (SPI < -0.8): NaN%
+  Exceptional (SPI  < -2.0): NaN%
+  Extreme     (SPI  < -1.6): NaN%
+  Severe      (SPI  < -1.3): NaN%
+  Moderate    (SPI  < -0.8): NaN%

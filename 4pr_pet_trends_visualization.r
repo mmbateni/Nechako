@@ -195,13 +195,13 @@ create_regime_shift_maps <- function() {
     
     # Map 1: Timing of first changepoint (by decade)
     var_data[, shift_decade := cut(first_changepoint_year,
-                                   breaks = seq(1980, 2060, by = 10),
-                                   labels = paste0(seq(1980, 2050, 10), "s"),
+                                   breaks = seq(1950, 2030, by = 10),
+                                   labels = paste0(seq(1950, 2020, 10), "s"),
                                    include.lowest = TRUE)]
     
     # Convert to numeric for rasterization
     var_data[, shift_decade_num := as.numeric(cut(first_changepoint_year,
-                                                  breaks = seq(1980, 2060, by = 10),
+                                                  breaks = seq(1950, 2030, by = 10),
                                                   include.lowest = TRUE))]
     
     r_decade <- create_raster_from_table(var_data, template_bc, "shift_decade_num")
@@ -213,7 +213,7 @@ create_regime_shift_maps <- function() {
                       legend_title = "")
     
     # Add legend manually
-    decade_labels <- c("1980s", "1990s", "2000s", "2010s", "2020s", "2030s", "2040s", "2050s")
+    decade_labels <- c("1950s", "1960s", "1970s", "1980s", "1990s", "2000s", "2010s", "2020s")
     legend("bottomright",
            legend = decade_labels[1:max(var_data$shift_decade_num, na.rm=TRUE)],
            fill = hcl.colors(8, "Spectral", rev = TRUE)[1:max(var_data$shift_decade_num, na.rm=TRUE)],
@@ -229,7 +229,7 @@ create_regime_shift_maps <- function() {
                       legend_title = "N")
   }
   
-  mtext("Regime Shift Detection (PELT Changepoint Analysis, 1980-2055)",
+  mtext("Regime Shift Detection (PELT Changepoint Analysis, 1950-2025)",
         outer = TRUE, cex = 1.2, font = 2, line = 0.5)
   
   dev.off()
@@ -330,7 +330,7 @@ create_spatial_pattern_analysis <- function() {
                       legend_title = "CV")
   }
   
-  mtext("Spatial Variability of Trends (Annual Data, 1980-2055)",
+  mtext("Spatial Variability of Trends (Annual Data, 1950-2025)",
         outer = TRUE, cex = 1.2, font = 2, line = 0.5)
   
   dev.off()
@@ -476,7 +476,8 @@ create_basin_timeseries_plot <- function() {
   plot(basin_avg_monthly$date, basin_avg_monthly$precip_mm_month, 
        type = "l", col = rgb(0.2, 0.4, 0.8, 0.3), lwd = 0.8,
        xlab = "Year", ylab = "Precipitation (mm/month)", 
-       main = "Nechako Basin Climate Time Series (1980-2055)\nSpatially Averaged Monthly Values",
+       main = "Nechako Basin Climate Time Series (1950-2025)\nSpatially Averaged Monthly Values",
+       xlim = c(as.Date("1950-01-01"), as.Date("2025-12-31")),
        ylim = c(0, max(basin_avg_monthly$precip_mm_month, na.rm = TRUE) * 1.1),
        cex.lab = 1.2, cex.axis = 1.1, cex.main = 1.3)
   lines(basin_avg_monthly$date, pr_rolling, col = "blue", lwd = 2.5)
@@ -485,6 +486,7 @@ create_basin_timeseries_plot <- function() {
   plot(basin_avg_monthly$date, basin_avg_monthly$pet_mm_month,
        type = "l", col = rgb(0.8, 0.2, 0.2, 0.3), lwd = 0.8,
        axes = FALSE, xlab = "", ylab = "", 
+       xlim = c(as.Date("1950-01-01"), as.Date("2025-12-31")),
        ylim = c(0, max(basin_avg_monthly$pet_mm_month, na.rm = TRUE) * 1.1))
   lines(basin_avg_monthly$date, pet_rolling, col = "red", lwd = 2.5)
   
@@ -549,7 +551,7 @@ create_publication_figure <- function(var_name, method = "vc") {
     title_prefix <- "Precipitation"
   }
   
-  mtext(sprintf("%s Annual Trends (1980-2055) | %s Method", title_prefix,
+  mtext(sprintf("%s Annual Trends (1950-2025) | %s Method", title_prefix,
                 ifelse(method == "vc", "Variance-Corrected MK", "TFPW-Corrected MK")),
         outer = TRUE, cex = 1.1, font = 2, line = 0.5)
   dev.off()
@@ -577,7 +579,7 @@ create_comparison_figure <- function() {
                     hcl.colors(101, "RdBu", rev = TRUE),
                     legend_title = "τ")
   
-  mtext("Nechako Basin Climate Trends (1980-2055) | Variance-Corrected MK", 
+  mtext("Nechako Basin Climate Trends (1950-2025) | Variance-Corrected MK", 
         outer = TRUE, cex = 1.3, font = 2, line = 0.5)
   dev.off()
   
