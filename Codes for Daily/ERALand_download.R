@@ -5,8 +5,8 @@ library(lubridate) # Robust date handling (Handles leap years correctly)
 
 # ---- 1. Credentials ----
 # Prefer environment variables:
-user_uid <- "bateni2000@gmail.com"
-user_key <- "47081be6-c313-4832-9275-c2c5deeed751"
+user_uid <- "***"
+user_key <- "***"
 
 if (is.na(user_uid) || is.na(user_key) || !nzchar(user_uid) || !nzchar(user_key)) {
   stop("CDS credentials not found. Set CDS_USER and CDS_KEY env vars, or hardcode temporarily.")

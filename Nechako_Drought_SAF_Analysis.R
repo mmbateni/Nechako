@@ -1,17 +1,30 @@
 #============================================================================
 # DROUGHT SEVERITY-AREA-FREQUENCY ANALYSIS FOR NECHAKO BASIN
-# Using PNPI & PNWBI with DUAL RETURN PERIOD METHODS
+# Using PNPI & PNWBI with DURATION CLASSIFICATION + DUAL RETURN PERIOD METHODS
 #============================================================================
 # This script performs regional drought analysis using:
 # 1. Percent of Normal Precipitation Index (PNPI)
 # 2. Percent of Normal Water Balance Index (PNWBI)
-# 3. TWO return period methods:
+# 3. Duration classification (Sheffield & Wood 2008):
+#    D4–6   : Short-term  (4–6 consecutive months below threshold)
+#    D7–12  : Medium-term (7–12 consecutive months below threshold)
+#    D12+   : Long-term   (>12 consecutive months below threshold)
+# 4. Per-class empirical return periods (events / record length)
+# 5. TWO multivariate return period methods applied per duration class:
 #    a) Conditional copula approach (Amirataee et al. 2018)
 #    b) Kendall distribution function approach (Genest et al. 2009)
+#
+# NEW OUTPUTS (added):
+#   *_duration_classified_events.csv  — all events with duration class
+#   *_return_periods_by_class.csv     — empirical T per D4-6 / D7-12 / D12+
+#   *_SAF_curves_conditional_<class>.csv  — SAF per duration class (Method A)
+#   *_SAF_curves_kendall_<class>.csv      — SAF per duration class (Method B)
+#   *_return_period_summary_plot.pdf      — bar chart of T by duration class
 #
 # Key References:
 # - PNPI methodology: WMO (2016); Heim (2002)
 # - Water balance: Palmer (1965); Thornthwaite (1948)
+# - Duration classes: Sheffield & Wood (2008), Clim. Dyn. 31:79-105
 # - Conditional approach: Amirataee et al. (2018); Shiau (2006)
 # - Kendall approach: Genest et al. (2009); Salvadori & De Michele (2004)
 #============================================================================
@@ -21,7 +34,8 @@
 gc()
 
 required_packages <- c("terra", "copula", "fitdistrplus", "MASS", 
-                       "ggplot2", "gridExtra", "viridis", "moments")
+                       "ggplot2", "gridExtra", "viridis", "moments",
+                       "dplyr", "openxlsx", "Kendall")
 for (pkg in required_packages) {
   if (!require(pkg, character.only = TRUE)) {
     install.packages(pkg)
@@ -30,6 +44,22 @@ for (pkg in required_packages) {
 }
 
 setwd("D:/Nechako_Drought/monthly_data_direct")
+
+# ── Duration class boundaries (Sheffield & Wood 2008) ─────────────────
+D_SHORT_MIN <- 4L;  D_SHORT_MAX <- 6L    # D4-6  : short-term
+D_MED_MIN   <- 7L;  D_MED_MAX  <- 12L   # D7-12 : medium-term
+D_LONG_MIN  <- 13L                        # D12+  : long-term
+DROUGHT_THRESHOLD_PCT <- 75               # <75% = moderate drought (WMO 2016)
+
+#' Classify a duration (integer months) into a Sheffield duration class
+classify_duration_class <- function(dur) {
+  dplyr::case_when(
+    dur >= D_SHORT_MIN & dur <= D_SHORT_MAX ~ "D4-6 (Short-term)",
+    dur >= D_MED_MIN   & dur <= D_MED_MAX   ~ "D7-12 (Medium-term)",
+    dur >= D_LONG_MIN                        ~ "D12+ (Long-term)",
+    TRUE                                     ~ "D1-3 (Sub-threshold)"
+  )
+}
 
 # Create output directory structure
 dir.create("drought_analysis", showWarnings = FALSE)
@@ -81,7 +111,7 @@ log_event(sprintf("  Total basin area: %.2f km²", total_area_km2))
 #============================================================================
 # STEP 2: PREPARE PET IN MONTHLY UNITS
 #============================================================================
-log_event("\n" + "="*70)
+log_event(paste(rep("=", 70), collapse = ""))
 log_event("STEP 2: CONVERTING PET TO MONTHLY TOTALS")
 log_event("="*70)
 
@@ -98,7 +128,7 @@ log_event(sprintf("  Monthly PET range: %.2f to %.2f mm (mean: %.2f)",
 #============================================================================
 # STEP 3: CALCULATE WATER BALANCE (P - PET)
 #============================================================================
-log_event("\n" + "="*70)
+log_event(paste(rep("=", 70), collapse = ""))
 log_event("STEP 3: CALCULATING WATER BALANCE (P - PET)")
 log_event("="*70)
 
@@ -113,15 +143,9 @@ writeCDF(wb, "drought_analysis/water_balance_monthly.nc", overwrite = TRUE)
 # FUNCTION: CALCULATE PERCENT OF NORMAL BY CALENDAR MONTH
 #============================================================================
 percent_of_normal_by_month <- function(data_rast, dates, name = "Index") {
-  """
-  Calculate Percent of Normal Index by calendar month climatology
-  
-  PNPI/PNWBI = (X_t / μ_m) * 100
-  
-  Reference:
-  - WMO (2016). Standardized Precipitation Index User Guide
-  - Heim (2002). A review of twentieth-century drought indices used in the USA
-  """
+  # Calculate Percent of Normal Index by calendar month climatology
+  # PNPI/PNWBI = (X_t / mu_m) * 100
+  # Reference: WMO (2016); Heim (2002)
   log_event(sprintf("  Calculating Percent of Normal %s by calendar month...", name))
   
   month_idx <- as.numeric(format(dates, "%m"))
@@ -153,7 +177,7 @@ percent_of_normal_by_month <- function(data_rast, dates, name = "Index") {
 #============================================================================
 # STEP 4A: CALCULATE PERCENT OF NORMAL PRECIPITATION INDEX (PNPI)
 #============================================================================
-log_event("\n" + "="*70)
+log_event(paste(rep("=", 70), collapse = ""))
 log_event("STEP 4A: CALCULATING PERCENT OF NORMAL PRECIPITATION INDEX (PNPI)")
 log_event("="*70)
 log_event("  Reference: WMO (2016) - Percent of Normal as drought indicator")
@@ -169,7 +193,7 @@ log_event("  PNPI saved to: PNPI_monthly.nc")
 #============================================================================
 # STEP 4B: CALCULATE PERCENT OF NORMAL WATER BALANCE INDEX (PNWBI)
 #============================================================================
-log_event("\n" + "="*70)
+log_event(paste(rep("=", 70), collapse = ""))
 log_event("STEP 4B: CALCULATING PERCENT OF NORMAL WATER BALANCE INDEX (PNWBI)")
 log_event("="*70)
 log_event("  Reference: Palmer (1965) water balance approach adapted to percentage format")
@@ -182,20 +206,187 @@ writeCDF(pnwbi, "drought_analysis/PNWBI_monthly.nc", overwrite = TRUE)
 log_event("  PNWBI saved to: PNWBI_monthly.nc")
 
 #============================================================================
+# FUNCTION: IDENTIFY INDIVIDUAL DROUGHT EVENTS WITH DURATION CLASSIFICATION
+# (Sheffield & Wood 2008 approach applied to PNPI/PNWBI)
+#============================================================================
+#' Scan the basin-averaged PN index time series and return a data.frame of
+#' individual drought events including their duration class (D4-6, D7-12, D12+).
+#'
+#' Entry condition : index < DROUGHT_THRESHOLD_PCT  for at least 1 month
+#' Exit condition  : index >= DROUGHT_THRESHOLD_PCT
+#'
+#' For each event the function records:
+#'   start_date, end_date, duration_months, duration_class,
+#'   mean_severity (mean % deficit below 100), max_severity (max deficit),
+#'   mean_area_pct (mean % basin in drought during event)
+identify_duration_classified_events <- function(drought_chars, index_name,
+                                                threshold_pct = DROUGHT_THRESHOLD_PCT) {
+  log_event(sprintf("  Identifying duration-classified events for %s...", index_name))
+  
+  dc   <- drought_chars[order(drought_chars$date), ]
+  vals <- dc$severity     # mean deficit (0 when no drought)
+  area <- dc$area_pct
+  indr <- dc$severity > 0 & dc$area_pct > 0   # in-drought months
+  
+  events <- list()
+  in_d   <- FALSE
+  s_idx  <- NA_integer_
+  
+  for (i in seq_len(nrow(dc))) {
+    if (!in_d && indr[i]) {
+      in_d  <- TRUE
+      s_idx <- i
+    } else if (in_d && !indr[i]) {
+      e_idx <- i - 1L
+      dur   <- e_idx - s_idx + 1L
+      events[[length(events) + 1L]] <- data.frame(
+        index           = index_name,
+        start_date      = dc$date[s_idx],
+        end_date        = dc$date[e_idx],
+        start_year      = dc$year[s_idx],
+        end_year        = dc$year[e_idx],
+        duration_months = dur,
+        duration_class  = classify_duration_class(dur),
+        mean_severity   = mean(vals[s_idx:e_idx], na.rm = TRUE),
+        max_severity    = max(vals[s_idx:e_idx],  na.rm = TRUE),
+        mean_area_pct   = mean(area[s_idx:e_idx], na.rm = TRUE),
+        max_area_pct    = max(area[s_idx:e_idx],  na.rm = TRUE),
+        stringsAsFactors = FALSE
+      )
+      in_d  <- FALSE
+      s_idx <- NA_integer_
+    }
+  }
+  # Close open event at end of record
+  if (in_d && !is.na(s_idx)) {
+    e_idx <- nrow(dc)
+    dur   <- e_idx - s_idx + 1L
+    events[[length(events) + 1L]] <- data.frame(
+      index           = index_name,
+      start_date      = dc$date[s_idx],
+      end_date        = dc$date[e_idx],
+      start_year      = dc$year[s_idx],
+      end_year        = dc$year[e_idx],
+      duration_months = dur,
+      duration_class  = classify_duration_class(dur),
+      mean_severity   = mean(vals[s_idx:e_idx], na.rm = TRUE),
+      max_severity    = max(vals[s_idx:e_idx],  na.rm = TRUE),
+      mean_area_pct   = mean(area[s_idx:e_idx], na.rm = TRUE),
+      max_area_pct    = max(area[s_idx:e_idx],  na.rm = TRUE),
+      stringsAsFactors = FALSE
+    )
+  }
+  
+  if (length(events) == 0) {
+    log_event(sprintf("  ⚠ No events detected for %s", index_name))
+    return(data.frame())
+  }
+  out <- do.call(rbind, events)
+  log_event(sprintf("  ✓ %d total events identified", nrow(out)))
+  for (cl in c("D4-6 (Short-term)", "D7-12 (Medium-term)", "D12+ (Long-term)")) {
+    n <- sum(out$duration_class == cl)
+    log_event(sprintf("    %s: %d events", cl, n))
+  }
+  out
+}
+
+#============================================================================
+# FUNCTION: EMPIRICAL RETURN PERIODS BY DURATION CLASS
+#============================================================================
+#' For each duration class compute:
+#'   n_events, freq_per_year, return_period_years,
+#'   mean/max severity, mean/max area, mean duration
+compute_return_periods_by_class <- function(events_df, index_name,
+                                            record_years = NULL) {
+  log_event(sprintf("  Computing return periods by duration class for %s...", index_name))
+  
+  if (is.null(record_years)) {
+    record_years <- as.integer(
+      max(events_df$end_year) - min(events_df$start_year) + 1L
+    )
+  }
+  
+  classes <- c("D4-6 (Short-term)", "D7-12 (Medium-term)", "D12+ (Long-term)")
+  out <- lapply(classes, function(cl) {
+    sub <- events_df[events_df$duration_class == cl, ]
+    n   <- nrow(sub)
+    if (n == 0) {
+      return(data.frame(
+        index                = index_name,
+        duration_class       = cl,
+        n_events             = 0L,
+        record_years         = record_years,
+        freq_per_year        = 0,
+        return_period_years  = Inf,
+        mean_duration_months = NA_real_,
+        mean_severity        = NA_real_,
+        max_severity         = NA_real_,
+        mean_area_pct        = NA_real_,
+        max_area_pct         = NA_real_,
+        stringsAsFactors     = FALSE
+      ))
+    }
+    data.frame(
+      index                = index_name,
+      duration_class       = cl,
+      n_events             = n,
+      record_years         = record_years,
+      freq_per_year        = n / record_years,
+      return_period_years  = record_years / n,
+      mean_duration_months = mean(sub$duration_months, na.rm = TRUE),
+      mean_severity        = mean(sub$mean_severity,   na.rm = TRUE),
+      max_severity         = max(sub$max_severity,     na.rm = TRUE),
+      mean_area_pct        = mean(sub$mean_area_pct,   na.rm = TRUE),
+      max_area_pct         = max(sub$max_area_pct,     na.rm = TRUE),
+      stringsAsFactors     = FALSE
+    )
+  })
+  rp <- do.call(rbind, out)
+  log_event(sprintf("  ✓ Return period table computed (%d rows)", nrow(rp)))
+  rp
+}
+
+#============================================================================
+# FUNCTION: PLOT RETURN PERIODS BY DURATION CLASS
+#============================================================================
+plot_return_periods_by_class <- function(rp_df, index_name, output_dir) {
+  rp_plot <- rp_df[is.finite(rp_df$return_period_years) &
+                     rp_df$duration_class != "D1-3 (Sub-threshold)", ]
+  
+  p <- ggplot(rp_plot, aes(x = duration_class, y = return_period_years,
+                           fill = duration_class)) +
+    geom_col(width = 0.6, colour = "grey30") +
+    geom_text(aes(label = sprintf("n=%d\nT=%.1f yr", n_events, return_period_years)),
+              vjust = -0.4, size = 3.5) +
+    scale_fill_manual(
+      values = c("D4-6 (Short-term)"   = "#fdae61",
+                 "D7-12 (Medium-term)" = "#f46d43",
+                 "D12+ (Long-term)"    = "#a50026"),
+      guide = "none") +
+    labs(title    = sprintf("%s — Empirical Return Periods by Duration Class", index_name),
+         subtitle = sprintf("Record: %d years (1950–%d); T = record_years / n_events",
+                            rp_plot$record_years[1],
+                            1950L + rp_plot$record_years[1] - 1L),
+         x = "Duration Class", y = "Return Period (Years)") +
+    theme_bw(base_size = 13) +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5))
+  
+  pdf(file.path(output_dir,
+                sprintf("%s_return_period_by_class.pdf", index_name)),
+      width = 8, height = 6)
+  print(p)
+  dev.off()
+  log_event(sprintf("    Return-period bar chart saved for %s", index_name))
+}
+
+#============================================================================
 # FUNCTION: EXTRACT DROUGHT CHARACTERISTICS FOR PERCENT INDICES
 #============================================================================
-extract_drought_characteristics_percent <- function(index_rast, cell_area, 
-                                                    threshold_pct = 75) {
-  """
-  Extract regional drought severity and area using percent-based indices
-  
-  Drought threshold: <75% = moderate drought (WMO 2016; Heim 2002)
-  Severity definition: Mean deficit from normal (100 - index) in drought areas
-  
-  Reference:
-  - Heim, R.R. (2002). A review of twentieth-century drought indices used in the USA.
-  - WMO (2016). Standardized Precipitation Index User Guide.
-  """
+extract_drought_characteristics_percent <- function(index_rast, cell_area,
+                                                    threshold_pct = DROUGHT_THRESHOLD_PCT) {
+  # Extract regional drought severity and area using percent-based indices
+  # Drought threshold: <75% = moderate drought (WMO 2016; Heim 2002)
+  # Severity definition: Mean deficit from normal (100 - index) in drought areas
   log_event(sprintf("  Extracting drought characteristics (threshold = %.0f%%)...", 
                     threshold_pct))
   
@@ -243,14 +434,12 @@ extract_drought_characteristics_percent <- function(index_rast, cell_area,
 }
 
 #============================================================================
-# STEP 5: EXTRACT DROUGHT CHARACTERISTICS (PNPI & PNWBI)
+# STEP 5: EXTRACT DROUGHT CHARACTERISTICS AND CLASSIFY EVENTS (PNPI & PNWBI)
 #============================================================================
-log_event("\n" + "="*70)
-log_event("STEP 5: EXTRACTING DROUGHT CHARACTERISTICS")
-log_event("="*70)
+log_event(paste(rep("=", 70), collapse = ""))
+log_event("STEP 5: EXTRACTING DROUGHT CHARACTERISTICS AND CLASSIFYING EVENTS")
+log_event(paste(rep("=", 70), collapse = ""))
 log_event("  Using drought threshold: 75% (moderate drought per WMO classification)")
-
-DROUGHT_THRESHOLD_PCT <- 75
 
 pnpi_drought <- extract_drought_characteristics_percent(
   pnpi, cell_area_km2, threshold_pct = DROUGHT_THRESHOLD_PCT
@@ -264,10 +453,77 @@ pnwbi_drought <- extract_drought_characteristics_percent(
 write.csv(pnwbi_drought, "drought_analysis/PNWBI_analysis/PNWBI_drought_characteristics.csv",
           row.names = FALSE)
 
+# ── NEW: Duration-classified event catalogs (Sheffield & Wood 2008) ───
+pnpi_events  <- identify_duration_classified_events(pnpi_drought,  "PNPI")
+pnwbi_events <- identify_duration_classified_events(pnwbi_drought, "PNWBI")
+
+write.csv(pnpi_events,
+          "drought_analysis/PNPI_analysis/PNPI_duration_classified_events.csv",
+          row.names = FALSE)
+write.csv(pnwbi_events,
+          "drought_analysis/PNWBI_analysis/PNWBI_duration_classified_events.csv",
+          row.names = FALSE)
+
+# ── NEW: Empirical return periods by duration class ────────────────────
+record_len <- as.integer(max(year_indices) - min(year_indices) + 1L)
+
+pnpi_rp  <- compute_return_periods_by_class(pnpi_events,  "PNPI",  record_len)
+pnwbi_rp <- compute_return_periods_by_class(pnwbi_events, "PNWBI", record_len)
+
+write.csv(pnpi_rp,
+          "drought_analysis/PNPI_analysis/PNPI_return_periods_by_class.csv",
+          row.names = FALSE)
+write.csv(pnwbi_rp,
+          "drought_analysis/PNWBI_analysis/PNWBI_return_periods_by_class.csv",
+          row.names = FALSE)
+
+log_event("  ── PNPI Return Periods by Duration Class ──")
+for (i in seq_len(nrow(pnpi_rp))) {
+  log_event(sprintf("    %-25s  n=%2d  T=%.1f yr  mean_dur=%.1f mo  mean_sev=%.1f%%",
+                    pnpi_rp$duration_class[i], pnpi_rp$n_events[i],
+                    pnpi_rp$return_period_years[i],
+                    pnpi_rp$mean_duration_months[i],
+                    pnpi_rp$mean_severity[i]))
+}
+log_event("  ── PNWBI Return Periods by Duration Class ──")
+for (i in seq_len(nrow(pnwbi_rp))) {
+  log_event(sprintf("    %-25s  n=%2d  T=%.1f yr  mean_dur=%.1f mo  mean_sev=%.1f%%",
+                    pnwbi_rp$duration_class[i], pnwbi_rp$n_events[i],
+                    pnwbi_rp$return_period_years[i],
+                    pnwbi_rp$mean_duration_months[i],
+                    pnwbi_rp$mean_severity[i]))
+}
+
+# ── NEW: Return-period bar chart (combined PNPI + PNWBI) ──────────────
+rp_all <- rbind(pnpi_rp, pnwbi_rp)
+rp_all <- rp_all[rp_all$duration_class != "D1-3 (Sub-threshold)" &
+                   is.finite(rp_all$return_period_years), ]
+
+pdf("drought_analysis/return_period_by_class_PNPI_PNWBI.pdf", width = 10, height = 6)
+ggplot(rp_all, aes(x = duration_class, y = return_period_years, fill = duration_class)) +
+  geom_col(width = 0.6, colour = "grey30") +
+  geom_text(aes(label = sprintf("n=%d\nT=%.1f yr", n_events, return_period_years)),
+            vjust = -0.3, size = 3.2) +
+  facet_wrap(~ index, nrow = 1) +
+  scale_fill_manual(
+    values = c("D4-6 (Short-term)"   = "#fdae61",
+               "D7-12 (Medium-term)" = "#f46d43",
+               "D12+ (Long-term)"    = "#a50026"),
+    guide = "none") +
+  labs(title    = "Nechako Watershed — Empirical Return Periods by Duration Class",
+       subtitle = sprintf("Record: %d years (1950–%d) | threshold <75%% of normal",
+                          record_len, 1950L + record_len - 1L),
+       x = "Duration Class", y = "Return Period (Years)") +
+  theme_bw(base_size = 13) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        strip.text = element_text(face = "bold"))
+dev.off()
+log_event("  ✓ Return-period bar chart saved: return_period_by_class_PNPI_PNWBI.pdf")
+
 #============================================================================
 # STEP 6: VISUALIZE DROUGHT CHARACTERISTICS
 #============================================================================
-log_event("\n" + "="*70)
+log_event(paste(rep("=", 70), collapse = ""))
 log_event("STEP 6: CREATING SCATTER PLOTS")
 log_event("="*70)
 
@@ -310,7 +566,7 @@ create_scatter_plot(pnwbi_drought, "PNWBI", "drought_analysis/PNWBI_analysis")
 #============================================================================
 # STEP 7: TEST DEPENDENCY BETWEEN SEVERITY AND AREA
 #============================================================================
-log_event("\n" + "="*70)
+log_event(paste(rep("=", 70), collapse = ""))
 log_event("STEP 7: TESTING DEPENDENCY (CORRELATION ANALYSIS)")
 log_event("="*70)
 
@@ -341,7 +597,7 @@ pnwbi_dep <- test_dependency(pnwbi_drought, "PNWBI")
 #============================================================================
 # STEP 8: FIT MARGINAL DISTRIBUTIONS
 #============================================================================
-log_event("\n" + "="*70)
+log_event(paste(rep("=", 70), collapse = ""))
 log_event("STEP 8: FITTING MARGINAL DISTRIBUTIONS")
 log_event("="*70)
 
@@ -419,7 +675,7 @@ pnwbi_marginals <- fit_marginal_distributions(pnwbi_drought, "PNWBI", "drought_a
 #============================================================================
 # STEP 9: FIT COPULA FUNCTIONS
 #============================================================================
-log_event("\n" + "="*70)
+log_event(paste(rep("=", 70), collapse = ""))
 log_event("STEP 9: FITTING AND SELECTING COPULA FUNCTIONS")
 log_event("="*70)
 
@@ -517,12 +773,12 @@ pnwbi_copulas <- fit_copulas(pnwbi_drought, pnwbi_marginals, "PNWBI", "drought_a
 # STEP 10A: DERIVE S-A-F CURVES - CONDITIONAL COPULA APPROACH
 #============================================================================
 derive_SAF_curves_conditional <- function(drought_data, marginal_fits, copula_fit,
-                                          copula_name, index_name, output_dir) {
-  """
-  Derive S-A-F curves using conditional copula approach (Amirataee et al. 2018)
-  T_S|A(s|a) = μ_T / [1 - C_S|A=a(s|a)]
-  """
-  log_event(sprintf("  Deriving S-A-F curves (%s) - Conditional Copula Approach...", index_name))
+                                          copula_name, index_name, output_dir,
+                                          duration_class = "all") {
+  # Derive S-A-F curves using conditional copula approach (Amirataee et al. 2018)
+  # T_S|A(s|a) = mu_T / [1 - C_S|A=a(s|a)]
+  log_event(sprintf("  Deriving S-A-F curves (%s | %s) - Conditional Copula...",
+                    index_name, duration_class))
   
   data_clean <- drought_data[drought_data$severity > 0 & drought_data$area_pct > 0, ]
   n_total_months <- nrow(drought_data)
@@ -590,7 +846,9 @@ derive_SAF_curves_conditional <- function(drought_data, marginal_fits, copula_fi
   }
   
   write.csv(saf_results,
-            file.path(output_dir, sprintf("%s_SAF_curves_conditional.csv", index_name)),
+            file.path(output_dir, sprintf("%s_SAF_curves_conditional_%s.csv",
+                                          index_name,
+                                          gsub("[^A-Za-z0-9]", "_", duration_class))),
             row.names = FALSE)
   return(saf_results)
 }
@@ -599,13 +857,13 @@ derive_SAF_curves_conditional <- function(drought_data, marginal_fits, copula_fi
 # STEP 10B: DERIVE S-A-F CURVES - KENDALL DISTRIBUTION APPROACH
 #============================================================================
 derive_SAF_curves_kendall <- function(drought_data, marginal_fits, copula_fit,
-                                      copula_name, index_name, output_dir) {
-  """
-  Derive S-A-F curves using Kendall distribution function
-  K_C(t) = t - (1 - C(t,t))/t
-  T_K = μ_T / (1 - K_C(t))
-  """
-  log_event(sprintf("  Deriving S-A-F curves (%s) - Kendall Distribution Approach...", index_name))
+                                      copula_name, index_name, output_dir,
+                                      duration_class = "all") {
+  # Derive S-A-F curves using Kendall distribution function
+  # K_C(t) = t - (1 - C(t,t))/t
+  # T_K = mu_T / (1 - K_C(t))
+  log_event(sprintf("  Deriving S-A-F curves (%s | %s) - Kendall Distribution...",
+                    index_name, duration_class))
   
   data_clean <- drought_data[drought_data$severity > 0 & drought_data$area_pct > 0, ]
   n_total_months <- nrow(drought_data)
@@ -691,7 +949,9 @@ derive_SAF_curves_kendall <- function(drought_data, marginal_fits, copula_fit,
   }
   
   write.csv(saf_results,
-            file.path(output_dir, sprintf("%s_SAF_curves_kendall.csv", index_name)),
+            file.path(output_dir, sprintf("%s_SAF_curves_kendall_%s.csv",
+                                          index_name,
+                                          gsub("[^A-Za-z0-9]", "_", duration_class))),
             row.names = FALSE)
   return(saf_results)
 }
@@ -791,52 +1051,163 @@ create_comparative_SAF_plots <- function(saf_conditional, saf_kendall,
 }
 
 #============================================================================
-# EXECUTE BOTH SAF METHODS FOR PNPI AND PNWBI
+# EXECUTE BOTH SAF METHODS FOR PNPI AND PNWBI — PER DURATION CLASS
 #============================================================================
-log_event("\n" + "="*70)
-log_event("STEP 10: DERIVING S-A-F CURVES WITH DUAL METHODS")
-log_event("="*70)
+log_event(paste(rep("=", 70), collapse = ""))
+log_event("STEP 10: DERIVING S-A-F CURVES WITH DUAL METHODS (PER DURATION CLASS)")
+log_event(paste(rep("=", 70), collapse = ""))
 
-# PNPI Analysis
-pnpi_saf_conditional <- derive_SAF_curves_conditional(
-  pnpi_drought, pnpi_marginals, pnpi_copulas,
-  pnpi_copulas$best_copula_name, "PNPI",
-  "drought_analysis/PNPI_analysis"
-)
+# Helper: subset drought_chars to the months that belong to a specific class
+subset_drought_chars_by_class <- function(drought_chars, events_df, class_label) {
+  # Collect all month-dates that fall inside events of the given class
+  ev_sub <- events_df[events_df$duration_class == class_label, ]
+  if (nrow(ev_sub) == 0) return(NULL)
+  # Mark months that are inside a class event
+  in_class <- logical(nrow(drought_chars))
+  for (i in seq_len(nrow(ev_sub))) {
+    in_class <- in_class |
+      (drought_chars$date >= ev_sub$start_date[i] &
+         drought_chars$date <= ev_sub$end_date[i])
+  }
+  # Return the full drought_chars but zero-out months not in the class
+  dc_sub <- drought_chars
+  dc_sub$severity[!in_class]  <- 0
+  dc_sub$area_pct[!in_class]  <- 0
+  dc_sub
+}
 
-pnpi_saf_kendall <- derive_SAF_curves_kendall(
-  pnpi_drought, pnpi_marginals, pnpi_copulas,
-  pnpi_copulas$best_copula_name, "PNPI",
-  "drought_analysis/PNPI_analysis"
-)
+# Duration classes to process for SAF curves (need >=10 events for copula fitting)
+DC_LABELS <- c("D4-6 (Short-term)", "D7-12 (Medium-term)", "D12+ (Long-term)")
 
-create_comparative_SAF_plots(
-  pnpi_saf_conditional, pnpi_saf_kendall,
-  "PNPI", "drought_analysis/PNPI_analysis"
-)
+# Initialise overall SAF storage (used in summary report, default = "all-classes")
+pnpi_saf_conditional  <- NULL
+pnpi_saf_kendall      <- NULL
+pnwbi_saf_conditional <- NULL
+pnwbi_saf_kendall     <- NULL
 
-# PNWBI Analysis
-pnwbi_saf_conditional <- derive_SAF_curves_conditional(
-  pnwbi_drought, pnwbi_marginals, pnwbi_copulas,
-  pnwbi_copulas$best_copula_name, "PNWBI",
-  "drought_analysis/PNWBI_analysis"
-)
+run_saf_for_index <- function(index_name, drought_chars, events_df,
+                              marginals, copulas, out_dir) {
+  saf_cond_list  <- list()
+  saf_kend_list  <- list()
+  
+  # ── (a) Full all-class SAF (original behaviour, preserved) ──────────
+  log_event(sprintf("  [%s] All-class SAF curves...", index_name))
+  sc <- derive_SAF_curves_conditional(
+    drought_chars, marginals, copulas,
+    copulas$best_copula_name, index_name, out_dir, "all")
+  sk <- derive_SAF_curves_kendall(
+    drought_chars, marginals, copulas,
+    copulas$best_copula_name, index_name, out_dir, "all")
+  create_comparative_SAF_plots(sc, sk, index_name, out_dir)
+  saf_cond_list[["all"]] <- sc
+  saf_kend_list[["all"]] <- sk
+  
+  # ── (b) Per-duration-class SAF curves ───────────────────────────────
+  for (cl in DC_LABELS) {
+    n_ev <- sum(events_df$duration_class == cl, na.rm = TRUE)
+    log_event(sprintf("  [%s | %s] n_events = %d", index_name, cl, n_ev))
+    
+    if (n_ev < 8L) {
+      log_event(sprintf("    ⚠ Fewer than 8 events — skipping copula SAF for %s", cl))
+      next
+    }
+    
+    dc_sub <- subset_drought_chars_by_class(drought_chars, events_df, cl)
+    if (is.null(dc_sub)) next
+    
+    # Re-fit marginals and copula on the class-specific severity/area pairs
+    data_cl <- dc_sub[dc_sub$severity > 0 & dc_sub$area_pct > 0, ]
+    if (nrow(data_cl) < 8L) {
+      log_event(sprintf("    ⚠ Insufficient drought months for %s — skipping", cl))
+      next
+    }
+    
+    tryCatch({
+      cl_marginals <- fit_marginal_distributions(
+        dc_sub, index_name, out_dir)
+      cl_copulas   <- fit_copulas(
+        dc_sub, cl_marginals, index_name, out_dir)
+      
+      sc_cl <- derive_SAF_curves_conditional(
+        dc_sub, cl_marginals, cl_copulas,
+        cl_copulas$best_copula_name, index_name, out_dir, cl)
+      sk_cl <- derive_SAF_curves_kendall(
+        dc_sub, cl_marginals, cl_copulas,
+        cl_copulas$best_copula_name, index_name, out_dir, cl)
+      
+      sc_cl$duration_class <- cl
+      sk_cl$duration_class <- cl
+      saf_cond_list[[cl]]  <- sc_cl
+      saf_kend_list[[cl]]  <- sk_cl
+      
+      log_event(sprintf("    ✓ SAF curves derived for %s | %s", index_name, cl))
+    }, error = function(e) {
+      log_event(sprintf("    ❌ SAF fitting failed for %s | %s: %s",
+                        index_name, cl, e$message))
+    })
+  }
+  
+  # ── Combined overlay plot — all duration classes on one figure ───────
+  cond_all_classes <- do.call(rbind, saf_cond_list)
+  kend_all_classes <- do.call(rbind, saf_kend_list)
+  if (!is.null(cond_all_classes) && "duration_class" %in% names(cond_all_classes)) {
+    pdf(file.path(out_dir,
+                  sprintf("%s_SAF_overlay_by_duration_class.pdf", index_name)),
+        width = 12, height = 8)
+    p <- ggplot(cond_all_classes[cond_all_classes$ReturnPeriod_years == 50, ],
+                aes(x = Area_pct, y = Severity,
+                    colour = duration_class, linetype = duration_class)) +
+      geom_line(linewidth = 1.1) +
+      geom_point(size = 2) +
+      scale_colour_manual(
+        values = c("all"                  = "grey50",
+                   "D4-6 (Short-term)"   = "#fdae61",
+                   "D7-12 (Medium-term)" = "#f46d43",
+                   "D12+ (Long-term)"    = "#a50026"),
+        name = "Duration Class") +
+      scale_linetype_manual(
+        values = c("all" = "dotted",
+                   "D4-6 (Short-term)"   = "solid",
+                   "D7-12 (Medium-term)" = "dashed",
+                   "D12+ (Long-term)"    = "longdash"),
+        name = "Duration Class") +
+      labs(title    = sprintf("%s — 50-Year SAF Curves by Duration Class (Conditional Method)",
+                              index_name),
+           subtitle = "Conditional copula approach; curves represent events of each duration class separately",
+           x = "Percent of Area Under Drought (%)",
+           y = "Drought Severity (% deficit from normal)") +
+      theme_bw(base_size = 13) +
+      theme(plot.title = element_text(face = "bold", hjust = 0.5),
+            legend.position = "right")
+    print(p)
+    dev.off()
+    log_event(sprintf("  ✓ Duration-class SAF overlay saved for %s", index_name))
+  }
+  
+  list(saf_conditional = saf_cond_list[["all"]],
+       saf_kendall     = saf_kend_list[["all"]],
+       saf_cond_by_class = saf_cond_list,
+       saf_kend_by_class = saf_kend_list)
+}
 
-pnwbi_saf_kendall <- derive_SAF_curves_kendall(
-  pnwbi_drought, pnwbi_marginals, pnwbi_copulas,
-  pnwbi_copulas$best_copula_name, "PNWBI",
-  "drought_analysis/PNWBI_analysis"
-)
+# ── Run for PNPI ──────────────────────────────────────────────────────
+pnpi_saf_results <- run_saf_for_index(
+  "PNPI", pnpi_drought, pnpi_events,
+  pnpi_marginals, pnpi_copulas, "drought_analysis/PNPI_analysis")
+pnpi_saf_conditional <- pnpi_saf_results$saf_conditional
+pnpi_saf_kendall     <- pnpi_saf_results$saf_kendall
 
-create_comparative_SAF_plots(
-  pnwbi_saf_conditional, pnwbi_saf_kendall,
-  "PNWBI", "drought_analysis/PNWBI_analysis"
-)
+# ── Run for PNWBI ─────────────────────────────────────────────────────
+pnwbi_saf_results <- run_saf_for_index(
+  "PNWBI", pnwbi_drought, pnwbi_events,
+  pnwbi_marginals, pnwbi_copulas, "drought_analysis/PNWBI_analysis")
+pnwbi_saf_conditional <- pnwbi_saf_results$saf_conditional
+pnwbi_saf_kendall     <- pnwbi_saf_results$saf_kendall
 
 #============================================================================
 # STEP 11: GENERATE COMPREHENSIVE SUMMARY REPORT
 #============================================================================
-log_event("\n" + "="*70)
+log_event(paste(rep("=", 70), collapse = ""))
 log_event("STEP 11: GENERATING COMPREHENSIVE SUMMARY REPORT")
 log_event("="*70)
 
@@ -1035,7 +1406,7 @@ WMO (2016). Standardized Precipitation Index User Guide. WMO-No. 1090.
 writeLines(summary_report, "drought_analysis/SUMMARY_REPORT.txt")
 log_event("Comprehensive summary report saved to: SUMMARY_REPORT.txt")
 
-log_event("\n" + "="*70)
+log_event(paste(rep("=", 70), collapse = ""))
 log_event("ANALYSIS COMPLETE")
 log_event("="*70)
 log_event(sprintf("Completed at: %s", Sys.time()))

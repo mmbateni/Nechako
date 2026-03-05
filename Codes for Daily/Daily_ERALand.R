@@ -4,8 +4,8 @@ library(foreach)
 library(doParallel)
 
 # --- Configuration -----------------------------------------------------------
-user_email <- "mehdi.bateni@iusspavia.it"
-pat_token  <- "44ace8e1-8ec8-4246-a44e-f30409c90c5b"
+user_email <- "***"
+pat_token  <- "***"
 wf_set_key(user = user_email, key = pat_token)
 
 setwd("D:/Nechako_Drought/")

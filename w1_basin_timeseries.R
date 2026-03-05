@@ -1,6 +1,7 @@
 # ####################################################################################
 # 01_basin_timeseries.R  ·  BASIN-AVERAGED TIME SERIES FOR ALL INDICES
 # ####################################################################################
+setwd("D:/Nechako_Drought/Nechako/")
 source("DROUGHT_ANALYSIS_utils.R")
 utils_load_packages(c("terra", "ggplot2", "lubridate",
                       "dplyr", "data.table", "patchwork"))
@@ -74,6 +75,12 @@ if (nrow(all_basin_data) > 0) {
     ev <- detect_drought_events(data.frame(date = sub$Date, value = sub$Mean_Value))
     p  <- ggplot2::ggplot(sub, ggplot2::aes(Date, Mean_Value)) +
       drought_band_layers() +
+      ggplot2::geom_ribbon(
+        ggplot2::aes(
+          ymin = ifelse(Mean_Value < DROUGHT_THRESHOLD, Mean_Value, 0),
+          ymax = 0
+        ),
+        fill = "#c0392b", alpha = 0.35) +
       ggplot2::geom_line(color = index_colours[tolower(substr(idx, 1, 4))],
                          linewidth = 0.8) +
       ggplot2::geom_hline(yintercept = 0, linetype = "dashed", color = "black") +

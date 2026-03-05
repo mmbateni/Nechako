@@ -15,7 +15,7 @@ TREND_DIR        <- file.path(WD_PATH,  "temporal_drought/")
 BASIN_PLOT_DIR   <- file.path(WD_PATH,  "basin_averaged_plots/")
 POINT_PLOT_DIR   <- file.path(WD_PATH,  "point_timeseries_plots/")
 GIF_DIR <- file.path(TREND_DIR, "drought_gifs/")
-CACHE_DIR        <- file.path(WD_PATH,  "cache/")
+CACHE_DIR <- file.path(WD_PATH, "temporal_drought/cache/")
 
 ## CRS and thresholds
 EQUAL_AREA_CRS  <- "EPSG:3005"

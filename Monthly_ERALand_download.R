@@ -13,8 +13,8 @@ setwd("D:/Nechako_Drought/")
 # ===================== CONFIGURATION =====================
 # Set credentials 
 wf_set_key(
-  user =  "mehdi.bateni@iusspavia.it",
-  key = "44ace8e1-8ec8-4246-a44e-f30409c90c5b"
+  user =  "***",
+  key = "***"
 )
 
 # Study Area Bounding Box (British Columbia)

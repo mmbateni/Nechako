@@ -59,7 +59,7 @@ if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 # EDH ERA5-Land hourly Zarr (0.1°). Variables include 'swvl4'. (EDH dataset page)
 # PAT method documented by EDH: https://edh:<PAT>@host/path (EDH "Getting started")
 # Sources: EDH getting-started & dataset page; ERA5-Land documentation.               [1][2][3]
-EDH_PAT <- "edh_pat_f628161a6b72e1620777ce8cb0b656975623f0c71b160cb28cd422b420e067ac95da82ec9cdaa7ef43353ffa295854b1"  # << your PAT
+EDH_PAT <- "***"  # << your PAT
 EDH_URL <- sprintf("https://edh:%s@data.earthdatahub.destine.eu/era5/reanalysis-era5-land-no-antartica-v0.zarr",
                    EDH_PAT)
 

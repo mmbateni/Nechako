@@ -4,3 +4,18 @@
 .Ruserdata
 investigation of the 2022.docx
 Nechako.Rproj
+# large data
+*.nc
+*.rar
+*.zip
+*.gif
+Hydrology/
+Lakes/
+monthly_data_direct/
+spei_results_seasonal/
+spi_results_seasonal/
+swei_results_seasonal/
+swsi_results_complete/
+trend_analysis_pr_pet/
+temporal_drought/
+
