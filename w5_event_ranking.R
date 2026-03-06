@@ -290,6 +290,82 @@ if (nrow(rp_table) > 0) {
   ggplot2::ggsave(file.path(RANKING_DIR, "FigRP_Return_Period_By_Duration_Class.png"),
                   p_rp, width = 11, height = 7, dpi = 300)
   cat("✓ Saved: FigRP_Return_Period_By_Duration_Class.png\n")
+  
+  # ── FigRP variant: same plot but with 2022-2025 drought overlaid ──────────────
+  # For each index, the most severe event that overlaps 2022-2025 is marked as a
+  # diamond (shape = 18).  Its return period comes from the Weibull ranking already
+  # computed in Part 2 (most_severe_recent$return_period_years).
+  # This lets the reader directly compare the 2022-2025 event against the empirical
+  # frequency distribution of ALL historical droughts of the same duration class.
+  if (!is.null(most_severe_recent) && nrow(most_severe_recent) > 0) {
+    
+    # Build a data frame of the 2022-2025 event per index, keeping only the
+    # duration classes that appear in the historical rp_table axes
+    valid_dc <- c("D4-6 (Short-term)", "D7-12 (Medium-term)", "D12+ (Long-term)")
+    
+    recent_rp_overlay <- most_severe_recent %>%
+      dplyr::filter(!is.na(return_period_years),
+                    duration_class %in% valid_dc) %>%
+      dplyr::mutate(
+        duration_class = factor(duration_class, levels = valid_dc),
+        # Label: show both return period and severity rank
+        rp_label = sprintf("2022–2025\n~%.0f yr", return_period_years)
+      )
+    
+    if (nrow(recent_rp_overlay) > 0) {
+      
+      p_rp_2022 <- p_rp +
+        # ── Large diamond for each index × duration-class combination ──────────
+        # shape=18 (filled diamond) distinguishes the 2022-2025 event from the
+        # historical-mean dots (shape default = 19, open circle)
+        ggplot2::geom_point(
+          data     = recent_rp_overlay,
+          ggplot2::aes(x     = duration_class,
+                       y     = return_period_years,
+                       colour = index_label,
+                       group  = index_label),
+          size     = 5,
+          shape    = 18,   # filled diamond
+          position = ggplot2::position_dodge(0.6),
+          show.legend = FALSE
+        ) +
+        # ── Text label above each diamond ──────────────────────────────────────
+        ggplot2::geom_label(
+          data     = recent_rp_overlay,
+          ggplot2::aes(x      = duration_class,
+                       y      = return_period_years,
+                       colour = index_label,
+                       group  = index_label,
+                       label  = rp_label),
+          size        = 2.8,
+          vjust       = -0.45,
+          fontface    = "bold",
+          label.size  = 0.25,
+          label.padding = ggplot2::unit(0.15, "lines"),
+          position    = ggplot2::position_dodge(0.6),
+          show.legend = FALSE
+        ) +
+        ggplot2::labs(
+          title    = "Drought Return Period by Duration Class — Nechako Watershed",
+          subtitle = sprintf(
+            paste0("Weibull empirical estimate \u00b1 95%% Poisson CI  |  Record: %d\u2013%d  ",
+                   " |  \u25c6 = 2022\u20132025 event return period"),
+            HISTORICAL_START, HISTORICAL_END
+          )
+        )
+      
+      ggplot2::ggsave(
+        file.path(RANKING_DIR,
+                  "FigRP_Return_Period_By_Duration_Class_with_2022-2025.png"),
+        p_rp_2022, width = 11, height = 7, dpi = 300
+      )
+      cat("✓ Saved: FigRP_Return_Period_By_Duration_Class_with_2022-2025.png\n")
+    } else {
+      cat("  ⚠ 2022-2025 event has no valid duration class for RP overlay – skipped\n")
+    }
+  } else {
+    cat("  ⚠ most_severe_recent is NULL – 2022-2025 RP overlay not drawn\n")
+  }
 }
 
 ####################################################################################
@@ -630,32 +706,59 @@ if (!is.null(basin_vect) && !is.null(most_severe_recent)) {
         basin_sf <- sf::st_as_sf(basin_vect)
         
         # Create three-panel map
+        # ── Fig 5 panel A: Mean index value during the event ──────────────────
+        # Values are negative for drought (SPI/SPEI onset threshold ~ -0.5 to -1.0).
+        # plasma with direction = -1 maps low (most-negative = most intense) to the
+        # bright/yellow end and high (near-zero = mild) to dark purple. We therefore
+        # use direction = 1 (default) so that MORE NEGATIVE → darker purple, which
+        # is the perceptually intuitive "darker = drier" direction.
         p_mean <- ggplot2::ggplot() +
           ggplot2::geom_raster(data = df_spatial, ggplot2::aes(x = x, y = y, fill = mean_value)) +
-          scale_fill_viridis_c(option = "plasma", name = "Mean Index") +
+          ggplot2::scale_fill_viridis_c(
+            option    = "plasma",
+            direction = 1,        # low (most negative) = darkest, 0 = yellow → darker = drier
+            name      = "Mean Index"
+          ) +
           ggplot2::geom_sf(data = basin_sf, fill = NA, color = "black", size = 0.6) +
-          coord_sf() +
-          theme_minimal() +
-          labs(title = "Mean Index Value", subtitle = sprintf("%s to %s", start_d, end_d)) +
-          theme(legend.position = "bottom")
+          ggplot2::coord_sf() +
+          ggplot2::theme_minimal() +
+          ggplot2::labs(title = "Mean Index Value",
+                        subtitle = sprintf("%s to %s", start_d, end_d)) +
+          ggplot2::theme(legend.position = "bottom")
         
+        # ── Fig 5 panel B: Minimum (peak intensity) during the event ──────────
+        # Same logic as panel A: most-negative SPI/SPEI = peak drought = darkest.
+        # Using inferno (direction = 1) keeps that mapping.
         p_min <- ggplot2::ggplot() +
           ggplot2::geom_raster(data = df_spatial, ggplot2::aes(x = x, y = y, fill = min_value)) +
-          scale_fill_viridis_c(option = "inferno", name = "Minimum Index") +
+          ggplot2::scale_fill_viridis_c(
+            option    = "inferno",
+            direction = 1,        # most-negative = darkest = most intense
+            name      = "Minimum Index"
+          ) +
           ggplot2::geom_sf(data = basin_sf, fill = NA, color = "black", size = 0.6) +
-          coord_sf() +
-          theme_minimal() +
-          labs(title = "Minimum Index (Peak Intensity)") +
-          theme(legend.position = "bottom")
+          ggplot2::coord_sf() +
+          ggplot2::theme_minimal() +
+          ggplot2::labs(title = "Minimum Index (Peak Intensity)") +
+          ggplot2::theme(legend.position = "bottom")
         
+        # ── Fig 5 panel C: Drought duration (months in drought) ───────────────
+        # months_drought is a POSITIVE count (0 = never in drought, max = all months).
+        # cividis default (direction = 1) goes dark-blue (low) → yellow (high), so
+        # pixels with MANY drought months appear LIGHT yellow — the wrong direction.
+        # Reversing with direction = -1 makes high counts dark → darker = longer drought.
         p_dur <- ggplot2::ggplot() +
           ggplot2::geom_raster(data = df_spatial, ggplot2::aes(x = x, y = y, fill = months_drought)) +
-          scale_fill_viridis_c(option = "cividis", name = "Months in Drought") +
+          ggplot2::scale_fill_viridis_c(
+            option    = "cividis",
+            direction = -1,       # flip: high month-count = dark, few months = light
+            name      = "Months in Drought"
+          ) +
           ggplot2::geom_sf(data = basin_sf, fill = NA, color = "black", size = 0.6) +
-          coord_sf() +
-          theme_minimal() +
-          labs(title = "Drought Duration within Event") +
-          theme(legend.position = "bottom")
+          ggplot2::coord_sf() +
+          ggplot2::theme_minimal() +
+          ggplot2::labs(title = "Drought Duration within Event") +
+          ggplot2::theme(legend.position = "bottom")
         
         # Combine panels
         p_spatial <- p_mean + p_min + p_dur +
@@ -856,14 +959,69 @@ if (file.exists(results_csv)) {
           error = function(e) NULL
         )
         
+        # ──────────────────────────────────────────────────────────────────────
+        # WHAT DOES "PERCENTILE RANK" MEAN IN THIS MAP?
+        # ──────────────────────────────────────────────────────────────────────
+        # For every grid pixel, we extracted the full time-series of the primary
+        # drought index (e.g. SPI-12) from HISTORICAL_START to HISTORICAL_END.
+        # Using the Sheffield & Wood (2008) event-identification algorithm
+        # (drought onset < DROUGHT_ONSET, termination ≥ DROUGHT_END) we built a
+        # catalogue of ALL discrete drought events at that pixel over the entire
+        # record.  Each event has a severity score S = mean_intensity × duration
+        # (where intensity = onset_threshold − index_value, always positive).
+        #
+        # For the 2022-2025 period we then isolated the sub-series (time columns
+        # col_2022_start : col_2025_end) and computed the maximum severity S_recent
+        # of any event detected within that window.
+        #
+        # The PERCENTILE RANK at each pixel is defined as:
+        #
+        #   pct_rank = 100 × (#historical events with S < S_recent) / #total events
+        #
+        # Interpretation:
+        #   • pct_rank = 90  → the 2022-2025 drought was more severe than 90 % of
+        #                       all historical droughts at that pixel.  In other
+        #                       words it is approximately a 1-in-10 event locally.
+        #   • pct_rank = 99  → exceeds 99 % of the record; roughly a 1-in-75-year
+        #                       event (given a ~75-year record).
+        #   • pct_rank = 0   → the 2022-2025 event is the mildest on record there.
+        #   • NA (grey)      → no drought event was detected at that pixel for
+        #                       either the historical period or 2022-2025 (e.g.
+        #                       perennially wet pixels at high elevation).
+        #
+        # The colour scale uses plasma with direction = -1 so that high percentile
+        # ranks appear DARK (visually prominent) and near-zero ranks appear LIGHT.
+        # ──────────────────────────────────────────────────────────────────────
+        # WHAT DOES "SEVERITY (I × D)" MEAN IN THIS MAP?
+        # ──────────────────────────────────────────────────────────────────────
+        # Severity follows Sheffield & Wood (2008, J. Climate):
+        #   S = Ī × D
+        # where Ī = mean intensity over the event duration and D = duration in months.
+        # Intensity for a single month is: I_t = onset_threshold − index_value
+        # (positive when the index is below the drought-onset threshold).
+        #
+        # This means a pixel can have high severity because it was:
+        #   (a) extremely dry (high I) even for a short time, OR
+        #   (b) persistently in drought (high D) even at moderate intensity.
+        # The S map therefore captures the COMBINED space-time footprint of the
+        # 2022-2025 event and complements the percentile-rank map.
+        #
+        # The colour scale uses inferno with direction = -1 so that high severity
+        # values appear DARK — matching the convention of all other maps in this
+        # analysis where "darker = more extreme drought".
+        # ──────────────────────────────────────────────────────────────────────
+        
         make_base_map <- function(df, aes_col, fill_label, palette, title_str) {
           p <- ggplot2::ggplot() +
             ggplot2::geom_raster(data = df,
                                  ggplot2::aes(x = x, y = y, fill = .data[[aes_col]])) +
             ggplot2::scale_fill_viridis_c(
-              option   = palette,
-              name     = fill_label,
-              na.value = "grey90"
+              option    = palette,
+              direction = -1,     # flip palette: HIGH values = DARK, low values = light.
+              # For pct_rank (0–100 %): high percentile = dark = most extreme.
+              # For severity  (I × D) : high severity  = dark = worst drought.
+              name      = fill_label,
+              na.value  = "grey90"
             ) +
             ggplot2::coord_sf() +
             ggplot2::labs(title = title_str) +
@@ -1035,6 +1193,7 @@ cat("  Figure 2          : ", file.path(RANKING_DIR, "Fig2_Drought_Severity_Dist
 cat("  Figure 3          : ", file.path(RANKING_DIR, "Fig3_Drought_Frequency_By_Duration.png"), "\n")
 cat("  Figure 4          : ", file.path(RANKING_DIR, "Fig4_Presentation_Dashboard.png"), "\n")
 cat("  Figure RP         : ", file.path(RANKING_DIR, "FigRP_Return_Period_By_Duration_Class.png"), "\n")
+cat("  Figure RP+2022    : ", file.path(RANKING_DIR, "FigRP_Return_Period_By_Duration_Class_with_2022-2025.png"), "\n")
 if (file.exists(file.path(RANKING_DIR, "Fig5_2022-2025_Spatial_Severity.png")))
   cat("  Figure 5          : ", file.path(RANKING_DIR, "Fig5_2022-2025_Spatial_Severity.png"), "\n")
 if (file.exists(file.path(RANKING_DIR, "Fig6_2022-2025_Pixel_Rank_Map.png")))

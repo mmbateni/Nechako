@@ -194,10 +194,23 @@ create_event_maps <- function(scale = 12, outfile) {
   n_plots <- length(indices_here)
   
   par(mfrow = c(3, n_plots), mar = c(2, 2, 3, 3), oma = c(0, 0, 2, 0))
+  
+  # Colour palettes for each metric.
+  # Design principle: DARKER colour = MORE extreme drought in every panel.
+  #   n_events     → "YlOrRd": light-yellow (few) to dark-red (many).
+  #                  Default order already maps high values to dark colours → rev = FALSE.
+  #   mean_duration → "viridis": default order goes dark-purple (low) → yellow (high),
+  #                  so long durations appear as LIGHT yellow, which is misleading.
+  #                  Reversing (rev = TRUE) makes long-duration pixels dark-purple → correct.
+  #   max_intensity → "Reds": intensity values are negative (drought onset < 0).
+  #                  zlm is set to c(most-negative, 0), so the colour domain runs from
+  #                  the worst drought value up to 0.  Reversing the Reds ramp
+  #                  (rev = TRUE) places the darkest red at the lowest (most extreme)
+  #                  value, so the most intense pixel appears darkest → correct.
   metrics <- list(
-    n_events = list(title = "# Events", pal = "YlOrRd"),
-    mean_duration = list(title = "Mean Duration", pal = "viridis"),
-    max_intensity = list(title = "Max Intensity", pal = "Reds"))
+    n_events      = list(title = "# Events",       pal = "YlOrRd"),
+    mean_duration = list(title = "Mean Duration",   pal = "viridis"),
+    max_intensity = list(title = "Max Intensity",   pal = "Reds"))
   
   for (idx in indices_here) {
     sub <- plot_data[index_type == idx & timescale == scale]
@@ -215,9 +228,15 @@ create_event_maps <- function(scale = 12, outfile) {
       r <- make_raster(sub, mn, tpl)
       zlm <- if (mn == "max_intensity") c(min(sub[[mn]], na.rm = TRUE), 0)
       else c(0, max(sub[[mn]], na.rm = TRUE))
+      
+      # rev logic (see palette comments above):
+      #   n_events      → rev = FALSE  (YlOrRd already dark at high end)
+      #   mean_duration → rev = TRUE   (flip viridis so long duration = dark)
+      #   max_intensity → rev = TRUE   (flip Reds so most-negative = darkest)
       plot_raster_clean(r, paste0(toupper(idx), ": ", metrics[[mn]]$title), zlm,
                         grDevices::hcl.colors(101, metrics[[mn]]$pal,
-                                              rev = (mn == "max_intensity")))
+                                              rev = mn %in% c("max_intensity",
+                                                              "mean_duration")))
     }
   }
   graphics::mtext(sprintf("Event Characteristics (%d-month)", scale),

@@ -16,6 +16,7 @@ BASIN_PLOT_DIR   <- file.path(WD_PATH,  "basin_averaged_plots/")
 POINT_PLOT_DIR   <- file.path(WD_PATH,  "point_timeseries_plots/")
 GIF_DIR <- file.path(TREND_DIR, "drought_gifs/")
 CACHE_DIR <- file.path(WD_PATH, "temporal_drought/cache/")
+TELE_DIR <- file.path(WD_PATH, "teleconnections")
 
 ## CRS and thresholds
 EQUAL_AREA_CRS  <- "EPSG:3005"
@@ -439,5 +440,5 @@ export_summary_excel <- function(timescales, index_types, ts_loader_fn, output_f
   cat(sprintf("✓ Excel summary saved: %s\n", basename(output_file)))
   invisible(wb)
 }
-
+source("utils_teleconnection_addon.R")
 cat("✓ DROUGHT_ANALYSIS_utils.R loaded\n")
