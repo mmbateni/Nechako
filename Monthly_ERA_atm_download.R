@@ -46,8 +46,8 @@ RUN <- list(
 # ============================================================================
 
 # ── CDS credentials ──────────────────────────────────────────────────────────
-CDS_USER <- "mehdi.bateni@iusspavia.it"   # Numeric UID from cds.climate.copernicus.eu
-CDS_KEY  <- "44ace8e1-8ec8-4246-a44e-f30409c90c5b" 
+CDS_USER <- "***"   # Numeric UID from cds.climate.copernicus.eu
+CDS_KEY  <- "***" 
 
 wf_set_key(user = CDS_USER, key = CDS_KEY)
 
@@ -431,4 +431,5 @@ tryCatch({
   cat("  Message:", conditionMessage(e), "\n")
   cat("\n  downloads/ folder preserved for debugging.\n")
   stop(e)
+
 })
