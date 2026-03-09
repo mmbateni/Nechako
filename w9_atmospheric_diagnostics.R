@@ -748,7 +748,121 @@ for (def in DROUGHT_DEFS) {
           mutate(panel = "Drought minus Non-drought")
       ) %>% mutate(panel = factor(panel, levels = unique(panel)))
     }
+    # ── Shared helper: two-panel time series ──────────────────────────────────────
+    # top_ts   = vector of the atmospheric variable (z500 or slp)
+    # bot_ts   = vector of the drought index
+    # drought_mask = logical vector marking drought months
+    # top_label / bot_label / title_txt / subtitle_txt = strings
     
+    plot_dual_panel_ts <- function(dates, top_ts, bot_ts, drought_mask,
+                                   top_label, bot_label,
+                                   title_txt, subtitle_txt,
+                                   def, thr_lbl) {
+      
+      roll_k <- 12   # 12-month rolling mean for smoothing
+      
+      df <- tibble(
+        date      = dates,
+        top       = top_ts,
+        bot       = bot_ts,
+        is_drought = drought_mask
+      ) %>%
+        filter(!is.na(top), !is.na(bot)) %>%
+        arrange(date) %>%
+        mutate(
+          top_smooth = rollmean(top, k = roll_k, fill = NA, align = "center"),
+          bot_smooth = rollmean(bot, k = roll_k, fill = NA, align = "center")
+        )
+      
+      # Drought period rectangles (for background shading)
+      drought_runs <- df %>%
+        mutate(grp = cumsum(c(TRUE, diff(as.integer(is_drought)) != 0))) %>%
+        group_by(grp) %>%
+        summarise(xmin = min(date), xmax = max(date),
+                  drought = first(is_drought), .groups = "drop") %>%
+        filter(drought)
+      
+      shade <- geom_rect(
+        data        = drought_runs,
+        aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf),
+        fill        = "#f4a582",
+        alpha       = 0.25,
+        inherit.aes = FALSE
+      )
+      
+      x_scale <- scale_x_date(date_breaks = "10 years", date_labels = "%Y",
+                              expand = c(0.01, 0))
+      base_theme <- theme_minimal(base_size = 11) +
+        theme(
+          plot.title       = element_text(face = "bold", size = 12),
+          plot.subtitle    = element_text(size = 9, color = "grey30"),
+          panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(color = "grey88"),
+          axis.title.y     = element_text(size = 9),
+          axis.text.x      = element_text(size = 9),
+          plot.margin      = margin(4, 8, 2, 8)
+        )
+      
+      # ── Top panel: atmospheric variable ─────────────────────────────────────────
+      top_lim <- ceiling(max(abs(df$top), na.rm = TRUE) / 10) * 10
+      
+      p_top <- ggplot(df, aes(x = date)) +
+        shade +
+        geom_ribbon(aes(ymin = 0, ymax = top),
+                    fill = "#92c5de", alpha = 0.55) +
+        geom_ribbon(aes(ymin = pmin(top, 0), ymax = 0),
+                    fill = "#4393c3", alpha = 0.35) +
+        # positive anomaly filled warm
+        geom_ribbon(aes(ymin = 0, ymax = pmax(top, 0)),
+                    fill = "#d6604d", alpha = 0.55) +
+        geom_line(aes(y = top_smooth), color = "grey15",
+                  linewidth = 0.9, na.rm = TRUE) +
+        geom_hline(yintercept = 0, color = "grey40", linewidth = 0.4) +
+        x_scale +
+        scale_y_continuous(name = top_label,
+                           limits = c(-top_lim, top_lim)) +
+        labs(x = NULL) +
+        base_theme
+      
+      # ── Bottom panel: drought index ──────────────────────────────────────────────
+      onset_thr <- if (def$classify == "single") def$threshold else def$onset
+      
+      p_bot <- ggplot(df, aes(x = date)) +
+        shade +
+        geom_ribbon(aes(ymin = pmin(bot, 0), ymax = 0),
+                    fill = "#d6604d", alpha = 0.4) +
+        geom_ribbon(aes(ymin = 0, ymax = pmax(bot, 0)),
+                    fill = "#92c5de", alpha = 0.4) +
+        geom_line(aes(y = bot_smooth), color = "grey15",
+                  linewidth = 0.85, na.rm = TRUE) +
+        geom_hline(yintercept = onset_thr,
+                   linetype = "dashed", color = "#b2182b", linewidth = 0.55) +
+        geom_hline(yintercept = 0, color = "grey40", linewidth = 0.4) +
+        annotate("text", x = min(df$date), y = onset_thr + 0.08,
+                 label = sprintf("Onset (%.2f)", onset_thr),
+                 hjust = 0, size = 2.8, color = "#b2182b") +
+        x_scale +
+        scale_y_continuous(name = bot_label) +
+        labs(
+          x       = NULL,
+          caption = paste0("Red shading = drought periods.  Ribbon = monthly values; ",
+                           "dark line = 12-month centred rolling mean.\n",
+                           "Def: ", thr_lbl)
+        ) +
+        base_theme
+      
+      # ── Combine ──────────────────────────────────────────────────────────────────
+      (p_top / p_bot) +
+        plot_layout(heights = c(1.1, 1)) +
+        plot_annotation(
+          title    = title_txt,
+          subtitle = subtitle_txt,
+          theme    = theme(
+            plot.title    = element_text(face = "bold", size = 13),
+            plot.subtitle = element_text(size = 9, color = "grey30")
+          )
+        )
+    }
     # ──────────────────────────────────────────────────────────────────────────
     #  FIG 01: Z500 monthly composites (12 panels always)
     # ──────────────────────────────────────────────────────────────────────────
@@ -807,37 +921,51 @@ for (def in DROUGHT_DEFS) {
     cat("Saved.\n")
     
     # ──────────────────────────────────────────────────────────────────────────
-    #  FIG 04: Z500 ridge time series
+    #  FIG 04: Z500 Z500 time series
     # ──────────────────────────────────────────────────────────────────────────
     cat("   04 Z500 time series... ")
-    ts_plot <- filter(date_index, !is.na(index_value), !is.na(z500_ridge))
-    z_range <- max(abs(ts_plot$z500_ridge), na.rm = TRUE)
-    sf_z    <- z_range / max(idx_range, 0.1)
-    
-    p04 <- ggplot(ts_plot, aes(x = date)) +
-      geom_col(aes(y = z500_ridge, fill = z500_ridge > 0), alpha = 0.5, width = 25) +
-      scale_fill_manual(values = c("TRUE" = "#d73027", "FALSE" = "#4575b4"), guide = "none") +
-      geom_line(aes(y = index_value * sf_z), color = "black", linewidth = 0.6) +
-      geom_hline(yintercept = (if (def$classify == "single") def$threshold else def$onset) * sf_z,
-                 linetype = "dashed", color = "darkred", linewidth = 0.5) +
-      geom_hline(yintercept = 0, color = "grey40", linewidth = 0.3) +
-      scale_y_continuous(
-        name     = "Z500 Anomaly (m) — NW Canada ridge region",
-        sec.axis = sec_axis(~. / sf_z, name = sprintf("%s", lbl))
-      ) +
-      scale_x_date(date_breaks = "10 years", date_labels = "%Y", expand = c(0.01, 0)) +
-      labs(
-        title   = sprintf("500 hPa Ridge Anomaly vs. %s", lbl),
-        subtitle = sprintf("Ridge region: %d-%d W, %d-%d N  |  Dashed = drought onset  |  Def: %s",
-                           abs(RIDGE_LON_MIN), abs(RIDGE_LON_MAX),
-                           RIDGE_LAT_MIN, RIDGE_LAT_MAX, thr_lbl),
-        x = NULL,
-        caption = "Bars: Z500 anomaly (red = ridge, blue = trough)  |  Line: drought index (Nechako)"
-      ) +
-      theme_bw(base_size = 11) + theme(plot.title = element_text(face = "bold"))
-    
+    p04 <- plot_dual_panel_ts(
+      dates        = date_index$date,
+      top_ts       = date_index$z500_ridge,
+      bot_ts       = date_index$index_value,
+      drought_mask = drought_mask,
+      top_label    = sprintf("Z500 Anom (m)\n%d–%d°W, %d–%d°N",
+                             abs(RIDGE_LON_MIN), abs(RIDGE_LON_MAX),
+                             RIDGE_LAT_MIN, RIDGE_LAT_MAX),
+      bot_label    = lbl,
+      title_txt    = sprintf("500 hPa Ridge Anomaly vs. %s — Nechako", lbl),
+      subtitle_txt = sprintf("Ridge box: %d–%d°W, %d–%d°N  |  Ref climatology: %d–%d",
+                             abs(RIDGE_LON_MIN), abs(RIDGE_LON_MAX),
+                             RIDGE_LAT_MIN, RIDGE_LAT_MAX,
+                             CLIM_START, CLIM_END),
+      def          = def,
+      thr_lbl      = thr_lbl
+    )
     ggsave(file.path(fig_dir, "04_z500_timeseries_ridge.png"),
-           p04, width = FIGURE_WIDTH_WIDE, height = 5.5, dpi = FIGURE_DPI)
+           p04, width = FIGURE_WIDTH_WIDE, height = 7, dpi = FIGURE_DPI)
+    cat("Saved.\n")
+    
+    # ── FIG 08 ─────────────────────────────────────────────────────────────────
+    cat("   08 SLP time series... ")
+    p08 <- plot_dual_panel_ts(
+      dates        = date_index$date,
+      top_ts       = date_index$slp_nwbc,
+      bot_ts       = date_index$index_value,
+      drought_mask = drought_mask,
+      top_label    = sprintf("SLP Anom (hPa)\n%d–%d°W, %d–%d°N",
+                             abs(RIDGE_LON_MIN), abs(RIDGE_LON_MAX),
+                             RIDGE_LAT_MIN, RIDGE_LAT_MAX),
+      bot_label    = lbl,
+      title_txt    = sprintf("SLP Anomaly vs. %s — Nechako", lbl),
+      subtitle_txt = sprintf("NW BC box: %d–%d°W, %d–%d°N  |  Ref climatology: %d–%d",
+                             abs(RIDGE_LON_MIN), abs(RIDGE_LON_MAX),
+                             RIDGE_LAT_MIN, RIDGE_LAT_MAX,
+                             CLIM_START, CLIM_END),
+      def          = def,
+      thr_lbl      = thr_lbl
+    )
+    ggsave(file.path(fig_dir, "08_slp_timeseries.png"),
+           p08, width = FIGURE_WIDTH_WIDE, height = 7, dpi = FIGURE_DPI)
     cat("Saved.\n")
     
     # ──────────────────────────────────────────────────────────────────────────
@@ -897,35 +1025,7 @@ for (def in DROUGHT_DEFS) {
            p06, width = FIGURE_WIDTH_WIDE, height = 6, dpi = FIGURE_DPI)
     cat("Saved.\n")
     
-    # ──────────────────────────────────────────────────────────────────────────
-    #  FIG 08: SLP time series
-    # ──────────────────────────────────────────────────────────────────────────
-    cat("   08 SLP time series... ")
-    slp_range <- max(abs(ts_plot$slp_nwbc), na.rm = TRUE)
-    sf_s      <- slp_range / max(idx_range, 0.1)
-    
-    p08 <- ggplot(ts_plot, aes(x = date)) +
-      geom_col(aes(y = slp_nwbc, fill = slp_nwbc > 0), alpha = 0.5, width = 25) +
-      scale_fill_manual(values = c("TRUE" = "#d73027", "FALSE" = "#4575b4"), guide = "none") +
-      geom_line(aes(y = index_value * sf_s), color = "black", linewidth = 0.6) +
-      geom_hline(yintercept = (if (def$classify == "single") def$threshold else def$onset) * sf_s,
-                 linetype = "dashed", color = "darkred", linewidth = 0.5) +
-      geom_hline(yintercept = 0, color = "grey40", linewidth = 0.3) +
-      scale_y_continuous(
-        name     = "SLP Anomaly (hPa) — NW BC",
-        sec.axis = sec_axis(~. / sf_s, name = sprintf("%s", lbl))
-      ) +
-      scale_x_date(date_breaks = "10 years", date_labels = "%Y", expand = c(0.01, 0)) +
-      labs(title   = sprintf("SLP Anomaly vs. %s", lbl),
-           subtitle = sprintf("Bars: SLP anomaly (red = blocking high, blue = low)  |  Line: drought index  |  Def: %s",
-                              thr_lbl),
-           x = NULL) +
-      theme_bw(base_size = 11) + theme(plot.title = element_text(face = "bold"))
-    
-    ggsave(file.path(fig_dir, "08_slp_timeseries.png"),
-           p08, width = FIGURE_WIDTH_WIDE, height = 5.5, dpi = FIGURE_DPI)
-    cat("Saved.\n")
-    
+
     # ──────────────────────────────────────────────────────────────────────────
     #  FIG 10: SST monthly composites (12 panels always)
     # ──────────────────────────────────────────────────────────────────────────
