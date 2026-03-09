@@ -3,34 +3,57 @@
 #  Nechako Watershed Drought — Atmospheric Pattern Diagnostics
 #
 #  Purpose (per research lead):
-#    1. 500 hPa geopotential height anomalies associated with drought —
+#    1. 500 hPa geopotential height anomalies associated with drought,
 #       month-by-month relative to 1991-2020 reference period
 #    2. SLP patterns during drought months vs. background
 #    3. NE Pacific SST over recent years relative to historical conditions
-#    4. Joint plots linking atmospheric fields to drought severity (SPEI-6)
+#    4. Joint plots linking atmospheric fields to drought severity
 #
-#  Outputs (all in {OUT_DIR}/):
-#    Figures/
-#      01_z500_monthly_anomaly_composites.png    monthly mean anom by calendar month
-#      02_z500_drought_vs_nondrought.png         composite difference maps
-#      03_z500_drought_severity_composites.png   stratified by SPEI quartile
-#      04_z500_timeseries_nw_canada_ridge.png    area-avg Z500 anom vs SPEI-6
-#      05_slp_monthly_anomaly_composites.png
-#      06_slp_drought_vs_nondrought.png
-#      07_slp_drought_severity_composites.png
-#      08_slp_timeseries.png
-#      09_sst_annual_anomaly_recent.png          recent years (2018-2025) vs clim
-#      10_sst_monthly_composites_drought.png     SST during drought months
-#      11_sst_timeseries_ne_pacific.png          basin-avg SST anomaly time series
-#      12_joint_z500_slp_sst_drought_scatter.png scatterplots vs SPEI-6
-#      13_composite_summary_panel.png            single-panel overview figure
-#    Tables/
-#      T1_drought_month_summary.csv              Z500/SLP/SST stats per drought event
-#      T2_seasonal_anomaly_statistics.csv        seasonal breakdown by variable
-#      T3_correlation_matrix.csv                 Z500/SLP/SST area-avgs vs SPEI-6
+#  Index coverage:
+#    ALL available SPI and SPEI timescales in the project pipeline
+#    (SPI 1, 3, 6, 12 and SPEI 1, 3, 6, 12 by default; scale 9 loaded if
+#    files exist).  There is no a priori reason to restrict atmospheric
+#    compositing to SPEI-6 alone — ENSO and PDO act on timescales from
+#    months (SPI-1/3 for precipitation response) to seasons and years
+#    (SPEI-6/12 for cumulative water deficit).  Running all timescales
+#    allows comparison of which atmospheric patterns are robustly
+#    associated with drought regardless of scale, and which only emerge
+#    at longer accumulation periods.
 #
-#  Authors: [Your Name]
-#  Last updated: 2025
+#  Notes on specific changes from earlier versions:
+#    - Yellow watershed centroid marker removed from all maps.  The
+#      Nechako watershed (~54 N, 124 W) is too small to be meaningfully
+#      located on synoptic-scale maps (domain 40-70 N, 100-180 W); readers
+#      are referred to the study area map in the manuscript.
+#    - Monthly composite figures (01, 05, 10) now always show all 12
+#      calendar months.  Months with no drought occurrences render as grey
+#      (n=0) instead of being silently omitted.  This avoids confusion about
+#      missing panels.
+#    - Severity-stratified composites (former 03, 07) removed.
+#    - Exact drought month tables added for every index (T0).
+#
+#  Output structure:
+#    {OUT_DIR}/
+#      Tables/
+#        T0_drought_months_all_indices.csv   <-- all indices, all drought months
+#        {INDEX}/T1_drought_month_summary.csv
+#        {INDEX}/T2_seasonal_anomaly_statistics.csv
+#        {INDEX}/T3_correlation_matrix.csv
+#        {INDEX}/T3_pvalue_matrix.csv
+#      Figures/
+#        SST/
+#          09_sst_annual_anomaly_recent.png  (index-independent)
+#          11_sst_timeseries_ne_pacific.png  (index-independent)
+#        {INDEX}/
+#          01_z500_monthly_anomaly_composites.png
+#          02_z500_drought_vs_nondrought.png
+#          04_z500_timeseries_ridge.png
+#          05_slp_monthly_anomaly_composites.png
+#          06_slp_drought_vs_nondrought.png
+#          08_slp_timeseries.png
+#          10_sst_monthly_composites_drought.png
+#          12_joint_scatter.png
+#          13_composite_summary_panel.png
 # ============================================================================
 
 # ── Libraries ────────────────────────────────────────────────────────────────
@@ -46,6 +69,7 @@ suppressPackageStartupMessages({
   library(sf)
   library(rnaturalearth)
   library(rnaturalearthdata)
+  library(zoo)
 })
 
 # ============================================================================
@@ -55,10 +79,15 @@ WD_PATH  <- "D:/Nechako_Drought/Nechako/"
 DATA_DIR <- "D:/Nechako_Drought/Nechako/monthly_data_direct"
 OUT_DIR  <- file.path(WD_PATH, "atmospheric_diagnostics")
 
-dir.create(file.path(OUT_DIR, "Figures"), recursive = TRUE, showWarnings = FALSE)
-dir.create(file.path(OUT_DIR, "Tables"),  recursive = TRUE, showWarnings = FALSE)
-
 setwd(WD_PATH)
+
+# ── Index CSV directories (must match DROUGHT_ANALYSIS_utils.R) ──────────────
+SPI_SEAS_DIR  <- file.path(WD_PATH, "spi_results_seasonal/")
+SPEI_SEAS_DIR <- file.path(WD_PATH, "spei_results_seasonal/")
+
+# Scales to attempt.  Scale 9 is included; skipped gracefully if no file found.
+SPI_SCALES_TRY  <- c(1, 3, 6, 9, 12)
+SPEI_SCALES_TRY <- c(1, 3, 6, 9, 12)
 
 # ── Analysis period ──────────────────────────────────────────────────────────
 START_YEAR <- 1950
@@ -68,81 +97,276 @@ END_YEAR   <- 2025
 CLIM_START <- 1991
 CLIM_END   <- 2020
 
-# ── Drought threshold (SPEI-6) ───────────────────────────────────────────────
-# Months with SPEI-6 below this are classified as drought
-DROUGHT_THRESHOLD <- -0.8   # moderate drought (McKee et al. 1993)
-SEVERE_THRESHOLD  <- -1.5   # severe/extreme drought
+# ── Drought definitions ──────────────────────────────────────────────────────
+# Two definitions are run in parallel; every output (table + figure) is
+# produced twice — once per definition — under separate sub-directories.
+#
+# [1] Sheffield & Wood (2008) — SINGLE threshold.
+#     Drought begins AND ends when the index crosses the same value.
+#     q0 = 10th percentile of a standard normal = qnorm(0.10) ≈ -1.282.
+#     No hysteresis, no minimum duration filter.
+#
+# [2] 2-Threshold / Alt — HYSTERESIS + minimum duration (matching
+#     ALT_DROUGHT_DEF in w3_trend_test.R).
+#     Onset: index < -1.0.  Termination: index >= -0.5.
+#     Scale-specific minimum duration filters out sub-threshold blips.
+DROUGHT_DEFS <- list(
+  
+  SW = list(
+    id          = "SW",
+    short_label = "SW_q10",
+    long_label  = "Sheffield & Wood (2008) \u2014 Single threshold (q\u2080=10%, \u2248-1.28)",
+    classify    = "single",
+    threshold   = qnorm(0.10)          # -1.2816 for a standard-normal index
+  ),
+  
+  Alt2T = list(
+    id          = "Alt2T",
+    short_label = "Alt2T",
+    long_label  = "2-Threshold (Onset \u2264-1.0 / Termination \u2265-0.5, min duration by scale)",
+    classify    = "hysteresis",
+    onset       = -1.0,
+    termination = -0.5,
+    # Minimum event duration (months) — matches ALT_DROUGHT_DEF in w3_trend_test.R
+    min_duration_map = list("1" = 2L, "3" = 3L, "6" = 4L, "12" = 6L),
+    default_min = 3L
+  )
+)
 
-# ── "Recent" period for SST trend analysis ───────────────────────────────────
-RECENT_START <- 2018   # captures post-Blob / recent marine heatwave era
+# ── Recent period for SST trend analysis ─────────────────────────────────────
+# 2018 marks the reintensification of the NE Pacific marine heatwave that
+# preceded the 2021 BC heat dome.  Extend back to 2014 to include the
+# original "Blob" (Bond et al. 2015) if desired.
+RECENT_START <- 2018
 RECENT_END   <- END_YEAR
 
-# ── Nechako watershed approximate centroid and study region ─────────────────
-NECHAKO_LON  <- -124.5
-NECHAKO_LAT  <-   53.7
-
-# For extracting area-averaged NW Canada ridge Z500 signal
-# (region where blocking ridge anomaly would appear for BC droughts)
+# ── NW Canada ridge averaging box ────────────────────────────────────────────
+# Where a blocking ridge would appear in Z500/SLP during warm-dry BC summers.
+# Covers the Gulf of Alaska action centre of the PNA pattern (~55 N, 120 W).
 RIDGE_LON_MIN <- -140; RIDGE_LON_MAX <- -110
 RIDGE_LAT_MIN <-   50; RIDGE_LAT_MAX <-   65
 
-# ── NE Pacific SST averaging region ─────────────────────────────────────────
-# Captures PDO/marine heatwave signal most relevant to NW BC
+# ── NE Pacific SST averaging box ─────────────────────────────────────────────
+# Covers the PDO "warm tongue" (~35-50 N, 150-130 W) — the region where NE
+# Pacific SSTs most strongly co-vary with the PDO index and marine heatwave
+# events.  The tropical Pacific is excluded to avoid aliasing ENSO SST
+# variance; ENSO forcing is captured via ONI in the teleconnection arm (w7-w8).
 SST_MEAN_LON_MIN <- -160; SST_MEAN_LON_MAX <- -130
 SST_MEAN_LAT_MIN <-   40; SST_MEAN_LAT_MAX <-   55
 
-# ── Plot aesthetics ──────────────────────────────────────────────────────────
-DROUGHT_COLOR     <- "#d73027"
-NONDROUGHT_COLOR  <- "#4575b4"
-ANOMALY_PALETTE   <- "RdBu"          # diverging, reversed for Z500/SLP
+# ── Plot settings ─────────────────────────────────────────────────────────────
+ANOMALY_PALETTE   <- "RdBu"
 SST_PALETTE       <- "RdBu"
 FIGURE_DPI        <- 200
 FIGURE_WIDTH_WIDE <- 16
 FIGURE_WIDTH_STD  <- 12
-FIGURE_HEIGHT_STD <- 9
-
-# Month labels
-MONTH_LABELS <- month.abb
+MONTH_LABELS      <- month.abb
 
 # ============================================================================
-#  HELPER: COASTLINES AND WATERSHED MARKER
+#  HELPER FUNCTIONS
 # ============================================================================
+
 get_map_layers <- function() {
-  coast   <- ne_coastline(scale = "medium", returnclass = "sf")
   borders <- ne_countries(scale = "medium", returnclass = "sf")
   lakes   <- ne_download(scale = "medium", type = "lakes",
                          category = "physical", returnclass = "sf")
-  list(coast = coast, borders = borders, lakes = lakes)
+  list(borders = borders, lakes = lakes)
+}
+
+# Load one index CSV (spi or spei at a given scale).Returns data.frame(date, value) or NULL.
+load_index_csv <- function(index_type, scale) {
+  dir_map <- list(spi = SPI_SEAS_DIR, spei = SPEI_SEAS_DIR)
+  dir     <- dir_map[[tolower(index_type)]]
+  f       <- file.path(dir, sprintf("%s_%02d_basin_averaged_by_month.csv",
+                                    tolower(index_type), as.integer(scale)))
+  if (!file.exists(f)) return(NULL)
+  
+  df <- read.csv(f, stringsAsFactors = FALSE, check.names = FALSE)
+  
+  # FIX: Handle "Year" column name variations
+  year_col <- grep("^year$", names(df), ignore.case = TRUE, value = TRUE)[1]
+  if (is.na(year_col) || !length(year_col)) return(NULL)
+  names(df)[names(df) == year_col] <- "Year"
+  
+  if (!"Year" %in% names(df)) return(NULL)
+  df$Year <- as.integer(df$Year)
+  
+  # FIX: Check BOTH full and abbreviated month names
+  month_names_full <- c("January","February","March","April","May","June",
+                        "July","August","September","October","November","December")
+  month_names_abb  <- c("Jan","Feb","Mar","Apr","May","Jun",
+                        "Jul","Aug","Sep","Oct","Nov","Dec")
+  mon_cols <- intersect(month_names_full, names(df))
+  if (!length(mon_cols)) mon_cols <- intersect(month_names_abb, names(df))
+  if (!length(mon_cols)) return(NULL)
+  
+  # Reshape wide (76 rows × 12 cols) to long (912 rows × 1 col)
+  long <- do.call(rbind, lapply(seq_along(mon_cols), function(mi) {
+    data.frame(date  = as.Date(paste(df$Year, sprintf("%02d", mi), "01", sep = "-")),
+               value = as.numeric(df[[mon_cols[mi]]]),
+               stringsAsFactors = FALSE)
+  }))
+  
+  long <- long[order(long$date), ]
+  long <- long[!is.na(long$value) & is.finite(long$value), ]
+  rownames(long) <- NULL
+  
+  # Validate
+  expected_rows <- length(unique(df$Year)) * 12
+  if (nrow(long) != expected_rows) {
+    warning(sprintf("Index %s-%d: expected %d rows, got %d",
+                    toupper(index_type), scale, expected_rows, nrow(long)))
+  }
+  
+  long
+}
+# Build 12-panel composite: ALWAYS all 12 calendar months.Months with no qualifying rows:all-NA layer.renders grey with n=0 label.
+build_monthly_composite <- function(rast_obj, date_idx, qualifying_mask) {
+  n_layers <- nlyr(rast_obj)
+  out_list <- vector("list", 12)
+  for (m in 1:12) {
+    idx <- which(date_idx$month == m & qualifying_mask)
+    n   <- length(idx)
+    mean_layer <- if (n > 0) {
+      app(subset(rast_obj, idx), mean, na.rm = TRUE)
+    } else {
+      rast_obj[[1]] * NA
+    }
+    df <- as.data.frame(mean_layer, xy = TRUE)
+    names(df)[3] <- "value"
+    # ── FIX: Handle empty data frame (n=0 months) ──────────────────
+    if (nrow(df) > 0) {
+      df$month_label <- MONTH_LABELS[m]
+      df$panel_title <- sprintf("%s (n=%d)", MONTH_LABELS[m], n)
+    } else {
+      df$month_label <- character(0)
+      df$panel_title <- character(0)
+    }
+    # ───────────────────────────────────────────────────────────────
+    out_list[[m]] <- df
+  }
+  bind_rows(out_list) %>%
+    mutate(month_label = factor(month_label, levels = MONTH_LABELS),
+           panel_title = factor(panel_title,
+                                levels = sprintf("%s (n=%d)",
+                                                 MONTH_LABELS,
+                                                 sapply(1:12, function(m)
+                                                   sum(date_idx$month == m &
+                                                         qualifying_mask)))))
+}
+map_theme <- function(base_size = 10) {
+  theme_bw(base_size = base_size) +
+    theme(strip.background = element_rect(fill = "grey92"),
+          strip.text       = element_text(face = "bold"),
+          legend.position  = "right",
+          plot.title       = element_text(face = "bold", size = base_size + 2),
+          plot.subtitle    = element_text(size = base_size - 1),
+          panel.spacing    = unit(0.3, "lines"),
+          axis.text        = element_blank(),
+          axis.ticks       = element_blank())
+}
+
+ensure_dir <- function(...) {
+  p <- file.path(...)
+  dir.create(p, recursive = TRUE, showWarnings = FALSE)
+  p
+}
+
+# ── Drought month classifiers ─────────────────────────────────────────────────
+
+# Extract numeric scale from an index label such as "SPI3", "SPEI12".
+extract_scale <- function(lbl) {
+  as.integer(regmatches(lbl, regexpr("[0-9]+$", lbl)))
+}
+
+# Sheffield & Wood (2008) — single threshold.
+# Returns a logical vector: TRUE for every month where value <= threshold.
+# Entry and exit are governed by the identical threshold value.
+classify_drought_sw <- function(values, threshold) {
+  !is.na(values) & values <= threshold
+}
+
+# 2-Threshold / Alt definition — hysteresis + minimum duration.
+# Mirrors vectorized_event_detection_alt() in w3_trend_test.R.
+# Returns a logical vector: TRUE for every month that falls INSIDE a
+# qualifying drought event (onset < onset_thr; termination >= term_thr;
+# event length >= min_dur months).
+classify_drought_alt <- function(values, onset_thr, term_thr, min_dur) {
+  n      <- length(values)
+  is_dr  <- logical(n)
+  in_d   <- FALSE
+  s_idx  <- NA_integer_
+  
+  for (j in seq_len(n)) {
+    v <- values[j]
+    if (is.na(v)) next
+    if (!in_d && v < onset_thr) {
+      in_d  <- TRUE
+      s_idx <- j
+    } else if (in_d && v >= term_thr) {
+      e_idx    <- j - 1L
+      duration <- e_idx - s_idx + 1L
+      if (duration >= min_dur) is_dr[s_idx:e_idx] <- TRUE
+      in_d  <- FALSE
+      s_idx <- NA_integer_
+    }
+  }
+  # Close any event still open at end of record
+  if (in_d && !is.na(s_idx)) {
+    duration <- n - s_idx + 1L
+    if (duration >= min_dur) is_dr[s_idx:n] <- TRUE
+  }
+  is_dr
+}
+
+# Dispatcher: classify drought months according to the active definition.
+# Returns a logical vector aligned to `values`.
+classify_drought <- function(values, def, index_label) {
+  if (def$classify == "single") {
+    classify_drought_sw(values, def$threshold)
+  } else {
+    sc    <- extract_scale(index_label)
+    sc_ch <- as.character(sc)
+    mndur <- if (!is.null(def$min_duration_map[[sc_ch]])) {
+      def$min_duration_map[[sc_ch]]
+    } else {
+      def$default_min
+    }
+    classify_drought_alt(values, def$onset, def$termination, mndur)
+  }
+}
+
+# Human-readable threshold annotation for plot subtitles / captions.
+def_thr_label <- function(def, lbl = NULL) {
+  if (def$classify == "single") {
+    sprintf("%s \u2264 %.3f", if (!is.null(lbl)) lbl else "Index", def$threshold)
+  } else {
+    sc    <- if (!is.null(lbl)) extract_scale(lbl) else NA
+    sc_ch <- as.character(sc)
+    mndur <- if (!is.na(sc) && !is.null(def$min_duration_map[[sc_ch]])) {
+      def$min_duration_map[[sc_ch]]
+    } else {
+      def$default_min
+    }
+    sprintf("Onset < %.1f / Term \u2265 %.1f / min %d months",
+            def$onset, def$termination, mndur)
+  }
 }
 
 # ============================================================================
-#  HELPER: RASTER TO TIDY DATA FRAME FOR GGPLOT
-# ============================================================================
-rast_to_df <- function(r, layer_idx = NULL) {
-  if (!is.null(layer_idx)) r <- subset(r, layer_idx)
-  as.data.frame(r, xy = TRUE)
-}
-
-# ============================================================================
-#  SECTION 1: LOAD DATA
+#  SECTION 1: LOAD ERA5 FIELDS
 # ============================================================================
 cat("============================================================\n")
-cat(" SECTION 1: Loading ERA5 fields and SPEI-6\n")
+cat(" SECTION 1: Loading ERA5 atmospheric fields\n")
 cat("============================================================\n")
 
-# ── 1a. ERA5 fixed-period anomalies (1991-2020 reference) ────────────────────
-cat("  Loading Z500 anomaly (fixed 1991-2020)... ")
-z500_anom <- rast(file.path(DATA_DIR, sprintf("z500_monthly_anomaly_clim%d_%d.nc",
-                                              CLIM_START, CLIM_END)))
+cat("  Loading Z500 anomaly (1991-2020 climatology)... ")
+z500_anom <- rast(file.path(DATA_DIR,
+                            sprintf("z500_monthly_anomaly_clim%d_%d.nc", CLIM_START, CLIM_END)))
 cat(sprintf("Done. (%d layers)\n", nlyr(z500_anom)))
 
-cat("  Loading SLP raw (hPa) and computing anomaly on-the-fly... ")
+cat("  Loading SLP (raw hPa) and computing 1991-2020 anomaly... ")
 slp_raw <- rast(file.path(DATA_DIR, "slp_monthly.nc"))
-cat(sprintf("Done. (%d layers)\n", nlyr(slp_raw)))
-
-# SLP anomaly: compute from raw since calculate_anomaly = FALSE in download script
-# Uses fixed 1991-2020 climatology to stay consistent with Z500
-all_years_vec <- rep(START_YEAR:END_YEAR, each = 12)
 slp_anom <- local({
   n_layers  <- nlyr(slp_raw)
   clim_mask <- (START_YEAR:END_YEAR) >= CLIM_START & (START_YEAR:END_YEAR) <= CLIM_END
@@ -157,1012 +381,748 @@ slp_anom <- local({
   layer_order <- order(c(sapply(1:12, function(m) seq(m, n_layers, by = 12))))
   combined[[layer_order]]
 })
-cat("  SLP anomaly computed.\n")
+cat(sprintf("Done. (%d layers)\n", nlyr(slp_anom)))
 
-cat("  Loading SST anomaly (fixed 1991-2020)... ")
-sst_anom <- rast(file.path(DATA_DIR, sprintf("sst_monthly_anomaly_clim%d_%d.nc",
-                                             CLIM_START, CLIM_END)))
-sst_raw  <- rast(file.path(DATA_DIR, "sst_monthly.nc"))
+cat("  Loading SST anomaly (1991-2020 climatology)... ")
+sst_anom <- rast(file.path(DATA_DIR,
+                           sprintf("sst_monthly_anomaly_clim%d_%d.nc", CLIM_START, CLIM_END)))
 cat(sprintf("Done. (%d layers)\n", nlyr(sst_anom)))
 
-# ── 1b. SPEI-6 time series ────────────────────────────────────────────────────
-# Loads the watershed-averaged SPEI-6 produced in w1 of the pipeline.
-# Expected format: CSV with columns 'date' (YYYY-MM-DD or YYYY-MM) and 'spei6'
-cat("  Loading SPEI-6... ")
-spei_file <- list.files(WD_PATH, pattern = "spei.*\\.csv$",
-                        recursive = TRUE, full.names = TRUE)[1]
-
-if (is.na(spei_file)) {
-  # Fallback: try RDS
-  spei_rds <- list.files(WD_PATH, pattern = "spei.*\\.rds$",
-                         recursive = TRUE, full.names = TRUE)[1]
-  if (!is.na(spei_rds)) {
-    spei_df <- readRDS(spei_rds)
-  } else {
-    stop("SPEI-6 file not found. Expected CSV or RDS under ", WD_PATH,
-         "\n  Check w1 output directory and update spei_file path manually.")
-  }
-} else {
-  spei_df <- read_csv(spei_file, show_col_types = FALSE)
-}
-
-# ── Standardise column names ──────────────────────────────────────────────────
-names(spei_df) <- tolower(trimws(names(spei_df)))
-
-cat(sprintf("  Columns found in SPEI file: %s\n",
-            paste(names(spei_df), collapse = ", ")))
-
-# ── Resolve SPEI-6 column ─────────────────────────────────────────────────────
-# Covers: standard SPEI package names, PCIC outputs, and w1 spatial summary
-# names (basin_mean, basin_median).  basin_mean is preferred over basin_median
-# because it is the spatial mean of SPEI-6 across all valid watershed pixels.
-SPEI_COL <- NULL   # set e.g. SPEI_COL <- "basin_mean" to force a specific column
-
-spei_candidates <- c(
-  "spei6", "spei_6", "spei.6", "spei06", "spei_06",
-  "spei_scale6", "spei6_mean", "spei_6_mean", "mean_spei6",
-  "basin_mean",    # w1 spatial summary output — watershed pixel mean of SPEI
-  "basin_median",  # w1 spatial summary output — fallback
-  "spei",          # generic (picked only if no scale-specific name exists)
-  "value"          # raster::extract / terra default
-)
-
-if (!is.null(SPEI_COL)) {
-  if (!SPEI_COL %in% names(spei_df))
-    stop(sprintf("SPEI_COL = '%s' not found.\n  Columns: %s",
-                 SPEI_COL, paste(names(spei_df), collapse = ", ")))
-  spei_col_found <- SPEI_COL
-  cat(sprintf("  SPEI-6 column : '%s'  [manual override]\n", spei_col_found))
-} else {
-  spei_col_found <- intersect(spei_candidates, names(spei_df))[1]
-  if (is.na(spei_col_found)) {
-    num_cols <- setdiff(names(spei_df)[sapply(spei_df, is.numeric)],
-                        c("year", "month", "day", "valid_pixels",
-                          "total_pixels", "coverage_pct"))
-    if (length(num_cols) == 0)
-      stop("Cannot identify SPEI-6 column.\n",
-           "  Columns: ", paste(names(spei_df), collapse = ", "), "\n",
-           "  Fix: set SPEI_COL <- '<column>' near the top of the script.")
-    spei_col_found <- num_cols[1]
-    warning(sprintf(
-      "SPEI column not recognised by name — using '%s'. Check this is correct.\n  All columns: %s",
-      spei_col_found, paste(names(spei_df), collapse = ", ")))
-  }
-  cat(sprintf("  SPEI-6 column : '%s'  [auto-detected]\n", spei_col_found))
-}
-
-if (spei_col_found != "spei6")
-  spei_df <- rename(spei_df, spei6 = all_of(spei_col_found))
-
-# ── Resolve & parse date column ───────────────────────────────────────────────
-# Strategy:
-#   1. Try common date column names
-#   2. Try multiple format strings on the winner
-#   3. If all formats fail, reconstruct from 'year' + 'month' columns (always present
-#      in w1 spatial summary outputs)
-date_candidates   <- c("date", "date_formatted", "time", "yearmon",
-                       "year_month", "ym", "period")
-date_col_found    <- intersect(date_candidates, names(spei_df))[1]
-
-if (is.na(date_col_found))
-  date_col_found <- names(spei_df)[
-    sapply(spei_df, function(x) {
-      tryCatch(!all(is.na(as.Date(as.character(head(x, 3)), tryFormats =
-                                    c("%Y-%m-%d", "%Y/%m/%d", "%Y-%m")))),
-               error = function(e) FALSE)
-    })
-  ][1]
-
-if (!is.na(date_col_found) && date_col_found != "date")
-  spei_df <- rename(spei_df, date = all_of(date_col_found))
-
-cat(sprintf("  Date column   : '%s'\n", if (is.na(date_col_found)) "(reconstructed from year+month)" else date_col_found))
-
-# Parse date robustly
-date_formats <- c("%Y-%m-%d", "%Y/%m/%d", "%Y-%m", "%d/%m/%Y",
-                  "%Y%m%d", "%Y%m")
-resolved_date <- NULL
-
-if (!is.na(date_col_found)) {
-  raw_dates <- as.character(spei_df$date)
-  for (fmt in date_formats) {
-    trial <- suppressWarnings(as.Date(raw_dates, format = fmt))
-    if (sum(!is.na(trial)) > nrow(spei_df) * 0.9) {
-      resolved_date <- trial
-      cat(sprintf("  Date format   : '%s'\n", fmt))
-      break
-    }
-  }
-}
-
-if (is.null(resolved_date)) {
-  # Fallback: reconstruct from year + month columns
-  if (all(c("year", "month") %in% names(spei_df))) {
-    resolved_date <- as.Date(sprintf("%04d-%02d-01",
-                                     as.integer(spei_df$year),
-                                     as.integer(spei_df$month)))
-    cat("  Date format   : reconstructed from 'year' + 'month' columns\n")
-  } else {
-    stop("Cannot parse date column and no 'year'/'month' columns to fall back on.\n",
-         "  Please ensure the SPEI file has a parseable date column.")
-  }
-}
-
-spei_df$date <- resolved_date
-
-spei_df <- spei_df %>%
-  mutate(
-    date  = date,
-    year  = year(date),
-    month = month(date),
-    season = case_when(
-      month %in% c(12, 1, 2)  ~ "DJF",
-      month %in% c(3, 4, 5)   ~ "MAM",
-      month %in% c(6, 7, 8)   ~ "JJA",
-      month %in% c(9, 10, 11) ~ "SON"
-    ),
-    drought_class = case_when(
-      spei6 <= SEVERE_THRESHOLD  ~ "Severe/Extreme",
-      spei6 <= DROUGHT_THRESHOLD ~ "Moderate",
-      TRUE                       ~ "Non-drought"
-    ),
-    is_drought = spei6 <= DROUGHT_THRESHOLD
-  ) %>%
-  filter(year >= START_YEAR, year <= END_YEAR) %>%
-  arrange(date)
-
-cat(sprintf("Done. %d months (%d–%d). Drought months: %d (%.1f%%)\n",
-            nrow(spei_df), min(spei_df$year), max(spei_df$year),
-            sum(spei_df$is_drought),
-            100 * mean(spei_df$is_drought)))
-
-# ── 1c. Build a master date index aligned to the raster layers ────────────────
-# ERA5 monthly rasters: layer i corresponds to month i chronologically
+# ── Date spine (raster layer i = calendar month i) ───────────────────────────
 all_dates <- seq.Date(as.Date(sprintf("%d-01-01", START_YEAR)),
                       as.Date(sprintf("%d-12-01", END_YEAR)),
                       by = "month")
-n_total   <- length(all_dates)
-
-# Safety check
+n_total <- length(all_dates)
 if (nlyr(z500_anom) != n_total)
-  warning(sprintf("Z500 has %d layers but expected %d. Check date alignment.",
-                  nlyr(z500_anom), n_total))
+  warning(sprintf("Z500 layers (%d) != expected (%d).", nlyr(z500_anom), n_total))
 
-date_index <- tibble(
-  layer = seq_len(n_total),
-  date  = all_dates,
-  year  = year(all_dates),
-  month = month(all_dates)
-) %>%
-  left_join(spei_df %>% select(date, spei6, drought_class, is_drought, season),
-            by = "date")
+base_date_index <- tibble(
+  layer  = seq_len(n_total),
+  date   = all_dates,
+  year   = year(all_dates),
+  month  = month(all_dates),
+  season = case_when(
+    month(all_dates) %in% c(12, 1, 2)  ~ "DJF",
+    month(all_dates) %in% c(3, 4, 5)   ~ "MAM",
+    month(all_dates) %in% c(6, 7, 8)   ~ "JJA",
+    month(all_dates) %in% c(9, 10, 11) ~ "SON"
+  )
+)
 
-cat(sprintf("  Date index built: %d entries.\n", nrow(date_index)))
+# ── Area-averaged atmospheric time series (computed once, reused every index) ─
+ridge_ext <- ext(RIDGE_LON_MIN, RIDGE_LON_MAX, RIDGE_LAT_MIN, RIDGE_LAT_MAX)
+sst_ext   <- ext(SST_MEAN_LON_MIN, SST_MEAN_LON_MAX, SST_MEAN_LAT_MIN, SST_MEAN_LAT_MAX)
 
-# ── 1d. Extract area-averaged time series ─────────────────────────────────────
-cat("  Extracting area-averaged time series...\n")
-
-ridge_ext  <- ext(RIDGE_LON_MIN, RIDGE_LON_MAX, RIDGE_LAT_MIN, RIDGE_LAT_MAX)
-sst_ext    <- ext(SST_MEAN_LON_MIN, SST_MEAN_LON_MAX, SST_MEAN_LAT_MIN, SST_MEAN_LAT_MAX)
-
-# Crop and compute spatial mean for each month
 z500_ridge_ts <- global(crop(z500_anom, ridge_ext), "mean", na.rm = TRUE)[, 1]
 slp_nwbc_ts   <- global(crop(slp_anom,  ridge_ext), "mean", na.rm = TRUE)[, 1]
 sst_nepac_ts  <- global(crop(sst_anom,  sst_ext),   "mean", na.rm = TRUE)[, 1]
+cat("  Area-averaged time series extracted.\n\n")
 
-ts_df <- date_index %>%
-  mutate(
-    z500_ridge = z500_ridge_ts,
-    slp_nwbc   = slp_nwbc_ts,
-    sst_nepac  = sst_nepac_ts
-  )
-
-cat("  Area-averaged time series complete.\n\n")
-
-# Load map layers (suppress output)
+cat("  Loading map layers...\n")
 map_layers <- suppressMessages(suppressWarnings(get_map_layers()))
 
 # ============================================================================
-#  SECTION 2: 500 hPa GEOPOTENTIAL HEIGHT ANOMALIES
+#  SECTION 2: LOAD ALL DROUGHT INDICES
 # ============================================================================
 cat("============================================================\n")
-cat(" SECTION 2: 500 hPa Geopotential Height\n")
+cat(" SECTION 2: Loading SPI / SPEI indices\n")
 cat("============================================================\n")
 
-# ── 2a. Monthly mean anomaly composites: ALL drought months by calendar month ─
-# For each calendar month (Jan-Dec), average Z500 anomaly over all drought months
-cat("  Fig 01: Monthly Z500 anomaly composites (drought months)... ")
-
-plot_data_list <- vector("list", 12)
-for (m in 1:12) {
-  idx <- which(date_index$month == m & date_index$is_drought %in% TRUE)
-  if (length(idx) == 0) next
-  mean_layer <- app(subset(z500_anom, idx), mean, na.rm = TRUE)
-  df <- as.data.frame(mean_layer, xy = TRUE)
-  names(df)[3] <- "value"
-  df$month_label <- MONTH_LABELS[m]
-  df$n_months    <- length(idx)
-  plot_data_list[[m]] <- df
-}
-z500_monthly_comp <- bind_rows(plot_data_list) %>%
-  mutate(month_label = factor(month_label, levels = MONTH_LABELS))
-
-clim_range <- quantile(abs(z500_monthly_comp$value), 0.98, na.rm = TRUE)
-clim_lim   <- ceiling(clim_range / 10) * 10
-
-p_z500_monthly <- ggplot(z500_monthly_comp, aes(x = x, y = y, fill = value)) +
-  geom_raster() +
-  geom_sf(data = map_layers$borders, fill = NA, color = "black",
-          linewidth = 0.3, inherit.aes = FALSE) +
-  geom_sf(data = map_layers$lakes, fill = "white", color = "grey60",
-          linewidth = 0.2, inherit.aes = FALSE) +
-  geom_point(aes(x = NECHAKO_LON, y = NECHAKO_LAT),
-             color = "gold", shape = 18, size = 2.5,
-             inherit.aes = FALSE) +
-  scale_fill_distiller(palette = ANOMALY_PALETTE,
-                       limits  = c(-clim_lim, clim_lim),
-                       oob     = squish,
-                       name    = "Z500 Anom\n(m)") +
-  coord_sf(xlim = c(-180, -100), ylim = c(40, 70), expand = FALSE) +
-  facet_wrap(~month_label, ncol = 4) +
-  labs(
-    title    = "500 hPa Geopotential Height Anomaly — Drought Months by Calendar Month",
-    subtitle = sprintf("Composite of all months with SPEI-6 ≤ %.1f  |  Reference: %d–%d  |  ◆ = Nechako Watershed",
-                       DROUGHT_THRESHOLD, CLIM_START, CLIM_END),
-    caption  = paste0("n shown = number of drought months per panel (varies by month)\n",
-                      "Positive (red) = ridge/blocking above normal; Negative (blue) = trough"),
-    x = NULL, y = NULL
-  ) +
-  theme_bw(base_size = 10) +
-  theme(
-    strip.background = element_rect(fill = "grey92"),
-    strip.text       = element_text(face = "bold"),
-    legend.position  = "right",
-    plot.title       = element_text(face = "bold", size = 12),
-    panel.spacing    = unit(0.3, "lines")
-  )
-
-ggsave(file.path(OUT_DIR, "Figures", "01_z500_monthly_anomaly_composites.png"),
-       p_z500_monthly, width = FIGURE_WIDTH_WIDE, height = 12, dpi = FIGURE_DPI)
-cat("Saved.\n")
-
-# ── 2b. Composite difference: drought minus non-drought ───────────────────────
-cat("  Fig 02: Z500 drought vs. non-drought composite difference... ")
-
-drought_idx     <- which(date_index$is_drought %in% TRUE)
-nondrought_idx  <- which(date_index$is_drought %in% FALSE)
-
-z500_drought_mean    <- app(subset(z500_anom, drought_idx),    mean, na.rm = TRUE)
-z500_nondrought_mean <- app(subset(z500_anom, nondrought_idx), mean, na.rm = TRUE)
-z500_diff            <- z500_drought_mean - z500_nondrought_mean
-
-df_drought    <- as.data.frame(z500_drought_mean,    xy = TRUE) %>% mutate(panel = "Drought months")
-df_nondrought <- as.data.frame(z500_nondrought_mean, xy = TRUE) %>% mutate(panel = "Non-drought months")
-df_diff       <- as.data.frame(z500_diff,            xy = TRUE) %>% mutate(panel = "Drought minus Non-drought")
-names(df_drought)[3]    <- "value"
-names(df_nondrought)[3] <- "value"
-names(df_diff)[3]       <- "value"
-
-z500_comp_df <- bind_rows(df_drought, df_nondrought, df_diff) %>%
-  mutate(panel = factor(panel, levels = c("Drought months",
-                                          "Non-drought months",
-                                          "Drought minus Non-drought")))
-
-diff_lim <- quantile(abs(df_diff$value), 0.98, na.rm = TRUE)
-diff_lim <- ceiling(diff_lim / 5) * 5
-
-p_z500_comp <- ggplot(z500_comp_df, aes(x = x, y = y, fill = value)) +
-  geom_raster() +
-  geom_sf(data = map_layers$borders, fill = NA, color = "black",
-          linewidth = 0.3, inherit.aes = FALSE) +
-  geom_point(aes(x = NECHAKO_LON, y = NECHAKO_LAT),
-             color = "gold", shape = 18, size = 3, inherit.aes = FALSE) +
-  scale_fill_distiller(palette = ANOMALY_PALETTE,
-                       limits  = c(-diff_lim, diff_lim),
-                       oob     = squish,
-                       name    = "Z500 Anom\n(m)") +
-  coord_sf(xlim = c(-180, -100), ylim = c(40, 70), expand = FALSE) +
-  facet_wrap(~panel, ncol = 3) +
-  labs(
-    title    = "500 hPa Geopotential Height: Drought vs. Non-drought Composites",
-    subtitle = sprintf("Drought: SPEI-6 ≤ %.1f (n=%d months)  |  Non-drought (n=%d months)  |  Ref: %d–%d",
-                       DROUGHT_THRESHOLD, length(drought_idx),
-                       length(nondrought_idx), CLIM_START, CLIM_END),
-    x = NULL, y = NULL
-  ) +
-  theme_bw(base_size = 11) +
-  theme(strip.background = element_rect(fill = "grey92"),
-        strip.text       = element_text(face = "bold", size = 11),
-        plot.title       = element_text(face = "bold", size = 13))
-
-ggsave(file.path(OUT_DIR, "Figures", "02_z500_drought_vs_nondrought.png"),
-       p_z500_comp, width = FIGURE_WIDTH_WIDE, height = 6, dpi = FIGURE_DPI)
-cat("Saved.\n")
-
-# ── 2c. Z500 composites stratified by drought severity ───────────────────────
-cat("  Fig 03: Z500 composites by drought severity quartile... ")
-
-severity_levels <- c("Severe/Extreme (SPEI ≤ -1.5)",
-                     "Moderate (-1.5 < SPEI ≤ -0.8)",
-                     "Non-drought (SPEI > -0.8)")
-
-sev_idx  <- which(date_index$spei6 <= SEVERE_THRESHOLD)
-mod_idx  <- which(date_index$spei6 >  SEVERE_THRESHOLD &
-                    date_index$spei6 <= DROUGHT_THRESHOLD)
-none_idx <- which(date_index$spei6 >  DROUGHT_THRESHOLD)
-
-make_severity_df <- function(idx, label) {
-  if (length(idx) == 0) return(NULL)
-  m <- app(subset(z500_anom, idx), mean, na.rm = TRUE)
-  df <- as.data.frame(m, xy = TRUE)
-  names(df)[3] <- "value"
-  df$panel <- label
-  df$n     <- length(idx)
-  df
+# ── FIX: Updated load_index_csv() to handle both full and abbreviated month names ──
+load_index_csv <- function(index_type, scale) {
+  dir_map <- list(spi = SPI_SEAS_DIR, spei = SPEI_SEAS_DIR)
+  dir <- dir_map[[tolower(index_type)]]
+  f <- file.path(dir, sprintf("%s_%02d_basin_averaged_by_month.csv",
+                              tolower(index_type), as.integer(scale)))
+  if (!file.exists(f)) return(NULL)
+  
+  # Try to read with data.table::fread (handles many formats)
+  df <- data.table::fread(f, data.table = FALSE)
+  
+  # Check number of columns
+  if (ncol(df) == 2 && names(df)[1] == "date" && names(df)[2] == "value") {
+    # Already long format
+    long <- df
+    names(long) <- c("date", "value")
+    long$date <- as.Date(long$date)
+  } else if (ncol(df) >= 13) {
+    # Wide format: assume first column is Year, next 12 are months
+    names(df)[1] <- "Year"
+    df$Year <- as.integer(df$Year)
+    month_cols <- names(df)[2:13]
+    long <- do.call(rbind, lapply(seq_along(month_cols), function(mi) {
+      data.frame(
+        date  = as.Date(paste(df$Year, sprintf("%02d", mi), "01", sep = "-")),
+        value = as.numeric(df[[month_cols[mi]]]),
+        stringsAsFactors = FALSE
+      )
+    }))
+  } else {
+    stop("Unexpected CSV format in ", f)
+  }
+  
+  long <- long[order(long$date), ]
+  long <- long[!is.na(long$value) & is.finite(long$value), ]
+  rownames(long) <- NULL
+  long
 }
 
-sev_df <- bind_rows(
-  make_severity_df(sev_idx,  severity_levels[1]),
-  make_severity_df(mod_idx,  severity_levels[2]),
-  make_severity_df(none_idx, severity_levels[3])
-) %>% mutate(panel = factor(panel, levels = severity_levels))
-
-sev_lim <- quantile(abs(sev_df$value), 0.98, na.rm = TRUE)
-sev_lim <- ceiling(sev_lim / 10) * 10
-
-p_z500_sev <- ggplot(sev_df, aes(x = x, y = y, fill = value)) +
-  geom_raster() +
-  geom_sf(data = map_layers$borders, fill = NA, color = "black",
-          linewidth = 0.3, inherit.aes = FALSE) +
-  geom_point(aes(x = NECHAKO_LON, y = NECHAKO_LAT),
-             color = "gold", shape = 18, size = 3, inherit.aes = FALSE) +
-  scale_fill_distiller(palette = ANOMALY_PALETTE,
-                       limits  = c(-sev_lim, sev_lim),
-                       oob     = squish,
-                       name    = "Z500 Anom\n(m)") +
-  coord_sf(xlim = c(-180, -100), ylim = c(40, 70), expand = FALSE) +
-  facet_wrap(~panel, ncol = 3) +
-  labs(
-    title    = "500 hPa Geopotential Height Anomaly by Drought Severity",
-    subtitle = sprintf("Reference period: %d–%d  |  ◆ = Nechako Watershed",
-                       CLIM_START, CLIM_END),
-    x = NULL, y = NULL
-  ) +
-  theme_bw(base_size = 11) +
-  theme(strip.background = element_rect(fill = "grey92"),
-        strip.text       = element_text(face = "bold"),
-        plot.title       = element_text(face = "bold", size = 13))
-
-ggsave(file.path(OUT_DIR, "Figures", "03_z500_drought_severity_composites.png"),
-       p_z500_sev, width = FIGURE_WIDTH_WIDE, height = 6, dpi = FIGURE_DPI)
-cat("Saved.\n")
-
-# ── 2d. Z500 NW Canada ridge time series vs SPEI-6 ────────────────────────────
-cat("  Fig 04: Z500 ridge time series vs SPEI-6... ")
-
-p_z500_ts <- ts_df %>%
-  filter(!is.na(spei6), !is.na(z500_ridge)) %>%
-  ggplot(aes(x = date)) +
-  # Z500 ridge anomaly as bar chart
-  geom_col(aes(y = z500_ridge / 5, fill = z500_ridge > 0),
-           alpha = 0.5, width = 25) +
-  scale_fill_manual(values = c("TRUE" = "#d73027", "FALSE" = "#4575b4"),
-                    guide = "none") +
-  # SPEI-6 line (secondary axis)
-  geom_line(aes(y = spei6 * 10), color = "black", linewidth = 0.6) +
-  geom_hline(yintercept = DROUGHT_THRESHOLD * 10, linetype = "dashed",
-             color = "darkred", linewidth = 0.5) +
-  geom_hline(yintercept = 0, color = "grey40", linewidth = 0.3) +
-  scale_y_continuous(
-    name     = "Z500 Anomaly (m) — NW Canada ridge region",
-    limits   = c(-60, 60),
-    sec.axis = sec_axis(~. / 10, name = "SPEI-6 (Nechako)")
-  ) +
-  scale_x_date(date_breaks = "10 years", date_labels = "%Y", expand = c(0.01, 0)) +
-  labs(
-    title    = "500 hPa Geopotential Height Anomaly (NW Canada Ridge Region) vs. SPEI-6",
-    subtitle = sprintf("Ridge region: %d–%d°W, %d–%d°N  |  Dashed line: drought threshold (SPEI-6 = %.1f)",
-                       abs(RIDGE_LON_MIN), abs(RIDGE_LON_MAX),
-                       RIDGE_LAT_MIN, RIDGE_LAT_MAX, DROUGHT_THRESHOLD),
-    x = NULL,
-    caption  = "Bars: Z500 anomaly (red = above normal / ridge, blue = below normal / trough)\nLine: SPEI-6 (lower = drier)"
-  ) +
-  theme_bw(base_size = 11) +
-  theme(plot.title     = element_text(face = "bold"),
-        axis.title.y   = element_text(color = "#d73027"),
-        axis.title.y.right = element_text(color = "black"))
-
-ggsave(file.path(OUT_DIR, "Figures", "04_z500_timeseries_nw_canada_ridge.png"),
-       p_z500_ts, width = FIGURE_WIDTH_WIDE, height = 5.5, dpi = FIGURE_DPI)
-cat("Saved.\n\n")
-
-# ============================================================================
-#  SECTION 3: SEA LEVEL PRESSURE
-# ============================================================================
-cat("============================================================\n")
-cat(" SECTION 3: Sea Level Pressure\n")
-cat("============================================================\n")
-
-# ── 3a. Monthly SLP anomaly composites ────────────────────────────────────────
-cat("  Fig 05: Monthly SLP anomaly composites (drought months)... ")
-
-slp_monthly_list <- vector("list", 12)
-for (m in 1:12) {
-  idx <- which(date_index$month == m & date_index$is_drought %in% TRUE)
-  if (length(idx) == 0) next
-  mean_layer <- app(subset(slp_anom, idx), mean, na.rm = TRUE)
-  df <- as.data.frame(mean_layer, xy = TRUE)
-  names(df)[3] <- "value"
-  df$month_label <- MONTH_LABELS[m]
-  slp_monthly_list[[m]] <- df
-}
-slp_monthly_comp <- bind_rows(slp_monthly_list) %>%
-  mutate(month_label = factor(month_label, levels = MONTH_LABELS))
-
-slp_clim_lim <- quantile(abs(slp_monthly_comp$value), 0.98, na.rm = TRUE)
-slp_clim_lim <- ceiling(slp_clim_lim / 0.5) * 0.5
-
-p_slp_monthly <- ggplot(slp_monthly_comp, aes(x = x, y = y, fill = value)) +
-  geom_raster() +
-  geom_sf(data = map_layers$borders, fill = NA, color = "black",
-          linewidth = 0.3, inherit.aes = FALSE) +
-  geom_point(aes(x = NECHAKO_LON, y = NECHAKO_LAT),
-             color = "gold", shape = 18, size = 2.5, inherit.aes = FALSE) +
-  scale_fill_distiller(palette = ANOMALY_PALETTE,
-                       limits  = c(-slp_clim_lim, slp_clim_lim),
-                       oob     = squish,
-                       name    = "SLP Anom\n(hPa)") +
-  coord_sf(xlim = c(-180, -100), ylim = c(40, 70), expand = FALSE) +
-  facet_wrap(~month_label, ncol = 4) +
-  labs(
-    title    = "Sea Level Pressure Anomaly — Drought Months by Calendar Month",
-    subtitle = sprintf("Composite of all months with SPEI-6 ≤ %.1f  |  Reference: %d–%d",
-                       DROUGHT_THRESHOLD, CLIM_START, CLIM_END),
-    caption  = "Positive (red) = high pressure anomaly (blocking); Negative (blue) = low pressure / trough",
-    x = NULL, y = NULL
-  ) +
-  theme_bw(base_size = 10) +
-  theme(strip.background = element_rect(fill = "grey92"),
-        strip.text       = element_text(face = "bold"),
-        legend.position  = "right",
-        plot.title       = element_text(face = "bold", size = 12),
-        panel.spacing    = unit(0.3, "lines"))
-
-ggsave(file.path(OUT_DIR, "Figures", "05_slp_monthly_anomaly_composites.png"),
-       p_slp_monthly, width = FIGURE_WIDTH_WIDE, height = 12, dpi = FIGURE_DPI)
-cat("Saved.\n")
-
-# ── 3b. SLP drought vs. non-drought ───────────────────────────────────────────
-cat("  Fig 06: SLP drought vs. non-drought composite... ")
-
-slp_dr_mean   <- app(subset(slp_anom, drought_idx),    mean, na.rm = TRUE)
-slp_nodr_mean <- app(subset(slp_anom, nondrought_idx), mean, na.rm = TRUE)
-slp_diff      <- slp_dr_mean - slp_nodr_mean
-
-df_slp <- bind_rows(
-  as.data.frame(slp_dr_mean,   xy = TRUE) %>%
-    setNames(c("x","y","value")) %>% mutate(panel = "Drought months"),
-  as.data.frame(slp_nodr_mean, xy = TRUE) %>%
-    setNames(c("x","y","value")) %>% mutate(panel = "Non-drought months"),
-  as.data.frame(slp_diff,      xy = TRUE) %>%
-    setNames(c("x","y","value")) %>% mutate(panel = "Drought minus Non-drought")
-) %>%
-  mutate(panel = factor(panel, levels = c("Drought months",
-                                          "Non-drought months",
-                                          "Drought minus Non-drought")))
-
-slp_diff_lim <- quantile(abs(as.data.frame(slp_diff)[, 3]), 0.98, na.rm = TRUE)
-slp_diff_lim <- ceiling(slp_diff_lim / 0.5) * 0.5
-
-p_slp_comp <- ggplot(df_slp, aes(x = x, y = y, fill = value)) +
-  geom_raster() +
-  geom_sf(data = map_layers$borders, fill = NA, color = "black",
-          linewidth = 0.3, inherit.aes = FALSE) +
-  geom_point(aes(x = NECHAKO_LON, y = NECHAKO_LAT),
-             color = "gold", shape = 18, size = 3, inherit.aes = FALSE) +
-  scale_fill_distiller(palette = ANOMALY_PALETTE,
-                       limits  = c(-slp_diff_lim, slp_diff_lim),
-                       oob     = squish,
-                       name    = "SLP Anom\n(hPa)") +
-  coord_sf(xlim = c(-180, -100), ylim = c(40, 70), expand = FALSE) +
-  facet_wrap(~panel, ncol = 3) +
-  labs(
-    title    = "Sea Level Pressure: Drought vs. Non-drought Composites",
-    subtitle = sprintf("Drought: SPEI-6 ≤ %.1f (n=%d)  |  Non-drought (n=%d)  |  Ref: %d–%d",
-                       DROUGHT_THRESHOLD, length(drought_idx),
-                       length(nondrought_idx), CLIM_START, CLIM_END),
-    x = NULL, y = NULL
-  ) +
-  theme_bw(base_size = 11) +
-  theme(strip.background = element_rect(fill = "grey92"),
-        strip.text       = element_text(face = "bold", size = 11),
-        plot.title       = element_text(face = "bold", size = 13))
-
-ggsave(file.path(OUT_DIR, "Figures", "06_slp_drought_vs_nondrought.png"),
-       p_slp_comp, width = FIGURE_WIDTH_WIDE, height = 6, dpi = FIGURE_DPI)
-cat("Saved.\n")
-
-# ── 3c. SLP severity composites ───────────────────────────────────────────────
-cat("  Fig 07: SLP composites by drought severity... ")
-
-make_sev_slp <- function(idx, label) {
-  if (length(idx) == 0) return(NULL)
-  m  <- app(subset(slp_anom, idx), mean, na.rm = TRUE)
-  df <- as.data.frame(m, xy = TRUE)
-  names(df)[3] <- "value"
-  df$panel <- label
-  df
+# ── Load all indices ──────────────────────────────────────────────────────────
+all_indices <- list()
+for (sc in SPI_SCALES_TRY) {
+  df <- load_index_csv("spi", sc)
+  lbl <- sprintf("SPI%d", sc)
+  if (!is.null(df)) {
+    all_indices[[lbl]] <- df
+    cat(sprintf("  + %s: %d months (%d years × 12)\n", lbl, nrow(df), length(unique(df$Year))))
+  } else {
+    cat(sprintf("  - %s: file not found, skipped\n", lbl))
+  }
 }
 
-slp_sev_df <- bind_rows(
-  make_sev_slp(sev_idx,  severity_levels[1]),
-  make_sev_slp(mod_idx,  severity_levels[2]),
-  make_sev_slp(none_idx, severity_levels[3])
-) %>% mutate(panel = factor(panel, levels = severity_levels))
+for (sc in SPEI_SCALES_TRY) {
+  df <- load_index_csv("spei", sc)
+  lbl <- sprintf("SPEI%d", sc)
+  if (!is.null(df)) {
+    all_indices[[lbl]] <- df
+    cat(sprintf("  + %s: %d months (%d years × 12)\n", lbl, nrow(df), length(unique(df$Year))))
+  } else {
+    cat(sprintf("  - %s: file not found, skipped\n", lbl))
+  }
+}
 
-slp_sev_lim <- quantile(abs(slp_sev_df$value), 0.98, na.rm = TRUE)
-slp_sev_lim <- ceiling(slp_sev_lim / 0.5) * 0.5
+if (length(all_indices) == 0)
+  stop("No index CSV files found. Check SPI_SEAS_DIR and SPEI_SEAS_DIR.")
 
-p_slp_sev <- ggplot(slp_sev_df, aes(x = x, y = y, fill = value)) +
-  geom_raster() +
-  geom_sf(data = map_layers$borders, fill = NA, color = "black",
-          linewidth = 0.3, inherit.aes = FALSE) +
-  geom_point(aes(x = NECHAKO_LON, y = NECHAKO_LAT),
-             color = "gold", shape = 18, size = 3, inherit.aes = FALSE) +
-  scale_fill_distiller(palette = ANOMALY_PALETTE,
-                       limits  = c(-slp_sev_lim, slp_sev_lim),
-                       oob     = squish,
-                       name    = "SLP Anom\n(hPa)") +
-  coord_sf(xlim = c(-180, -100), ylim = c(40, 70), expand = FALSE) +
-  facet_wrap(~panel, ncol = 3) +
-  labs(title    = "SLP Anomaly by Drought Severity",
-       subtitle = sprintf("Reference: %d–%d  |  ◆ = Nechako", CLIM_START, CLIM_END),
-       x = NULL, y = NULL) +
-  theme_bw(base_size = 11) +
-  theme(strip.background = element_rect(fill = "grey92"),
-        strip.text       = element_text(face = "bold"),
-        plot.title       = element_text(face = "bold", size = 13))
+# ── Validation: Confirm all indices have 912 rows (76 years × 12 months) ─────
+cat("\n  Validation:\n")
+for (lbl in names(all_indices)) {
+  n <- nrow(all_indices[[lbl]])
+  status <- if (n == 912) "✓" else "⚠"
+  cat(sprintf("    %s %s: %d rows (expected 912)\n", status, lbl, n))
+}
 
-ggsave(file.path(OUT_DIR, "Figures", "07_slp_drought_severity_composites.png"),
-       p_slp_sev, width = FIGURE_WIDTH_WIDE, height = 6, dpi = FIGURE_DPI)
-cat("Saved.\n")
-
-# ── 3d. SLP time series ────────────────────────────────────────────────────────
-cat("  Fig 08: SLP NW BC time series vs SPEI-6... ")
-
-p_slp_ts <- ts_df %>%
-  filter(!is.na(spei6), !is.na(slp_nwbc)) %>%
-  ggplot(aes(x = date)) +
-  geom_col(aes(y = slp_nwbc * 5, fill = slp_nwbc > 0),
-           alpha = 0.5, width = 25) +
-  scale_fill_manual(values = c("TRUE" = "#d73027", "FALSE" = "#4575b4"),
-                    guide = "none") +
-  geom_line(aes(y = spei6 * 2), color = "black", linewidth = 0.6) +
-  geom_hline(yintercept = DROUGHT_THRESHOLD * 2, linetype = "dashed",
-             color = "darkred", linewidth = 0.5) +
-  geom_hline(yintercept = 0, color = "grey40", linewidth = 0.3) +
-  scale_y_continuous(
-    name     = "SLP Anomaly (hPa × 5) — NW BC region",
-    sec.axis = sec_axis(~. / 2, name = "SPEI-6 (Nechako)")
-  ) +
-  scale_x_date(date_breaks = "10 years", date_labels = "%Y", expand = c(0.01, 0)) +
-  labs(
-    title   = "Sea Level Pressure Anomaly (NW BC Region) vs. SPEI-6",
-    subtitle = "Bars: SLP anomaly (red = anomalous high pressure / blocking, blue = low pressure)\nLine: SPEI-6",
-    x = NULL
-  ) +
-  theme_bw(base_size = 11) +
-  theme(plot.title = element_text(face = "bold"))
-
-ggsave(file.path(OUT_DIR, "Figures", "08_slp_timeseries.png"),
-       p_slp_ts, width = FIGURE_WIDTH_WIDE, height = 5.5, dpi = FIGURE_DPI)
-cat("Saved.\n\n")
+cat(sprintf("\n  Loaded: %s\n\n", paste(names(all_indices), collapse = ", ")))
 
 # ============================================================================
-#  SECTION 4: SST NE PACIFIC
+#  SECTION 3: TABLE T0 — EXACT DROUGHT MONTHS FOR ALL INDICES
+#  Generated separately for each drought definition.
 # ============================================================================
 cat("============================================================\n")
-cat(" SECTION 4: SST — NE Pacific\n")
+cat(" SECTION 3: Drought month tables (both definitions)\n")
 cat("============================================================\n")
 
-# ── 4a. Annual SST anomaly maps — recent years ────────────────────────────────
-cat("  Fig 09: Annual mean SST anomaly maps for recent years... ")
+for (def in DROUGHT_DEFS) {
+  
+  cat(sprintf("\n  -- Definition: %s --\n", def$long_label))
+  
+  def_tbl_root <- ensure_dir(OUT_DIR, def$short_label, "Tables")
+  
+  drought_rows <- lapply(names(all_indices), function(lbl) {
+    df_temp <- all_indices[[lbl]]
+    df_temp$yr  <- as.integer(format(df_temp$date, "%Y"))
+    df_temp$mon <- as.integer(format(df_temp$date, "%m"))
+    
+    # Classify using the active definition
+    drought_flag <- classify_drought(df_temp$value, def, lbl)
+    
+    df_temp %>%
+      mutate(is_drought_def = drought_flag) %>%
+      filter(yr >= START_YEAR,
+             yr <= END_YEAR,
+             is_drought_def,
+             !is.na(value)) %>%
+      transmute(
+        index          = lbl,
+        definition     = def$short_label,
+        date           = format(date, "%Y-%m"),
+        year           = yr,
+        month_num      = mon,
+        month_name     = month.abb[mon],
+        season         = case_when(
+          mon %in% c(12, 1, 2)  ~ "DJF",
+          mon %in% c(3, 4, 5)   ~ "MAM",
+          mon %in% c(6, 7, 8)   ~ "JJA",
+          mon %in% c(9, 10, 11) ~ "SON"
+        ),
+        index_value    = round(value, 3),
+        threshold_used = def_thr_label(def, lbl)
+      )
+  })
+  
+  t0 <- bind_rows(drought_rows) %>% arrange(index, date)
+  write_csv(t0, file.path(def_tbl_root, "T0_drought_months_all_indices.csv"))
+  
+  cat(sprintf("  Drought month counts [%s]:\n", def$short_label))
+  t0 %>%
+    group_by(index) %>%
+    summarise(n_drought = n(),
+              pct = round(100 * n() / n_total, 1),
+              .groups = "drop") %>%
+    as.data.frame() %>%
+    print()
+  cat(sprintf("  Saved: %s/Tables/T0_drought_months_all_indices.csv\n", def$short_label))
+  
+}  # end definition loop (T0)
 
+# ============================================================================
+#  SECTION 4: SST FIGURES (index-independent, generated once)
+# ============================================================================
+cat("============================================================\n")
+cat(" SECTION 4: SST figures (not index-specific)\n")
+cat("============================================================\n")
+ensure_dir(OUT_DIR, "Figures", "SST")
+
+# ── Fig 09 ────────────────────────────────────────────────────────────────────
+cat("  Fig 09: Annual SST anomaly maps (recent years)... ")
 recent_years <- RECENT_START:min(RECENT_END, END_YEAR)
-sst_annual_list <- vector("list", length(recent_years))
-
-for (i in seq_along(recent_years)) {
-  yr  <- recent_years[i]
-  idx <- which(date_index$year == yr)
-  if (length(idx) == 0) next
-  mean_sst <- app(subset(sst_anom, idx), mean, na.rm = TRUE)
-  df <- as.data.frame(mean_sst, xy = TRUE)
+sst_annual_list <- lapply(recent_years, function(yr) {
+  idx <- which(base_date_index$year == yr)
+  if (!length(idx)) return(NULL)
+  df  <- as.data.frame(app(subset(sst_anom, idx), mean, na.rm = TRUE), xy = TRUE)
   names(df)[3] <- "value"
-  df$year <- yr
-  sst_annual_list[[i]] <- df
-}
+  df$year <- yr; df
+})
+sst_annual_df <- bind_rows(sst_annual_list) %>% mutate(year = factor(year))
+sst_lim <- ceiling(max(abs(quantile(sst_annual_df$value, c(0.02, 0.98), na.rm = TRUE))) * 2) / 2
 
-sst_annual_df <- bind_rows(sst_annual_list) %>%
-  mutate(year = factor(year))
-
-sst_lim <- max(abs(quantile(sst_annual_df$value, c(0.02, 0.98), na.rm = TRUE)))
-sst_lim <- ceiling(sst_lim * 2) / 2
-
-p_sst_annual <- ggplot(sst_annual_df, aes(x = x, y = y, fill = value)) +
+p09 <- ggplot(sst_annual_df, aes(x = x, y = y, fill = value)) +
   geom_raster() +
   geom_sf(data = map_layers$borders, fill = "grey85", color = "black",
           linewidth = 0.3, inherit.aes = FALSE) +
   scale_fill_distiller(palette = SST_PALETTE,
-                       limits  = c(-sst_lim, sst_lim),
-                       oob     = squish,
-                       name    = "SST Anom\n(°C)") +
+                       limits = c(-sst_lim, sst_lim), oob = squish,
+                       name = "SST Anom\n(deg C)", na.value = "grey80") +
   coord_sf(xlim = c(-180, -110), ylim = c(20, 65), expand = FALSE) +
   facet_wrap(~year, ncol = 4) +
   labs(
-    title    = sprintf("NE Pacific SST Anomaly — Annual Mean, %d–%d",
+    title    = sprintf("NE Pacific SST Anomaly, Annual Mean %d-%d",
                        RECENT_START, min(RECENT_END, END_YEAR)),
-    subtitle = sprintf("Reference: %d–%d WMO climatology  |  Positive (red) = warmer than normal",
+    subtitle = sprintf("Reference climatology: %d-%d (WMO standard)",
                        CLIM_START, CLIM_END),
-    caption  = "Captures PDO, Marine Heatwave / Blob signal and California Current variability",
+    caption  = paste0(
+      "Domain: ", abs(SST_MEAN_LON_MIN), "-", abs(SST_MEAN_LON_MAX),
+      " W, ", SST_MEAN_LAT_MIN, "-", SST_MEAN_LAT_MAX, " N.\n",
+      "This region captures the PDO 'warm tongue', the area in the NE Pacific where SST anomalies ",
+      "most strongly co-vary with the Pacific Decadal Oscillation (PDO) index. A warm PDO phase ",
+      "(sustained positive/red anomalies here) is associated with atmospheric ridging over BC that ",
+      "suppresses precipitation and enhances evapotranspiration, favouring drought. ",
+      "The 2014-2016 'Blob' (Bond et al. 2015) and the 2019-2021 NE Pacific marine heatwave ",
+      "both appear as multi-year positive anomalies in this domain. ",
+      "The tropical Pacific is excluded: ENSO SST influence is captured via ONI in the ",
+      "teleconnection analysis (w7-w8), avoiding double-counting."
+    ),
     x = NULL, y = NULL
   ) +
-  theme_bw(base_size = 10) +
-  theme(strip.background = element_rect(fill = "grey92"),
-        strip.text       = element_text(face = "bold"),
-        plot.title       = element_text(face = "bold", size = 12))
+  map_theme(10)
 
-ggsave(file.path(OUT_DIR, "Figures", "09_sst_annual_anomaly_recent.png"),
-       p_sst_annual,
+ggsave(file.path(OUT_DIR, "Figures", "SST", "09_sst_annual_anomaly_recent.png"),
+       p09,
        width  = FIGURE_WIDTH_WIDE,
        height = ceiling(length(recent_years) / 4) * 4 + 2,
        dpi    = FIGURE_DPI)
 cat("Saved.\n")
 
-# ── 4b. SST composites during drought months ──────────────────────────────────
-cat("  Fig 10: SST composites during drought months (by calendar month)... ")
-
-sst_monthly_list <- vector("list", 12)
-for (m in 1:12) {
-  idx <- which(date_index$month == m & date_index$is_drought %in% TRUE)
-  if (length(idx) == 0) next
-  mean_sst <- app(subset(sst_anom, idx), mean, na.rm = TRUE)
-  df <- as.data.frame(mean_sst, xy = TRUE)
-  names(df)[3] <- "value"
-  df$month_label <- MONTH_LABELS[m]
-  sst_monthly_list[[m]] <- df
-}
-
-sst_monthly_comp <- bind_rows(sst_monthly_list) %>%
-  mutate(month_label = factor(month_label, levels = MONTH_LABELS))
-
-sst_month_lim <- quantile(abs(sst_monthly_comp$value), 0.98, na.rm = TRUE)
-sst_month_lim <- ceiling(sst_month_lim * 2) / 2
-
-p_sst_monthly <- ggplot(sst_monthly_comp, aes(x = x, y = y, fill = value)) +
-  geom_raster() +
-  geom_sf(data = map_layers$borders, fill = "grey85", color = "black",
-          linewidth = 0.3, inherit.aes = FALSE) +
-  scale_fill_distiller(palette = SST_PALETTE,
-                       limits  = c(-sst_month_lim, sst_month_lim),
-                       oob     = squish,
-                       name    = "SST Anom\n(°C)") +
-  coord_sf(xlim = c(-180, -110), ylim = c(20, 65), expand = FALSE) +
-  facet_wrap(~month_label, ncol = 4) +
-  labs(
-    title    = "NE Pacific SST Anomaly — Drought Months by Calendar Month",
-    subtitle = sprintf("Composite of all months with SPEI-6 ≤ %.1f  |  Reference: %d–%d",
-                       DROUGHT_THRESHOLD, CLIM_START, CLIM_END),
-    x = NULL, y = NULL
-  ) +
-  theme_bw(base_size = 10) +
-  theme(strip.background = element_rect(fill = "grey92"),
-        strip.text       = element_text(face = "bold"),
-        plot.title       = element_text(face = "bold", size = 12),
-        panel.spacing    = unit(0.3, "lines"))
-
-ggsave(file.path(OUT_DIR, "Figures", "10_sst_monthly_composites_drought.png"),
-       p_sst_monthly, width = FIGURE_WIDTH_WIDE, height = 12, dpi = FIGURE_DPI)
-cat("Saved.\n")
-
-# ── 4c. SST NE Pacific time series: long-record + recent highlight ────────────
-cat("  Fig 11: SST NE Pacific time series... ")
-
-# 12-month rolling mean for smoothed signal
-ts_df_sst <- ts_df %>%
+# ── Fig 11 ────────────────────────────────────────────────────────────────────
+cat("  Fig 11: SST NE Pacific long time series... ")
+sst_ts <- base_date_index %>%
+  mutate(sst_nepac = sst_nepac_ts) %>%
   filter(!is.na(sst_nepac)) %>%
   arrange(date) %>%
-  mutate(
-    sst_12mo = zoo::rollmean(sst_nepac, k = 12, fill = NA, align = "right")
-  )
+  mutate(sst_12mo = rollmean(sst_nepac, k = 12, fill = NA, align = "right"))
 
-p_sst_ts <- ggplot(ts_df_sst, aes(x = date, y = sst_nepac)) +
-  # shade recent period
+p11 <- ggplot(sst_ts, aes(x = date, y = sst_nepac)) +
   annotate("rect",
            xmin = as.Date(sprintf("%d-01-01", RECENT_START)),
            xmax = as.Date(sprintf("%d-12-31", min(RECENT_END, END_YEAR))),
-           ymin = -Inf, ymax = Inf,
-           fill = "lightyellow", alpha = 0.5) +
+           ymin = -Inf, ymax = Inf, fill = "lightyellow", alpha = 0.5) +
   geom_col(aes(fill = sst_nepac > 0), alpha = 0.4, width = 25) +
   scale_fill_manual(values = c("TRUE" = "#d73027", "FALSE" = "#4575b4"),
                     guide = "none") +
   geom_line(aes(y = sst_12mo), color = "black", linewidth = 0.8, na.rm = TRUE) +
-  geom_hline(yintercept = 0, color = "grey30", linewidth = 0.4) +
-  geom_hline(yintercept =  0.5, linetype = "dotted", color = "darkred",  linewidth = 0.5) +
+  geom_hline(yintercept =  0.0, color = "grey30", linewidth = 0.4) +
+  geom_hline(yintercept =  0.5, linetype = "dotted", color = "darkred",   linewidth = 0.5) +
   geom_hline(yintercept = -0.5, linetype = "dotted", color = "steelblue", linewidth = 0.5) +
-  annotate("text",
-           x = as.Date(sprintf("%d-06-01", RECENT_START + 1)),
-           y = max(ts_df_sst$sst_nepac, na.rm = TRUE) * 0.9,
-           label = sprintf("Recent period\n(%d–%d)", RECENT_START, min(RECENT_END, END_YEAR)),
-           size = 3, hjust = 0, color = "grey40") +
   scale_x_date(date_breaks = "10 years", date_labels = "%Y", expand = c(0.01, 0)) +
   labs(
     title    = "NE Pacific SST Anomaly — Monthly Time Series",
-    subtitle = sprintf("Area average: %d–%d°W, %d–%d°N  |  Black line: 12-month rolling mean  |  Ref: %d–%d",
+    subtitle = sprintf("Area average: %d-%d W, %d-%d N  |  Black line: 12-month rolling mean  |  Ref: %d-%d",
                        abs(SST_MEAN_LON_MIN), abs(SST_MEAN_LON_MAX),
-                       SST_MEAN_LAT_MIN, SST_MEAN_LAT_MAX,
-                       CLIM_START, CLIM_END),
-    x = NULL, y = "SST Anomaly (°C)",
-    caption  = "Dotted lines: ±0.5°C thresholds (approximate warm/cool PDO phase boundary)"
+                       SST_MEAN_LAT_MIN, SST_MEAN_LAT_MAX, CLIM_START, CLIM_END),
+    x = NULL, y = "SST Anomaly (deg C)",
+    caption = paste0(
+      "Dotted lines: +/-0.5 deg C (approximate warm/cool PDO phase boundary).\n",
+      "Yellow shading: recent period (", RECENT_START, " onward)."
+    )
   ) +
   theme_bw(base_size = 11) +
   theme(plot.title = element_text(face = "bold"))
 
-ggsave(file.path(OUT_DIR, "Figures", "11_sst_timeseries_ne_pacific.png"),
-       p_sst_ts, width = FIGURE_WIDTH_WIDE, height = 5.5, dpi = FIGURE_DPI)
+ggsave(file.path(OUT_DIR, "Figures", "SST", "11_sst_timeseries_ne_pacific.png"),
+       p11, width = FIGURE_WIDTH_WIDE, height = 5.5, dpi = FIGURE_DPI)
 cat("Saved.\n\n")
 
 # ============================================================================
-#  SECTION 5: JOINT ANALYSIS — SCATTERPLOTS AND CORRELATION
+#  SECTION 5: PER-INDEX LOOP  ×  DROUGHT DEFINITION LOOP
+#  Every figure and table is produced twice — once per definition.
+#  Output structure:
+#    {OUT_DIR}/{def$short_label}/Figures/{INDEX}/  <-- figures
+#    {OUT_DIR}/{def$short_label}/Tables/{INDEX}/   <-- tables T1-T3
 # ============================================================================
 cat("============================================================\n")
-cat(" SECTION 5: Joint Analysis — Area-averaged fields vs SPEI-6\n")
-cat("============================================================\n")
+cat(" SECTION 5: Per-index composites and tables (both definitions)\n")
+cat("============================================================\n\n")
 
-cat("  Fig 12: Scatter plots of Z500/SLP/SST area-averages vs SPEI-6... ")
-
-scatter_df <- ts_df %>%
-  filter(!is.na(spei6), !is.na(z500_ridge), !is.na(slp_nwbc), !is.na(sst_nepac)) %>%
-  mutate(season = factor(season, levels = c("DJF", "MAM", "JJA", "SON")))
-
-make_scatter <- function(df, xvar, xlabel, title_text) {
-  ggplot(df, aes(x = .data[[xvar]], y = spei6, color = season)) +
-    geom_hline(yintercept = DROUGHT_THRESHOLD, linetype = "dashed",
-               color = "darkred", linewidth = 0.5) +
-    geom_hline(yintercept = 0, color = "grey50", linewidth = 0.3) +
-    geom_vline(xintercept = 0, color = "grey50", linewidth = 0.3) +
-    geom_point(alpha = 0.5, size = 1.2) +
-    geom_smooth(method = "lm", se = TRUE, color = "black",
-                linewidth = 0.8, fill = "grey70", alpha = 0.3) +
-    scale_color_brewer(palette = "Set1", name = "Season") +
-    labs(
-      title    = title_text,
-      x        = xlabel,
-      y        = "SPEI-6 (Nechako)",
-      subtitle = sprintf("r = %.3f  (p < 0.001 if |r| > %.3f, n = %d)",
-                         cor(df[[xvar]], df$spei6, use = "complete.obs"),
-                         qnorm(0.975) / sqrt(nrow(df) - 2) * sqrt(1),
-                         nrow(df))
+for (def in DROUGHT_DEFS) {
+  
+  cat(sprintf("\n╔══════════════════════════════════════════════════════╗\n"))
+  cat(sprintf("  Definition: %s\n", def$long_label))
+  cat(sprintf("╚══════════════════════════════════════════════════════╝\n\n"))
+  
+  # Root output directories for this definition
+  def_fig_root <- ensure_dir(OUT_DIR, def$short_label, "Figures")
+  def_tbl_root <- ensure_dir(OUT_DIR, def$short_label, "Tables")
+  
+  for (lbl in names(all_indices)) {
+    
+    cat(sprintf(">> %s  [%s]\n", lbl, def$short_label))
+    
+    fig_dir <- ensure_dir(def_fig_root, lbl)
+    tbl_dir <- ensure_dir(def_tbl_root, lbl)
+    
+    # ── Attach index to date spine ───────────────────────────────────────────────
+    idx_df <- all_indices[[lbl]] %>%
+      filter(as.integer(format(date, "%Y")) >= START_YEAR,
+             as.integer(format(date, "%Y")) <= END_YEAR) %>%
+      rename(index_value = value)
+    
+    # Classify drought months according to the active definition
+    idx_df <- idx_df %>%
+      mutate(is_drought = classify_drought(index_value, def, lbl))
+    
+    # Human-readable threshold label for plot annotations
+    thr_lbl <- def_thr_label(def, lbl)
+    
+    date_index <- base_date_index %>%
+      left_join(idx_df %>% select(date, index_value, is_drought), by = "date") %>%
+      mutate(z500_ridge = z500_ridge_ts,
+             slp_nwbc   = slp_nwbc_ts,
+             sst_nepac  = sst_nepac_ts)
+    
+    drought_mask   <- date_index$is_drought %in% TRUE
+    nondrought_mask <- date_index$is_drought %in% FALSE
+    drought_idx    <- which(drought_mask)
+    nondrought_idx <- which(nondrought_mask)
+    n_dr  <- length(drought_idx)
+    n_ndr <- length(nondrought_idx)
+    idx_range <- max(abs(date_index$index_value), na.rm = TRUE)
+    
+    cat(sprintf("   Drought months [%s]: %d  |  Non-drought: %d\n",
+                thr_lbl, n_dr, n_ndr))
+    
+    if (n_dr == 0) {
+      cat("   No drought months found — skipping.\n\n"); next
+    }
+    
+    # ── Shared composite rasters (used in multiple figures) ──────────────────────
+    z500_dr   <- app(subset(z500_anom, drought_idx),    mean, na.rm = TRUE)
+    z500_ndr  <- app(subset(z500_anom, nondrought_idx), mean, na.rm = TRUE)
+    z500_diff <- z500_dr - z500_ndr
+    
+    slp_dr   <- app(subset(slp_anom, drought_idx),    mean, na.rm = TRUE)
+    slp_ndr  <- app(subset(slp_anom, nondrought_idx), mean, na.rm = TRUE)
+    slp_diff <- slp_dr - slp_ndr
+    
+    sst_dr   <- app(subset(sst_anom, drought_idx),    mean, na.rm = TRUE)
+    sst_ndr  <- app(subset(sst_anom, nondrought_idx), mean, na.rm = TRUE)
+    sst_diff <- sst_dr - sst_ndr
+    
+    # Helper: build 3-panel drought/non-drought/difference df
+    diff_panels <- function(r_dr, r_ndr, r_diff) {
+      bind_rows(
+        as.data.frame(r_dr,   xy = TRUE) %>% setNames(c("x","y","value")) %>%
+          mutate(panel = sprintf("Drought months (n=%d)", n_dr)),
+        as.data.frame(r_ndr,  xy = TRUE) %>% setNames(c("x","y","value")) %>%
+          mutate(panel = sprintf("Non-drought months (n=%d)", n_ndr)),
+        as.data.frame(r_diff, xy = TRUE) %>% setNames(c("x","y","value")) %>%
+          mutate(panel = "Drought minus Non-drought")
+      ) %>% mutate(panel = factor(panel, levels = unique(panel)))
+    }
+    
+    # ──────────────────────────────────────────────────────────────────────────
+    #  FIG 01: Z500 monthly composites (12 panels always)
+    # ──────────────────────────────────────────────────────────────────────────
+    cat("   01 Z500 monthly... ")
+    z500_mc  <- build_monthly_composite(z500_anom, date_index, drought_mask)
+    clim_lim <- ceiling(quantile(abs(z500_mc$value), 0.98, na.rm = TRUE) / 10) * 10
+    
+    p01 <- ggplot(z500_mc, aes(x = x, y = y, fill = value)) +
+      geom_raster() +
+      geom_sf(data = map_layers$borders, fill = NA, color = "black",
+              linewidth = 0.3, inherit.aes = FALSE) +
+      geom_sf(data = map_layers$lakes,   fill = "white", color = "grey60",
+              linewidth = 0.2, inherit.aes = FALSE) +
+      scale_fill_distiller(palette = ANOMALY_PALETTE,
+                           limits = c(-clim_lim, clim_lim), oob = squish,
+                           name = "Z500 Anom\n(m)", na.value = "grey80") +
+      coord_sf(xlim = c(-180, -100), ylim = c(40, 70), expand = FALSE) +
+      facet_wrap(~panel_title, ncol = 4) +
+      labs(
+        title    = sprintf("500 hPa Geopotential Height Anomaly — %s Drought Months by Calendar Month", lbl),
+        subtitle = sprintf(
+          "Mean Z500 anomaly over drought months of each calendar month [%s | %s]. Grey = no drought (n=0). Ref: %d-%d.",
+          lbl, thr_lbl, CLIM_START, CLIM_END),
+        caption  = "Red = ridge/blocking above normal; Blue = trough; Grey fill = no drought occurred in that calendar month.",
+        x = NULL, y = NULL
+      ) +
+      map_theme(10)
+    
+    ggsave(file.path(fig_dir, "01_z500_monthly_anomaly_composites.png"),
+           p01, width = FIGURE_WIDTH_WIDE, height = 12, dpi = FIGURE_DPI)
+    cat("Saved.\n")
+    
+    # ──────────────────────────────────────────────────────────────────────────
+    #  FIG 02: Z500 drought vs. non-drought
+    # ──────────────────────────────────────────────────────────────────────────
+    cat("   02 Z500 drought/non-drought... ")
+    diff_lim <- ceiling(quantile(abs(values(z500_diff)), 0.98, na.rm = TRUE) / 5) * 5
+    
+    p02 <- ggplot(diff_panels(z500_dr, z500_ndr, z500_diff),
+                  aes(x = x, y = y, fill = value)) +
+      geom_raster() +
+      geom_sf(data = map_layers$borders, fill = NA, color = "black",
+              linewidth = 0.3, inherit.aes = FALSE) +
+      scale_fill_distiller(palette = ANOMALY_PALETTE,
+                           limits = c(-diff_lim, diff_lim), oob = squish,
+                           name = "Z500 Anom\n(m)", na.value = "grey80") +
+      coord_sf(xlim = c(-180, -100), ylim = c(40, 70), expand = FALSE) +
+      facet_wrap(~panel, ncol = 3) +
+      labs(title    = sprintf("500 hPa Geopotential Height: %s Drought vs. Non-drought", lbl),
+           subtitle = sprintf("%s | %s  |  Ref: %d-%d", lbl, thr_lbl, CLIM_START, CLIM_END),
+           x = NULL, y = NULL) +
+      map_theme(11)
+    
+    ggsave(file.path(fig_dir, "02_z500_drought_vs_nondrought.png"),
+           p02, width = FIGURE_WIDTH_WIDE, height = 6, dpi = FIGURE_DPI)
+    cat("Saved.\n")
+    
+    # ──────────────────────────────────────────────────────────────────────────
+    #  FIG 04: Z500 ridge time series
+    # ──────────────────────────────────────────────────────────────────────────
+    cat("   04 Z500 time series... ")
+    ts_plot <- filter(date_index, !is.na(index_value), !is.na(z500_ridge))
+    z_range <- max(abs(ts_plot$z500_ridge), na.rm = TRUE)
+    sf_z    <- z_range / max(idx_range, 0.1)
+    
+    p04 <- ggplot(ts_plot, aes(x = date)) +
+      geom_col(aes(y = z500_ridge, fill = z500_ridge > 0), alpha = 0.5, width = 25) +
+      scale_fill_manual(values = c("TRUE" = "#d73027", "FALSE" = "#4575b4"), guide = "none") +
+      geom_line(aes(y = index_value * sf_z), color = "black", linewidth = 0.6) +
+      geom_hline(yintercept = (if (def$classify == "single") def$threshold else def$onset) * sf_z,
+                 linetype = "dashed", color = "darkred", linewidth = 0.5) +
+      geom_hline(yintercept = 0, color = "grey40", linewidth = 0.3) +
+      scale_y_continuous(
+        name     = "Z500 Anomaly (m) — NW Canada ridge region",
+        sec.axis = sec_axis(~. / sf_z, name = sprintf("%s", lbl))
+      ) +
+      scale_x_date(date_breaks = "10 years", date_labels = "%Y", expand = c(0.01, 0)) +
+      labs(
+        title   = sprintf("500 hPa Ridge Anomaly vs. %s", lbl),
+        subtitle = sprintf("Ridge region: %d-%d W, %d-%d N  |  Dashed = drought onset  |  Def: %s",
+                           abs(RIDGE_LON_MIN), abs(RIDGE_LON_MAX),
+                           RIDGE_LAT_MIN, RIDGE_LAT_MAX, thr_lbl),
+        x = NULL,
+        caption = "Bars: Z500 anomaly (red = ridge, blue = trough)  |  Line: drought index (Nechako)"
+      ) +
+      theme_bw(base_size = 11) + theme(plot.title = element_text(face = "bold"))
+    
+    ggsave(file.path(fig_dir, "04_z500_timeseries_ridge.png"),
+           p04, width = FIGURE_WIDTH_WIDE, height = 5.5, dpi = FIGURE_DPI)
+    cat("Saved.\n")
+    
+    # ──────────────────────────────────────────────────────────────────────────
+    #  FIG 05: SLP monthly composites (12 panels always)
+    # ──────────────────────────────────────────────────────────────────────────
+    cat("   05 SLP monthly... ")
+    slp_mc   <- build_monthly_composite(slp_anom, date_index, drought_mask)
+    slp_clim_lim <- ceiling(quantile(abs(slp_mc$value), 0.98, na.rm = TRUE) / 0.5) * 0.5
+    
+    p05 <- ggplot(slp_mc, aes(x = x, y = y, fill = value)) +
+      geom_raster() +
+      geom_sf(data = map_layers$borders, fill = NA, color = "black",
+              linewidth = 0.3, inherit.aes = FALSE) +
+      geom_sf(data = map_layers$lakes,   fill = "white", color = "grey60",
+              linewidth = 0.2, inherit.aes = FALSE) +
+      scale_fill_distiller(palette = ANOMALY_PALETTE,
+                           limits = c(-slp_clim_lim, slp_clim_lim), oob = squish,
+                           name = "SLP Anom\n(hPa)", na.value = "grey80") +
+      coord_sf(xlim = c(-180, -100), ylim = c(40, 70), expand = FALSE) +
+      facet_wrap(~panel_title, ncol = 4) +
+      labs(
+        title    = sprintf("Sea Level Pressure Anomaly — %s Drought Months by Calendar Month", lbl),
+        subtitle = sprintf(
+          "Mean SLP anomaly over drought months of each calendar month [%s | %s]. Grey = no drought (n=0). Ref: %d-%d.",
+          lbl, thr_lbl, CLIM_START, CLIM_END),
+        caption  = "Red = anomalous high pressure (blocking high); Blue = anomalous low pressure.",
+        x = NULL, y = NULL
+      ) +
+      map_theme(10)
+    
+    ggsave(file.path(fig_dir, "05_slp_monthly_anomaly_composites.png"),
+           p05, width = FIGURE_WIDTH_WIDE, height = 12, dpi = FIGURE_DPI)
+    cat("Saved.\n")
+    
+    # ──────────────────────────────────────────────────────────────────────────
+    #  FIG 06: SLP drought vs. non-drought
+    # ──────────────────────────────────────────────────────────────────────────
+    cat("   06 SLP drought/non-drought... ")
+    slp_lim <- ceiling(quantile(abs(values(slp_diff)), 0.98, na.rm = TRUE) / 0.5) * 0.5
+    
+    p06 <- ggplot(diff_panels(slp_dr, slp_ndr, slp_diff),
+                  aes(x = x, y = y, fill = value)) +
+      geom_raster() +
+      geom_sf(data = map_layers$borders, fill = NA, color = "black",
+              linewidth = 0.3, inherit.aes = FALSE) +
+      scale_fill_distiller(palette = ANOMALY_PALETTE,
+                           limits = c(-slp_lim, slp_lim), oob = squish,
+                           name = "SLP Anom\n(hPa)", na.value = "grey80") +
+      coord_sf(xlim = c(-180, -100), ylim = c(40, 70), expand = FALSE) +
+      facet_wrap(~panel, ncol = 3) +
+      labs(title    = sprintf("SLP: %s Drought vs. Non-drought", lbl),
+           subtitle = sprintf("%s | %s  |  Ref: %d-%d", lbl, thr_lbl, CLIM_START, CLIM_END),
+           x = NULL, y = NULL) +
+      map_theme(11)
+    
+    ggsave(file.path(fig_dir, "06_slp_drought_vs_nondrought.png"),
+           p06, width = FIGURE_WIDTH_WIDE, height = 6, dpi = FIGURE_DPI)
+    cat("Saved.\n")
+    
+    # ──────────────────────────────────────────────────────────────────────────
+    #  FIG 08: SLP time series
+    # ──────────────────────────────────────────────────────────────────────────
+    cat("   08 SLP time series... ")
+    slp_range <- max(abs(ts_plot$slp_nwbc), na.rm = TRUE)
+    sf_s      <- slp_range / max(idx_range, 0.1)
+    
+    p08 <- ggplot(ts_plot, aes(x = date)) +
+      geom_col(aes(y = slp_nwbc, fill = slp_nwbc > 0), alpha = 0.5, width = 25) +
+      scale_fill_manual(values = c("TRUE" = "#d73027", "FALSE" = "#4575b4"), guide = "none") +
+      geom_line(aes(y = index_value * sf_s), color = "black", linewidth = 0.6) +
+      geom_hline(yintercept = (if (def$classify == "single") def$threshold else def$onset) * sf_s,
+                 linetype = "dashed", color = "darkred", linewidth = 0.5) +
+      geom_hline(yintercept = 0, color = "grey40", linewidth = 0.3) +
+      scale_y_continuous(
+        name     = "SLP Anomaly (hPa) — NW BC",
+        sec.axis = sec_axis(~. / sf_s, name = sprintf("%s", lbl))
+      ) +
+      scale_x_date(date_breaks = "10 years", date_labels = "%Y", expand = c(0.01, 0)) +
+      labs(title   = sprintf("SLP Anomaly vs. %s", lbl),
+           subtitle = sprintf("Bars: SLP anomaly (red = blocking high, blue = low)  |  Line: drought index  |  Def: %s",
+                              thr_lbl),
+           x = NULL) +
+      theme_bw(base_size = 11) + theme(plot.title = element_text(face = "bold"))
+    
+    ggsave(file.path(fig_dir, "08_slp_timeseries.png"),
+           p08, width = FIGURE_WIDTH_WIDE, height = 5.5, dpi = FIGURE_DPI)
+    cat("Saved.\n")
+    
+    # ──────────────────────────────────────────────────────────────────────────
+    #  FIG 10: SST monthly composites (12 panels always)
+    # ──────────────────────────────────────────────────────────────────────────
+    cat("   10 SST monthly... ")
+    sst_mc   <- build_monthly_composite(sst_anom, date_index, drought_mask)
+    sst_mlim <- ceiling(quantile(abs(sst_mc$value), 0.98, na.rm = TRUE) * 2) / 2
+    
+    p10 <- ggplot(sst_mc, aes(x = x, y = y, fill = value)) +
+      geom_raster() +
+      geom_sf(data = map_layers$borders, fill = "grey85", color = "black",
+              linewidth = 0.3, inherit.aes = FALSE) +
+      scale_fill_distiller(palette = SST_PALETTE,
+                           limits = c(-sst_mlim, sst_mlim), oob = squish,
+                           name = "SST Anom\n(deg C)", na.value = "grey80") +
+      coord_sf(xlim = c(-180, -110), ylim = c(20, 65), expand = FALSE) +
+      facet_wrap(~panel_title, ncol = 4) +
+      labs(
+        title    = sprintf("NE Pacific SST Anomaly — %s Drought Months by Calendar Month", lbl),
+        subtitle = sprintf(
+          "Mean SST anomaly over drought months of each calendar month [%s | %s]. Grey = no drought (n=0). Ref: %d-%d.",
+          lbl, thr_lbl, CLIM_START, CLIM_END),
+        x = NULL, y = NULL
+      ) +
+      map_theme(10)
+    
+    ggsave(file.path(fig_dir, "10_sst_monthly_composites_drought.png"),
+           p10, width = FIGURE_WIDTH_WIDE, height = 12, dpi = FIGURE_DPI)
+    cat("Saved.\n")
+    
+    # ──────────────────────────────────────────────────────────────────────────
+    #  FIG 12: Joint scatter plots
+    # ──────────────────────────────────────────────────────────────────────────
+    cat("   12 Scatter plots... ")
+    sc_df <- date_index %>%
+      filter(!is.na(index_value), !is.na(z500_ridge), !is.na(slp_nwbc), !is.na(sst_nepac)) %>%
+      mutate(season = factor(season, levels = c("DJF","MAM","JJA","SON")))
+    
+    mk_scatter <- function(xvar, xlabel, title_txt) {
+      r <- round(cor(sc_df[[xvar]], sc_df$index_value, use = "complete.obs"), 3)
+      ggplot(sc_df, aes(x = .data[[xvar]], y = index_value, color = season)) +
+        geom_hline(yintercept = if (def$classify == "single") def$threshold else def$onset,
+                   linetype = "dashed", color = "darkred", linewidth = 0.5) +
+        geom_hline(yintercept = 0, color = "grey50", linewidth = 0.3) +
+        geom_vline(xintercept = 0, color = "grey50", linewidth = 0.3) +
+        geom_point(alpha = 0.5, size = 1.2) +
+        geom_smooth(method = "lm", se = TRUE, color = "black",
+                    linewidth = 0.8, fill = "grey70", alpha = 0.3) +
+        scale_color_brewer(palette = "Set1", name = "Season") +
+        labs(title = title_txt, x = xlabel, y = lbl,
+             subtitle = sprintf("r = %.3f  (n = %d)", r, nrow(sc_df))) +
+        theme_bw(base_size = 10) +
+        theme(plot.title = element_text(face = "bold", size = 10),
+              legend.position = "bottom")
+    }
+    
+    p12 <- (mk_scatter("z500_ridge",
+                       sprintf("Z500 Anom (m)\n%d-%d W, %d-%d N",
+                               abs(RIDGE_LON_MIN), abs(RIDGE_LON_MAX),
+                               RIDGE_LAT_MIN, RIDGE_LAT_MAX),
+                       "Z500 Ridge vs. Index") |
+              mk_scatter("slp_nwbc",
+                         sprintf("SLP Anom (hPa)\n%d-%d W, %d-%d N",
+                                 abs(RIDGE_LON_MIN), abs(RIDGE_LON_MAX),
+                                 RIDGE_LAT_MIN, RIDGE_LAT_MAX),
+                         "SLP vs. Index") |
+              mk_scatter("sst_nepac",
+                         sprintf("SST Anom (deg C)\n%d-%d W, %d-%d N",
+                                 abs(SST_MEAN_LON_MIN), abs(SST_MEAN_LON_MAX),
+                                 SST_MEAN_LAT_MIN, SST_MEAN_LAT_MAX),
+                         "NE Pacific SST vs. Index")) +
+      plot_annotation(
+        title   = sprintf("Atmospheric / Ocean Anomalies vs. %s (Nechako)", lbl),
+        caption = sprintf("Dashed = drought onset. Def: %s. Shading = 95%% CI.", thr_lbl),
+        theme   = theme(plot.title = element_text(face = "bold", size = 13))
+      )
+    
+    ggsave(file.path(fig_dir, "12_joint_scatter.png"),
+           p12, width = FIGURE_WIDTH_WIDE, height = 6, dpi = FIGURE_DPI)
+    cat("Saved.\n")
+    
+    # ──────────────────────────────────────────────────────────────────────────
+    #  FIG 13: Summary composite panel
+    # ──────────────────────────────────────────────────────────────────────────
+    cat("   13 Summary panel... ")
+    lim_z  <- ceiling(quantile(abs(values(z500_diff)), 0.98, na.rm = TRUE) / 10) * 10
+    lim_sl <- ceiling(quantile(abs(values(slp_diff)),  0.98, na.rm = TRUE) / 0.5) * 0.5
+    lim_ss <- ceiling(quantile(abs(values(sst_diff)),  0.98, na.rm = TRUE) * 2)  / 2
+    
+    mk_diff_map <- function(r, lim, title_txt, unit, xlim, ylim) {
+      df <- as.data.frame(r, xy = TRUE); names(df)[3] <- "value"
+      ggplot(df, aes(x = x, y = y, fill = value)) +
+        geom_raster() +
+        geom_sf(data = map_layers$borders, fill = NA, color = "black",
+                linewidth = 0.25, inherit.aes = FALSE) +
+        scale_fill_distiller(palette = "RdBu",
+                             limits = c(-lim, lim), oob = squish,
+                             name = unit, na.value = "grey80") +
+        coord_sf(xlim = xlim, ylim = ylim, expand = FALSE) +
+        labs(title = title_txt, x = NULL, y = NULL) +
+        map_theme(10)
+    }
+    
+    p13 <- (
+      mk_diff_map(z500_diff, lim_z,
+                  sprintf("Z500 (m): %s Drought minus Non-drought", lbl),
+                  "Z500 (m)", c(-180, -100), c(40, 70)) /
+        mk_diff_map(slp_diff,  lim_sl,
+                    sprintf("SLP (hPa): %s Drought minus Non-drought", lbl),
+                    "SLP (hPa)", c(-180, -100), c(40, 70)) /
+        mk_diff_map(sst_diff,  lim_ss,
+                    sprintf("SST (deg C): %s Drought minus Non-drought", lbl),
+                    "SST (deg C)", c(-180, -110), c(20, 65))
     ) +
-    theme_bw(base_size = 10) +
-    theme(plot.title = element_text(face = "bold", size = 10),
-          legend.position = "bottom")
-}
-
-p_sc1 <- make_scatter(scatter_df, "z500_ridge",
-                      sprintf("Z500 Anomaly (m)\nNW Canada ridge (%d–%d°W, %d–%d°N)",
-                              abs(RIDGE_LON_MIN), abs(RIDGE_LON_MAX),
-                              RIDGE_LAT_MIN, RIDGE_LAT_MAX),
-                      "Z500 Ridge Anomaly vs. SPEI-6")
-
-p_sc2 <- make_scatter(scatter_df, "slp_nwbc",
-                      sprintf("SLP Anomaly (hPa)\nNW BC (%d–%d°W, %d–%d°N)",
-                              abs(RIDGE_LON_MIN), abs(RIDGE_LON_MAX),
-                              RIDGE_LAT_MIN, RIDGE_LAT_MAX),
-                      "SLP Anomaly vs. SPEI-6")
-
-p_sc3 <- make_scatter(scatter_df, "sst_nepac",
-                      sprintf("SST Anomaly (°C)\nNE Pacific (%d–%d°W, %d–%d°N)",
-                              abs(SST_MEAN_LON_MIN), abs(SST_MEAN_LON_MAX),
-                              SST_MEAN_LAT_MIN, SST_MEAN_LAT_MAX),
-                      "NE Pacific SST Anomaly vs. SPEI-6")
-
-p_scatter <- (p_sc1 | p_sc2 | p_sc3) +
-  plot_annotation(
-    title   = "Area-averaged Atmospheric / Ocean Fields vs. Nechako SPEI-6",
-    caption = sprintf("Dashed red line = drought threshold (SPEI-6 = %.1f). Shading = 95%% confidence band on regression.",
-                      DROUGHT_THRESHOLD),
-    theme   = theme(plot.title = element_text(face = "bold", size = 13))
-  )
-
-ggsave(file.path(OUT_DIR, "Figures", "12_joint_z500_slp_sst_drought_scatter.png"),
-       p_scatter, width = FIGURE_WIDTH_WIDE, height = 6, dpi = FIGURE_DPI)
-cat("Saved.\n")
-
-# ── 5b. Summary composite panel ───────────────────────────────────────────────
-cat("  Fig 13: Summary composite panel (drought-minus-nondrought for all 3 vars)... ")
-
-# Crop SST diff to ATM domain for visual consistency — use full SST domain instead
-sst_dr_mean   <- app(subset(sst_anom, drought_idx),    mean, na.rm = TRUE)
-sst_nodr_mean <- app(subset(sst_anom, nondrought_idx), mean, na.rm = TRUE)
-sst_diff_r    <- sst_dr_mean - sst_nodr_mean
-
-lim_z  <- ceiling(quantile(abs(as.data.frame(z500_diff)[,3]), 0.98, na.rm = TRUE) / 10) * 10
-lim_sl <- ceiling(quantile(abs(as.data.frame(slp_diff) [,3]), 0.98, na.rm = TRUE) / 0.5) * 0.5
-lim_ss <- ceiling(quantile(abs(as.data.frame(sst_diff_r)[,3]), 0.98, na.rm = TRUE) * 2) / 2
-
-make_composite_map <- function(r, lim, var_label, unit, xlim, ylim) {
-  df <- as.data.frame(r, xy = TRUE); names(df)[3] <- "value"
-  ggplot(df, aes(x = x, y = y, fill = value)) +
-    geom_raster() +
-    geom_sf(data = map_layers$borders, fill = NA, color = "black",
-            linewidth = 0.25, inherit.aes = FALSE) +
-    geom_point(aes(x = NECHAKO_LON, y = NECHAKO_LAT),
-               color = "gold", shape = 18, size = 3, inherit.aes = FALSE) +
-    scale_fill_distiller(palette = "RdBu",
-                         limits  = c(-lim, lim),
-                         oob     = squish,
-                         name    = unit) +
-    coord_sf(xlim = xlim, ylim = ylim, expand = FALSE) +
-    labs(title = var_label, x = NULL, y = NULL) +
-    theme_bw(base_size = 10) +
-    theme(plot.title = element_text(face = "bold", size = 11),
-          legend.position = "right")
-}
-
-p_sum1 <- make_composite_map(z500_diff, lim_z,
-                             "Z500 Anomaly Difference (m)\nDrought minus Non-drought",
-                             "Z500\n(m)", c(-180, -100), c(40, 70))
-
-p_sum2 <- make_composite_map(slp_diff, lim_sl,
-                             "SLP Anomaly Difference (hPa)\nDrought minus Non-drought",
-                             "SLP\n(hPa)", c(-180, -100), c(40, 70))
-
-p_sum3 <- make_composite_map(sst_diff_r, lim_ss,
-                             "SST Anomaly Difference (°C)\nDrought minus Non-drought",
-                             "SST\n(°C)", c(-180, -110), c(20, 65))
-
-p_summary_panel <- (p_sum1 / p_sum2 / p_sum3) +
-  plot_annotation(
-    title    = "Composite Atmospheric & Ocean Anomalies Associated with Nechako Drought",
-    subtitle = sprintf("Drought: SPEI-6 ≤ %.1f (n=%d months)  minus  Non-drought (n=%d months)  |  ◆ = Nechako Watershed",
-                       DROUGHT_THRESHOLD, length(drought_idx), length(nondrought_idx)),
-    caption  = sprintf("Reference period: %d–%d (WMO standard). ERA5 monthly means.", CLIM_START, CLIM_END),
-    theme    = theme(plot.title    = element_text(face = "bold", size = 14),
-                     plot.subtitle = element_text(size = 10))
-  )
-
-ggsave(file.path(OUT_DIR, "Figures", "13_composite_summary_panel.png"),
-       p_summary_panel,
-       width  = FIGURE_WIDTH_STD,
-       height = 16,
-       dpi    = FIGURE_DPI)
-cat("Saved.\n\n")
-
-# ============================================================================
-#  SECTION 6: TABLES
-# ============================================================================
-cat("============================================================\n")
-cat(" SECTION 6: Summary Tables\n")
-cat("============================================================\n")
-
-# ── T1: Drought month summary — Z500/SLP/SST stats per SPEI-6 class ──────────
-cat("  Table T1: Drought month summary statistics... ")
-
-t1 <- ts_df %>%
-  filter(!is.na(spei6), !is.na(z500_ridge)) %>%
-  mutate(drought_class = case_when(
-    spei6 <= SEVERE_THRESHOLD  ~ sprintf("Severe/Extreme (SPEI ≤ %.1f)", SEVERE_THRESHOLD),
-    spei6 <= DROUGHT_THRESHOLD ~ sprintf("Moderate (%.1f < SPEI ≤ %.1f)", SEVERE_THRESHOLD, DROUGHT_THRESHOLD),
-    TRUE                       ~ "Non-drought"
-  )) %>%
-  group_by(drought_class) %>%
-  summarise(
-    n_months           = n(),
-    SPEI6_mean         = round(mean(spei6,     na.rm = TRUE), 3),
-    SPEI6_sd           = round(sd(spei6,       na.rm = TRUE), 3),
-    Z500_ridge_mean_m  = round(mean(z500_ridge, na.rm = TRUE), 1),
-    Z500_ridge_sd_m    = round(sd(z500_ridge,   na.rm = TRUE), 1),
-    SLP_nwbc_mean_hPa  = round(mean(slp_nwbc,   na.rm = TRUE), 2),
-    SLP_nwbc_sd_hPa    = round(sd(slp_nwbc,     na.rm = TRUE), 2),
-    SST_nepac_mean_C   = round(mean(sst_nepac,   na.rm = TRUE), 3),
-    SST_nepac_sd_C     = round(sd(sst_nepac,     na.rm = TRUE), 3),
-    .groups = "drop"
-  ) %>%
-  arrange(SPEI6_mean)
-
-write_csv(t1, file.path(OUT_DIR, "Tables", "T1_drought_month_summary.csv"))
-cat("Saved.\n")
-print(t1)
-
-# ── T2: Seasonal anomaly breakdown ────────────────────────────────────────────
-cat("\n  Table T2: Seasonal anomaly statistics... ")
-
-t2 <- ts_df %>%
-  filter(!is.na(spei6), is_drought %in% TRUE,
-         !is.na(z500_ridge), !is.na(slp_nwbc), !is.na(sst_nepac)) %>%
-  group_by(season) %>%
-  summarise(
-    n_drought_months   = n(),
-    SPEI6_mean         = round(mean(spei6,      na.rm = TRUE), 3),
-    Z500_ridge_mean    = round(mean(z500_ridge,  na.rm = TRUE), 1),
-    Z500_ridge_sd      = round(sd(z500_ridge,    na.rm = TRUE), 1),
-    SLP_mean_hPa       = round(mean(slp_nwbc,    na.rm = TRUE), 2),
-    SLP_sd_hPa         = round(sd(slp_nwbc,      na.rm = TRUE), 2),
-    SST_nepac_mean_C   = round(mean(sst_nepac,    na.rm = TRUE), 3),
-    SST_nepac_sd_C     = round(sd(sst_nepac,      na.rm = TRUE), 3),
-    .groups = "drop"
-  ) %>%
-  arrange(match(season, c("DJF", "MAM", "JJA", "SON")))
-
-write_csv(t2, file.path(OUT_DIR, "Tables", "T2_seasonal_anomaly_statistics.csv"))
-cat("Saved.\n")
-print(t2)
-
-# ── T3: Correlation matrix — area-averaged fields vs SPEI-6 ──────────────────
-cat("\n  Table T3: Correlation matrix... ")
-
-cor_vars <- c("spei6", "z500_ridge", "slp_nwbc", "sst_nepac")
-cor_labels <- c("SPEI-6", "Z500 Ridge (m)", "SLP NW-BC (hPa)", "SST NE-Pac (°C)")
-
-cor_mat_data <- ts_df %>%
-  filter(!is.na(spei6), !is.na(z500_ridge), !is.na(slp_nwbc), !is.na(sst_nepac)) %>%
-  select(all_of(cor_vars))
-
-n_obs  <- nrow(cor_mat_data)
-cor_r  <- cor(cor_mat_data, use = "complete.obs")
-t_stat <- cor_r * sqrt((n_obs - 2) / (1 - cor_r^2))
-p_mat  <- 2 * pt(-abs(t_stat), df = n_obs - 2)
-
-# Build tidy output table
-cor_out <- as.data.frame(round(cor_r, 3))
-cor_out <- cbind(Variable = cor_labels, cor_out)
-names(cor_out)[-1] <- cor_labels
-
-write_csv(cor_out, file.path(OUT_DIR, "Tables", "T3_correlation_matrix.csv"))
-cat("Saved.\n")
-print(cor_out)
-
-# Also save p-values
-pval_out <- as.data.frame(round(p_mat, 4))
-pval_out <- cbind(Variable = cor_labels, pval_out)
-names(pval_out)[-1] <- cor_labels
-write_csv(pval_out, file.path(OUT_DIR, "Tables", "T3_pvalue_matrix.csv"))
-
-# ── T4: Annual SST anomaly summary — recent vs historical ─────────────────────
-cat("\n  Table T4: Annual SST anomaly — recent vs historical... ")
-
-t4 <- ts_df %>%
-  filter(!is.na(sst_nepac)) %>%
-  group_by(year) %>%
-  summarise(
-    SST_annual_mean_C = round(mean(sst_nepac, na.rm = TRUE), 3),
-    SST_annual_max_C  = round(max(sst_nepac,  na.rm = TRUE), 3),
-    SST_annual_min_C  = round(min(sst_nepac,  na.rm = TRUE), 3),
-    .groups = "drop"
-  ) %>%
-  mutate(
-    period = ifelse(year >= RECENT_START, sprintf("Recent (%d–)", RECENT_START),
-                    sprintf("Historical (%d–%d)", START_YEAR, RECENT_START - 1))
-  )
-
-write_csv(t4, file.path(OUT_DIR, "Tables", "T4_annual_sst_anomaly_summary.csv"))
-cat("Saved.\n")
-
-# Print recent years
-cat("  Recent years:\n")
-print(tail(t4, length(recent_years)))
+      plot_annotation(
+        title    = sprintf("Composite Anomalies: %s Drought — Nechako", lbl),
+        subtitle = sprintf("%s  (n=%d drought months vs. n=%d non-drought)  |  Ref: %d-%d",
+                           thr_lbl, n_dr, n_ndr, CLIM_START, CLIM_END),
+        caption  = sprintf("ERA5 monthly means. Reference: %d-%d WMO climatology.", CLIM_START, CLIM_END),
+        theme    = theme(plot.title    = element_text(face = "bold", size = 14),
+                         plot.subtitle = element_text(size = 10))
+      )
+    
+    ggsave(file.path(fig_dir, "13_composite_summary_panel.png"),
+           p13, width = FIGURE_WIDTH_STD, height = 16, dpi = FIGURE_DPI)
+    cat("Saved.\n")
+    
+    # ──────────────────────────────────────────────────────────────────────────
+    #  TABLES T1-T3
+    # ──────────────────────────────────────────────────────────────────────────
+    cat("   Tables T1-T3... ")
+    
+    t1 <- date_index %>%
+      filter(!is.na(index_value)) %>%
+      mutate(dclass = ifelse(is_drought %in% TRUE,
+                             sprintf("Drought [%s]", thr_lbl),
+                             "Non-drought")) %>%
+      group_by(dclass) %>%
+      summarise(n          = n(),
+                index_mean = round(mean(index_value, na.rm=TRUE), 3),
+                index_sd   = round(sd(index_value,   na.rm=TRUE), 3),
+                z500_mean  = round(mean(z500_ridge,   na.rm=TRUE), 1),
+                z500_sd    = round(sd(z500_ridge,     na.rm=TRUE), 1),
+                slp_mean   = round(mean(slp_nwbc,     na.rm=TRUE), 2),
+                slp_sd     = round(sd(slp_nwbc,       na.rm=TRUE), 2),
+                sst_mean   = round(mean(sst_nepac,    na.rm=TRUE), 3),
+                sst_sd     = round(sd(sst_nepac,      na.rm=TRUE), 3),
+                .groups = "drop")
+    write_csv(t1, file.path(tbl_dir, "T1_drought_month_summary.csv"))
+    
+    t2 <- date_index %>%
+      filter(!is.na(index_value), is_drought %in% TRUE) %>%
+      group_by(season) %>%
+      summarise(n          = n(),
+                index_mean = round(mean(index_value, na.rm=TRUE), 3),
+                z500_mean  = round(mean(z500_ridge,  na.rm=TRUE), 1),
+                z500_sd    = round(sd(z500_ridge,    na.rm=TRUE), 1),
+                slp_mean   = round(mean(slp_nwbc,    na.rm=TRUE), 2),
+                sst_mean   = round(mean(sst_nepac,   na.rm=TRUE), 3),
+                .groups = "drop") %>%
+      arrange(match(season, c("DJF","MAM","JJA","SON")))
+    write_csv(t2, file.path(tbl_dir, "T2_seasonal_anomaly_statistics.csv"))
+    
+    cor_data <- date_index %>%
+      filter(!is.na(index_value), !is.na(z500_ridge), !is.na(slp_nwbc), !is.na(sst_nepac)) %>%
+      select(index_value, z500_ridge, slp_nwbc, sst_nepac)
+    cor_labels <- c(lbl, "Z500 Ridge (m)", "SLP NW-BC (hPa)", "SST NE-Pac (degC)")
+    n_obs  <- nrow(cor_data)
+    cor_r  <- cor(cor_data, use = "complete.obs")
+    t_stat <- cor_r * sqrt((n_obs - 2) / (1 - cor_r^2))
+    p_mat  <- 2 * pt(-abs(t_stat), df = n_obs - 2)
+    cor_out  <- cbind(Variable = cor_labels, as.data.frame(round(cor_r, 3)))
+    names(cor_out)[-1] <- cor_labels
+    pval_out <- cbind(Variable = cor_labels, as.data.frame(round(p_mat, 4)))
+    names(pval_out)[-1] <- cor_labels
+    write_csv(cor_out,  file.path(tbl_dir, "T3_correlation_matrix.csv"))
+    write_csv(pval_out, file.path(tbl_dir, "T3_pvalue_matrix.csv"))
+    cat("Saved.\n")
+    
+    cat(sprintf("   Done: %s  [%s]\n\n", lbl, def$short_label))
+    
+  }  # end per-index loop
+  
+  cat(sprintf("  ✓ Definition [%s] complete.\n\n", def$short_label))
+  
+}  # end drought-definition loop
 
 # ============================================================================
 #  DONE
 # ============================================================================
-cat("\n============================================================\n")
-cat(" COMPLETE. All outputs written to:\n")
-cat(sprintf("   %s\n", OUT_DIR))
+cat("============================================================\n")
+cat(" COMPLETE.\n")
+cat(sprintf(" All outputs: %s\n", OUT_DIR))
 cat("------------------------------------------------------------\n")
-cat(" Figures:\n")
-fig_files <- list.files(file.path(OUT_DIR, "Figures"), full.names = FALSE)
-for (f in fig_files) cat(sprintf("   %s\n", f))
-cat(" Tables:\n")
-tbl_files <- list.files(file.path(OUT_DIR, "Tables"), full.names = FALSE)
-for (f in tbl_files) cat(sprintf("   %s\n", f))
+cat(" Output structure (one sub-tree per drought definition):\n")
+cat(sprintf(" %s/SW_q10/Tables/T0_drought_months_all_indices.csv\n", OUT_DIR))
+cat(sprintf(" %s/SW_q10/Figures/{INDEX}/  &  .../Tables/{INDEX}/\n", OUT_DIR))
+cat(sprintf(" %s/Alt2T/Tables/T0_drought_months_all_indices.csv\n",  OUT_DIR))
+cat(sprintf(" %s/Alt2T/Figures/{INDEX}/   &  .../Tables/{INDEX}/\n", OUT_DIR))
+cat(" Figures/SST/  -- SST figures (index- and definition-independent)\n")
 cat("============================================================\n")

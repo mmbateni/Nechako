@@ -27,7 +27,7 @@ library(lubridate)
 library(ncdf4)
 
 # ── Working directory ────────────────────────────────────────────────────────
-setwd("D:/Nechako_Drought/")
+setwd("D:/Nechako_Drought/Nechako")
 
 # ============================================================================
 #  DOWNLOAD CONTROL
@@ -36,8 +36,8 @@ setwd("D:/Nechako_Drought/")
 #  set z500 = FALSE, slp = FALSE, sst = TRUE to only fetch SST.
 # ============================================================================
 RUN <- list(
-  z500 = TRUE,    # 500 hPa Geopotential Height
-  slp  = TRUE,    # Mean Sea Level Pressure
+  #z500 = TRUE,    # 500 hPa Geopotential Height
+  #slp  = TRUE,    # Mean Sea Level Pressure
   sst  = TRUE     # Sea Surface Temperature (NE Pacific)
 )
 
@@ -431,6 +431,4 @@ tryCatch({
   cat("  Message:", conditionMessage(e), "\n")
   cat("\n  downloads/ folder preserved for debugging.\n")
   stop(e)
-
 })
-

@@ -1,6 +1,5 @@
 ####################################################################################
 # w5_event_ranking.R  ·  DROUGHT EVENT RANKING & 2022-2025 CONTEXTUALIZATION
-# [FINAL CORRECTED VERSION]
 ####################################################################################
 
 source("DROUGHT_ANALYSIS_utils.R")
