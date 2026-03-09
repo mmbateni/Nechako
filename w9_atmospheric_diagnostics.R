@@ -1,5 +1,5 @@
 # ============================================================================
-#  w10_atmospheric_diagnostics.R
+#  w9_atmospheric_diagnostics.R
 #  Nechako Watershed Drought — Atmospheric Pattern Diagnostics
 #
 #  Purpose (per research lead):
