@@ -135,7 +135,8 @@ build_frame <- function(xy, vals_i, basin_geom, title_str, date_lbl) {
 }
 
 # ── 3. Render all frames then encode GIF ──────────────────────────────────────
-render_gif <- function(index_type, scale, data_dir, find_fn, basin_shp) {
+render_gif <- function(index_type, scale, data_dir, find_fn, basin_shp,
+                       gif_idx = NA, n_gifs = NA, session_start = NA) {
   
   label     <- toupper(index_type)
   tag       <- if (is.na(scale)) label else sprintf("%s-%d", label, scale)
@@ -161,7 +162,19 @@ render_gif <- function(index_type, scale, data_dir, find_fn, basin_shp) {
     dates <- dates[seq_len(n)]
   }
   
-  cli::cli_h2("{tag}  [{n} frames]")
+  cli::cli_h2("{tag}  [{n} frames]  \u2500  GIF {gif_idx}/{n_gifs}")
+  if (!is.na(session_start)) {
+    overall_elapsed <- round(proc.time()["elapsed"] - session_start, 1)
+    gifs_done <- gif_idx - 1L
+    if (gifs_done > 0L) {
+      overall_eta <- round((overall_elapsed / gifs_done) * (n_gifs - gifs_done), 0)
+      cli::cli_alert_info(
+        "Overall: {gifs_done}/{n_gifs} GIFs done \u00b7 {overall_elapsed}s elapsed \u00b7 ~{overall_eta}s remaining"
+      )
+    } else {
+      cli::cli_alert_info("Overall: first GIF \u2014 no overall ETA yet")
+    }
+  }
   
   # ── Extract coordinates and values ONCE for the entire stack ───────────────
   # Working per-column on the matrix avoids the 1.84 M-row long dataframe
@@ -250,9 +263,21 @@ render_gif <- function(index_type, scale, data_dir, find_fn, basin_shp) {
   )
   
   size_mb <- round(file.size(out) / 1e6, 1)
-  cli::cli_alert_success(
-    "Saved: {.file {basename(out)}}  ({size_mb} MB)"
-  )
+  if (!is.na(session_start)) {
+    overall_elapsed <- round(proc.time()["elapsed"] - session_start, 1)
+    gifs_left <- n_gifs - gif_idx
+    if (gif_idx > 1L) {
+      overall_eta <- round((overall_elapsed / gif_idx) * gifs_left, 0)
+      eta_str <- if (gifs_left > 0L) sprintf(" \u00b7 ~%ds remaining", overall_eta) else " \u00b7 last GIF"
+    } else {
+      eta_str <- ""
+    }
+    cli::cli_alert_success(
+      "Saved: {.file {basename(out)}}  ({size_mb} MB) \u00b7 overall {overall_elapsed}s elapsed{eta_str}"
+    )
+  } else {
+    cli::cli_alert_success("Saved: {.file {basename(out)}}  ({size_mb} MB)")
+  }
 }
 
 # ── 4. Run for all indices ─────────────────────────────────────────────────────
@@ -282,8 +307,10 @@ pb_outer <- cli::cli_progress_bar(
 
 session_start <- proc.time()["elapsed"]
 
-for (job in jobs) {
-  render_gif(job[[1]], job[[2]], job[[3]], job[[4]], basin_shp)
+for (i in seq_along(jobs)) {
+  job <- jobs[[i]]
+  render_gif(job[[1]], job[[2]], job[[3]], job[[4]], basin_shp,
+             gif_idx = i, n_gifs = n_jobs, session_start = session_start)
   cli::cli_progress_update(id = pb_outer)
 }
 
