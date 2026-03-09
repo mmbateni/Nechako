@@ -52,8 +52,8 @@ suppressPackageStartupMessages({
 #  CONFIGURATION
 # ============================================================================
 WD_PATH  <- "D:/Nechako_Drought/Nechako/"
-DATA_DIR <- "D:/Nechako_Drought/monthly_data_direct/"
-OUT_DIR  <- file.path(WD_PATH, "atmospheric/diagnostics/")
+DATA_DIR <- "D:/Nechako_Drought/Nechako/monthly_data_direct"
+OUT_DIR  <- file.path(WD_PATH, "atmospheric_diagnostics")
 
 dir.create(file.path(OUT_DIR, "Figures"), recursive = TRUE, showWarnings = FALSE)
 dir.create(file.path(OUT_DIR, "Tables"),  recursive = TRUE, showWarnings = FALSE)
@@ -133,7 +133,7 @@ cat("============================================================\n")
 # ── 1a. ERA5 fixed-period anomalies (1991-2020 reference) ────────────────────
 cat("  Loading Z500 anomaly (fixed 1991-2020)... ")
 z500_anom <- rast(file.path(DATA_DIR, sprintf("z500_monthly_anomaly_clim%d_%d.nc",
-                                               CLIM_START, CLIM_END)))
+                                              CLIM_START, CLIM_END)))
 cat(sprintf("Done. (%d layers)\n", nlyr(z500_anom)))
 
 cat("  Loading SLP raw (hPa) and computing anomaly on-the-fly... ")
@@ -161,7 +161,7 @@ cat("  SLP anomaly computed.\n")
 
 cat("  Loading SST anomaly (fixed 1991-2020)... ")
 sst_anom <- rast(file.path(DATA_DIR, sprintf("sst_monthly_anomaly_clim%d_%d.nc",
-                                              CLIM_START, CLIM_END)))
+                                             CLIM_START, CLIM_END)))
 sst_raw  <- rast(file.path(DATA_DIR, "sst_monthly.nc"))
 cat(sprintf("Done. (%d layers)\n", nlyr(sst_anom)))
 
@@ -170,12 +170,12 @@ cat(sprintf("Done. (%d layers)\n", nlyr(sst_anom)))
 # Expected format: CSV with columns 'date' (YYYY-MM-DD or YYYY-MM) and 'spei6'
 cat("  Loading SPEI-6... ")
 spei_file <- list.files(WD_PATH, pattern = "spei.*\\.csv$",
-                         recursive = TRUE, full.names = TRUE)[1]
+                        recursive = TRUE, full.names = TRUE)[1]
 
 if (is.na(spei_file)) {
   # Fallback: try RDS
   spei_rds <- list.files(WD_PATH, pattern = "spei.*\\.rds$",
-                          recursive = TRUE, full.names = TRUE)[1]
+                         recursive = TRUE, full.names = TRUE)[1]
   if (!is.na(spei_rds)) {
     spei_df <- readRDS(spei_rds)
   } else {
@@ -186,18 +186,113 @@ if (is.na(spei_file)) {
   spei_df <- read_csv(spei_file, show_col_types = FALSE)
 }
 
-# Standardise column names
-names(spei_df) <- tolower(names(spei_df))
-if (!"date" %in% names(spei_df))
-  stop("SPEI data must have a 'date' column.")
-if (!"spei6" %in% names(spei_df) && "spei_6" %in% names(spei_df))
-  spei_df <- rename(spei_df, spei6 = spei_6)
-if (!"spei6" %in% names(spei_df))
-  stop("SPEI data must have a 'spei6' (or 'spei_6') column.")
+# ── Standardise column names ──────────────────────────────────────────────────
+names(spei_df) <- tolower(trimws(names(spei_df)))
+
+cat(sprintf("  Columns found in SPEI file: %s\n",
+            paste(names(spei_df), collapse = ", ")))
+
+# ── Resolve SPEI-6 column ─────────────────────────────────────────────────────
+# Covers: standard SPEI package names, PCIC outputs, and w1 spatial summary
+# names (basin_mean, basin_median).  basin_mean is preferred over basin_median
+# because it is the spatial mean of SPEI-6 across all valid watershed pixels.
+SPEI_COL <- NULL   # set e.g. SPEI_COL <- "basin_mean" to force a specific column
+
+spei_candidates <- c(
+  "spei6", "spei_6", "spei.6", "spei06", "spei_06",
+  "spei_scale6", "spei6_mean", "spei_6_mean", "mean_spei6",
+  "basin_mean",    # w1 spatial summary output — watershed pixel mean of SPEI
+  "basin_median",  # w1 spatial summary output — fallback
+  "spei",          # generic (picked only if no scale-specific name exists)
+  "value"          # raster::extract / terra default
+)
+
+if (!is.null(SPEI_COL)) {
+  if (!SPEI_COL %in% names(spei_df))
+    stop(sprintf("SPEI_COL = '%s' not found.\n  Columns: %s",
+                 SPEI_COL, paste(names(spei_df), collapse = ", ")))
+  spei_col_found <- SPEI_COL
+  cat(sprintf("  SPEI-6 column : '%s'  [manual override]\n", spei_col_found))
+} else {
+  spei_col_found <- intersect(spei_candidates, names(spei_df))[1]
+  if (is.na(spei_col_found)) {
+    num_cols <- setdiff(names(spei_df)[sapply(spei_df, is.numeric)],
+                        c("year", "month", "day", "valid_pixels",
+                          "total_pixels", "coverage_pct"))
+    if (length(num_cols) == 0)
+      stop("Cannot identify SPEI-6 column.\n",
+           "  Columns: ", paste(names(spei_df), collapse = ", "), "\n",
+           "  Fix: set SPEI_COL <- '<column>' near the top of the script.")
+    spei_col_found <- num_cols[1]
+    warning(sprintf(
+      "SPEI column not recognised by name — using '%s'. Check this is correct.\n  All columns: %s",
+      spei_col_found, paste(names(spei_df), collapse = ", ")))
+  }
+  cat(sprintf("  SPEI-6 column : '%s'  [auto-detected]\n", spei_col_found))
+}
+
+if (spei_col_found != "spei6")
+  spei_df <- rename(spei_df, spei6 = all_of(spei_col_found))
+
+# ── Resolve & parse date column ───────────────────────────────────────────────
+# Strategy:
+#   1. Try common date column names
+#   2. Try multiple format strings on the winner
+#   3. If all formats fail, reconstruct from 'year' + 'month' columns (always present
+#      in w1 spatial summary outputs)
+date_candidates   <- c("date", "date_formatted", "time", "yearmon",
+                       "year_month", "ym", "period")
+date_col_found    <- intersect(date_candidates, names(spei_df))[1]
+
+if (is.na(date_col_found))
+  date_col_found <- names(spei_df)[
+    sapply(spei_df, function(x) {
+      tryCatch(!all(is.na(as.Date(as.character(head(x, 3)), tryFormats =
+                                    c("%Y-%m-%d", "%Y/%m/%d", "%Y-%m")))),
+               error = function(e) FALSE)
+    })
+  ][1]
+
+if (!is.na(date_col_found) && date_col_found != "date")
+  spei_df <- rename(spei_df, date = all_of(date_col_found))
+
+cat(sprintf("  Date column   : '%s'\n", if (is.na(date_col_found)) "(reconstructed from year+month)" else date_col_found))
+
+# Parse date robustly
+date_formats <- c("%Y-%m-%d", "%Y/%m/%d", "%Y-%m", "%d/%m/%Y",
+                  "%Y%m%d", "%Y%m")
+resolved_date <- NULL
+
+if (!is.na(date_col_found)) {
+  raw_dates <- as.character(spei_df$date)
+  for (fmt in date_formats) {
+    trial <- suppressWarnings(as.Date(raw_dates, format = fmt))
+    if (sum(!is.na(trial)) > nrow(spei_df) * 0.9) {
+      resolved_date <- trial
+      cat(sprintf("  Date format   : '%s'\n", fmt))
+      break
+    }
+  }
+}
+
+if (is.null(resolved_date)) {
+  # Fallback: reconstruct from year + month columns
+  if (all(c("year", "month") %in% names(spei_df))) {
+    resolved_date <- as.Date(sprintf("%04d-%02d-01",
+                                     as.integer(spei_df$year),
+                                     as.integer(spei_df$month)))
+    cat("  Date format   : reconstructed from 'year' + 'month' columns\n")
+  } else {
+    stop("Cannot parse date column and no 'year'/'month' columns to fall back on.\n",
+         "  Please ensure the SPEI file has a parseable date column.")
+  }
+}
+
+spei_df$date <- resolved_date
 
 spei_df <- spei_df %>%
   mutate(
-    date  = as.Date(as.character(date)),
+    date  = date,
     year  = year(date),
     month = month(date),
     season = case_when(
@@ -350,8 +445,8 @@ names(df_diff)[3]       <- "value"
 
 z500_comp_df <- bind_rows(df_drought, df_nondrought, df_diff) %>%
   mutate(panel = factor(panel, levels = c("Drought months",
-                                           "Non-drought months",
-                                           "Drought minus Non-drought")))
+                                          "Non-drought months",
+                                          "Drought minus Non-drought")))
 
 diff_lim <- quantile(abs(df_diff$value), 0.98, na.rm = TRUE)
 diff_lim <- ceiling(diff_lim / 5) * 5
@@ -553,8 +648,8 @@ df_slp <- bind_rows(
     setNames(c("x","y","value")) %>% mutate(panel = "Drought minus Non-drought")
 ) %>%
   mutate(panel = factor(panel, levels = c("Drought months",
-                                           "Non-drought months",
-                                           "Drought minus Non-drought")))
+                                          "Non-drought months",
+                                          "Drought minus Non-drought")))
 
 slp_diff_lim <- quantile(abs(as.data.frame(slp_diff)[, 3]), 0.98, na.rm = TRUE)
 slp_diff_lim <- ceiling(slp_diff_lim / 0.5) * 0.5
@@ -854,22 +949,22 @@ make_scatter <- function(df, xvar, xlabel, title_text) {
 }
 
 p_sc1 <- make_scatter(scatter_df, "z500_ridge",
-                       sprintf("Z500 Anomaly (m)\nNW Canada ridge (%d–%d°W, %d–%d°N)",
-                               abs(RIDGE_LON_MIN), abs(RIDGE_LON_MAX),
-                               RIDGE_LAT_MIN, RIDGE_LAT_MAX),
-                       "Z500 Ridge Anomaly vs. SPEI-6")
+                      sprintf("Z500 Anomaly (m)\nNW Canada ridge (%d–%d°W, %d–%d°N)",
+                              abs(RIDGE_LON_MIN), abs(RIDGE_LON_MAX),
+                              RIDGE_LAT_MIN, RIDGE_LAT_MAX),
+                      "Z500 Ridge Anomaly vs. SPEI-6")
 
 p_sc2 <- make_scatter(scatter_df, "slp_nwbc",
-                       sprintf("SLP Anomaly (hPa)\nNW BC (%d–%d°W, %d–%d°N)",
-                               abs(RIDGE_LON_MIN), abs(RIDGE_LON_MAX),
-                               RIDGE_LAT_MIN, RIDGE_LAT_MAX),
-                       "SLP Anomaly vs. SPEI-6")
+                      sprintf("SLP Anomaly (hPa)\nNW BC (%d–%d°W, %d–%d°N)",
+                              abs(RIDGE_LON_MIN), abs(RIDGE_LON_MAX),
+                              RIDGE_LAT_MIN, RIDGE_LAT_MAX),
+                      "SLP Anomaly vs. SPEI-6")
 
 p_sc3 <- make_scatter(scatter_df, "sst_nepac",
-                       sprintf("SST Anomaly (°C)\nNE Pacific (%d–%d°W, %d–%d°N)",
-                               abs(SST_MEAN_LON_MIN), abs(SST_MEAN_LON_MAX),
-                               SST_MEAN_LAT_MIN, SST_MEAN_LAT_MAX),
-                       "NE Pacific SST Anomaly vs. SPEI-6")
+                      sprintf("SST Anomaly (°C)\nNE Pacific (%d–%d°W, %d–%d°N)",
+                              abs(SST_MEAN_LON_MIN), abs(SST_MEAN_LON_MAX),
+                              SST_MEAN_LAT_MIN, SST_MEAN_LAT_MAX),
+                      "NE Pacific SST Anomaly vs. SPEI-6")
 
 p_scatter <- (p_sc1 | p_sc2 | p_sc3) +
   plot_annotation(
@@ -915,16 +1010,16 @@ make_composite_map <- function(r, lim, var_label, unit, xlim, ylim) {
 }
 
 p_sum1 <- make_composite_map(z500_diff, lim_z,
-                              "Z500 Anomaly Difference (m)\nDrought minus Non-drought",
-                              "Z500\n(m)", c(-180, -100), c(40, 70))
+                             "Z500 Anomaly Difference (m)\nDrought minus Non-drought",
+                             "Z500\n(m)", c(-180, -100), c(40, 70))
 
 p_sum2 <- make_composite_map(slp_diff, lim_sl,
-                              "SLP Anomaly Difference (hPa)\nDrought minus Non-drought",
-                              "SLP\n(hPa)", c(-180, -100), c(40, 70))
+                             "SLP Anomaly Difference (hPa)\nDrought minus Non-drought",
+                             "SLP\n(hPa)", c(-180, -100), c(40, 70))
 
 p_sum3 <- make_composite_map(sst_diff_r, lim_ss,
-                              "SST Anomaly Difference (°C)\nDrought minus Non-drought",
-                              "SST\n(°C)", c(-180, -110), c(20, 65))
+                             "SST Anomaly Difference (°C)\nDrought minus Non-drought",
+                             "SST\n(°C)", c(-180, -110), c(20, 65))
 
 p_summary_panel <- (p_sum1 / p_sum2 / p_sum3) +
   plot_annotation(
