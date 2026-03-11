@@ -19,7 +19,7 @@
 # METHODOLOGY NOTE:
 #   Step 1 — SPI/SPEI/SWEI are computed per-pixel by 1SPI_ERALand.R /
 #             3SPEI_ERALand.R; results live in seasonal NetCDF files.
-#   Step 2 — w*_trend_test.R area-weights per-pixel values with
+#   Step 2 — w1_trend_test.R area-weights per-pixel values with
 #             terra::cellSize() in BC Albers (EPSG:3005) and writes
 #             {index}_{scale:02d}_basin_averaged_by_month.csv.
 #   Step 3 — This script reads those authoritative CSVs.
