@@ -40,15 +40,18 @@ MONTH_NAMES    <- c("Jan", "Feb", "Mar", "Apr", "May", "Jun",
 #' Load a pre-computed basin-averaged drought index CSV and return a tidy
 #' long-format data.frame(date, value).
 #'
-#' These CSVs are produced by the SPI / SPEI / SWEI calculation scripts with
-#' the naming convention  {index}_{scale:02d}_basin_averaged_by_month.csv
-#' and have the structure:
+#' AUTHORITATIVE SOURCE: these CSVs are produced by w1_trend_test.R via
+#' save_basin_avg_from_pixels() (see Section B2 below).  The methodology is:
+#'   (1) compute the drought index at every basin pixel from per-pixel inputs,
+#'   (2) take the area-weighted spatial mean of those pixel-level index values.
+#' This is the standard hydrometeorological approach: area-weighted averaging
+#' of standardised index values that were calibrated on the same spatial basis.
+#' Run w1_trend_test.R before w1_basin_timeseries.R.
+#'
+#' File naming convention: {index}_{scale:02d}_basin_averaged_by_month.csv
+#' File structure:
 #'   Year | Jan | Feb | Mar | … | Dec
 #'   1950 | -1.88 |  NA | …
-#'
-#' This is the CORRECT source for any basin-level time series analysis because
-#' the indices were computed from basin-averaged climate inputs (correct), NOT
-#' by spatially averaging per-pixel indices (incorrect for standardised indices).
 #'
 #' @param index_type  "spi", "spei", or "swei"
 #' @param scale       Integer timescale (e.g. 1, 3, 6, 12)
@@ -56,7 +59,7 @@ MONTH_NAMES    <- c("Jan", "Feb", "Mar", "Apr", "May", "Jun",
 #'                    seasonal directory from section A is used automatically.
 #' @return data.frame with columns \code{date} (Date) and \code{value} (numeric),
 #'         sorted by date with NA rows removed.  Returns NULL with a warning if
-#'         the file is not found.
+#'         the file is not found (usually means w3 has not been run yet).
 load_basin_avg_csv <- function(index_type, scale, data_dir = NULL) {
   dir_map <- list(spi = SPI_SEAS_DIR, spei = SPEI_SEAS_DIR, swei = SWEI_SEAS_DIR)
   dir     <- if (!is.null(data_dir)) data_dir else {
@@ -89,7 +92,95 @@ load_basin_avg_csv <- function(index_type, scale, data_dir = NULL) {
   long
 }
 
-## B2. PACKAGE BOOTSTRAP ──────────────────────────────────────────────
+## B2. BASIN-AVERAGED CSV WRITER ────────────────────────────────────
+#' Compute an area-weighted basin-average time series from a pixel × month
+#' matrix and write the result as the standard basin_averaged_by_month.csv
+#' expected by load_basin_avg_csv().
+#'
+#' Called by w1_trend_test.R::process_index() after the pixel time-series
+#' matrix has been assembled.  The area weights are the equal-area cell sizes
+#' extracted from the raster template (already in EPSG:3005).
+#'
+#' Methodology:
+#'   basin_avg[t] = Σ( index_value[pixel, t] × cell_area[pixel] )
+#'                / Σ( cell_area[pixel] )          (sum over non-NA pixels)
+#'
+#' @param ts_matrix   Numeric matrix (n_valid_pixels × n_months).  Rows
+#'                    correspond to valid basin pixels; columns to calendar
+#'                    months in chronological order.
+#' @param area_weights Numeric vector of length n_valid_pixels; cell areas in
+#'                    m² in the equal-area CRS (from terra::cellSize on the
+#'                    BC Albers projected raster template).
+#' @param dates       Date vector of length n_months giving the first day of
+#'                    each month represented by a column of ts_matrix.
+#' @param index_type  "spi", "spei", "swei", or any other index key.
+#' @param scale       Integer timescale (e.g. 1, 3, 6, 12).
+#' @param out_dir     Directory to write the CSV.  Should be the index-specific
+#'                    seasonal results directory (SPI_SEAS_DIR etc.) so that
+#'                    load_basin_avg_csv() can find it without specifying data_dir.
+#' @return Invisible data.frame (Year × month-name columns) as written to disk.
+save_basin_avg_from_pixels <- function(ts_matrix, area_weights, dates,
+                                       index_type, scale, out_dir) {
+  ## ── Input validation ───────────────────────────────────────────────
+  if (!is.matrix(ts_matrix))
+    stop("ts_matrix must be a numeric matrix (pixels × months)")
+  if (nrow(ts_matrix) != length(area_weights))
+    stop(sprintf(
+      "ts_matrix has %d rows but area_weights has %d elements",
+      nrow(ts_matrix), length(area_weights)))
+  if (ncol(ts_matrix) != length(dates))
+    stop(sprintf(
+      "ts_matrix has %d columns but dates has %d elements",
+      ncol(ts_matrix), length(dates)))
+  
+  ## ── Guard: replace zero / negative / NA areas with column median ───
+  bad_w <- is.na(area_weights) | !is.finite(area_weights) | area_weights <= 0
+  if (any(bad_w)) {
+    med_w <- median(area_weights[!bad_w], na.rm = TRUE)
+    area_weights[bad_w] <- if (is.finite(med_w) && med_w > 0) med_w else 1
+    warning(sprintf(
+      "save_basin_avg_from_pixels: %d bad area weight(s) replaced with %.0f m²",
+      sum(bad_w), area_weights[which(bad_w)[1]]))
+  }
+  
+  ## ── Area-weighted mean for every time step ─────────────────────────
+  basin_avg <- vapply(seq_len(ncol(ts_matrix)), function(t) {
+    v  <- ts_matrix[, t]
+    ok <- !is.na(v) & is.finite(v)
+    if (!any(ok)) return(NA_real_)
+    sum(v[ok] * area_weights[ok]) / sum(area_weights[ok])
+  }, numeric(1L))
+  
+  ## ── Reshape to Year × Month wide format ────────────────────────────
+  yrs <- as.integer(format(dates, "%Y"))
+  mos <- as.integer(format(dates, "%m"))
+  all_years <- sort(unique(yrs))
+  
+  df <- data.frame(Year = all_years, stringsAsFactors = FALSE)
+  for (mi in seq_along(MONTH_NAMES)) {
+    col_vals <- rep(NA_real_, length(all_years))
+    hits <- which(mos == mi)
+    for (h in hits) {
+      row_idx <- match(yrs[h], all_years)
+      if (!is.na(row_idx)) col_vals[row_idx] <- basin_avg[h]
+    }
+    df[[MONTH_NAMES[mi]]] <- col_vals
+  }
+  
+  ## ── Write CSV ───────────────────────────────────────────────────────
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  out_file <- file.path(
+    out_dir,
+    sprintf("%s_%02d_basin_averaged_by_month.csv",
+            tolower(index_type), as.integer(scale)))
+  utils::write.csv(df, out_file, row.names = FALSE)
+  cat(sprintf(
+    "  ✓ Basin-avg CSV written (area-weighted, %d pixels, %d months): %s\n",
+    nrow(ts_matrix), ncol(ts_matrix), basename(out_file)))
+  invisible(df)
+}
+
+## B3. PACKAGE BOOTSTRAP ──────────────────────────────────────────────
 utils_load_packages <- function(pkgs) {
   missing <- pkgs[!sapply(pkgs, requireNamespace, quietly = TRUE)]
   if (length(missing)) {
@@ -148,12 +239,12 @@ extract_dates_from_nc <- function(nc_file, n_layers = NULL) {
     NULL
   }, error = function(e) NULL)
   if (is.null(dates)) {
-    cat("  [dates] Using fallback monthly sequence (Jan 1954)\n")
-    d  <- seq(as.Date("1954-01-01"), by = "month", length.out = n_layers)
-    if (tail(d, 1) > as.Date("2024-12-31")) {
-      end  <- as.Date("2024-12-01")
-      start  <- end - lubridate::months(n_layers - 1)
-      d  <- seq(start, by = "month", length.out = n_layers)
+    cat("  [dates] Using fallback monthly sequence (Jan 1950)\n")
+    d <- seq(as.Date("1950-01-01"), by = "month", length.out = n_layers)
+    if (tail(d, 1) > as.Date("2025-12-31")) {
+      end <- as.Date("2025-12-01")
+      start <- end - lubridate::months(n_layers - 1)
+      d <- seq(start, by = "month", length.out = n_layers)
     }
     d
   } else dates

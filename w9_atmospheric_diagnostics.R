@@ -2,13 +2,6 @@
 #  w9_atmospheric_diagnostics.R
 #  Nechako Watershed Drought — Atmospheric Pattern Diagnostics
 #
-#  Purpose (per research lead):
-#    1. 500 hPa geopotential height anomalies associated with drought,
-#       month-by-month relative to 1991-2020 reference period
-#    2. SLP patterns during drought months vs. background
-#    3. NE Pacific SST over recent years relative to historical conditions
-#    4. Joint plots linking atmospheric fields to drought severity
-#
 #  Index coverage:
 #    ALL available SPI and SPEI timescales in the project pipeline
 #    (SPI 1, 3, 6, 12 and SPEI 1, 3, 6, 12 by default; scale 9 loaded if
@@ -19,18 +12,6 @@
 #    allows comparison of which atmospheric patterns are robustly
 #    associated with drought regardless of scale, and which only emerge
 #    at longer accumulation periods.
-#
-#  Notes on specific changes from earlier versions:
-#    - Yellow watershed centroid marker removed from all maps.  The
-#      Nechako watershed (~54 N, 124 W) is too small to be meaningfully
-#      located on synoptic-scale maps (domain 40-70 N, 100-180 W); readers
-#      are referred to the study area map in the manuscript.
-#    - Monthly composite figures (01, 05, 10) now always show all 12
-#      calendar months.  Months with no drought occurrences render as grey
-#      (n=0) instead of being silently omitted.  This avoids confusion about
-#      missing panels.
-#    - Severity-stratified composites (former 03, 07) removed.
-#    - Exact drought month tables added for every index (T0).
 #
 #  Output structure:
 #    {OUT_DIR}/
@@ -757,21 +738,54 @@ for (def in DROUGHT_DEFS) {
     plot_dual_panel_ts <- function(dates, top_ts, bot_ts, drought_mask,
                                    top_label, bot_label,
                                    title_txt, subtitle_txt,
-                                   def, thr_lbl) {
+                                   def, thr_lbl,
+                                   index_label = NULL) {   # <-- add this argument
       
-      roll_k <- 12   # 12-month rolling mean for smoothing
+      roll_k <- 12
       
-      df <- tibble(
-        date      = dates,
-        top       = top_ts,
-        bot       = bot_ts,
+      # ── Scale-aware LOESS span ─────────────────────────────────────────────────
+      # Span decreases with accumulation scale because the index already carries
+      # built-in temporal smoothing.  Target: ~5-year effective bandwidth for
+      # ENSO-to-PDO tele-climatic signal detection.
+      loess_span_map <- c("1"  = 0.10,   # SPI1 / SPEI1  — no built-in smoothing
+                          "3"  = 0.08,   # SPI3 / SPEI3
+                          "6"  = 0.07,   # SPI6 / SPEI6
+                          "9"  = 0.06,   # SPI9 / SPEI9
+                          "12" = 0.05)   # SPI12 / SPEI12 — already ~1 year smooth
+      
+      sc_key   <- as.character(as.integer(regmatches(
+        index_label, regexpr("[0-9]+$", index_label))))
+      bot_span <- if (!is.null(index_label) && sc_key %in% names(loess_span_map)) {
+        loess_span_map[[sc_key]]
+      } else {
+        0.08   # safe fallback
+      }
+      
+      # ── inside plot_dual_panel_ts(), replace the two separate df <- tibble(...) blocks
+      # with this single one ──────────────────────────────────────────────────────────
+      
+      df_raw <- tibble(
+        date       = dates,
+        top        = top_ts,
+        bot        = bot_ts,
         is_drought = drought_mask
       ) %>%
         filter(!is.na(top), !is.na(bot)) %>%
-        arrange(date) %>%
+        arrange(date)
+      
+      # LOESS smooth for bottom panel (scale-aware span, degree-2)
+      loess_fit <- loess(
+        bot ~ as.numeric(date),
+        data      = df_raw,
+        span      = bot_span,
+        degree    = 2,
+        na.action = na.exclude
+      )
+      
+      df <- df_raw %>%
         mutate(
           top_smooth = rollmean(top, k = roll_k, fill = NA, align = "center"),
-          bot_smooth = rollmean(bot, k = roll_k, fill = NA, align = "center")
+          bot_smooth = predict(loess_fit, newdata = data.frame(date = as.numeric(date)))
         )
       
       # Drought period rectangles (for background shading)
@@ -845,9 +859,12 @@ for (def in DROUGHT_DEFS) {
         scale_y_continuous(name = bot_label) +
         labs(
           x       = NULL,
-          caption = paste0("Red shading = drought periods.  Ribbon = monthly values; ",
-                           "dark line = 12-month centred rolling mean.\n",
-                           "Def: ", thr_lbl)
+          caption = paste0(
+            "Red shading = drought periods.  Ribbon = monthly values.\n",
+            "Upper panel line = 12-month centred moving average.  ",
+            "Lower panel line = LOESS smooth (span = ", bot_span, ", degree = 2).  ",
+            "Def: ", thr_lbl
+          )
         ) +
         base_theme
       
@@ -939,7 +956,8 @@ for (def in DROUGHT_DEFS) {
                              RIDGE_LAT_MIN, RIDGE_LAT_MAX,
                              CLIM_START, CLIM_END),
       def          = def,
-      thr_lbl      = thr_lbl
+      thr_lbl      = thr_lbl,
+      index_label   = lbl   
     )
     ggsave(file.path(fig_dir, "04_z500_timeseries_ridge.png"),
            p04, width = FIGURE_WIDTH_WIDE, height = 7, dpi = FIGURE_DPI)

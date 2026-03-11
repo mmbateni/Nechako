@@ -1,14 +1,6 @@
 ####################################################################################
 # w5_gif_animations.R  ·  ANIMATED GIFS FOR ALL INDICES  (Optimised & Enhanced)
 ####################################################################################
-# Key improvements over the original:
-#  • terra::values(mat=TRUE) + terra::crds() — no layer-name deduplication risk
-#  • Manual frame loop replaces gganimate — no hidden 1.84 M-row subsetting stall
-#  • ragg::agg_png — faster PNG device than base png() (no cairo overhead)
-#  • gifski::gifski — single Rust-based encoding pass at the end (no magick)
-#  • scico "vik" — perceptually-uniform diverging palette
-#  • ggspatial — scale bar + north arrow on every frame
-#  • cli — real per-frame progress bar with elapsed time and ETA
 ####################################################################################
 
 setwd("D:/Nechako_Drought/Nechako/")

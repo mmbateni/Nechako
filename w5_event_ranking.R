@@ -32,7 +32,7 @@ DURATION_CLASSES <- list(
   long    = c(13, 999, "D12+ (Long-term)")
 )
 
-# Indices and scales to analyze (match w3 output)
+# Indices and scales to analyze (match w1 output)
 INDICES_TO_ANALYZE <- list(
   list(index = "spi", scales = c(3, 6, 12)),
   list(index = "spei", scales = c(3, 6, 12)),
@@ -58,7 +58,7 @@ classify_duration <- function(duration_months) {
 
 #' Calculate severity (intensity × duration)
 calc_severity <- function(intensity, duration) {
-  abs(intensity) * duration
+  intensity * duration
 }
 
 #' Estimate return period from empirical frequency
@@ -67,8 +67,8 @@ calc_return_period <- function(event_rank, n_years_record) {
   (n_years_record + 1) / event_rank
 }
 
-#' Load event catalog from w3 output
-#' FIX: use same filename pattern as w3_trend_test.R (uppercase index, hyphen)
+#' Load event catalog from w1 output
+#' FIX: use same filename pattern as w1_trend_test.R (uppercase index, hyphen)
 load_event_catalog <- function(index_type, scale) {
   label <- sprintf("%s-%02d", toupper(index_type), scale)
   file_path <- file.path(TREND_DIR, "basin_extent",
@@ -130,7 +130,7 @@ for (idx_info in INDICES_TO_ANALYZE) {
 }
 
 if (length(all_events) == 0) {
-  stop("No event catalogs found. Please run w3_trend_test.R first.")
+  stop("No event catalogs found. Please run w1_trend_test.R first.")
 }
 
 # Merge all catalogs
@@ -151,7 +151,7 @@ cat("PART 2: Calculating Ranking Metrics\n")
 cat("══════════════════════════════════════\n")
 
 # Calculate severity
-master_events$severity <- calc_severity(master_events$mean_severity,
+master_events$severity <- calc_severity(master_events$mean_int,
                                         master_events$duration_months)
 
 # Classify duration
@@ -204,7 +204,7 @@ cat("═════════════════════════
 
 # Select columns for export
 export_cols <- c("index_label", "start_date", "end_date", "start_year",
-                 "duration_months", "duration_class", "mean_severity",
+                 "duration_months", "duration_class", "mean_int",
                  "severity", "rank_by_severity", "return_period_years",
                  "percentile_rank", "is_recent")
 
@@ -228,7 +228,7 @@ rp_table <- master_events %>%
   dplyr::summarise(
     n_events         = dplyr::n(),
     mean_duration_mo = round(mean(duration_months, na.rm = TRUE), 1),
-    mean_I           = round(mean(mean_severity,   na.rm = TRUE), 4),  # S&W intensity
+    mean_I           = round(mean(mean_int,   na.rm = TRUE), 4),  # S&W intensity
     mean_S           = round(mean(severity,        na.rm = TRUE), 3),  # S&W severity
     max_S            = round(max(severity,         na.rm = TRUE), 3),
     .groups = "drop"
@@ -510,7 +510,7 @@ duration_summary <- primary_events %>%
   summarise(
     n_events = n(),
     mean_duration = mean(duration_months),
-    mean_severity = mean(severity),
+    mean_severity = mean(mean_S),
     max_severity = max(severity),
     .groups = "drop"
   ) %>%
@@ -840,248 +840,249 @@ extract_pixel_events_sw <- function(x, onset = DROUGHT_ONSET, end_thr = DROUGHT_
 idx_parts_p <- strsplit(PRIMARY_INDEX, "_")[[1]]
 idx_type_p  <- idx_parts_p[1]
 idx_scale_p <- as.integer(idx_parts_p[2])
-results_csv <- file.path(TREND_DIR,
-                         sprintf("%s_%02d_results.csv", idx_type_p, idx_scale_p))
+
+# Part 5b reads the time-series RDS written by w1_trend_test.R (not the results
+# CSV, which deliberately omits raw time-series to stay lightweight).
+ts_rds_file <- file.path(TREND_DIR,
+                         sprintf("%s_%02d_timeseries.rds", idx_type_p, idx_scale_p))
 
 rank_map_done <- FALSE
 
-if (file.exists(results_csv)) {
-  cat(sprintf("  Loading pixel results: %s\n", basename(results_csv)))
+if (file.exists(ts_rds_file)) {
+  cat(sprintf("  Loading pixel time-series matrix: %s\n", basename(ts_rds_file)))
   
-  pix_dt <- tryCatch(
-    data.table::fread(results_csv, showProgress = FALSE),
+  ts_obj <- tryCatch(
+    readRDS(ts_rds_file),
     error = function(e) {
-      cat(sprintf("  ⚠ Could not load results CSV: %s\n", e$message))
+      cat(sprintf("  ⚠ Could not load time-series RDS: %s\n", e$message))
       NULL
     }
   )
   
-  if (!is.null(pix_dt)) {
-    time_cols <- grep("^time_", names(pix_dt), value = TRUE)
-    n_tcols   <- length(time_cols)
-    cat(sprintf("  Pixels: %d  |  Time columns: %d\n", nrow(pix_dt), n_tcols))
+  if (!is.null(ts_obj)) {
+    ts_mat_p        <- ts_obj$ts_mat
+    lon_p           <- ts_obj$lon
+    lat_p           <- ts_obj$lat
+    record_start_yr <- ts_obj$record_start_year %||% 1950L
+    n_tcols         <- ncol(ts_mat_p)
+    n_pix_p         <- nrow(ts_mat_p)
     
-    if (n_tcols >= 12L) {
-      # Determine which time columns fall in 2022-2025
-      record_start_yr <- tryCatch(get("RECORD_START_YEAR"), error = function(e) 1950L)
-      col_2022_start  <- (2022L - record_start_yr) * 12L + 1L
-      col_2025_end    <- min((2025L - record_start_yr + 1L) * 12L, n_tcols)
-      
-      if (col_2022_start < 1L || col_2022_start > n_tcols) {
-        cat("  ⚠ 2022-2025 columns out of range for this record – skipping rank map\n")
-      } else {
-        ts_mat_p <- as.matrix(pix_dt[, time_cols, with = FALSE])
-        n_pix_p  <- nrow(ts_mat_p)
-        cat(sprintf("  Computing per-pixel event catalogs (onset < %.1f)...\n", DROUGHT_ONSET))
-        
-        rank_vec  <- rep(NA_real_, n_pix_p)
-        sev_2022  <- rep(NA_real_, n_pix_p)
-        n_hist    <- rep(NA_integer_, n_pix_p)
-        
-        for (i in seq_len(n_pix_p)) {
-          full_ts   <- ts_mat_p[i, ]
-          hist_ts   <- full_ts
-          
-          idx_22_25 <- seq(col_2022_start, col_2025_end)
-          ts_22_25  <- full_ts[idx_22_25]
-          
-          ev_all    <- extract_pixel_events_sw(hist_ts)
-          ev_recent <- extract_pixel_events_sw(ts_22_25)
-          
-          if (nrow(ev_recent) == 0L || nrow(ev_all) == 0L) next
-          
-          s_recent <- max(ev_recent$S, na.rm = TRUE)
-          sev_2022[i] <- s_recent
-          
-          n_less      <- sum(ev_all$S < s_recent, na.rm = TRUE)
-          rank_vec[i] <- 100 * n_less / nrow(ev_all)
-          n_hist[i]   <- nrow(ev_all)
-        }
-        
-        # Assemble output data frame
-        rank_df <- data.frame(
-          lon           = pix_dt$lon,
-          lat           = pix_dt$lat,
-          severity_2022 = sev_2022,
-          pct_rank_2022 = rank_vec,
-          n_hist_events = n_hist
-        )
-        write.csv(rank_df,
-                  file.path(RANKING_DIR, "pixel_rank_2022-2025.csv"),
-                  row.names = FALSE)
-        cat("  ✓ Saved: pixel_rank_2022-2025.csv\n")
-        
-        # Build rasters
-        r_base <- tryCatch(terra::rast(r_tmpl_path <- file.path(
-          TREND_DIR, sprintf("%s_%02d_D12p_pixel_frequency.nc", idx_type_p, idx_scale_p)
-        )), error = function(e) NULL)
-        
-        if (is.null(r_base)) {
-          r_base <- terra::rast(
-            xmin = min(rank_df$lon) - 0.05, xmax = max(rank_df$lon) + 0.05,
-            ymin = min(rank_df$lat) - 0.05, ymax = max(rank_df$lat) + 0.05,
-            resolution = 0.1, crs = "EPSG:4326"
-          )
-          cat("  ℹ Using synthetic raster extent (D12p NC not found)\n")
-        }
-        
-        fill_raster <- function(base_r, df, col_name) {
-          r_out <- base_r[[1]]
-          terra::values(r_out) <- NA_real_
-          cell_ids <- terra::cellFromXY(r_out, cbind(df$lon, df$lat))
-          valid    <- !is.na(cell_ids)
-          terra::values(r_out)[cell_ids[valid]] <- df[[col_name]][valid]
-          r_out
-        }
-        
-        r_rank <- fill_raster(r_base, rank_df, "pct_rank_2022")
-        r_sev  <- fill_raster(r_base, rank_df, "severity_2022")
-        
-        names(r_rank) <- "pct_rank_2022_2025"
-        names(r_sev)  <- "severity_2022_2025"
-        
-        terra::writeCDF(
-          c(r_rank, r_sev),
-          file.path(RANKING_DIR, "pixel_rank_2022-2025.nc"),
-          overwrite = TRUE
-        )
-        cat("  ✓ Saved: pixel_rank_2022-2025.nc\n")
-        
-        # Two-panel PNG map
-        df_rank <- as.data.frame(r_rank, xy = TRUE, na.rm = TRUE)
-        df_sev  <- as.data.frame(r_sev,  xy = TRUE, na.rm = TRUE)
-        colnames(df_rank)[3] <- "pct_rank"
-        colnames(df_sev)[3]  <- "severity"
-        
-        basin_sf_plot <- tryCatch(
-          sf::st_as_sf(terra::vect(BASIN_SHP)),
-          error = function(e) NULL
-        )
-        
-        # ──────────────────────────────────────────────────────────────────────
-        # WHAT DOES "PERCENTILE RANK" MEAN IN THIS MAP?
-        # ──────────────────────────────────────────────────────────────────────
-        # For every grid pixel, we extracted the full time-series of the primary
-        # drought index (e.g. SPI-12) from HISTORICAL_START to HISTORICAL_END.
-        # Using the Sheffield & Wood (2008) event-identification algorithm
-        # (drought onset < DROUGHT_ONSET, termination ≥ DROUGHT_END) we built a
-        # catalogue of ALL discrete drought events at that pixel over the entire
-        # record.  Each event has a severity score S = mean_intensity × duration
-        # (where intensity = onset_threshold − index_value, always positive).
-        #
-        # For the 2022-2025 period we then isolated the sub-series (time columns
-        # col_2022_start : col_2025_end) and computed the maximum severity S_recent
-        # of any event detected within that window.
-        #
-        # The PERCENTILE RANK at each pixel is defined as:
-        #
-        #   pct_rank = 100 × (#historical events with S < S_recent) / #total events
-        #
-        # Interpretation:
-        #   • pct_rank = 90  → the 2022-2025 drought was more severe than 90 % of
-        #                       all historical droughts at that pixel.  In other
-        #                       words it is approximately a 1-in-10 event locally.
-        #   • pct_rank = 99  → exceeds 99 % of the record; roughly a 1-in-75-year
-        #                       event (given a ~75-year record).
-        #   • pct_rank = 0   → the 2022-2025 event is the mildest on record there.
-        #   • NA (grey)      → no drought event was detected at that pixel for
-        #                       either the historical period or 2022-2025 (e.g.
-        #                       perennially wet pixels at high elevation).
-        #
-        # The colour scale uses plasma with direction = -1 so that high percentile
-        # ranks appear DARK (visually prominent) and near-zero ranks appear LIGHT.
-        # ──────────────────────────────────────────────────────────────────────
-        # WHAT DOES "SEVERITY (I × D)" MEAN IN THIS MAP?
-        # ──────────────────────────────────────────────────────────────────────
-        # Severity follows Sheffield & Wood (2008, J. Climate):
-        #   S = Ī × D
-        # where Ī = mean intensity over the event duration and D = duration in months.
-        # Intensity for a single month is: I_t = onset_threshold − index_value
-        # (positive when the index is below the drought-onset threshold).
-        #
-        # This means a pixel can have high severity because it was:
-        #   (a) extremely dry (high I) even for a short time, OR
-        #   (b) persistently in drought (high D) even at moderate intensity.
-        # The S map therefore captures the COMBINED space-time footprint of the
-        # 2022-2025 event and complements the percentile-rank map.
-        #
-        # The colour scale uses inferno with direction = -1 so that high severity
-        # values appear DARK — matching the convention of all other maps in this
-        # analysis where "darker = more extreme drought".
-        # ──────────────────────────────────────────────────────────────────────
-        
-        make_base_map <- function(df, aes_col, fill_label, palette, title_str) {
-          p <- ggplot2::ggplot() +
-            ggplot2::geom_raster(data = df,
-                                 ggplot2::aes(x = x, y = y, fill = .data[[aes_col]])) +
-            ggplot2::scale_fill_viridis_c(
-              option    = palette,
-              direction = -1,     # flip palette: HIGH values = DARK, low values = light.
-              # For pct_rank (0–100 %): high percentile = dark = most extreme.
-              # For severity  (I × D) : high severity  = dark = worst drought.
-              name      = fill_label,
-              na.value  = "grey90"
-            ) +
-            ggplot2::coord_sf() +
-            ggplot2::labs(title = title_str) +
-            ggplot2::theme_bw(base_size = 11) +
-            ggplot2::theme(
-              plot.title      = ggplot2::element_text(face = "bold"),
-              legend.position = "bottom",
-              axis.title      = ggplot2::element_blank()
-            )
-          if (!is.null(basin_sf_plot))
-            p <- p + ggplot2::geom_sf(data = basin_sf_plot, fill = NA,
-                                      colour = "black", linewidth = 0.6)
-          p
-        }
-        
-        p_rank_map <- make_base_map(
-          df_rank, "pct_rank",
-          "Percentile rank (%)",
-          "plasma",
-          "2022-2025 Drought: Percentile rank vs all historical events"
-        )
-        p_sev_map <- make_base_map(
-          df_sev, "severity",
-          "Severity (I × D)",
-          "inferno",
-          "2022-2025 Drought: Pixel-level S&W severity"
-        )
-        
-        p_rank_combo <- p_rank_map + p_sev_map +
-          patchwork::plot_annotation(
-            title    = "2022-2025 Drought — Pixel-Level Rank vs Historical Record",
-            subtitle = sprintf(
-              "%s  |  Percentile of 2022-2025 severity relative to all events at each pixel  |  %d–%d",
-              toupper(PRIMARY_INDEX), HISTORICAL_START, HISTORICAL_END
-            ),
-            theme = ggplot2::theme(
-              plot.title    = ggplot2::element_text(face = "bold", size = 14, hjust = 0.5),
-              plot.subtitle = ggplot2::element_text(colour = "grey40", size = 10, hjust = 0.5)
-            )
-          )
-        
-        ggplot2::ggsave(
-          file.path(RANKING_DIR, "Fig6_2022-2025_Pixel_Rank_Map.png"),
-          p_rank_combo, width = 14, height = 7, dpi = 300
-        )
-        cat("  ✓ Saved: Fig6_2022-2025_Pixel_Rank_Map.png\n")
-        rank_map_done <- TRUE
-        
-        cat(sprintf(
-          "  Basin-wide: median percentile = %.1f%%  |  %.1f%% of pixels at ≥ 75th pct\n",
-          median(rank_vec, na.rm = TRUE),
-          100 * mean(rank_vec >= 75, na.rm = TRUE)
-        ))
-      }
+    cat(sprintf("  Pixels: %d  |  Time columns: %d  |  Record start: %d\n",
+                n_pix_p, n_tcols, record_start_yr))
+    
+    col_2022_start  <- (2022L - record_start_yr) * 12L + 1L
+    col_2025_end    <- min((2025L - record_start_yr + 1L) * 12L, n_tcols)
+    
+    if (col_2022_start < 1L || col_2022_start > n_tcols) {
+      cat("  ⚠ 2022-2025 columns out of range for this record – skipping rank map\n")
     } else {
-      cat("  ⚠ Fewer than 12 time columns in results CSV – rank map skipped\n")
+      cat(sprintf("  Computing per-pixel event catalogs (onset < %.1f)...\n", DROUGHT_ONSET))
+      
+      rank_vec  <- rep(NA_real_, n_pix_p)
+      sev_2022  <- rep(NA_real_, n_pix_p)
+      n_hist    <- rep(NA_integer_, n_pix_p)
+      
+      for (i in seq_len(n_pix_p)) {
+        full_ts   <- ts_mat_p[i, ]
+        hist_ts   <- full_ts
+        
+        idx_22_25 <- seq(col_2022_start, col_2025_end)
+        ts_22_25  <- full_ts[idx_22_25]
+        
+        ev_all    <- extract_pixel_events_sw(hist_ts)
+        ev_recent <- extract_pixel_events_sw(ts_22_25)
+        
+        if (nrow(ev_recent) == 0L || nrow(ev_all) == 0L) next
+        
+        s_recent <- max(ev_recent$S, na.rm = TRUE)
+        sev_2022[i] <- s_recent
+        
+        n_less      <- sum(ev_all$S < s_recent, na.rm = TRUE)
+        rank_vec[i] <- 100 * n_less / nrow(ev_all)
+        n_hist[i]   <- nrow(ev_all)
+      }
+      
+      # Assemble output data frame
+      rank_df <- data.frame(
+        lon           = lon_p,
+        lat           = lat_p,
+        severity_2022 = sev_2022,
+        pct_rank_2022 = rank_vec,
+        n_hist_events = n_hist
+      )
+      write.csv(rank_df,
+                file.path(RANKING_DIR, "pixel_rank_2022-2025.csv"),
+                row.names = FALSE)
+      cat("  ✓ Saved: pixel_rank_2022-2025.csv\n")
+      
+      # Build rasters
+      r_base <- tryCatch(terra::rast(r_tmpl_path <- file.path(
+        TREND_DIR, sprintf("%s_%02d_D12p_pixel_frequency.nc", idx_type_p, idx_scale_p)
+      )), error = function(e) NULL)
+      
+      if (is.null(r_base)) {
+        r_base <- terra::rast(
+          xmin = min(rank_df$lon) - 0.05, xmax = max(rank_df$lon) + 0.05,
+          ymin = min(rank_df$lat) - 0.05, ymax = max(rank_df$lat) + 0.05,
+          resolution = 0.1, crs = "EPSG:4326"
+        )
+        cat("  ℹ Using synthetic raster extent (D12p NC not found)\n")
+      }
+      
+      fill_raster <- function(base_r, df, col_name) {
+        r_out <- base_r[[1]]
+        terra::values(r_out) <- NA_real_
+        cell_ids <- terra::cellFromXY(r_out, cbind(df$lon, df$lat))
+        valid    <- !is.na(cell_ids)
+        terra::values(r_out)[cell_ids[valid]] <- df[[col_name]][valid]
+        r_out
+      }
+      
+      r_rank <- fill_raster(r_base, rank_df, "pct_rank_2022")
+      r_sev  <- fill_raster(r_base, rank_df, "severity_2022")
+      
+      names(r_rank) <- "pct_rank_2022_2025"
+      names(r_sev)  <- "severity_2022_2025"
+      
+      terra::writeCDF(
+        c(r_rank, r_sev),
+        file.path(RANKING_DIR, "pixel_rank_2022-2025.nc"),
+        overwrite = TRUE
+      )
+      cat("  ✓ Saved: pixel_rank_2022-2025.nc\n")
+      
+      # Two-panel PNG map
+      df_rank <- as.data.frame(r_rank, xy = TRUE, na.rm = TRUE)
+      df_sev  <- as.data.frame(r_sev,  xy = TRUE, na.rm = TRUE)
+      colnames(df_rank)[3] <- "pct_rank"
+      colnames(df_sev)[3]  <- "severity"
+      
+      basin_sf_plot <- tryCatch(
+        sf::st_as_sf(terra::vect(BASIN_SHP)),
+        error = function(e) NULL
+      )
+      
+      # ──────────────────────────────────────────────────────────────────────
+      # WHAT DOES "PERCENTILE RANK" MEAN IN THIS MAP?
+      # ──────────────────────────────────────────────────────────────────────
+      # For every grid pixel, we extracted the full time-series of the primary
+      # drought index (e.g. SPI-12) from HISTORICAL_START to HISTORICAL_END.
+      # Using the Sheffield & Wood (2008) event-identification algorithm
+      # (drought onset < DROUGHT_ONSET, termination ≥ DROUGHT_END) we built a
+      # catalogue of ALL discrete drought events at that pixel over the entire
+      # record.  Each event has a severity score S = mean_intensity × duration
+      # (where intensity = onset_threshold − index_value, always positive).
+      #
+      # For the 2022-2025 period we then isolated the sub-series (time columns
+      # col_2022_start : col_2025_end) and computed the maximum severity S_recent
+      # of any event detected within that window.
+      #
+      # The PERCENTILE RANK at each pixel is defined as:
+      #
+      #   pct_rank = 100 × (#historical events with S < S_recent) / #total events
+      #
+      # Interpretation:
+      #   • pct_rank = 90  → the 2022-2025 drought was more severe than 90 % of
+      #                       all historical droughts at that pixel.  In other
+      #                       words it is approximately a 1-in-10 event locally.
+      #   • pct_rank = 99  → exceeds 99 % of the record; roughly a 1-in-75-year
+      #                       event (given a ~75-year record).
+      #   • pct_rank = 0   → the 2022-2025 event is the mildest on record there.
+      #   • NA (grey)      → no drought event was detected at that pixel for
+      #                       either the historical period or 2022-2025 (e.g.
+      #                       perennially wet pixels at high elevation).
+      #
+      # The colour scale uses plasma with direction = -1 so that high percentile
+      # ranks appear DARK (visually prominent) and near-zero ranks appear LIGHT.
+      # ──────────────────────────────────────────────────────────────────────
+      # WHAT DOES "SEVERITY (I × D)" MEAN IN THIS MAP?
+      # ──────────────────────────────────────────────────────────────────────
+      # Severity follows Sheffield & Wood (2008, J. Climate):
+      #   S = Ī × D
+      # where Ī = mean intensity over the event duration and D = duration in months.
+      # Intensity for a single month is: I_t = onset_threshold − index_value
+      # (positive when the index is below the drought-onset threshold).
+      #
+      # This means a pixel can have high severity because it was:
+      #   (a) extremely dry (high I) even for a short time, OR
+      #   (b) persistently in drought (high D) even at moderate intensity.
+      # The S map therefore captures the COMBINED space-time footprint of the
+      # 2022-2025 event and complements the percentile-rank map.
+      #
+      # The colour scale uses inferno with direction = -1 so that high severity
+      # values appear DARK — matching the convention of all other maps in this
+      # analysis where "darker = more extreme drought".
+      # ──────────────────────────────────────────────────────────────────────
+      
+      make_base_map <- function(df, aes_col, fill_label, palette, title_str) {
+        p <- ggplot2::ggplot() +
+          ggplot2::geom_raster(data = df,
+                               ggplot2::aes(x = x, y = y, fill = .data[[aes_col]])) +
+          ggplot2::scale_fill_viridis_c(
+            option    = palette,
+            direction = -1,     # flip palette: HIGH values = DARK, low values = light.
+            # For pct_rank (0–100 %): high percentile = dark = most extreme.
+            # For severity  (I × D) : high severity  = dark = worst drought.
+            name      = fill_label,
+            na.value  = "grey90"
+          ) +
+          ggplot2::coord_sf() +
+          ggplot2::labs(title = title_str) +
+          ggplot2::theme_bw(base_size = 11) +
+          ggplot2::theme(
+            plot.title      = ggplot2::element_text(face = "bold"),
+            legend.position = "bottom",
+            axis.title      = ggplot2::element_blank()
+          )
+        if (!is.null(basin_sf_plot))
+          p <- p + ggplot2::geom_sf(data = basin_sf_plot, fill = NA,
+                                    colour = "black", linewidth = 0.6)
+        p
+      }
+      
+      p_rank_map <- make_base_map(
+        df_rank, "pct_rank",
+        "Percentile rank (%)",
+        "plasma",
+        "2022-2025 Drought: Percentile rank vs all historical events"
+      )
+      p_sev_map <- make_base_map(
+        df_sev, "severity",
+        "Severity (I × D)",
+        "inferno",
+        "2022-2025 Drought: Pixel-level S&W severity"
+      )
+      
+      p_rank_combo <- p_rank_map + p_sev_map +
+        patchwork::plot_annotation(
+          title    = "2022-2025 Drought — Pixel-Level Rank vs Historical Record",
+          subtitle = sprintf(
+            "%s  |  Percentile of 2022-2025 severity relative to all events at each pixel  |  %d–%d",
+            toupper(PRIMARY_INDEX), HISTORICAL_START, HISTORICAL_END
+          ),
+          theme = ggplot2::theme(
+            plot.title    = ggplot2::element_text(face = "bold", size = 14, hjust = 0.5),
+            plot.subtitle = ggplot2::element_text(colour = "grey40", size = 10, hjust = 0.5)
+          )
+        )
+      
+      ggplot2::ggsave(
+        file.path(RANKING_DIR, "Fig6_2022-2025_Pixel_Rank_Map.png"),
+        p_rank_combo, width = 14, height = 7, dpi = 300
+      )
+      cat("  ✓ Saved: Fig6_2022-2025_Pixel_Rank_Map.png\n")
+      rank_map_done <- TRUE
+      
+      cat(sprintf(
+        "  Basin-wide: median percentile = %.1f%%  |  %.1f%% of pixels at ≥ 75th pct\n",
+        median(rank_vec, na.rm = TRUE),
+        100 * mean(rank_vec >= 75, na.rm = TRUE)
+      ))
     }
   }
 } else {
-  cat(sprintf("  ⚠ w3 results CSV not found: %s\n  → Run w3_trend_test.R first, then re-run w5.\n",
-              basename(results_csv)))
+  cat(sprintf("  ⚠ Time-series RDS not found: %s\n  → Run w1_trend_test.R first, then re-run w5.\n",
+              basename(ts_rds_file)))
 }
 
 if (!rank_map_done)
@@ -1115,7 +1116,7 @@ exec_summary <- data.frame(
             sum(primary_events$duration_class == "D12+ (Long-term)"),
             n_years_record / sum(primary_events$duration_class == "D12+ (Long-term)")),
     "See Fig5 for pixel-level severity map (mean, minimum, duration during 2022-2025).",
-    "Refer to w3_trend_test.R for Mann-Kendall trend analysis on frequency/intensity.",
+    "Refer to w1_trend_test.R for Mann-Kendall trend analysis on frequency/intensity.",
     sprintf("Rank #%d of %d events (%.1fth percentile, ~1-in-%.1f year event)",
             most_severe_recent$rank_by_severity[1] %||% NA,
             nrow(primary_events),

@@ -2,8 +2,8 @@
 # w7_teleconnection_prep.R  ·  TELECONNECTION DATA PREPARATION + GAM EXPLORATION
 ####################################################################################
 # Downloads and parses ONI, PDO, PNA. Produces QC plots and descriptive stats.
-# NEW: Section 6 runs predictor-level GAMs characterising pairwise nonlinear
-# relationships — informs k choices and concurvity diagnostics used in w7.
+# Section 6 runs predictor-level GAMs characterising pairwise nonlinear
+# relationships — informs k choices and concurvity diagnostics used.
 #
 # OUTPUTS (all to {WD_PATH}/teleconnections/):
 #   oni_monthly.csv / pdo_monthly.csv / pna_monthly.csv
@@ -13,7 +13,7 @@
 #   teleconnections_QC_plots.pdf        — 5 pages: TS / scatter / density / clim / ACF
 #   teleconnections_predictor_GAM.pdf   — NEW: pairwise predictor GAM smooths
 #
-# Run BEFORE: w7_moderated_mediation_gam.R
+# Run BEFORE: w8_moderated_mediation_gam.R
 # Depends on: DROUGHT_ANALYSIS_utils.R, utils_teleconnection_addon.R
 ####################################################################################
 

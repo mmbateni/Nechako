@@ -12,7 +12,11 @@ library(Kendall)
 library(future.apply)
 library(zoo)
 library(sf)
-library(changepoint)  # NEW: For PELT changepoint detection
+library(changepoint)  
+library(trend) 
+library(modifiedmk) 
+library(lubridate)
+
 
 # ================= USER / ENV =================
 setwd("D:/Nechako_Drought/Nechako/")
@@ -87,24 +91,6 @@ check_min_value_threshold <- function(ts_clean, min_val_threshold = 0.01, max_pc
   max_allowed <- if (is_precip) max_min_value_pct_precip else max_min_value_pct_pet
   exceeds_threshold <- pct_min_vals > max_allowed
   list(exceeds_threshold = exceeds_threshold, pct_min_vals = pct_min_vals)
-}
-
-calculate_sens_slope_manual <- function(x) {
-  n <- length(x)
-  if (n < 2) return(NA_real_)
-  slopes <- numeric()
-  for (i in 1:(n-1)) {
-    xi <- x[i]
-    if (is.na(xi)) next
-    for (j in (i+1):n) {
-      xj <- x[j]
-      if (!is.na(xj)) {
-        slopes <- c(slopes, (xj - xi) / (j - i))
-      }
-    }
-  }
-  if (!length(slopes)) return(NA_real_)
-  median(slopes, na.rm = TRUE)
 }
 
 calculate_variance_with_ties <- function(S, n, x) {
@@ -219,7 +205,6 @@ mk_tfpw_spectral_for_series <- function(ts_vec, is_precip, alpha, max_tie_pct,
                                         n_sim_spectral, conf_cache_env, start_year = NULL) {
   ts_clean <- na.omit(ts_vec)
   n <- length(ts_clean)
-  
   if (n < 10) {
     return(list(
       vc = list(tau = NA_real_, p = NA_real_, sl = NA_real_, S = NA_real_, varS = NA_real_,
@@ -236,7 +221,6 @@ mk_tfpw_spectral_for_series <- function(ts_vec, is_precip, alpha, max_tie_pct,
                  mean_before = NA_real_, mean_after = NA_real_, magnitude_shift = NA_real_)
     ))
   }
-  
   min_val_threshold <- if (is_precip) 0.0 else min_positive_value
   min_check <- check_min_value_threshold(
     ts_clean, min_val_threshold,
@@ -259,7 +243,6 @@ mk_tfpw_spectral_for_series <- function(ts_vec, is_precip, alpha, max_tie_pct,
                  mean_before = NA_real_, mean_after = NA_real_, magnitude_shift = NA_real_)
     ))
   }
-  
   n_unique <- length(unique(ts_clean))
   n_ties <- n - n_unique
   percent_ties <- (n_ties / n) * 100
@@ -279,9 +262,8 @@ mk_tfpw_spectral_for_series <- function(ts_vec, is_precip, alpha, max_tie_pct,
                  mean_before = NA_real_, mean_after = NA_real_, magnitude_shift = NA_real_)
     ))
   }
-  
-  sen_slope <- calculate_sens_slope_manual(ts_clean)
-  if (is.na(sen_slope) || is.infinite(sen_slope)) {
+  sen_slope <- trend::sens.slope(ts_clean)$coefficients
+  if (is.na(sen_slope) || is.infinite(sen_slope) || length(sen_slope) == 0) {
     return(list(
       vc = list(tau = NA_real_, p = NA_real_, sl = NA_real_, S = NA_real_, varS = NA_real_,
                 n = n, rho1 = NA_real_, vc_corrected = FALSE, n_ties = n_ties, percent_ties = percent_ties,
@@ -297,35 +279,35 @@ mk_tfpw_spectral_for_series <- function(ts_vec, is_precip, alpha, max_tie_pct,
                  mean_before = NA_real_, mean_after = NA_real_, magnitude_shift = NA_real_)
     ))
   }
-  
   time_index <- seq_len(n)
   trend_line <- sen_slope * time_index
   detrended <- ts_clean - trend_line
-  
   acf_result <- tryCatch(acf(detrended, lag.max = 1, plot = FALSE, na.action = na.pass),
                          error = function(e) NULL, warning = function(w) NULL)
   rho1 <- if (!is.null(acf_result)) acf_result$acf[2] else NA_real_
   
-  # Variance-corrected MK (VC)
-  s_mat <- sign(outer(ts_clean, ts_clean, `-`))
-  S_vc <- sum(s_mat[upper.tri(s_mat)], na.rm = TRUE)
-  varS_taub <- calculate_variance_with_ties(S_vc, n, ts_clean)
-  n_pairs <- n * (n - 1) / 2
-  tau_vc <- S_vc / n_pairs
+  # --- MODIFIED SECTION START: Variance-corrected MK (VC) using modifiedmk ---
   tau_b_adjusted <- (percent_ties > 5)
-  
   vc_corrected <- FALSE
-  varS_final <- varS_taub
-  if (!is.na(rho1) && abs(rho1) > 0.1) {
-    correction_factor <- 1 + (2 * rho1 * (n - 1 - 2 * (n - 1) * rho1 + 3 * rho1 * rho1)) /
-      ((n - 1) * (1 - rho1) * (1 - rho1))
-    varS_final <- varS_taub * correction_factor
-    vc_corrected <- TRUE
+  varS_final <- NA_real_
+  p_vc <- NA_real_
+  S_vc <- NA_real_
+  tau_vc <- NA_real_
+  
+  # Use modifiedmk::mk3 for Variance Corrected MK
+  vc_res <- tryCatch({
+    modifiedmk::mk3(ts_clean)
+  }, error = function(e) NULL)
+  
+  if (!is.null(vc_res)) {
+    tau_vc <- vc_res$tau
+    p_vc <- vc_res$p.value
+    S_vc <- vc_res$S
+    varS_final <- vc_res$varS
+    # Flag as corrected if significant autocorrelation exists (consistent with TFPW logic)
+    if (!is.na(rho1) && abs(rho1) > 0.1) vc_corrected <- TRUE
   }
-  p_vc <- if (varS_final <= 0) NA_real_ else {
-    z_stat <- S_vc / sqrt(varS_final)
-    2 * pnorm(-abs(z_stat))
-  }
+  # --- MODIFIED SECTION END ---
   
   vc_list <- list(
     tau = tau_vc, p = p_vc, sl = sen_slope, S = S_vc, varS = varS_final,
@@ -335,7 +317,7 @@ mk_tfpw_spectral_for_series <- function(ts_vec, is_precip, alpha, max_tie_pct,
     tau_b_adjusted = tau_b_adjusted, filtered = FALSE, reason = "none"
   )
   
-  # TFPW MK
+  # TFPW MK (Untouched)
   tfpw_applied <- FALSE
   if (!is.na(rho1) && abs(rho1) > 0.1) {
     pw <- numeric(n)
@@ -346,7 +328,6 @@ mk_tfpw_spectral_for_series <- function(ts_vec, is_precip, alpha, max_tie_pct,
   } else {
     corrected <- ts_clean
   }
-  
   s_mat_tf <- sign(outer(corrected, corrected, `-`))
   S_tf <- sum(s_mat_tf[upper.tri(s_mat_tf)], na.rm = TRUE)
   varS_tf <- calculate_variance_with_ties(S_tf, n, corrected)
@@ -355,7 +336,6 @@ mk_tfpw_spectral_for_series <- function(ts_vec, is_precip, alpha, max_tie_pct,
     z_stat <- S_tf / sqrt(varS_tf)
     2 * pnorm(-abs(z_stat))
   }
-  
   tf_list <- list(
     tau = tau_tf, p = p_tf, sl = sen_slope, S = S_tf, varS = varS_tf,
     n = n, rho1 = rho1, tfpw_applied = tfpw_applied,
@@ -364,12 +344,11 @@ mk_tfpw_spectral_for_series <- function(ts_vec, is_precip, alpha, max_tie_pct,
     tau_b_adjusted = tau_b_adjusted, filtered = FALSE, reason = "none"
   )
   
-  # Spectral analysis
+  # Spectral analysis (Untouched)
   dstd <- detrended - mean(detrended)
   sd_d <- stats::sd(dstd)
   if (!is.finite(sd_d) || sd_d == 0) sd_d <- 1
   dstd <- dstd / sd_d
-  
   key <- paste0("n_", n)
   if (!exists(key, envir = conf_cache_env, inherits = FALSE)) {
     max_spectra <- numeric(n_sim_spectral)
@@ -383,7 +362,6 @@ mk_tfpw_spectral_for_series <- function(ts_vec, is_precip, alpha, max_tie_pct,
     assign(key, stats::quantile(max_spectra, 1 - alpha, na.rm = TRUE), envir = conf_cache_env)
   }
   conf_limit <- get(key, envir = conf_cache_env, inherits = FALSE)
-  
   half <- floor(n / 2)
   ff <- fft(dstd)
   spectral_density <- Mod(ff[1:half])^2 / n
@@ -396,19 +374,17 @@ mk_tfpw_spectral_for_series <- function(ts_vec, is_precip, alpha, max_tie_pct,
     ord <- order(spectral_density[peak_idx], decreasing = TRUE)
     pp[ord]
   } else numeric(0)
-  
   spec_list <- list(
     n_peaks = length(peak_periods),
     dominant_period = if (length(peak_periods)) peak_periods[1] else NA_real_,
     conf = conf_limit
   )
   
-  # NEW: Apply PELT changepoint detection to the time series
+  # NEW: Apply PELT changepoint detection to the time series (Untouched)
   cpt_result <- detect_regime_shift_pelt(ts_clean, min_obs = min_obs_changepoint, start_year = start_year)
   
   list(vc = vc_list, tf = tf_list, spec = spec_list, cpt = cpt_result)
 }
-
 # ===== DATA LOADING & PREPROCESSING =====
 log_event("Loading precipitation and PET data...")
 precip_full <- rast(precip_path)
@@ -436,9 +412,8 @@ months_full <- as.integer(format(dates_full, "%m"))
 
 log_event("Computing days per month for each layer...")
 month_days_base <- c(31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
-is_leap <- function(year) (year %% 4 == 0) & (year %% 100 != 0 | year %% 400 == 0)
 days_in_month <- month_days_base[months_full]
-leap_years <- is_leap(years_full)
+leap_years <- lubridate::leap_year(years_full)
 days_in_month[leap_years & months_full == 2] <- 29
 
 # Convert from meters to millimeters (mm/day)
@@ -463,7 +438,7 @@ cat("Precipitation mean:", mean(values(precip_full), na.rm=TRUE), "\n")
 cat("=== PET AFTER × N.days CONVERSION (mm/month) ===\n")
 pet_min    <- min(global(pet_full,    "min", na.rm = TRUE))
 pet_max    <- max(global(pet_full,    "max", na.rm = TRUE))
-pet_mean    <- mean(global(pet_full,    "max", na.rm = TRUE))
+pet_mean    <- mean(global(pet_full,    "meanx", na.rm = TRUE))
 cat("PET – min:", pet_min, " max:", pet_max, "\n")
 cat("PET Mean:",pet_mean, "\n")
 
@@ -493,20 +468,8 @@ log_event(sprintf("✓ BASIN CLIPPING: %d bbox cells → %d basin pixels (%.1f%%
 if (n_basin_pixels == 0) stop("CRITICAL ERROR: No valid cells after basin clipping. Check CRS alignment.")
 
 log_event("Extracting time dimension...")
-dates <- NULL
-tryCatch({
-  dates_temp <- terra::time(precip_clipped)
-  if (!is.null(dates_temp) && length(dates_temp) > 0) {
-    dates <- dates_temp
-    log_event("Time extracted using terra::time()")
-  }
-}, error = function(e) {})
-if (is.null(dates) || length(dates) == 0 || all(is.na(dates))) {
-  n_layers <- nlyr(precip_clipped)
-  start_year <- 1950
-  dates <- seq(as.Date(paste0(start_year, "-01-01")), by = "month", length.out = n_layers)
-  log_event(paste("Generated", n_layers, "monthly dates from", start_year))
-}
+dates <- dates_full
+log_event(paste("Generated", n_layers, "monthly dates from", start_year))
 years  <- as.integer(format(dates, "%Y"))
 months <- as.integer(format(dates, "%m"))
 

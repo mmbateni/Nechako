@@ -47,7 +47,7 @@
 #    convergence_table_SPEI-6.csv    — side-by-side GAM vs MM results per lag
 #
 # Depends on: DROUGHT_ANALYSIS_utils.R, utils_teleconnection_addon.R
-# Run AFTER: w6_teleconnection_prep.R
+# Run AFTER: w7_teleconnection_prep.R
 ####################################################################################
 
 rm(list=ls()); gc()
@@ -709,7 +709,7 @@ cat(sprintf("  Saved: %s\n", basename(xlsx_out)))
 # DONE
 ####################################################################################
 cat("\n╔════════════════════════════════════════════════════════╗\n")
-cat("║  w7 COMPLETE                                           ║\n")
+cat("║  w8 COMPLETE                                           ║\n")
 cat("╚════════════════════════════════════════════════════════╝\n")
 cat(sprintf("  All outputs: %s\n\n", MM_DIR))
 cat("  KEY OUTPUTS:\n")

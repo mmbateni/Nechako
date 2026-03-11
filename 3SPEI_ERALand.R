@@ -9,7 +9,8 @@
 # ##############################################
 
 # ---- Libraries ----
-  library(terra)
+library(terra)
+library(lubridate)
 library(zoo)
 library(writexl)
 library(lmomco)  # Parametric distribution fitting via L-moments
@@ -81,15 +82,16 @@ cat("\n===== WATER BALANCE CALCULATION =====\n")
 wb <- precip - pet
 
 # Get number of days in each month
-days_in_month <- as.integer(format(seq(dates[1], by = "month", length.out = length(dates)) + 31, "%d"))
-
 # Alternative using a lookup table
 month_nums <- as.integer(format(dates, "%m"))
 year_nums <- as.integer(format(dates, "%Y"))
 days_in_month <- c(31,28,31,30,31,30,31,31,30,31,30,31)[month_nums]
+#days_in_month <- as.integer(format(seq(dates[1], by = "month", length.out = length(dates)) + 31, "%d"))
+
 
 # Adjust for leap years
-leap_years <- (year_nums %% 4 == 0 & year_nums %% 100 != 0) | (year_nums %% 400 == 0)
+#leap_years <- (year_nums %% 4 == 0 & year_nums %% 100 != 0) | (year_nums %% 400 == 0)
+leap_years <- lubridate::leap_year(year_nums)
 days_in_month[month_nums == 2 & leap_years] <- 29
 
 cat("✓ Converting from mm/day to mm/month (multiplying by days in month)...\n")
