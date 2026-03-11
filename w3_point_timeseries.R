@@ -1,5 +1,6 @@
 ####################################################################################
 # w3_point_timeseries.R  ·  POINT-BASED ANALYSIS FOR ALL INDICES
+# [FIXED VERSION — BUGFIX 2: find_swei_seasonal_files called without scale arg]
 # ─────────────────────────────────────────────────────────────────────────────────
 # Extracts time series at specific or randomly-selected grid points within the
 # Nechako Basin for SPI, SPEI (multiple scales) and SWEI and performs:
@@ -31,7 +32,7 @@
 #     too small and will inflate apparent significance.  It is flagged with the
 #     suffix _std and the companion column MK_significant_std to distinguish it
 #     clearly from the corrected version.  Do not cite or map MK_significant_std
-#     as an evidence of trend; always prefer MK_significant_vc.
+#     as evidence of trend; always prefer MK_significant_vc.
 #
 #   Sens_pvalue  (context)
 #     p-value from trend::sens.slope(), which applies a normal approximation to
@@ -109,12 +110,21 @@ select_points <- function() {
 # TIME SERIES EXTRACTION
 ####################################################################################
 #' Extract time series for one index at one point.
+#'
+#' BUGFIX 2: find_swei_seasonal_files() in DROUGHT_ANALYSIS_utils.R does not
+#' accept a `scale` argument.  The old code passed `scale` directly, which caused
+#' "argument 'scale' is missing, with no default" on every SWEI extraction call,
+#' silently returning NULL and skipping all SWEI plots and trend statistics.
+#' Fix: call find_swei_seasonal_files(data_dir) without the scale argument.
 extract_ts <- function(data_dir, index_type, scale, x, y, label) {
   cat(sprintf("    Extracting %s ...\n", label))
+  
+  # BUGFIX 2: SWEI file finder does not accept a scale argument
   files <- if (index_type == "swei")
-    find_swei_seasonal_files(data_dir, scale)
+    find_swei_seasonal_files(data_dir)   # ← no scale argument
   else
     find_seasonal_nc_files(data_dir, index_type, scale)
+  
   if (!length(files)) {
     cat(sprintf("      ⚠ No files found for %s\n", label))
     return(NULL)
@@ -298,11 +308,11 @@ make_trend_panel <- function(trend_res, label) {
       "MK:  τ=%.3f\n",
       "  p_vc=%.3f%s  ← use for inference\n",
       "  p_std=%.3f%s  [uncorrected, do not use]%s"),
-    st$LR_slope,        st$LR_pvalue,       ifelse(st$LR_significant,  "*", ""),
-    st$Sens_slope,      st$Sens_pvalue,     ifelse(st$Sens_significant, "*", ""),
+    st$LR_slope,      st$LR_pvalue,     ifelse(st$LR_significant,  "*", ""),
+    st$Sens_slope,    st$Sens_pvalue,   ifelse(st$Sens_significant, "*", ""),
     st$MK_tau,
-    st$MK_pvalue_vc,    ifelse(st$MK_significant_vc,  "*", ""),
-    st$MK_pvalue_std,   ifelse(st$MK_significant_std, "*", ""),
+    st$MK_pvalue_vc,  ifelse(st$MK_significant_vc,  "*", ""),
+    st$MK_pvalue_std, ifelse(st$MK_significant_std, "*", ""),
     note)
   
   ylm <- calc_dynamic_ylim(orig$Value)
@@ -310,10 +320,8 @@ make_trend_panel <- function(trend_res, label) {
   ggplot2::ggplot(orig, ggplot2::aes(Date, Value)) +
     ggplot2::geom_line(color = "steelblue", alpha = 0.6, na.rm = FALSE) +
     ggplot2::geom_point(color = "steelblue", size = 0.4, alpha = 0.4, na.rm = TRUE) +
-    # Linear regression fit
     ggplot2::geom_line(data = clean, ggplot2::aes(y = LR_fit),
                        color = "red", linewidth = 1, alpha = 0.8) +
-    # Sen's slope fit
     ggplot2::geom_line(data = clean, ggplot2::aes(y = Sens_fit),
                        color = "darkgreen", linewidth = 1,
                        linetype = "dashed", alpha = 0.8) +
@@ -379,7 +387,7 @@ make_swei_ts_plot <- function(all_ts, point, pt_id, outfile) {
 
 # ── 4-panel trend analysis: SPI1, SPI12, SPEI1, SPEI12 ───────────────
 make_trend_plot <- function(trend_list, labels, point, pt_id, outfile) {
-  plots    <- lapply(labels, function(lbl) make_trend_panel(trend_list[[lbl]], lbl))
+  plots <- lapply(labels, function(lbl) make_trend_panel(trend_list[[lbl]], lbl))
   combined <-
     ((plots[[1]] | plots[[2]]) /
        (plots[[3]] | plots[[4]])) +
@@ -429,10 +437,10 @@ proj_to_latlon <- function(x, y, from_crs) {
   list(lat = coords[1, 2], lon = coords[1, 1])
 }
 
-raster_crs           <- terra::crs(template_raster)
-selected_pts         <- select_points()
+raster_crs            <- terra::crs(template_raster)
+selected_pts          <- select_points()
 selected_pts$point_id <- seq_len(nrow(selected_pts))
-all_trend_stats      <- list()
+all_trend_stats       <- list()
 
 for (i in seq_len(nrow(selected_pts))) {
   pt  <- selected_pts[i, ]
@@ -460,20 +468,20 @@ for (i in seq_len(nrow(selected_pts))) {
       error = function(e) { cat("  ❌", lbl, ":", e$message, "\n"); NULL })
   }
   
-  # SWEI
+  # SWEI — BUGFIX 2 applies inside extract_ts (no scale passed to file finder)
   lbl <- sprintf("SWEI%d", SWEI_SCALE)
   ts_all[[lbl]] <- tryCatch(
     extract_ts(SWEI_SEAS_DIR, "swei", SWEI_SCALE, pt$x, pt$y, lbl),
     error = function(e) { cat("  ❌", lbl, ":", e$message, "\n"); NULL })
   
-  # ── Data gap diagnostics ──────────────────────────────────────────
+  # Data gap diagnostics
   cat("  Data gap diagnostics:\n")
   for (lbl in names(ts_all))
     if (!is.null(ts_all[[lbl]])) diagnose_data_gaps(ts_all[[lbl]], lbl)
   
   all_ts_df <- dplyr::bind_rows(ts_all)
   
-  # ── Trend analysis ────────────────────────────────────────────────
+  # Trend analysis
   cat("  Trend analysis:\n")
   trends <- lapply(names(ts_all), function(lbl) {
     if (is.null(ts_all[[lbl]])) return(NULL)
@@ -489,7 +497,7 @@ for (i in seq_len(nrow(selected_pts))) {
     all_trend_stats[[i]] <- pt_stats
   }
   
-  # ── Build coordinate-based file paths ──────────────────────────────
+  # Build coordinate-based file paths
   fn_base    <- sprintf("point_%d_%.4fN_%.4fW", pt$point_id, lat_disp, abs(lon_disp))
   f_1_12     <- file.path(POINT_PLOT_DIR, paste0(fn_base, "_ts_1_12mo.png"))
   f_3_6      <- file.path(POINT_PLOT_DIR, paste0(fn_base, "_ts_3_6mo.png"))
@@ -499,7 +507,7 @@ for (i in seq_len(nrow(selected_pts))) {
   
   pt_geo <- list(y = lat_disp, x = lon_disp, point_id = pt$point_id)
   
-  # ── Time series plots ─────────────────────────────────────────────
+  # Time series plots
   tryCatch(make_four_panel_ts(all_ts_df, 1, 12, pt_geo, pt$point_id, f_1_12),
            error = function(e) cat("  ⚠ 1&12 plot:", e$message, "\n"))
   tryCatch(make_four_panel_ts(all_ts_df, 3,  6, pt_geo, pt$point_id, f_3_6),
@@ -507,7 +515,7 @@ for (i in seq_len(nrow(selected_pts))) {
   tryCatch(make_swei_ts_plot(all_ts_df, pt_geo, pt$point_id, f_swei),
            error = function(e) cat("  ⚠ SWEI TS plot:", e$message, "\n"))
   
-  # ── Trend plots ───────────────────────────────────────────────────
+  # Trend plots
   trend_labels <- c("SPI1", "SPI12", "SPEI1", "SPEI12")
   avail        <- trends[intersect(trend_labels, names(trends))]
   if (length(avail) == 4)
@@ -536,15 +544,13 @@ if (length(all_trend_stats)) {
   smry <- stats_df |>
     dplyr::group_by(Index) |>
     dplyr::summarise(
-      n                  = dplyr::n(),
-      pct_complete       = mean(Completeness_pct,    na.rm = TRUE),
-      sig_LR             = sum(LR_significant,        na.rm = TRUE),
-      sig_Sens           = sum(Sens_significant,       na.rm = TRUE),
-      # Recommended: H-R98 variance-corrected MK
-      sig_MK_vc          = sum(MK_significant_vc,     na.rm = TRUE),
-      # Diagnostic only: uncorrected standard MK (not for inference)
-      sig_MK_std_DIAG    = sum(MK_significant_std,    na.rm = TRUE),
-      .groups            = "drop")
+      n               = dplyr::n(),
+      pct_complete    = mean(Completeness_pct,  na.rm = TRUE),
+      sig_LR          = sum(LR_significant,      na.rm = TRUE),
+      sig_Sens        = sum(Sens_significant,     na.rm = TRUE),
+      sig_MK_vc       = sum(MK_significant_vc,   na.rm = TRUE),
+      sig_MK_std_DIAG = sum(MK_significant_std,  na.rm = TRUE),
+      .groups         = "drop")
   print(as.data.frame(smry))
   cat("\n  Column sig_MK_std_DIAG is for diagnostic comparison only.\n")
   cat("  Use sig_MK_vc for any significance claims.\n")

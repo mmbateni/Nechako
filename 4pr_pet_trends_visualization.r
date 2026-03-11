@@ -7,6 +7,9 @@
 # - Method comparison plots
 # - Comprehensive statistical summaries
 # 
+# MODIFIED: 2026-03-11
+# - Force coordinate reconstruction for all pixel rows
+# - Guard against empty data in spatial pattern and method comparison plots
 ####################################################################################
 
 library(terra)
@@ -27,7 +30,7 @@ all_results <- readRDS(file.path("trend_analysis_pr_pet", "all_results.rds"))
 basin_boundary <- readRDS(file.path("trend_analysis_pr_pet", "basin_boundary.rds"))
 metadata <- readRDS(file.path("trend_analysis_pr_pet", "analysis_metadata.rds"))
 
-# FIX: Clean all column names (remove trailing spaces)
+# Clean column names (remove trailing spaces)
 names(all_results) <- trimws(names(all_results))
 names(metadata$basin_avg_monthly) <- trimws(names(metadata$basin_avg_monthly))
 names(metadata$basin_avg_annual) <- trimws(names(metadata$basin_avg_annual))
@@ -35,52 +38,27 @@ names(metadata$basin_avg_annual) <- trimws(names(metadata$basin_avg_annual))
 basin_avg_monthly <- metadata$basin_avg_monthly
 basin_avg_annual <- metadata$basin_avg_annual
 
-# ===== FIX MISSING X,Y COORDINATES =====
-cat("📍 Checking coordinate data...\n")
-has_valid_coords <- sum(!is.na(all_results$x) & !is.na(all_results$y)) > 0
-
-if (!has_valid_coords) {
-  cat("⚠️  WARNING: No valid x,y coordinates found in all_results!\n")
-  cat("   Attempting to reconstruct from saved raster template...\n")
+# ===== FORCE COORDINATE RECONSTRUCTION FOR ALL PIXEL ROWS =====
+# This ensures that every non‑basin‑average row gets correct x,y from the original template.
+template_file <- file.path(out_dir, "original_template.rds")
+if (file.exists(template_file)) {
+  original_template <- readRDS(template_file)
+  cat("📍 Reconstructing coordinates for all pixel rows from saved template...\n")
   
-  # Try to load the original template
-  template_file <- file.path(out_dir, "original_template.rds")
-  if (file.exists(template_file)) {
-    original_template <- readRDS(template_file)
-    cat(sprintf("   ✓ Loaded template: %d x %d cells\n", 
-                nrow(original_template), ncol(original_template)))
-    
-    # Get pixel data (non-basin-average rows)
-    pixel_data <- all_results[is_basin_average == FALSE]
-    
-    if (nrow(pixel_data) > 0) {
-      # Calculate cell centers from template
-      n_cells <- ncell(original_template)
-      n_pixels <- nrow(pixel_data)
-      
-      if (n_pixels == n_cells || n_pixels <= n_cells) {
-        # Generate coordinates from template
-        cell_indices <- 1:n_pixels
-        xy_coords <- xyFromCell(original_template, cell_indices)
-        
-        # Assign coordinates to pixel data
-        all_results[is_basin_average == FALSE, `:=`(x = xy_coords[,1], y = xy_coords[,2])]
-        
-        cat(sprintf("   ✓ Reconstructed coordinates for %d pixels\n", n_pixels))
-      } else {
-        cat(sprintf("   ⚠️  Pixel count mismatch: %d pixels vs %d template cells\n",
-                    n_pixels, n_cells))
-      }
-    }
+  pixel_idx <- which(all_results$is_basin_average == FALSE)
+  n_pixels <- length(pixel_idx)
+  n_cells <- ncell(original_template)
+  
+  if (n_pixels == n_cells) {
+    xy_coords <- xyFromCell(original_template, 1:n_cells)
+    all_results[pixel_idx, `:=`(x = xy_coords[,1], y = xy_coords[,2])]
+    cat(sprintf("   ✓ Assigned coordinates to %d pixels\n", n_pixels))
   } else {
-    cat("   ⚠️  Template file not found. Cannot reconstruct coordinates.\n")
+    cat(sprintf("   ⚠️  Pixel count (%d) ≠ template cells (%d). Cannot reconstruct coordinates.\n",
+                n_pixels, n_cells))
   }
-  
-  # Re-check
-  has_valid_coords <- sum(!is.na(all_results$x) & !is.na(all_results$y)) > 0
-  if (!has_valid_coords) {
-    stop("CRITICAL: Cannot proceed without valid coordinates. Re-run processing script.")
-  }
+} else {
+  cat("   ⚠️  Template file not found. Coordinates will not be reconstructed.\n")
 }
 
 # Verify key columns exist
@@ -126,7 +104,6 @@ for (analysis_name in names(analysis_cols)) {
     cat(sprintf("   ⚠️  %s (missing): %s\n", analysis_name, paste(missing, collapse=", ")))
   }
 }
-
 cat("\n")
 
 # ===== CREATE NATIVE-RESOLUTION TEMPLATE =====
@@ -135,10 +112,8 @@ pet_annual_sample <- all_results[variable == "PET" & period == "annual" &
                                    !filtered_vc & !is_basin_average & 
                                    !is.na(x) & !is.na(y)][1:1000]
 
-# Check if we have valid coordinates
 if (nrow(pet_annual_sample) == 0 || all(is.na(pet_annual_sample$x))) {
-  # Fallback: use basin boundary extent with default resolution
-  cat("⚠️  Using basin extent with default 1km resolution\n")
+  cat("⚠️  No valid PET pixel coordinates. Using basin extent with default 1km resolution\n")
   resolution_bc <- 1000
 } else {
   dx <- median(diff(sort(unique(pet_annual_sample$x))), na.rm = TRUE)
@@ -361,24 +336,26 @@ create_spectral_analysis_maps <- function() {
   return(pdf_path)
 }
 
-# ===== SPATIAL PATTERN ANALYSIS =====
+# ===== SPATIAL PATTERN ANALYSIS (FIXED) =====
 create_spatial_pattern_analysis <- function() {
   cat("📊 Creating spatial pattern analysis...\n")
   pdf_path <- file.path(out_dir, "spatial_patterns.pdf")
   pdf(pdf_path, width = 10, height = 6.67, family = "Helvetica")
+  
+  any_plotted <- FALSE
   par(mfrow = c(1, 2), mar = c(2, 1.5, 2.5, 1), oma = c(1, 1, 3, 1))
   
   for (var in c("PET", "Precipitation")) {
     var_data <- all_results[variable == var & period == "annual" &
                               !is_basin_average & !filtered_vc]
     
-    # ADDED FALLBACK HERE
     if (nrow(var_data) == 0) {
       plot.new()
-      text(0.5, 0.5, paste("No spatial pattern data for", var), cex = 1.2)
+      text(0.5, 0.5, paste("No data for", var), cex = 1.2)
       next
     }
     
+    any_plotted <- TRUE
     var_data[, spatial_cv := abs(sl_vc) / (abs(mean(sl_vc, na.rm = TRUE)) + 0.001)]
     
     r_cv <- create_raster_from_table(var_data, template_bc, "spatial_cv")
@@ -390,23 +367,31 @@ create_spatial_pattern_analysis <- function() {
                       legend_title = "CV")
   }
   
-  mtext("Spatial Variability of Trends (Annual Data, 1950-2025)",
-        outer = TRUE, cex = 1.2, font = 2, line = 0.5)
+  if (any_plotted) {
+    mtext("Spatial Variability of Trends (Annual Data, 1950-2025)",
+          outer = TRUE, cex = 1.2, font = 2, line = 0.5)
+  } else {
+    # If nothing was plotted, still add a title to avoid empty PDF
+    mtext("No spatial variability data available", outer = TRUE, cex = 1.2, line = 0.5)
+  }
+  
   dev.off()
   cat(sprintf("✅ Spatial pattern map: %s\n", basename(pdf_path)))
   return(pdf_path)
 }
 
-# ===== METHOD COMPARISON =====
+# ===== METHOD COMPARISON (FIXED) =====
 create_method_comparison <- function() {
   cat("📊 Creating method comparison plots...\n")
   
-  comp_data <- all_results[period == "annual" & !is_basin_average & 
+  comp_data <- all_results[period == "annual" & !is_basin_average &
                              !filtered_vc & !filtered_tfpw]
+  
   if (nrow(comp_data) == 0) {
-    cat("⚠️  No significant or valid pixels found for method comparison. Skipping.\n")
+    cat("⚠️  No valid pixels for method comparison. Skipping.\n")
     return(NULL)
   }
+  
   comp_data[, vc_sig := p_value_vc < 0.05]
   comp_data[, tfpw_sig := p_value_tfpw < 0.05]
   
@@ -432,43 +417,36 @@ create_method_comparison <- function() {
     Neither = sum(!vc_sig & !tfpw_sig)
   ), by = variable]
   
-  # For Agreement plot
-  agreement_long <- melt(agreement, id.vars = "variable", 
-                         variable.name = "Agreement_Type", value.name = "value")
+  agreement_long <- melt(agreement, id.vars = "variable")
   
- 
-  p2 <- ggplot(agreement_long, aes(x = variable, y = value, fill = Agreement_Type)) +
+  p2 <- ggplot(agreement_long, aes(x = variable, y = value, fill = variable)) +
     geom_col(position = "stack") +
     facet_wrap(~variable, scales = "free_x") +
-    geom_text(aes(label = sprintf("%.0f%%", value/sum(value)*100), group = Agreement_Type),
+    geom_text(aes(label = sprintf("%.0f%%", value/sum(value)*100), group = variable),
               position = position_stack(vjust = 0.5), size = 3) +
-    # Let ggplot pick default colors for the stacks, or define a scale for the 4 Agreement_Types
-    scale_fill_brewer(palette = "Set2") +
+    scale_fill_manual(values = c("PET" = "#d73027", "Precipitation" = "#4575b4")) +
     theme_bw(base_size = 11) +
-    theme(legend.position = "bottom", # Show legend so we know what the stacks mean
+    theme(legend.position = "none",
           axis.text.x = element_blank(),
           axis.ticks.x = element_blank()) +
     labs(title = "B) Method Agreement on Significance",
-         x = NULL, y = "Number of Pixels", fill = "Agreement")
+         x = NULL, y = "Number of Pixels")
   
   pct_sig <- comp_data[, .(
     VC_Pct = sum(vc_sig) / .N * 100,
     TFPW_Pct = sum(tfpw_sig) / .N * 100
   ), by = variable]
   
-  # For Percentage plot
-  pct_long <- melt(pct_sig, id.vars = "variable", 
-                   variable.name = "Method_Type", value.name = "value") 
+  pct_long <- melt(pct_sig, id.vars = "variable")
   
-  # Update fill = Method
-  p3 <- ggplot(pct_long, aes(x = Method, y = value, fill = Method)) +
+  p3 <- ggplot(pct_long, aes(x = variable, y = value, fill = variable)) +
     geom_col(position = "dodge") +
     geom_text(aes(label = sprintf("%.1f%%", value)),
               position = position_dodge(width = 0.9), vjust = -0.5, size = 3.5) +
-    scale_fill_manual(values = c("VC_Pct" = "grey30", "TFPW_Pct" = "grey70")) +
+    scale_fill_manual(values = c("PET" = "#d73027", "Precipitation" = "#4575b4")) +
     facet_wrap(~variable, scales = "free_x") +
     theme_bw(base_size = 11) +
-    theme(legend.position = "bottom",
+    theme(legend.position = "none",
           axis.text.x = element_blank(),
           axis.ticks.x = element_blank()) +
     labs(title = "C) % Pixels with Significant Trends",
@@ -489,7 +467,8 @@ create_method_comparison <- function() {
 create_statistics_table <- function() {
   cat("📊 Creating statistics summary table...\n")
   
-  has_rho <- "rho1" %in% names(all_results)  # ✅ Single column
+  has_rho_vc <- "rho1_vc" %in% names(all_results)
+  has_rho_tfpw <- "rho1_tfpw" %in% names(all_results)
   
   stats_summary <- all_results[period == "annual" & !is_basin_average, .(
     N_Pixels = .N,
@@ -500,7 +479,8 @@ create_statistics_table <- function() {
     Median_Tau_TFPW = sprintf("%.3f", median(tau_tfpw[!filtered_tfpw], na.rm = TRUE)),
     Median_Slope_VC = sprintf("%.3f", median(sl_vc[!filtered_vc], na.rm = TRUE)),
     Median_Slope_TFPW = sprintf("%.3f", median(sl_tfpw[!filtered_tfpw], na.rm = TRUE)),
-    Mean_Autocorr = if (has_rho) sprintf("%.3f", mean(rho1[!filtered_vc], na.rm = TRUE)) else NA_character_
+    Mean_Autocorr_VC = if (has_rho_vc) sprintf("%.3f", mean(rho1_vc[!filtered_vc], na.rm = TRUE)) else NA_character_,
+    Mean_Autocorr_TFPW = if (has_rho_tfpw) sprintf("%.3f", mean(rho1_tfpw[!filtered_tfpw], na.rm = TRUE)) else NA_character_
   ), by = .(variable, period)]
   
   fwrite(stats_summary, file.path(out_dir, "summary_statistics.csv"))

@@ -143,16 +143,39 @@ master_events <- master_events %>%
 cat(sprintf("\n✓ Total events loaded: %d (period: %d-%d)\n",
             nrow(master_events), HISTORICAL_START, HISTORICAL_END))
 
-####################################################################################
+# --- Harmonize event columns from w1 catalogs (minimal patch) -----------------
+# If the catalogs shipped a pre-computed severity called 'mean_severity',
+# adopt it as 'severity'. Then back-compute mean_int if needed.
+
+if (!"severity" %in% names(master_events) &&
+    "mean_severity" %in% names(master_events)) {
+  master_events$severity <- as.numeric(master_events$mean_severity)
+}
+
+# If mean intensity is missing but we have severity and duration,
+# derive I = S / D (Sheffield & Wood severity definition).
+if (!"mean_int" %in% names(master_events) &&
+    "severity" %in% names(master_events) &&
+    "duration_months" %in% names(master_events)) {
+  master_events$mean_int <- as.numeric(master_events$severity) /
+    pmax(as.numeric(master_events$duration_months), 1)
+}
+
+# Safety: ensure types
+master_events$duration_months <- as.integer(master_events$duration_months)
+master_events$start_date      <- as.Date(master_events$start_date)
+master_events$end_date        <- as.Date(master_events$end_date)
+################################################################################
 # PART 2: CALCULATE RANKING METRICS
-####################################################################################
+################################################################################
 cat("\n══════════════════════════════════════\n")
 cat("PART 2: Calculating Ranking Metrics\n")
 cat("══════════════════════════════════════\n")
 
 # Calculate severity
-master_events$severity <- calc_severity(master_events$mean_int,
-                                        master_events$duration_months)
+if (!"severity" %in% names(master_events)) {
+  master_events$severity <- calc_severity(master_events$mean_int, master_events$duration_months)
+}
 
 # Classify duration
 master_events$duration_class <- classify_duration(master_events$duration_months)
@@ -503,34 +526,40 @@ cat("    ✓ Saved: Fig2_Drought_Severity_Distribution.png\n")
 ####################################################################################
 # FIGURE 3: Drought Frequency by Duration Class (Sheffield & Wood 2008 style)
 ####################################################################################
+####################################################################################
+# FIGURE 3: Drought Frequency by Duration Class (Sheffield & Wood 2008 style)
+####################################################################################
 cat("\n  Fig 3: Drought Frequency by Duration Class...\n")
 
 duration_summary <- primary_events %>%
-  group_by(duration_class) %>%
-  summarise(
-    n_events = n(),
-    mean_duration = mean(duration_months),
-    mean_severity = mean(mean_S),
-    max_severity = max(severity),
+  dplyr::group_by(duration_class) %>%
+  dplyr::summarise(
+    n_events      = dplyr::n(),
+    mean_duration = mean(duration_months, na.rm = TRUE),
+    mean_severity = mean(severity,         na.rm = TRUE),  # <-- was mean(mean_S)
+    max_severity  = max(severity,          na.rm = TRUE),
     .groups = "drop"
   ) %>%
-  mutate(
-    return_period = n_years_record / n_events,
-    duration_class = factor(duration_class,
-                            levels = c("D1-3 (Sub-threshold)",
-                                       "D4-6 (Short-term)",
-                                       "D7-12 (Medium-term)",
-                                       "D12+ (Long-term)"))
+  dplyr::mutate(
+    return_period = n_years_record / pmax(n_events, 1), # avoid divide-by-zero
+    duration_class = factor(
+      duration_class,
+      levels = c("D1-3 (Sub-threshold)",
+                 "D4-6 (Short-term)",
+                 "D7-12 (Medium-term)",
+                 "D12+ (Long-term)")
+    )
   )
 
 p3 <- ggplot2::ggplot(duration_summary,
                       ggplot2::aes(x = duration_class, y = n_events, fill = duration_class)) +
   ggplot2::geom_col(alpha = 0.8, color = "black", linewidth = 0.5) +
-  ggplot2::geom_text(ggplot2::aes(label = sprintf("n=%d\nReturn: %.1f yrs",
-                                                  n_events, return_period)),
-                     vjust = -0.5, size = 4, fontface = "bold") +
+  ggplot2::geom_text(
+    ggplot2::aes(label = sprintf("n=%d\nReturn: %.1f yrs", n_events, return_period)),
+    vjust = -0.5, size = 4, fontface = "bold"
+  ) +
   ggplot2::scale_fill_brewer(palette = "YlOrRd") +
-  ggplot2::scale_y_continuous(expand = ggplot2::expansion(mult = c(0, 0.2))) + 
+  ggplot2::scale_y_continuous(expand = ggplot2::expansion(mult = c(0, 0.2))) +
   ggplot2::labs(
     title = "Drought Frequency by Duration Class (Sheffield & Wood 2008)",
     subtitle = sprintf("%s Basin-Averaged | %d-%d | Nechako Watershed",

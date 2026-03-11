@@ -1,11 +1,9 @@
 ####################################################################################
-# w5_gif_animations.R  ·  ANIMATED GIFS FOR ALL INDICES  (Optimised & Enhanced)
-####################################################################################
+# w6_gif_animations.R · ANIMATED GIFS FOR ALL INDICES (Optimised & Enhanced)
 ####################################################################################
 
 setwd("D:/Nechako_Drought/Nechako/")
 source("DROUGHT_ANALYSIS_utils.R")
-
 utils_load_packages(c(
   # Core
   "terra", "ggplot2", "lubridate", "scales",
@@ -27,111 +25,30 @@ dir.create(GIF_DIR, showWarnings = FALSE, recursive = TRUE)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 GIF_START_YEAR <- 1981
-GIF_FPS        <- 4
+GIF_FPS <- 4
 DROUGHT_LIMITS <- c(-4, 4)
-FRAME_W        <- 900L    # px
-FRAME_H        <- 720L    # px
-FRAME_RES      <- 110L    # dpi
+FRAME_W <- 900L # px
+FRAME_H <- 720L # px
+FRAME_RES <- 110L # dpi
 
 # ── 1. Build raster stack ─────────────────────────────────────────────────────
 build_stack <- function(data_dir, index_type, scale, find_fn) {
   files <- find_fn(data_dir, index_type, scale)
   if (!length(files)) return(NULL)
   stacks <- lapply(files, terra::rast)
-  dates  <- do.call(c, lapply(seq_along(stacks), function(i)
+  dates <- do.call(c, lapply(seq_along(stacks), function(i)
     extract_dates_from_nc(files[i], terra::nlyr(stacks[[i]]))))
   list(stack = do.call(c, stacks), dates = dates)
 }
 
-# ── 2. Build a single-frame ggplot ────────────────────────────────────────────
-# Called inside the per-frame loop; receives pre-extracted xy, vals column,
-# and the basin geometry — all computed ONCE outside the loop.
-build_frame <- function(xy, vals_i, basin_geom, title_str, date_lbl) {
-  
-  df <- data.frame(x = xy$x, y = xy$y, value = vals_i)
-  
-  ggplot2::ggplot() +
-    
-    # Raster fill
-    ggplot2::geom_raster(
-      data    = df,
-      mapping = ggplot2::aes(x = x, y = y, fill = value)
-    ) +
-    
-    # Drought isolines (plain geom_contour — no external stat dependencies)
-    ggplot2::geom_contour(
-      data      = df,
-      mapping   = ggplot2::aes(x = x, y = y, z = value),
-      bins      = 6,
-      colour    = "grey25",
-      linewidth = 0.35,
-      na.rm     = TRUE
-    ) +
-    
-    # Basin boundary
-    ggplot2::geom_path(
-      data      = basin_geom,
-      mapping   = ggplot2::aes(x = x, y = y, group = group),
-      colour    = "#1B5E20",
-      linewidth = 1.2,
-      lineend   = "round"
-    ) +
-    
-    # Perceptually-uniform diverging palette
-    scico::scale_fill_scico(
-      palette  = "vik",
-      limits   = DROUGHT_LIMITS,
-      midpoint = 0,
-      name     = title_str,
-      guide    = ggplot2::guide_colorbar(
-        barwidth       = 0.8,
-        barheight      = 10,
-        title.position = "top"
-      )
-    ) +
-    
-    # Scale bar + north arrow
-    ggspatial::annotation_scale(
-      location   = "bl",
-      width_hint = 0.3,
-      text_cex   = 0.75
-    ) +
-    ggspatial::annotation_north_arrow(
-      location    = "tr",
-      which_north = "true",
-      style = ggspatial::north_arrow_fancy_orienteering(
-        fill      = c("grey80", "grey20"),
-        text_size = 8
-      ),
-      height = ggplot2::unit(1.2, "cm"),
-      width  = ggplot2::unit(1.2, "cm")
-    ) +
-    
-    ggplot2::labs(
-      title    = title_str,
-      subtitle = date_lbl,
-      caption  = "Nechako Watershed \u00b7 Drought Analysis"
-    ) +
-    
-    shared_ts_theme(11) +
-    ggplot2::theme(
-      plot.subtitle    = ggplot2::element_text(size = 12, face = "bold",
-                                               colour = "grey30"),
-      legend.position  = "right",
-      panel.grid.major = ggplot2::element_line(colour = "grey92"),
-      panel.grid.minor = ggplot2::element_blank(),
-      plot.background  = ggplot2::element_rect(fill = "white",   colour = NA),
-      panel.background = ggplot2::element_rect(fill = "#EEF4F8", colour = NA)
-    ) +
-    ggplot2::coord_equal(expand = FALSE)
-}
+# (build_frame removed — we will build a single reusable plot and mutate data)
 
 # ── 3. Render all frames then encode GIF ──────────────────────────────────────
 render_gif <- function(index_type, scale, data_dir, find_fn, basin_shp,
                        gif_idx = NA, n_gifs = NA, session_start = NA) {
   
-  label     <- toupper(index_type)
-  tag       <- if (is.na(scale)) label else sprintf("%s-%d", label, scale)
+  label <- toupper(index_type)
+  tag <- if (is.na(scale)) label else sprintf("%s-%d", label, scale)
   title_str <- tag
   
   # ── Load data ──────────────────────────────────────────────────────────────
@@ -140,21 +57,20 @@ render_gif <- function(index_type, scale, data_dir, find_fn, basin_shp,
     cli::cli_alert_warning("{tag}: no files found \u2014 skipping.")
     return(invisible(NULL))
   }
-  
-  r     <- seasonal$stack
+  r <- seasonal$stack
   dates <- seasonal$dates
-  n     <- terra::nlyr(r)
+  n <- terra::nlyr(r)
   
   # Guard: trim if date count mismatches layer count
   if (length(dates) != n) {
     cli::cli_alert_warning(
       "{tag}: date count ({length(dates)}) != nlyr ({n}). Trimming to min."
     )
-    n     <- min(length(dates), n)
+    n <- min(length(dates), n)
     dates <- dates[seq_len(n)]
   }
   
-  cli::cli_h2("{tag}  [{n} frames]  \u2500  GIF {gif_idx}/{n_gifs}")
+  cli::cli_h2("{tag} [{n} frames] \u2500 GIF {gif_idx}/{n_gifs}")
   if (!is.na(session_start)) {
     overall_elapsed <- round(proc.time()["elapsed"] - session_start, 1)
     gifs_done <- gif_idx - 1L
@@ -168,81 +84,150 @@ render_gif <- function(index_type, scale, data_dir, find_fn, basin_shp,
     }
   }
   
+  # ── OPTIONAL: crop/mask to basin extent to reduce pixels rendered ──────────
+  # (Keeps the same information if you only need the basin. Commented to preserve
+  # current framing exactly.)
+  # r <- terra::mask(terra::crop(r, terra::ext(basin_shp)), basin_shp)
+  
   # ── Extract coordinates and values ONCE for the entire stack ───────────────
-  # Working per-column on the matrix avoids the 1.84 M-row long dataframe
-  # that caused gganimate to stall before any rendering began.
   cli::cli_alert_info("Extracting raster values\u2026")
-  vals <- terra::values(r, mat = TRUE)            # ncell x nlyr matrix
+  vals <- terra::values(r, mat = TRUE)  # ncell x nlyr
   if (n < ncol(vals)) vals <- vals[, seq_len(n), drop = FALSE]
-  xy   <- terra::crds(r, df = TRUE, na.rm = FALSE)   # data.frame: x, y (all cells — na.rm=FALSE must match values())
+  xy <- terra::crds(r, df = TRUE, na.rm = FALSE)  # x, y (matches values())
   
   # Basin outline extracted once, reused for every frame
   basin_geom <- data.frame(
-    x     = terra::geom(basin_shp)[, "x"],
-    y     = terra::geom(basin_shp)[, "y"],
+    x = terra::geom(basin_shp)[, "x"],
+    y = terra::geom(basin_shp)[, "y"],
     group = 1L
   )
   
+  # ── Precompute immutable UI bits ────────────────────────────────────────────
+  date_lbls <- format(dates, "%B %Y")
+  
+  # Reusable data frame backing both raster + contour layers
+  # We mutate only 'value' per frame
+  df0 <- data.frame(x = xy$x, y = xy$y, value = vals[, 1])
+  
+  # Build the base plot ONCE; identical appearance and scales
+  p_base <-
+    ggplot2::ggplot() +
+    ggplot2::geom_raster(
+      data = df0,
+      mapping = ggplot2::aes(x = x, y = y, fill = value)
+    ) +
+    ggplot2::geom_contour(
+      data = df0,
+      mapping = ggplot2::aes(x = x, y = y, z = value),
+      bins = 6,                    # unchanged from original (no method change)
+      colour = "grey25",
+      linewidth = 0.35,
+      na.rm = TRUE
+    ) +
+    ggplot2::geom_path(
+      data = basin_geom,
+      mapping = ggplot2::aes(x = x, y = y, group = group),
+      colour = "#1B5E20",
+      linewidth = 1.2,
+      lineend = "round"
+    ) +
+    scico::scale_fill_scico(
+      palette = "vik",
+      limits = DROUGHT_LIMITS,
+      midpoint = 0,
+      name = title_str,
+      guide = ggplot2::guide_colorbar(
+        barwidth = 0.8,
+        barheight = 10,
+        title.position = "top"
+      )
+    ) +
+    ggspatial::annotation_scale(
+      location = "bl",
+      width_hint = 0.3,
+      text_cex = 0.75
+    ) +
+    ggspatial::annotation_north_arrow(
+      location = "tr",
+      which_north = "true",
+      style = ggspatial::north_arrow_fancy_orienteering(
+        fill = c("grey80", "grey20"),
+        text_size = 8
+      ),
+      height = ggplot2::unit(1.2, "cm"),
+      width  = ggplot2::unit(1.2, "cm")
+    ) +
+    ggplot2::labs(
+      title = title_str,
+      subtitle = date_lbls[1],
+      caption = "Nechako Watershed \u00b7 Drought Analysis"
+    ) +
+    shared_ts_theme(11) +
+    ggplot2::theme(
+      plot.subtitle = ggplot2::element_text(size = 12, face = "bold", colour = "grey30"),
+      legend.position = "right",
+      panel.grid.major = ggplot2::element_line(colour = "grey92"),
+      panel.grid.minor = ggplot2::element_blank(),
+      plot.background = ggplot2::element_rect(fill = "white", colour = NA),
+      panel.background = ggplot2::element_rect(fill = "#EEF4F8", colour = NA)
+    ) +
+    ggplot2::coord_equal(expand = FALSE)
+  
   # ── Temp directory for PNGs (auto-deleted on function exit) ────────────────
-  tmp_dir   <- tempfile("gifframes_")
+  tmp_dir <- tempfile("gifframes_")
   dir.create(tmp_dir)
   on.exit(unlink(tmp_dir, recursive = TRUE), add = TRUE)
-  
   png_paths <- file.path(tmp_dir, sprintf("frame_%05d.png", seq_len(n)))
   
-  # ── Per-frame rendering loop ───────────────────────────────────────────────
-  # This is the stage that was stalling silently inside gganimate.
-  # Owning the loop means the progress bar updates after every single frame.
+  # ── Per-frame rendering loop (mutating df0$value only) ─────────────────────
   pb <- cli::cli_progress_bar(
-    name   = "Rendering frames",
-    total  = n,
+    name = "Rendering frames",
+    total = n,
     format = paste0(
-      "  {cli::pb_spin} {cli::pb_name}  ",
-      "{cli::pb_bar}  ",
-      "{cli::pb_current}/{cli::pb_total}  ",
-      "[{cli::pb_elapsed} elapsed | ETA {cli::pb_eta}]"
+      " {cli::pb_spin} {cli::pb_name} ",
+      "{cli::pb_bar} ",
+      "{cli::pb_current}/{cli::pb_total} ",
+      "[{cli::pb_elapsed} elapsed · ETA {cli::pb_eta}]"
     ),
-    clear  = FALSE
+    clear = FALSE
   )
   
   frame_start <- proc.time()["elapsed"]
-  
   for (i in seq_len(n)) {
-    p <- build_frame(
-      xy         = xy,
-      vals_i     = vals[, i],
-      basin_geom = basin_geom,
-      title_str  = title_str,
-      date_lbl   = format(dates[i], "%B %Y")
-    )
+    # Update only the values vector
+    df0$value <- vals[, i]
     
-    # ragg::agg_png: faster than base png() — uses the AGG renderer,
-    # same quality as Cairo but lower startup overhead per frame.
+    # Update only the subtitle; everything else is reused
+    p <- p_base + ggplot2::labs(subtitle = date_lbls[i])
+    
+    # ragg::agg_png: fast, high-quality rasterizer (unchanged)
     ragg::agg_png(
       filename = png_paths[i],
-      width    = FRAME_W,
-      height   = FRAME_H,
-      res      = FRAME_RES,
-      units    = "px"
+      width = FRAME_W,
+      height = FRAME_H,
+      res = FRAME_RES,
+      units = "px"
+      # background = "white" # (optional explicit, white by default)
     )
     print(p)
     grDevices::dev.off()
     
     cli::cli_progress_update(id = pb)
+    # If console overhead is noticeable, update every 3–5 frames instead:
+    # if (i %% 5L == 0L) cli::cli_progress_update(id = pb)
   }
-  
   cli::cli_progress_done(id = pb)
   
   frame_secs <- round(proc.time()["elapsed"] - frame_start, 1)
   cli::cli_alert_info(
-    "Frames rendered in {frame_secs}s  ({round(frame_secs / n, 2)}s / frame)"
+    "Frames rendered in {frame_secs}s ({round(frame_secs / n, 2)}s / frame)"
   )
   
-  # ── Encode all PNGs into GIF with gifski (one Rust pass) ───────────────────
+  # ── Encode all PNGs into GIF with gifski (unchanged) ───────────────────────
   out <- file.path(
     GIF_DIR,
     if (is.na(scale)) sprintf("%s_animation.gif", label)
-    else              sprintf("%s_%d_animation.gif", label, scale)
+    else sprintf("%s_%d_animation.gif", label, scale)
   )
   
   cli::cli_alert_info("Encoding GIF with gifski\u2026")
@@ -251,10 +236,10 @@ render_gif <- function(index_type, scale, data_dir, find_fn, basin_shp,
     gif_file  = out,
     width     = FRAME_W,
     height    = FRAME_H,
-    delay     = 1 / GIF_FPS        # seconds per frame
+    delay     = 1 / GIF_FPS  # seconds per frame
   )
-  
   size_mb <- round(file.size(out) / 1e6, 1)
+  
   if (!is.na(session_start)) {
     overall_elapsed <- round(proc.time()["elapsed"] - session_start, 1)
     gifs_left <- n_gifs - gif_idx
@@ -265,20 +250,19 @@ render_gif <- function(index_type, scale, data_dir, find_fn, basin_shp,
       eta_str <- ""
     }
     cli::cli_alert_success(
-      "Saved: {.file {basename(out)}}  ({size_mb} MB) \u00b7 overall {overall_elapsed}s elapsed{eta_str}"
+      "Saved: {.file {basename(out)}} ({size_mb} MB) \u00b7 overall {overall_elapsed}s elapsed{eta_str}"
     )
   } else {
-    cli::cli_alert_success("Saved: {.file {basename(out)}}  ({size_mb} MB)")
+    cli::cli_alert_success("Saved: {.file {basename(out)}} ({size_mb} MB)")
   }
 }
 
 # ── 4. Run for all indices ─────────────────────────────────────────────────────
 basin_shp <- terra::vect(BASIN_SHP)
-
 jobs <- c(
-  lapply(SPI_SCALES,  function(sc) list("spi",  sc,          SPI_SEAS_DIR,  find_seasonal_nc_files)),
-  lapply(SPEI_SCALES, function(sc) list("spei", sc,          SPEI_SEAS_DIR, find_seasonal_nc_files)),
-  list(               list("swei", NA_integer_,  SWEI_SEAS_DIR, find_swei_seasonal_files))
+  lapply(SPI_SCALES,  function(sc) list("spi",  sc, SPI_SEAS_DIR,  find_seasonal_nc_files)),
+  lapply(SPEI_SCALES, function(sc) list("spei", sc, SPEI_SEAS_DIR, find_seasonal_nc_files)),
+  list( list("swei", NA_integer_, SWEI_SEAS_DIR, find_swei_seasonal_files) )
 )
 n_jobs <- length(jobs)
 
@@ -287,25 +271,23 @@ cli::cli_alert_info("{n_jobs} index/scale combinations to render")
 
 # Outer bar — one tick per completed GIF
 pb_outer <- cli::cli_progress_bar(
-  name   = "Overall progress",
-  total  = n_jobs,
+  name  = "Overall progress",
+  total = n_jobs,
   format = paste0(
-    "{cli::pb_name}  {cli::pb_bar}  ",
-    "{cli::pb_current}/{cli::pb_total} GIFs  ",
-    "[elapsed {cli::pb_elapsed} | ETA {cli::pb_eta}]"
+    "{cli::pb_name} {cli::pb_bar} ",
+    "{cli::pb_current}/{cli::pb_total} GIFs ",
+    "[elapsed {cli::pb_elapsed} · ETA {cli::pb_eta}]"
   ),
-  clear  = FALSE
+  clear = FALSE
 )
 
 session_start <- proc.time()["elapsed"]
-
 for (i in seq_along(jobs)) {
   job <- jobs[[i]]
   render_gif(job[[1]], job[[2]], job[[3]], job[[4]], basin_shp,
              gif_idx = i, n_gifs = n_jobs, session_start = session_start)
   cli::cli_progress_update(id = pb_outer)
 }
-
 cli::cli_progress_done(id = pb_outer)
 
 total_min <- round((proc.time()["elapsed"] - session_start) / 60, 1)
