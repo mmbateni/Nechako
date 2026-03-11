@@ -215,13 +215,14 @@ n_cores <- max(1L, detectCores() - 1L)   # leave 1 core for the OS
 cat(sprintf("\n✓ Starting parallel cluster with %d cores\n", n_cores))
 dir.create(tempdir(), recursive = TRUE, showWarnings = FALSE)  # fix Windows temp-dir issue
 cl <- makeCluster(n_cores)
+eps_clip <- 1e-6
+
 
 # Export data and functions needed by worker processes
 clusterExport(cl, varlist = c("variance_aware_spi", "roll_sum_right", "clip_prob",
                               "precip_matrix", "dates", "eps_clip"),
               envir = environment())
 clusterEvalQ(cl, { library(zoo); library(lmomco) })
-eps_clip <- 1e-6
 month_names <- c("Jan", "Feb", "Mar", "Apr", "May", "Jun", 
                  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
