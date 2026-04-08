@@ -53,7 +53,7 @@ mspei_file <- "mspei_results/mspei_basin_timeseries_1950-2025.xlsx"
 # NEW: NetCDF files for spatial maps
 mspi_nc_file <- "mspi_results/mspi_monthly_1950-2025.nc"
 mspei_nc_file <- "mspei_results/mspei_monthly_1950-2025.nc"
-basin_path <- "Spatial/nechakoBound_dissolve.shp"
+basin_path <- "Spatial/nechakoBound_dissolve.kmz"
 
 #---- Configuration ----
 drought_threshold_onset <- -1.0
@@ -546,6 +546,7 @@ if (file.exists(mspi_nc_file) && file.exists(mspei_nc_file) && file.exists(basin
   }
   
   basin <- vect(basin_path)
+  if (nrow(basin) > 1L) basin <- aggregate(basin)
   if (!same.crs(mspi_rast, basin)) {
     basin <- project(basin, crs(mspi_rast))
   }

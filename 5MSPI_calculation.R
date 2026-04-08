@@ -30,6 +30,7 @@ load_basin_boundary <- function(basin_path) {
   }
   
   basin <- vect(basin_path)
+  if (nrow(basin) > 1L) basin <- aggregate(basin)
   cat(sprintf("OK: Basin loaded: %s\n", basename(basin_path)))
   cat(sprintf("  -> Geometry: %s | Features: %d | CRS: %s\n",
               geomtype(basin), nrow(basin), crs(basin, describe = TRUE)$name))
@@ -39,7 +40,7 @@ load_basin_boundary <- function(basin_path) {
               xmin(basin), xmax(basin), ymin(basin), ymax(basin)))
   
   if (geomtype(basin) == "polygons") {
-    area_km2 <- expanse(basin) / 1e6
+    area_km2 <- sum(expanse(basin)) / 1e6
     cat(sprintf("  -> Basin area: %.1f km2\n", area_km2))
     
     # Show sample coordinates
@@ -930,7 +931,7 @@ compute_both_indices <- function(start_year = 1950,
 # EXECUTION
 #==============================================================================
 if (interactive()) {
-  basin_path <- "Spatial/nechakoBound_dissolve.shp"
+  basin_path <- "Spatial/nechakoBound_dissolve.kmz"
   
   if (!file.exists(basin_path)) {
     stop(sprintf("ERROR: Basin file not found: %s", basin_path))

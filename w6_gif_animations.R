@@ -258,7 +258,7 @@ render_gif <- function(index_type, scale, data_dir, find_fn, basin_shp,
 }
 
 # ── 4. Run for all indices ─────────────────────────────────────────────────────
-basin_shp <- terra::vect(BASIN_SHP)
+basin_shp <- load_basin_vect(BASIN_SHP)
 jobs <- c(
   lapply(SPI_SCALES,  function(sc) list("spi",  sc, SPI_SEAS_DIR,  find_seasonal_nc_files)),
   lapply(SPEI_SCALES, function(sc) list("spei", sc, SPEI_SEAS_DIR, find_seasonal_nc_files)),

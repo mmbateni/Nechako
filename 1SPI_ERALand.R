@@ -18,8 +18,10 @@ out_dir <- "spi_results_seasonal"
 if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 
 # ---- Load Basin Boundary ----
-basin_path <- "Spatial/nechakoBound_dissolve.shp"
-basin <- if (file.exists(basin_path)) vect(basin_path) else NULL
+basin_path <- "Spatial/nechakoBound_dissolve.kmz"
+basin <- if (file.exists(basin_path)) {
+  v <- vect(basin_path); if (nrow(v) > 1L) v <- aggregate(v); v
+} else NULL
 
 if (!is.null(basin)) {
   cat("✓ Basin boundary loaded\n")

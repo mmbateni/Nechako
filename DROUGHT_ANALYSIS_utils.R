@@ -3,12 +3,22 @@
 ####################################################################################
 ## A. PROJECT CONFIGURATION ───────────────────────────────────────────
 WD_PATH <- Sys.getenv("NECHAKO_WD", "D:/Nechako_Drought/Nechako/")
-BASIN_SHP       <- file.path(WD_PATH, "Spatial/nechakoBound_dissolve.shp")
+BASIN_SHP       <- file.path(WD_PATH, "Spatial/nechakoBound_dissolve.kmz")
+
+## Helper: load basin as a single dissolved SpatVector (terra).
+## KMZ files may contain multiple polygon features; aggregate() merges them
+## into one before any masking, rasterizing, or area calculations.
+load_basin_vect <- function(path = BASIN_SHP) {
+  v <- terra::vect(path)
+  if (nrow(v) > 1L) v <- terra::aggregate(v)
+  v
+}
 
 ## Index-specific directories
-SPI_SEAS_DIR    <- file.path(WD_PATH, "spi_results_seasonal/")
-SPEI_SEAS_DIR   <- file.path(WD_PATH, "spei_results_seasonal/")
-SWEI_SEAS_DIR   <- file.path(WD_PATH, "swei_results_seasonal/")
+SPI_SEAS_DIR     <- file.path(WD_PATH, "spi_results_seasonal/")
+SPEI_SEAS_DIR    <- file.path(WD_PATH, "spei_results_seasonal/")
+SPEI_THW_SEAS_DIR <- file.path(WD_PATH, "spei_results_seasonal_thw/")   # Thornthwaite PET
+SWEI_SEAS_DIR    <- file.path(WD_PATH, "swei_results_seasonal/")
 
 ## Output directories
 TREND_DIR        <- file.path(WD_PATH,  "temporal_drought/")
@@ -30,7 +40,7 @@ DROUGHT_THRESHOLD  <- -1.0
 SPI_SCALES          <- c(1, 2, 3, 6, 12)
 SPEI_SCALES         <- c(1, 2, 3, 6, 12)
 SWEI_SCALE          <- 3  # Single timescale only
-INDICES             <- c("spi", "spei", "swei")
+INDICES             <- c("spi", "spei", "spei_thw", "swei")
 TIMESCALES_STANDARD <- SPI_SCALES          # used by w4 for time series plots
 TIMESCALES_SPATIAL  <- SPI_SCALES          # used by w4 for spatial figures
 MONTH_NAMES    <- c("Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -61,7 +71,10 @@ MONTH_NAMES    <- c("Jan", "Feb", "Mar", "Apr", "May", "Jun",
 #'         sorted by date with NA rows removed.  Returns NULL with a warning if
 #'         the file is not found (usually means w3 has not been run yet).
 load_basin_avg_csv <- function(index_type, scale, data_dir = NULL) {
-  dir_map <- list(spi = SPI_SEAS_DIR, spei = SPEI_SEAS_DIR, swei = SWEI_SEAS_DIR)
+  dir_map <- list(spi      = SPI_SEAS_DIR,
+                  spei     = SPEI_SEAS_DIR,
+                  spei_thw = SPEI_THW_SEAS_DIR,
+                  swei     = SWEI_SEAS_DIR)
   dir     <- if (!is.null(data_dir)) data_dir else {
     d <- dir_map[[tolower(index_type)]]
     if (is.null(d)) stop("Unknown index_type: ", index_type)
@@ -262,7 +275,7 @@ precompute_basin_geometry  <- function(basin_shp_path, raster_file_path, crs = E
   r_tmpl  <- terra::rast(raster_file_path)[[1]]
   r_proj  <- terra::project(r_tmpl, crs)
   b_proj  <- terra::project(basin_v, crs)
-  total_area  <- terra::expanse(b_proj, unit = "m")
+  total_area  <- sum(terra::expanse(b_proj, unit = "m"))
   cell_areas  <- terra::cellSize(r_proj, unit = "m")
   areas_masked  <- terra::mask(cell_areas, b_proj)
   basin_rast  <- terra::rasterize(b_proj, r_proj, cover = TRUE)
@@ -355,10 +368,11 @@ detect_drought_events  <- function(df,
 ## F2. SPATIAL HELPERS (used by w4_trends_visualization.R) ──────────
 #' Load basin shapefile and reproject to equal-area CRS
 load_basin <- function(shp_path = BASIN_SHP, crs = EQUAL_AREA_CRS) {
-  if (!file.exists(shp_path)) stop("Basin shapefile not found: ", shp_path)
+  if (!file.exists(shp_path)) stop("Basin file not found: ", shp_path)
   b <- sf::st_read(shp_path, quiet = TRUE)
+  if (nrow(b) > 1L) b <- sf::st_as_sf(sf::st_union(b))
   if (sf::st_crs(b)$input != crs) b <- sf::st_transform(b, crs)
-  cat(sprintf("✓ Basin loaded (%d polygon(s), CRS: %s)\n", nrow(b), crs))
+  cat(sprintf("✓ Basin loaded (%d polygon(s) → dissolved, CRS: %s)\n", nrow(b), crs))
   b
 }
 

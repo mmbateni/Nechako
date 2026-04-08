@@ -900,18 +900,33 @@ process_index <- function(index_type, scales, find_fn, seas_dir) {
     cat(sprintf("  Valid pixels: %d  |  %.1f%% non-NA values\n",
                 n_pix, 100 * sum(!is.na(ts_mat)) / length(ts_mat)))
     
-    # Cell area weights
-    cat("  → Computing cell area weights (BC Albers)...\n")
+    # Cell area weights — fractional coverage for boundary pixels
+    # Each pixel's effective weight = full cell area × fraction of that cell
+    # that actually lies inside the basin polygon (0–1, via cover = TRUE).
+    # Interior pixels get cover = 1.0 (unchanged from the old approach).
+    # Edge pixels that only partially overlap the basin are down-weighted
+    # proportionally, rather than being counted at their full cell area.
+    cat("  → Computing fractional-coverage area weights...\n")
+    basin_v        <- terra::project(terra::vect(BASIN_SHP), terra::crs(r_tmpl))
     cell_area_rast <- terra::cellSize(r_tmpl, unit = "m")
+    cover_rast     <- terra::rasterize(basin_v, r_tmpl, cover = TRUE)
     area_all       <- as.numeric(terra::values(cell_area_rast, na.rm = FALSE))
-    area_valid     <- area_all[valid_pix]
+    cover_all      <- as.numeric(terra::values(cover_rast,     na.rm = FALSE))
+    cover_all[is.na(cover_all)] <- 0   # pixels fully outside basin → weight 0
+    eff_area_all   <- area_all * cover_all
+    area_valid     <- eff_area_all[valid_pix]
     bad_w <- is.na(area_valid) | !is.finite(area_valid) | area_valid <= 0
     if (any(bad_w)) {
       med_w <- median(area_valid[!bad_w], na.rm = TRUE)
       area_valid[bad_w] <- if (is.finite(med_w) && med_w > 0) med_w else 1
+      cat(sprintf("  ⚠ %d pixel(s) with zero/invalid effective area replaced with median (%.0f m²)\n",
+                  sum(bad_w), med_w))
     }
-    cat(sprintf("  ✓ Area weights: range %.0f – %.0f m² (median %.0f m²)\n",
+    n_partial <- sum(cover_all[valid_pix] > 0 & cover_all[valid_pix] < 1,
+                     na.rm = TRUE)
+    cat(sprintf("  ✓ Fractional area weights: range %.0f – %.0f m² (median %.0f m²)\n",
                 min(area_valid), max(area_valid), median(area_valid)))
+    cat(sprintf("  ✓ Boundary pixels with partial coverage: %d\n", n_partial))
     
     # Area-weighted basin average (computed once, reused below)
     cat("  → Computing area-weighted basin average time series...\n")

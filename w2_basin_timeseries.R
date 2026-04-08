@@ -13,6 +13,12 @@
 #             1950–2025 average; climatic water balance panel.
 #             Requires ERA5Land_Nechako_PET_monthly_summary.csv from
 #             2preq_PET_ERALand.R.  Output: FigS_Seasonality_P_PET.pdf/.png.
+#   PART 4e– SPI-1/2/3 manuscript figure + 9-panel combined Results figure.
+#             Fig4e_MS_SPI_123_timeseries.pdf/.png  (3-panel SPI-1/2/3).
+#             Fig2_MS_AllIndices_3x3.pdf/.png       (3×3: SPI / SPEI-PM / SPEI-Thw,
+#             scales 1-2-3).  This is the comprehensive Results Figure 2
+#             that includes all drought indices and timescales discussed in
+#             Section 4.2 of the manuscript.
 #   PART 5 – Excel summary: descriptive statistics + drought event counts
 #             (2020-2025) + pairwise correlation matrix (Drought_Summary.xlsx).
 #
@@ -43,9 +49,9 @@ for (d in c(BASIN_PLOT_DIR, BASIN_TS_DIR, CACHE_DIR))
   dir.create(d, showWarnings = FALSE, recursive = TRUE)
 
 ## ── Basin extent (informational only) ───────────────────────────────────────────
-basin_shp  <- terra::vect(BASIN_SHP)
+basin_shp  <- load_basin_vect(BASIN_SHP)
 basin_proj <- terra::project(basin_shp, EQUAL_AREA_CRS)
-cat(sprintf("✓ Basin: %.1f km²\n", terra::expanse(basin_proj, unit = "km")))
+cat(sprintf("✓ Basin: %.1f km²\n", sum(terra::expanse(basin_proj, unit = "km"))))
 
 ## ── MSPI / MSPEI single scale (mirror of w4 constant) ───────────────────────────
 MSPI_MSPEI_SCALE <- 1L
@@ -843,6 +849,7 @@ tryCatch({
     is_proj <- max(abs(coords$lon), na.rm = TRUE) > 200
     tryCatch({
       b <- sf::st_read(BASIN_SHP, quiet = TRUE)
+      if (nrow(b) > 1L) b <- sf::st_as_sf(sf::st_union(b))
       if (is_proj) sf::st_transform(b, terra::crs(basin_proj))
       else         sf::st_transform(b, "EPSG:4326")
     }, error = function(e) NULL)
@@ -1214,7 +1221,7 @@ tryCatch({
     seq(as.Date("1950-01-01"), by = "month", length.out = terra::nlyr(pr_r)))
   
   # Reproject and mask to basin (same CRS as the rest of the script)
-  basin_4d <- terra::project(terra::vect(BASIN_SHP), EQUAL_AREA_CRS)
+  basin_4d <- terra::project(load_basin_vect(BASIN_SHP), EQUAL_AREA_CRS)
   if (!terra::same.crs(pr_r, EQUAL_AREA_CRS))
     pr_r <- terra::project(pr_r, EQUAL_AREA_CRS, method = "bilinear")
   pr_r <- terra::mask(pr_r, basin_4d)
@@ -1393,6 +1400,370 @@ tryCatch({
 })
 
 ################################################################################
+# PART 4e – RESULTS FIGURES: SPI-1/2/3 TIME SERIES  +
+#            COMPREHENSIVE 9-PANEL COMBINED FIGURE
+#
+# SCOPE (added to support the expanded Results section):
+#   The manuscript Results section now includes SPI-1/2 and SPEI-1/2
+#   (both Penman-Monteith and Thornthwaite) alongside SPI-3 and SPEI-1/2/3.
+#   Part 4b already generates separate 3-panel figures for SPEI-PM and
+#   SPEI-Thw.  This part adds:
+#
+#   Fig4e_MS_SPI_123_timeseries.pdf/.png
+#       3-panel (a)/(b)/(c): SPI-1, SPI-2, SPI-3  basin-averaged time series.
+#       Data read from spi_results_seasonal/ CSVs via load_flat_csv() or,
+#       for scales absent from w1, from the per-month CSV files directly.
+#
+#   Fig2_MS_AllIndices_3x3.pdf/.png
+#       3 × 3 panel grid (the full Results Figure 2):
+#         Row 1: SPI-1,      SPI-2,      SPI-3
+#         Row 2: SPEIₚₘ-1,  SPEIₚₘ-2,  SPEIₚₘ-3
+#         Row 3: SPEI₀-1,   SPEI₀-2,   SPEI₀-3
+#       Each panel produced by make_all_panel() below, a unified wrapper
+#       around the existing make_spei_panel_v2 / SPI data paths.
+#
+# SPI data path:
+#   PRIMARY  : load_flat_csv("spi", sc)   (written by w1 for scales in SPI_SCALES)
+#   FALLBACK : load_spi_seasonal_csvs(sc) (reads 12 per-month CSVs directly)
+#
+# Consistency notes:
+#   • SPI panels use the same fill scheme and y-axis limits as the SPEI panels
+#     in Part 4b to ensure visual comparability across all three index rows.
+#   • The drought threshold annotation (x₀ = −0.5), the 2022–2025 highlight
+#     band, and the panel-label typography are identical across all panels.
+#   • Line colours: SPI = "#2ca02c" (green) | SPEI-PM = "#1f77b4" (blue)
+#                   SPEI-Thw = "#d62728" (red) — matching Part 4b.
+################################################################################
+cat("\n══════════════════════════════════════════════\n")
+cat("PART 4e: SPI-1/2/3 MS figure + 9-panel Results figure\n")
+cat("══════════════════════════════════════════════\n")
+
+# ── SPI per-month CSV directory (fallback path) ───────────────────────────────
+SPI_SEAS_DIR_4e <- file.path(WD_PATH, "spi_results_seasonal")
+
+# ── Shared panel constants (mirror Part 4b) ────────────────────────────────────
+THR_EVENT_4e       <- -0.5
+THR_MOD_4e         <- -1.0
+HIGHLIGHT_START_4e <- as.Date("2022-01-01")
+HIGHLIGHT_END_4e   <- as.Date("2025-12-31")
+
+fill_pal_4e <- c(
+  "Wet"              = "#4393c3",
+  "Mild deficit"     = "#ffffbf",
+  "Moderate drought" = "#fdae61",
+  "Severe drought"   = "#f46d43",
+  "Extreme drought"  = "#d73027"
+)
+
+# ── SPI per-month CSV fallback loader ─────────────────────────────────────────
+# Analogous to load_spei_seasonal_csvs() in Part 4b — reads the 12 per-month
+# CSV files written by 1SPI_ERALand.R and returns an area-weighted basin mean.
+load_spi_seasonal_csvs <- function(scale, seas_dir = SPI_SEAS_DIR_4e) {
+  if (!dir.exists(seas_dir)) {
+    cat(sprintf("    [load_spi_seasonal_csvs] Directory not found: %s\n", seas_dir))
+    return(NULL)
+  }
+  month_rows <- vector("list", 12L)
+  for (m in seq_len(12L)) {
+    csv_file <- file.path(
+      seas_dir,
+      sprintf("spi_%02d_month%02d_%s.csv", scale, m, MONTH_NAMES_3[m])
+    )
+    if (!file.exists(csv_file)) next
+    tryCatch({
+      df      <- data.table::fread(csv_file, data.table = FALSE)
+      yr_cols <- setdiff(names(df), c("lon", "lat"))
+      yr_cols <- yr_cols[grepl("^[0-9]{4}$", yr_cols)]
+      if (!length(yr_cols)) return(NULL)
+      yrs_int <- as.integer(yr_cols)
+      vals    <- colMeans(df[, yr_cols, drop = FALSE], na.rm = TRUE)
+      vals[is.nan(vals)] <- NA_real_
+      month_rows[[m]] <- data.frame(
+        date  = as.Date(paste(yrs_int, m, "01", sep = "-")),
+        value = as.numeric(vals),
+        stringsAsFactors = FALSE)
+    }, error = function(e)
+      cat(sprintf("    \u26a0 Could not read %s: %s\n",
+                  basename(csv_file), e$message)))
+  }
+  valid <- Filter(Negate(is.null), month_rows)
+  if (!length(valid)) return(NULL)
+  out <- do.call(rbind, valid)
+  out <- out[order(out$date), ]
+  out <- out[!is.na(out$value) & is.finite(out$value), ]
+  rownames(out) <- NULL
+  out
+}
+
+# ── Unified panel builder (SPI, SPEI-PM, or SPEI-Thw) ─────────────────────────
+#
+# Arguments:
+#   sc         integer scale (1, 2, or 3)
+#   panel_lab  character "(a)" etc.
+#   index_type "spi" | "spei_pm" | "spei_thw"
+#   show_xlab  logical — show x-axis tick labels on this panel?
+#   is_first   logical — attach legend to this panel?
+make_all_panel <- function(sc, panel_lab,
+                           index_type = c("spi", "spei_pm", "spei_thw"),
+                           show_xlab  = FALSE,
+                           is_first   = FALSE) {
+  index_type <- match.arg(index_type)
+  
+  # ── Load time series ──────────────────────────────────────────────────────
+  df <- NULL
+  if (index_type == "spi") {
+    df <- tryCatch(load_flat_csv("spi", sc), error = function(e) NULL)
+    if (is.null(df) || !nrow(df))
+      df <- tryCatch(load_spi_seasonal_csvs(sc, SPI_SEAS_DIR_4e),
+                     error = function(e) NULL)
+    col_line  <- "#2ca02c"
+    pet_label <- sprintf("SPI-%d  (precipitation only)", sc)
+    
+  } else if (index_type == "spei_pm") {
+    df <- tryCatch(load_flat_csv("spei", sc), error = function(e) NULL)
+    if (is.null(df) || !nrow(df))
+      df <- tryCatch(load_spei_seasonal_csvs(sc, SPEI_PM_DIR),
+                     error = function(e) NULL)
+    col_line  <- "#1f77b4"
+    pet_label <- sprintf("SPEI\u209a\u2098-%d  (Penman-Monteith)", sc)
+    
+  } else {  # spei_thw
+    df <- tryCatch(load_spei_seasonal_csvs(sc, SPEI_THW_DIR),
+                   error = function(e) NULL)
+    col_line  <- "#d62728"
+    pet_label <- sprintf("SPEI\u2080-%d  (Thornthwaite)", sc)
+  }
+  
+  if (is.null(df) || !nrow(df))
+    return(ggplot2::ggplot() +
+             ggplot2::annotate("text", x = 0.5, y = 0.5,
+                               label = sprintf("No data\n%s", pet_label),
+                               size = 4, colour = "grey50") +
+             ggplot2::theme_void())
+  
+  df$date  <- as.Date(df$date)
+  df$value <- as.numeric(df$value)
+  
+  # ── Fill categories ───────────────────────────────────────────────────────
+  df_fill <- df
+  df_fill$fill_cat <- factor(dplyr::case_when(
+    df_fill$value >  0    ~ "Wet",
+    df_fill$value > -0.5  ~ "Mild deficit",
+    df_fill$value > -1.0  ~ "Moderate drought",
+    df_fill$value > -1.5  ~ "Severe drought",
+    TRUE                  ~ "Extreme drought"),
+    levels = c("Wet", "Mild deficit", "Moderate drought",
+               "Severe drought", "Extreme drought"))
+  df_fill$date_end <- pmin(df_fill$date + 31, max(df_fill$date) + 31)
+  
+  ylo <- min(-2.8, min(df$value, na.rm = TRUE) * 1.05)
+  yhi <- max( 2.2, max(df$value, na.rm = TRUE) * 1.05)
+  
+  p <- ggplot2::ggplot() +
+    ggplot2::annotate("rect",
+                      xmin = HIGHLIGHT_START_4e, xmax = HIGHLIGHT_END_4e,
+                      ymin = -Inf, ymax = Inf, fill = "grey85", alpha = 0.55) +
+    ggplot2::geom_rect(
+      data = df_fill,
+      ggplot2::aes(xmin = date, xmax = date_end,
+                   ymin = -Inf, ymax = Inf, fill = fill_cat),
+      alpha = 0.28, inherit.aes = FALSE) +
+    ggplot2::scale_fill_manual(
+      values = fill_pal_4e, name = "Drought category", drop = FALSE,
+      guide  = if (is_first)
+        ggplot2::guide_legend(title.position = "top", nrow = 1,
+                              override.aes = list(alpha = 0.7))
+      else "none") +
+    ggplot2::geom_hline(yintercept = 0,
+                        colour = "grey40", linewidth = 0.35) +
+    ggplot2::geom_hline(yintercept = THR_EVENT_4e,
+                        colour = "grey30", linewidth = 0.50, linetype = "dashed") +
+    ggplot2::geom_hline(yintercept = THR_MOD_4e,
+                        colour = "grey50", linewidth = 0.35, linetype = "dotted") +
+    ggplot2::geom_line(
+      data = df, ggplot2::aes(x = date, y = value),
+      colour = col_line, linewidth = 0.55, inherit.aes = FALSE) +
+    ggplot2::annotate("text",
+                      x = min(df$date) + 365, y = yhi * 0.88,
+                      label = panel_lab, size = 3.2, fontface = "bold",
+                      hjust = 0, vjust = 1, colour = "grey10") +
+    ggplot2::annotate("text",
+                      x = as.Date("1951-01-01"), y = THR_EVENT_4e + 0.08,
+                      label = "x\u2080 = \u22120.5", size = 2.4,
+                      hjust = 0, colour = "grey30") +
+    ggplot2::annotate("text",
+                      x = HIGHLIGHT_START_4e + 365, y = yhi * 0.97,
+                      label = "2022\u20132025", size = 2.4, hjust = 0.5,
+                      colour = "grey30", fontface = "italic") +
+    ggplot2::scale_x_date(
+      date_breaks = "10 years", date_labels = "%Y",
+      expand = ggplot2::expansion(add = c(0, 0))) +
+    ggplot2::scale_y_continuous(
+      limits = c(ylo, yhi),
+      breaks = c(-2, -1.5, -1, -0.5, 0, 1, 2),
+      expand = ggplot2::expansion(mult = c(0, 0))) +
+    ggplot2::labs(
+      title = sprintf("%s  (area-weighted basin mean)", pet_label),
+      x     = if (show_xlab) "Year" else NULL,
+      y     = sub("  .*", "", pet_label)) +
+    ggplot2::theme_classic(base_size = 8.5) +
+    ggplot2::theme(
+      plot.title   = ggplot2::element_text(size = 8, face = "bold",
+                                           hjust = 0,
+                                           margin = ggplot2::margin(b = 2)),
+      axis.text.x  = if (show_xlab) ggplot2::element_text(size = 7)
+      else ggplot2::element_blank(),
+      axis.ticks.x = if (show_xlab) ggplot2::element_line()
+      else ggplot2::element_blank(),
+      axis.text.y  = ggplot2::element_text(size = 7),
+      axis.title.y = ggplot2::element_text(size = 7.5, angle = 90),
+      axis.title.x = ggplot2::element_text(size = 7.5),
+      legend.position = "bottom",
+      legend.text     = ggplot2::element_text(size = 6.5),
+      legend.key.size = ggplot2::unit(0.35, "cm"),
+      legend.title    = ggplot2::element_text(size = 7),
+      panel.grid      = ggplot2::element_blank(),
+      plot.margin     = ggplot2::margin(3, 5, 2, 4))
+  
+  # Scale-3 persistence annotation on the bottom panel only
+  if (sc == 3) {
+    p <- p +
+      ggplot2::annotate("segment",
+                        x = as.Date("2023-01-01"), xend = as.Date("2025-12-31"),
+                        y = -0.42, yend = -0.42,
+                        colour = "#d73027", linewidth = 0.6) +
+      ggplot2::annotate("text",
+                        x = as.Date("2024-06-01"), y = -0.35,
+                        label = "Persistent below \u22120.5",
+                        size = 2.3, hjust = 0.5,
+                        colour = "#d73027", fontface = "italic")
+  }
+  p
+}
+
+# ── Helper: assemble + save a 3-panel figure (mirrors save_spei_fig) ──────────
+save_3panel_fig <- function(panels, title_str, subtitle_str, base_name) {
+  fig <- panels[[1]] / panels[[2]] / panels[[3]] +
+    patchwork::plot_layout(guides = "collect") +
+    patchwork::plot_annotation(
+      title    = title_str,
+      subtitle = subtitle_str,
+      theme    = ggplot2::theme(
+        plot.title      = ggplot2::element_text(size = 10, face = "bold",
+                                                hjust = 0.5),
+        plot.subtitle   = ggplot2::element_text(size = 7.5, colour = "grey40",
+                                                hjust = 0,
+                                                margin = ggplot2::margin(b = 4)),
+        legend.position = "bottom",
+        legend.text     = ggplot2::element_text(size = 7.5),
+        legend.key.size = ggplot2::unit(0.38, "cm")))
+  for (ext in c("pdf", "png")) {
+    out <- file.path(BASIN_PLOT_DIR, paste0(base_name, ".", ext))
+    tryCatch(
+      ggplot2::ggsave(out, fig, width = 7.0, height = 9.0, units = "in",
+                      dpi = if (ext == "png") 300 else "print",
+                      device = ext),
+      error = function(e) cat(sprintf("  \u26a0 %s: %s\n", ext, e$message)))
+    cat(sprintf("  \u2713 Saved: %s\n", basename(out)))
+  }
+  invisible(fig)
+}
+
+common_subtitle_4e <- paste0(
+  "Fill: drought category  |  ",
+  "Dashed: event threshold (x\u2080 = \u22120.5)  |  ",
+  "Dotted: moderate drought (\u22121.0)  |  ",
+  "Grey band: 2022\u20132025  |  ",
+  "Red segment: persistent sub-threshold anomaly 2023\u20132025 (scale-3 panel)")
+
+# ── Figure A: SPI-1 / SPI-2 / SPI-3 ──────────────────────────────────────────
+tryCatch({
+  cat("  Building SPI-1/2/3 figure...\n")
+  spi_panels <- list(
+    make_all_panel(1, "(a)", "spi", show_xlab = FALSE, is_first = TRUE),
+    make_all_panel(2, "(b)", "spi", show_xlab = FALSE, is_first = FALSE),
+    make_all_panel(3, "(c)", "spi", show_xlab = TRUE,  is_first = FALSE)
+  )
+  save_3panel_fig(
+    spi_panels,
+    "Basin-averaged SPI (precipitation only) \u2014 Nechako River Basin (1950\u20132025)",
+    common_subtitle_4e,
+    "Fig4e_MS_SPI_123_timeseries")
+  cat("  \u2713 SPI-1/2/3 figure complete\n")
+}, error = function(e) cat(sprintf("  \u26a0 SPI-1/2/3 figure failed: %s\n", e$message)))
+
+# ── Figure B: 9-panel comprehensive Results figure ────────────────────────────
+#
+#  Layout (3 rows × 3 columns, reading order):
+#    Row 1: SPI-1       SPI-2       SPI-3        (green lines)
+#    Row 2: SPEIₚₘ-1   SPEIₚₘ-2   SPEIₚₘ-3    (blue lines)
+#    Row 3: SPEI₀-1    SPEI₀-2    SPEI₀-3      (red lines)
+#  Panel labels: (a)–(i)
+tryCatch({
+  cat("  Building 9-panel combined Results figure...\n")
+  
+  label_grid <- c("(a)","(b)","(c)", "(d)","(e)","(f)", "(g)","(h)","(i)")
+  sc_grid    <- c(1, 2, 3,   1, 2, 3,   1, 2, 3)
+  type_grid  <- c("spi","spi","spi",
+                  "spei_pm","spei_pm","spei_pm",
+                  "spei_thw","spei_thw","spei_thw")
+  
+  panels_9 <- lapply(seq_len(9), function(k) {
+    row_idx  <- ceiling(k / 3)
+    last_row <- (row_idx == 3)
+    tryCatch(
+      make_all_panel(sc_grid[k], label_grid[k],
+                     index_type = type_grid[k],
+                     show_xlab  = last_row,
+                     is_first   = (k == 1L)),
+      error = function(e) {
+        cat(sprintf("    \u26a0 Panel %s failed: %s\n", label_grid[k], e$message))
+        ggplot2::ggplot() +
+          ggplot2::annotate("text", x = 0.5, y = 0.5,
+                            label = sprintf("No data\n%s", label_grid[k]),
+                            size = 3.5, colour = "grey60") +
+          ggplot2::theme_void()
+      })
+  })
+  
+  fig_9 <- patchwork::wrap_plots(panels_9, nrow = 3, ncol = 3,
+                                 guides = "collect") +
+    patchwork::plot_annotation(
+      title    = paste0(
+        "Basin-averaged drought indices \u2014 Nechako River Basin (1950\u20132025)\n",
+        "SPI (row 1)  |  SPEI\u209a\u2098 / Penman-Monteith (row 2)  |  ",
+        "SPEI\u2080 / Thornthwaite (row 3)"),
+      subtitle = paste0(
+        "Columns: 1-month, 2-month, 3-month accumulation scales.  ",
+        common_subtitle_4e),
+      theme = ggplot2::theme(
+        plot.title      = ggplot2::element_text(size = 10, face = "bold",
+                                                hjust = 0.5,
+                                                margin = ggplot2::margin(b = 3)),
+        plot.subtitle   = ggplot2::element_text(size = 7, colour = "grey40",
+                                                hjust = 0,
+                                                margin = ggplot2::margin(b = 5)),
+        legend.position = "bottom",
+        legend.text     = ggplot2::element_text(size = 7.5),
+        legend.key.size = ggplot2::unit(0.38, "cm")))
+  
+  for (ext in c("pdf", "png")) {
+    out_9 <- file.path(BASIN_PLOT_DIR,
+                       paste0("Fig2_MS_AllIndices_3x3.", ext))
+    tryCatch(
+      ggplot2::ggsave(out_9, fig_9,
+                      width  = 16, height = 13, units = "in",
+                      dpi    = if (ext == "png") 300 else "print",
+                      device = ext),
+      error = function(e) cat(sprintf("  \u26a0 %s: %s\n", ext, e$message)))
+    cat(sprintf("  \u2713 Saved: %s\n", basename(out_9)))
+  }
+  cat("  \u2713 9-panel combined figure complete\n")
+}, error = function(e) cat(sprintf("  \u26a0 9-panel figure failed: %s\n", e$message)))
+
+cat("\n\u2550\u2550 PART 4e complete \u2550\u2550\n")
+
+################################################################################
 # PART 5 – EXCEL SUMMARY (statistics + drought event counts + correlations)
 ################################################################################
 cat("\n══════════════════════════════════════════════\n")
@@ -1532,6 +1903,12 @@ cat("  MS figure SPEI (Thw)  : ",
 cat("  MS figure SPEI (both) : ",
     normalizePath(file.path(BASIN_PLOT_DIR,
                             "Fig4_MS_SPEI_123_overlay_timeseries.pdf")), "\n")
+cat("  MS figure SPI-1/2/3   : ",
+    normalizePath(file.path(BASIN_PLOT_DIR,
+                            "Fig4e_MS_SPI_123_timeseries.pdf")), "\n")
+cat("  Fig 2 (9-panel, all)  : ",
+    normalizePath(file.path(BASIN_PLOT_DIR,
+                            "Fig2_MS_AllIndices_3x3.pdf")), "\n")
 cat("  Spatial homogeneity (PDF): ",
     normalizePath(file.path(BASIN_PLOT_DIR,
                             "Fig4c_spatial_homogeneity_SPEI3_PM.pdf")), "\n")

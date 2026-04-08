@@ -30,7 +30,13 @@ if (length(new_pkgs) > 0) {
   install.packages(new_pkgs, quiet = TRUE)
 }
 invisible(lapply(required_pkgs, library, character.only = TRUE))
-
+if (!requireNamespace("rnaturalearthhires", quietly = TRUE)) {
+  install.packages(
+    "rnaturalearthhires",
+    repos = "https://ropensci.r-universe.dev",  # CRAN doesn't host it
+    quiet = TRUE
+  )
+}
 # NOTE: osmdata is no longer used as a fallback — it hangs on large bounding boxes.
 # geodata::hydrosheds() and geodata::waterbody() are used instead (fast, tiled).
 has_bcdata <- requireNamespace("bcdata", quietly = TRUE)

@@ -99,9 +99,12 @@ log_event(paste("Using", num_cores, "cores for parallel processing"))
 ####################################################################################
 # ── BASIN BOUNDARY
 ####################################################################################
-log_event("Searching for Nechako Basin boundary shapefile...")
+log_event("Searching for Nechako Basin boundary file...")
 basin_boundary <- NULL
 basin_files <- c(
+  "Spatial/nechakoBound_dissolve.kmz",
+  "nechakoBound_dissolve.kmz",
+  "D:/Nechako_Drought/Nechako/Spatial/nechakoBound_dissolve.kmz",
   "nechako_basin.shp", "Nechako_Basin.shp", "basin_boundary.shp",
   "../nechako_basin.shp", "data/nechako_basin.shp",
   "D:/Nechako_Drought/Nechako/Spatial/nechakoBound_dissolve.shp"
@@ -110,6 +113,8 @@ for (bf in basin_files) {
   if (file.exists(bf)) {
     tryCatch({
       basin_boundary <- st_read(bf, quiet = TRUE)
+      if (nrow(basin_boundary) > 1L)
+        basin_boundary <- sf::st_as_sf(sf::st_union(basin_boundary))
       basin_boundary <- st_transform(basin_boundary, "EPSG:3005")
       log_event(paste("✓ Loaded basin boundary from:", bf))
       break

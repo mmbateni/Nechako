@@ -84,8 +84,6 @@ cat("============================================================\n")
 WD_PATH  <- "D:/Nechako_Drought/Nechako/"
 DATA_DIR <- "D:/Nechako_Drought/Nechako/monthly_data_direct"
 ATM_DIR  <- file.path(WD_PATH, "atmospheric_diagnostics")    # w9 output dir
-OUT_DIR  <- file.path(ATM_DIR, "eof_analysis")               # w10c outputs
-dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
 
 # ── Load w9 shared state (inherits all configuration scalars) ─────────────────
 rds_w9 <- file.path(ATM_DIR, "w9_shared_state.rds")
@@ -95,6 +93,8 @@ if (!file.exists(rds_w9))
 w9 <- readRDS(rds_w9)
 list2env(w9, envir = environment())   # unpack all w9 scalars into local scope
 cat("  w9 shared state loaded.\n")
+OUT_DIR  <- file.path(ATM_DIR, "eof_analysis")               # w10c outputs
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
 
 # ── Index CSV directories (for SPEI) ─────────────────────────────────────────
 source(file.path(WD_PATH, "DROUGHT_ANALYSIS_utils.R"))      # load_basin_avg_csv
@@ -125,12 +125,13 @@ SEASONS <- list(
 
 # ── Correlation / regression settings ────────────────────────────────────────
 ALPHA_CORR  <- 0.05       # significance level for correlations
-MAX_LAG_MO  <- 6L         # maximum lag (months) for PC–SPEI lag analysis
+MAX_LAG_MO  <- 2L         # maximum lag (months) for PC–index lag analysis
 NW_BANDWIDTH <- NULL      # NULL = automatic Newey-West bandwidth selection
-SPEI_SCALES_MAIN <- c(3L, 6L, 12L)  # SPEI scales to use in analysis
+SPEI_SCALES_MAIN <- c(1L, 2L, 3L)   # SPEI (Penman-Monteith) accumulation scales
+SPI_SCALES_MAIN  <- c(1L, 2L, 3L)   # SPI accumulation scales
 
 # ── Figure DPI (use w9 constant; fallback if not in shared state) ─────────────
-FIG_DPI  <- if (exists("FIGURE_DPI")) FIGURE_DPI else 200L
+FIG_DPI  <- if (exists("FIGURE_DPI")) FIGURE_DPI else 300L
 FIG_W    <- if (exists("FIGURE_WIDTH_STD"))  FIGURE_WIDTH_STD  else 12
 FIG_W_WD <- if (exists("FIGURE_WIDTH_WIDE")) FIGURE_WIDTH_WIDE else 16
 
@@ -280,17 +281,29 @@ compute_eof <- function(rast_anom, dates, month_sel = NULL,
   
   # ── Eigenvalues & variance explained ─────────────────────────────────────
   # prcomp stores standard deviations; eigenvalues = sdev^2
-  eigenvals <- pca_res$sdev^2
-  # Total variance should equal ncol(mat_w) (each column has unit variance
-  # after cosine weighting * sqrt(w) approximately, so total ≈ sum of weights)
-  total_var <- sum(eigenvals) + sum(pca_res$sdev[-(1:n_pcs_eff)]^2,
-                                    na.rm = TRUE)
-  # Approximate total using trace of cov matrix: sum over all spatial points
-  # A more accurate total: use full svd or note that Kaiser criterion uses
-  # eigenvalues relative to the number of variables (ncol of mat_w)
-  total_var_approx <- ncol(mat_w)   # each col has ~unit variance
-  var_pct   <- (eigenvals / total_var_approx) * 100
-  cum_var   <- cumsum(var_pct)
+  # ── Eigenvalues & variance explained ─────────────────────────────────────
+  # prcomp stores standard deviations; eigenvalues = sdev^2.
+  # IMPORTANT: with a wide matrix (n_space >> n_time), prcomp's internal
+  # cross-product path may return all min(n_time-1, n_space-1) eigenvalues
+  # regardless of the rank. parameter.  We:
+  #   (a) keep the full eigenvalue vector for the Kaiser criterion (which must
+  #       be assessed against the full eigenvalue spectrum, not a truncated one)
+  #   (b) truncate to n_pcs_eff for all stored outputs so downstream data.frame()
+  #       calls never encounter a length mismatch (1 × n_pcs vs 912).
+  eigenvals_full <- pca_res$sdev^2               # all eigenvalues prcomp computed
+  n_ev           <- length(eigenvals_full)        # may be > n_pcs_eff
+  
+  # Kaiser criterion: computed on the FULL spectrum before truncation so that
+  # kaiser_n reflects the true number of meaningful modes (not just the top 10).
+  kaiser_n <- sum(eigenvals_full > mean(eigenvals_full))
+  
+  # Truncate to the n_pcs_eff components that were actually extracted
+  n_keep    <- min(n_pcs_eff, n_ev)
+  eigenvals <- eigenvals_full[seq_len(n_keep)]   # [n_pcs_eff]
+  
+  total_var_approx <- ncol(mat_w)   # each col has ~unit variance (trace approximation)
+  var_pct   <- (eigenvals / total_var_approx) * 100   # [n_pcs_eff]
+  cum_var   <- cumsum(var_pct)                         # [n_pcs_eff]
   
   # ── PC scores (temporal) — unweighted for physical interpretability ───────
   # pca_res$x gives [n_time × n_pcs] scores in the WEIGHTED space.
@@ -330,15 +343,11 @@ compute_eof <- function(rast_anom, dates, month_sel = NULL,
   # NOTE: the strict Kaiser criterion requires the full covariance matrix.
   # With SVD on truncated rank, we report an approximation and advise
   # inspection of the scree diagram.
-  kaiser_cutoff <- 1.0   # per-variable eigenvalue threshold
-  # Eigenvalue per variable = eigenval / (ncol/ncol) = eigenval (standardised)
-  # Here: retain PCs where eigenval > mean(eigenval) (modified Kaiser)
-  kaiser_n <- sum(eigenvals > mean(eigenvals))
-  cat(sprintf("    [%s] Kaiser criterion (eigenval > mean): %d PCs\n",
+  cat(sprintf("    [%s] Kaiser criterion (eigenval > mean, full spectrum): %d PCs\n",
               field_name, kaiser_n))
-  cat(sprintf("    [%s] Variance explained: %s%%\n",
-              field_name,
-              paste(round(var_pct[1:min(5, n_pcs_eff)], 1), collapse = ", ")))
+  cat(sprintf("    [%s] Variance explained (top %d PCs): %s%%\n",
+              field_name, n_keep,
+              paste(round(var_pct[1:min(5, n_keep)], 1), collapse = ", ")))
   
   # ── Template raster for spatial reconstruction ────────────────────────────
   # A single-layer template of the domain at the EOF resolution
@@ -350,11 +359,12 @@ compute_eof <- function(rast_anom, dates, month_sel = NULL,
     scores       = scores_norm,          # [n_time × n_pcs] normalised
     scores_raw   = scores,               # [n_time × n_pcs] raw
     loadings     = loadings,             # [n_weighted_cells × n_pcs]
-    eigenvals    = eigenvals,
-    var_pct      = var_pct,
-    cum_var      = cum_var,
-    kaiser_n     = kaiser_n,
-    n_pcs        = n_pcs_eff,
+    eigenvals    = eigenvals,            # [n_pcs_eff] — truncated to extracted PCs
+    eigenvals_full = eigenvals_full,     # [all]       — full spectrum for diagnostics
+    var_pct      = var_pct,              # [n_pcs_eff]
+    cum_var      = cum_var,              # [n_pcs_eff]
+    kaiser_n     = kaiser_n,             # scalar — based on full eigenvalue spectrum
+    n_pcs        = n_keep,              # = n_pcs_eff (number of extracted PCs)
     dates_sub    = d_sub,
     t_idx        = t_idx,               # index into full date vector
     vc_used      = vc_used,             # cell indices in r_domain
@@ -552,6 +562,43 @@ slp_anom  <- req_nc(file.path(DATA_DIR, sprintf(
 sst_anom  <- req_nc(file.path(DATA_DIR, sprintf(
   "sst_monthly_anomaly_clim%d_%d.nc",  CLIM_START, CLIM_END)))
 
+# ── Longitude convention normalisation ────────────────────────────────────────
+#
+#  ERA5 raw files use 0–360 longitudes internally in terra (confirmed: DOM_XMIN
+#  = 100, DOM_XMAX = 250 in w9/w10a Section 6).  However, when anomaly fields
+#  are written with terra::writeCDF() and re-read, terra (via the underlying
+#  netCDF library) may re-encode the x-axis as –180:+180 (confirmed by the
+#  ms1_atmospheric_blanks.csv output, which shows Z500 ridge lon = –176.75 °).
+#
+#  The EOF domain is defined in the 0–360 convention (EOF_LON_MIN = 140,
+#  EOF_LON_MAX = 240).  terra::crop() fails with "[crop] extents do not overlap"
+#  when the raster is in –180:+180 and the crop extent is in 0–360, because
+#  the 140–240 rectangle lies entirely outside the –180:+180 extent.
+#
+#  Fix: detect the convention from the x-extent of the first loaded raster and,
+#  if –180:+180, rotate all three anomaly rasters to 0–360 with terra::rotate().
+#  terra::rotate() reorders columns so that longitude 0° is at the left edge,
+#  converting a –180:+180 raster to 0–360.  All subsequent EOF crop calls then
+#  work as coded.
+#
+#  This rotation is applied ONLY inside w10c (local copies); the original
+#  anomaly NetCDF files on disk are not modified.
+
+.lon_max <- terra::ext(z500_anom)[2]   # xmax of first raster layer
+if (.lon_max <= 181) {
+  # Raster is in –180:+180 convention → rotate to 0–360
+  cat("  [INFO] Anomaly rasters are in –180:+180 convention (xmax =",
+      round(.lon_max, 1), "). Rotating to 0–360 for EOF domain crop.\n")
+  z500_anom <- terra::rotate(z500_anom)
+  slp_anom  <- terra::rotate(slp_anom)
+  sst_anom  <- terra::rotate(sst_anom)
+  cat(sprintf("  [INFO] After rotation: Z500 x-extent [%.1f, %.1f]\n",
+              terra::ext(z500_anom)[1], terra::ext(z500_anom)[2]))
+} else {
+  cat("  [INFO] Anomaly rasters already in 0–360 convention (xmax =",
+      round(.lon_max, 1), "). No rotation needed.\n")
+}
+
 # ── Full date spine ────────────────────────────────────────────────────────────
 all_dates <- seq.Date(as.Date(sprintf("%d-01-01", START_YEAR)),
                       as.Date(sprintf("%d-12-01", END_YEAR)),
@@ -561,8 +608,8 @@ stopifnot(terra::nlyr(z500_anom) == n_total)
 cat(sprintf("  Date spine: %s – %s (%d months)\n",
             min(all_dates), max(all_dates), n_total))
 
-# ── SPEI basin-averaged time series ───────────────────────────────────────────
-cat("\n  Loading SPEI basin means...\n")
+# ── SPEI (Penman-Monteith) basin-averaged time series ─────────────────────────
+cat("\n  Loading SPEI (PM) basin means...\n")
 spei_list <- lapply(SPEI_SCALES_MAIN, function(sc) {
   df <- tryCatch(load_basin_avg_csv("spei", sc),
                  error = function(e) NULL,
@@ -577,6 +624,28 @@ spei_list <- lapply(SPEI_SCALES_MAIN, function(sc) {
 names(spei_list) <- sprintf("SPEI%d", SPEI_SCALES_MAIN)
 spei_list <- Filter(Negate(is.null), spei_list)
 cat(sprintf("  SPEI scales loaded: %s\n", paste(names(spei_list), collapse = ", ")))
+
+# ── SPI basin-averaged time series ────────────────────────────────────────────
+cat("\n  Loading SPI basin means...\n")
+spi_list <- lapply(SPI_SCALES_MAIN, function(sc) {
+  df <- tryCatch(load_basin_avg_csv("spi", sc),
+                 error = function(e) NULL,
+                 warning = function(w) suppressWarnings(load_basin_avg_csv("spi", sc)))
+  if (is.null(df) || nrow(df) == 0) {
+    cat(sprintf("  ⚠ SPI-%d: not found, skipped\n", sc)); return(NULL)
+  }
+  df$scale <- sc
+  df$index <- sprintf("SPI%d", sc)
+  df
+})
+names(spi_list) <- sprintf("SPI%d", SPI_SCALES_MAIN)
+spi_list <- Filter(Negate(is.null), spi_list)
+cat(sprintf("  SPI scales loaded: %s\n", paste(names(spi_list), collapse = ", ")))
+
+# ── Combined drought index list (SPEI-PM + SPI) ───────────────────────────────
+index_list <- c(spei_list, spi_list)
+cat(sprintf("  Drought indices available: %s\n",
+            paste(names(index_list), collapse = ", ")))
 
 # ── Standard teleconnection indices (from cache) ──────────────────────────────
 cat("\n  Loading standard teleconnection indices...\n")
@@ -710,10 +779,12 @@ corr_rows    <- list()   # for Table 4
 reg_rows     <- list()   # for Table 5
 ms_blanks    <- list()   # manuscript text fill-in values
 
-# Primary SPEI scale for regression
-SPEI_PRIMARY <- SPEI_SCALES_MAIN[which(SPEI_SCALES_MAIN == 3)]
-if (!length(SPEI_PRIMARY)) SPEI_PRIMARY <- SPEI_SCALES_MAIN[1]
-spei_key_nm  <- sprintf("SPEI%d", SPEI_PRIMARY)
+# Primary scales for variance-partitioning regression (one per index type)
+PRIMARY_SCALES <- c(
+  SPEI = sprintf("SPEI%d", if (3L %in% SPEI_SCALES_MAIN) 3L else SPEI_SCALES_MAIN[length(SPEI_SCALES_MAIN)]),
+  SPI  = sprintf("SPI%d",  if (3L %in% SPI_SCALES_MAIN)  3L else SPI_SCALES_MAIN[length(SPI_SCALES_MAIN)])
+)
+PRIMARY_SCALES <- PRIMARY_SCALES[PRIMARY_SCALES %in% names(index_list)]
 
 for (fld in names(fields)) {
   key_all <- sprintf("%s_all", fld)
@@ -721,8 +792,8 @@ for (fld in names(fields)) {
   res <- eof_results[[key_all]]
   n_p <- min(res$kaiser_n + 1L, res$n_pcs, 4L)  # top PCs to correlate
   
-  for (spei_nm in names(spei_list)) {
-    spei_df  <- spei_list[[spei_nm]]
+  for (index_nm in names(index_list)) {
+    index_df  <- index_list[[index_nm]]
     
     for (k in seq_len(n_p)) {
       pc_vals   <- res$scores[, k]
@@ -730,51 +801,53 @@ for (fld in names(fields)) {
       
       # Lag correlation table
       lc <- tryCatch(
-        pc_spei_lag_cor(pc_vals, spei_df$value, pc_dates, spei_df$date,
+        pc_spei_lag_cor(pc_vals, index_df$value, pc_dates, index_df$date,
                         max_lag   = MAX_LAG_MO,
                         label_pc  = sprintf("%s-PC%d", fld, k)),
         error = function(e) NULL)
       if (!is.null(lc)) corr_rows <- c(corr_rows, list(
-        lc %>% mutate(field = fld, spei_scale = spei_nm)))
+        lc %>% mutate(field = fld, index_nm = index_nm)))
     }
   }
   
-  # ── Multiple regression: SPEI ~ PC1 + PC2 + PC3 ──────────────────────────
-  if (!spei_key_nm %in% names(spei_list)) next
-  spei_df <- spei_list[[spei_key_nm]]
-  n_p_reg <- min(n_p, 3L)
-  pc_labels <- sprintf("%s_PC%d", fld, seq_len(n_p_reg))
-  
-  # Align PC scores to SPEI dates (common dates)
-  pc_wide <- data.frame(date = res$dates_sub,
-                        do.call(cbind, lapply(seq_len(n_p_reg), function(k)
-                          res$scores[, k])))
-  colnames(pc_wide)[-1] <- pc_labels
-  merged_reg <- spei_df %>%
-    select(date, spei = value) %>%
-    inner_join(pc_wide, by = "date") %>%
-    arrange(date)
-  
-  if (nrow(merged_reg) < 30) next
-  
-  reg_res <- tryCatch(
-    nw_regression(merged_reg$spei,
-                  as.matrix(merged_reg[, pc_labels]),
-                  pc_labels),
-    error = function(e) { cat("  ⚠ NW regression failed:", e$message, "\n"); NULL })
-  
-  if (!is.null(reg_res)) {
-    reg_row <- reg_res$coefs %>%
-      mutate(field = fld, spei_scale = spei_key_nm,
-             adj_r2 = reg_res$adj_r2)
-    reg_rows <- c(reg_rows, list(reg_row))
+  # ── Multiple regression: Index ~ PC1 + PC2 + PC3 (for each primary scale) ──
+  for (prim_key in PRIMARY_SCALES) {
+    if (!prim_key %in% names(index_list)) next
+    index_df <- index_list[[prim_key]]
+    n_p_reg <- min(n_p, 3L)
+    pc_labels <- sprintf("%s_PC%d", fld, seq_len(n_p_reg))
     
-    cat(sprintf("  [%s ~ %s] adj-R² = %.3f\n",
-                fld, spei_key_nm, reg_res$adj_r2))
+    # Align PC scores to index dates (common dates)
+    pc_wide <- data.frame(date = res$dates_sub,
+                          do.call(cbind, lapply(seq_len(n_p_reg), function(k)
+                            res$scores[, k])))
+    colnames(pc_wide)[-1] <- pc_labels
+    merged_reg <- index_df %>%
+      select(date, spei = value) %>%
+      inner_join(pc_wide, by = "date") %>%
+      arrange(date)
     
-    # Manuscript blank: field-level adj-R²
-    ms_blanks[[sprintf("reg_adjR2_%s_%s", fld, spei_key_nm)]] <-
-      round(reg_res$adj_r2 * 100, 1)
+    if (nrow(merged_reg) < 30) next
+    
+    reg_res <- tryCatch(
+      nw_regression(merged_reg$spei,
+                    as.matrix(merged_reg[, pc_labels]),
+                    pc_labels),
+      error = function(e) { cat("  ⚠ NW regression failed:", e$message, "\n"); NULL })
+    
+    if (!is.null(reg_res)) {
+      reg_row <- reg_res$coefs %>%
+        mutate(field = fld, index_nm = prim_key,
+               adj_r2 = reg_res$adj_r2)
+      reg_rows <- c(reg_rows, list(reg_row))
+      
+      cat(sprintf("  [%s ~ %s] adj-R² = %.3f\n",
+                  fld, prim_key, reg_res$adj_r2))
+      
+      # Manuscript blank: field-level adj-R²
+      ms_blanks[[sprintf("reg_adjR2_%s_%s", fld, prim_key)]] <-
+        round(reg_res$adj_r2 * 100, 1)
+    }
   }
 }
 
@@ -1039,31 +1112,37 @@ for (fld in names(fields)) {
 }
 scree_df <- bind_rows(scree_rows)
 
-p_scree <- ggplot(scree_df, aes(x = pc, y = var_pct)) +
-  geom_col(aes(fill = kaiser), width = 0.7, colour = "white", linewidth = 0.3) +
-  geom_line(aes(y = cum_var), colour = "grey30", linewidth = 0.7,
-            linetype = "dashed") +
-  geom_point(aes(y = cum_var), colour = "grey30", size = 1.5) +
-  geom_hline(yintercept = 80, colour = "#E74C3C", linewidth = 0.5,
-             linetype = "dotted", alpha = 0.7) +
-  scale_fill_manual(values = c("TRUE" = "#1F4E79", "FALSE" = "#AED6F1"),
-                    labels = c("TRUE" = "Retained (Kaiser)", "FALSE" = "Rejected"),
-                    name   = NULL) +
-  facet_wrap(~ field, ncol = 3) +
-  scale_x_continuous(breaks = seq(1, N_PCS_MAX, 2)) +
-  scale_y_continuous(
-    name     = "Variance explained (%)",
-    sec.axis = dup_axis(name = "Cumulative variance (%)")) +
-  labs(title    = "Scree diagram — North Pacific EOF analysis",
-       subtitle  = paste0("Domain: ", EOF_LON_MIN, "°E–", EOF_LON_MAX-360, "°W ",
-                          "(", EOF_LON_MIN, "–", EOF_LON_MAX, "° in 0-360), ",
-                          EOF_LAT_MIN, "°–", EOF_LAT_MAX, "°N  |  ",
-                          "Anomalies relative to WMO ", CLIM_START, "–", CLIM_END,
-                          "  |  Red dotted: 80% cumulative variance"),
-       x = "PC number") +
-  theme_ts(10)
-
-save_fig(p_scree, "FigS1_scree_diagrams", w = 12, h = 5)
+if (nrow(scree_df) == 0) {
+  cat("  ⚠ No EOF results available for scree diagram — skipping.\n")
+} else {
+  
+  p_scree <- ggplot(scree_df, aes(x = pc, y = var_pct)) +
+    geom_col(aes(fill = kaiser), width = 0.7, colour = "white", linewidth = 0.3) +
+    geom_line(aes(y = cum_var), colour = "grey30", linewidth = 0.7,
+              linetype = "dashed") +
+    geom_point(aes(y = cum_var), colour = "grey30", size = 1.5) +
+    geom_hline(yintercept = 80, colour = "#E74C3C", linewidth = 0.5,
+               linetype = "dotted", alpha = 0.7) +
+    scale_fill_manual(values = c("TRUE" = "#1F4E79", "FALSE" = "#AED6F1"),
+                      labels = c("TRUE" = "Retained (Kaiser)", "FALSE" = "Rejected"),
+                      name   = NULL) +
+    facet_wrap(~ field, ncol = 3) +
+    scale_x_continuous(breaks = seq(1, N_PCS_MAX, 2)) +
+    scale_y_continuous(
+      name     = "Variance explained (%)",
+      sec.axis = dup_axis(name = "Cumulative variance (%)")) +
+    labs(title    = "Scree diagram — North Pacific EOF analysis",
+         subtitle  = paste0("Domain: ", EOF_LON_MIN, "°E–", EOF_LON_MAX-360, "°W ",
+                            "(", EOF_LON_MIN, "–", EOF_LON_MAX, "° in 0-360), ",
+                            EOF_LAT_MIN, "°–", EOF_LAT_MAX, "°N  |  ",
+                            "Anomalies relative to WMO ", CLIM_START, "–", CLIM_END,
+                            "  |  Red dotted: 80% cumulative variance"),
+         x = "PC number") +
+    theme_ts(10)
+  
+  save_fig(p_scree, "FigS1_scree_diagrams", w = 12, h = 5)
+  
+} # end scree guard
 
 # ── 10-B: EOF SPATIAL PATTERN MAPS ──────────────────────────────────────────
 cat("\n  10-B: EOF spatial pattern maps\n")
@@ -1098,7 +1177,7 @@ make_eof_panel <- function(eof_res, pc_k, fld_label, var_pct_k) {
     ggplot2::geom_sf(data = borders, fill = NA, colour = "grey30",
                      linewidth = 0.2, inherit.aes = FALSE) +
     ggplot2::coord_sf(
-      xlim   = c(wrap_lon(EOF_LON_MIN), -120),
+      xlim   = c(140 - 360, -120),   # 140°E = -220 wraps to +140; use -220:-120 in WGS84
       ylim   = c(EOF_LAT_MIN, EOF_LAT_MAX),
       expand = FALSE, crs = sf::st_crs(4326)) +
     ggplot2::labs(
@@ -1158,10 +1237,11 @@ cat("\n  10-C: PC time series with SPEI overlay\n")
 
 pc_ts_panels <- list()
 
-# Use SPEI-3 as the primary overlay series
-spei_overlay_nm <- sprintf("SPEI%d", SPEI_PRIMARY)
-spei_overlay    <- if (spei_overlay_nm %in% names(spei_list)) {
-  spei_list[[spei_overlay_nm]]
+# Use SPEI-3 as the primary overlay series (fallback to first available SPEI)
+spei_overlay_nm <- if ("SPEI3" %in% names(index_list)) "SPEI3" else
+  names(index_list)[startsWith(names(index_list), "SPEI")][1]
+spei_overlay    <- if (!is.na(spei_overlay_nm) && spei_overlay_nm %in% names(index_list)) {
+  index_list[[spei_overlay_nm]]
 } else NULL
 
 for (fld in names(fields)) {
@@ -1250,37 +1330,103 @@ if (length(pc_ts_panels) >= 1) {
 cat("\n  10-D: Correlation heatmap\n")
 
 if (!is.null(corr_df)) {
-  # Keep lag = 0 correlations for the main heatmap
+  
+  # ── Filter: SPEI-PM only (drop SPI), lag = 0, PC1-PC3 only ─────────────────
+  SPEI_LABELS <- c("SPEI1", "SPEI2", "SPEI3")
+  MS_PCS      <- c("PC1", "PC2", "PC3")
+  
   heatmap_df <- corr_df %>%
-    filter(lag_mo == 0) %>%
-    mutate(
-      pc_label   = sprintf("%s-%s", field, pc),
-      sig_label  = ifelse(p_effn < 0.01, "**",
-                          ifelse(p_effn < ALPHA_CORR, "*", "")),
-      r_label    = sprintf("%.2f%s", r, sig_label)
+    dplyr::filter(
+      lag_mo   == 0,
+      index_nm %in% SPEI_LABELS,
+      pc       %in% paste0(field, "-", MS_PCS[match(
+        sub(".*-", "", pc), MS_PCS)])
+    ) %>%
+    # pc column already contains e.g. "Z500-PC1" — use directly as label
+    dplyr::mutate(
+      pc_label  = pc,
+      sig_label = ifelse(p_effn < 0.01, "**",
+                         ifelse(p_effn < ALPHA_CORR, "*", "")),
+      r_label   = sprintf("%.2f%s", r, sig_label),
+      pc_label  = factor(pc_label,
+                         levels = c("Z500-PC1", "Z500-PC2", "Z500-PC3",
+                                    "SLP-PC1",  "SLP-PC2",  "SLP-PC3",
+                                    "SST-PC1",  "SST-PC2",  "SST-PC3")),
+      spei_label = dplyr::recode(index_nm,
+                                 SPEI1 = "SPEI-1",
+                                 SPEI2 = "SPEI-2",
+                                 SPEI3 = "SPEI-3"),
+      spei_label = factor(spei_label, levels = c("SPEI-1", "SPEI-2", "SPEI-3"))
+    ) %>%
+    dplyr::filter(!is.na(pc_label))
+  
+  # Vertical separator positions (between Z500/SLP and SLP/SST groups)
+  vline_pos <- c(3.5, 6.5)
+  
+  p_heat <- ggplot2::ggplot(heatmap_df,
+                            ggplot2::aes(x = pc_label, y = spei_label, fill = r)) +
+    ggplot2::geom_vline(xintercept = vline_pos, colour = "grey55",
+                        linewidth = 0.9, linetype = "solid") +
+    ggplot2::geom_tile(colour = "white", linewidth = 0.5) +
+    ggplot2::geom_text(ggplot2::aes(label = r_label),
+                       size = 3.8, colour = "grey10", fontface = "bold") +
+    # Field group labels above tiles
+    ggplot2::annotate("text", x = 2, y = 3.7, label = "Z500",
+                      size = 3.8, fontface = "bold", colour = "grey20") +
+    ggplot2::annotate("text", x = 5, y = 3.7, label = "SLP",
+                      size = 3.8, fontface = "bold", colour = "grey20") +
+    ggplot2::annotate("text", x = 8, y = 3.7, label = "SST",
+                      size = 3.8, fontface = "bold", colour = "grey20") +
+    ggplot2::scale_fill_distiller(
+      palette   = "RdBu",
+      direction = 1,
+      limits    = c(-1, 1),
+      oob       = scales::squish,
+      name      = "Pearson r",
+      guide     = ggplot2::guide_colorbar(
+        barwidth = 10, barheight = 0.5,
+        title.position = "top", title.hjust = 0.5)) +
+    ggplot2::scale_x_discrete(name = NULL) +
+    ggplot2::scale_y_discrete(
+      name   = NULL,
+      expand = ggplot2::expansion(add = c(0.5, 0.9))) +
+    ggplot2::labs(
+      title    = "North Pacific circulation PCs vs basin-average SPEI (PM) — Nechako Basin",
+      subtitle = paste0(
+        "Lag = 0 months  |  PC1\u2013PC3 for Z500, SLP, SST  |  ",
+        "** p < 0.01, * p < 0.05 (effective sample size)  |  ",
+        "Anomalies vs WMO ", CLIM_START, "\u2013", CLIM_END)) +
+    ggplot2::theme_minimal(base_size = 11) +
+    ggplot2::theme(
+      plot.title      = ggplot2::element_text(size = 11, face = "bold", hjust = 0,
+                                              margin = ggplot2::margin(b = 4)),
+      plot.subtitle   = ggplot2::element_text(size = 8.5, colour = "grey35", hjust = 0,
+                                              margin = ggplot2::margin(b = 8)),
+      axis.text.x     = ggplot2::element_text(size = 10, angle = 35, hjust = 1),
+      axis.text.y     = ggplot2::element_text(size = 11, face = "bold"),
+      panel.grid      = ggplot2::element_blank(),
+      legend.position = "bottom",
+      legend.title    = ggplot2::element_text(size = 9, face = "bold"),
+      legend.text     = ggplot2::element_text(size = 9),
+      plot.margin     = ggplot2::margin(t = 10, r = 10, b = 8, l = 8)
     )
   
-  p_heat <- ggplot(heatmap_df,
-                   aes(x = spei_scale, y = pc_label, fill = r)) +
-    geom_tile(colour = "white", linewidth = 0.4) +
-    geom_text(aes(label = r_label), size = 3.2, colour = "grey10") +
-    scale_fill_distiller(palette = "RdBu", direction = 1,
-                         limits = c(-1, 1), oob = scales::squish,
-                         name = "Pearson r",
-                         guide = guide_colorbar(barwidth = 7, barheight = 0.45,
-                                                title.position = "top")) +
-    scale_x_discrete(name = "SPEI scale") +
-    scale_y_discrete(name = "Circulation PC") +
-    labs(
-      title    = "Correlation heatmap: North Pacific circulation PCs vs SPEI",
-      subtitle = paste0("Lag = 0 months  |  Effective-n significance: * p<0.05, ** p<0.01  |  ",
-                        "Anomalies: WMO ", CLIM_START, "–", CLIM_END)) +
-    theme_ts(10) +
-    theme(axis.text.x = element_text(angle = 30, hjust = 1),
-          panel.grid  = element_blank(),
-          legend.position = "bottom")
+  FIG9_W <- 9.5
+  FIG9_H <- 4.2
   
-  save_fig(p_heat, "Fig9_correlation_heatmap", w = 8, h = max(5, nrow(heatmap_df) * 0.45 + 2))
+  tryCatch({
+    ggplot2::ggsave(file.path(OUT_DIR, "Fig9_correlation_heatmap.pdf"),
+                    p_heat, width = FIG9_W, height = FIG9_H,
+                    units = "in", device = "pdf")
+    cat("  \u2713 Fig9_correlation_heatmap.pdf\n")
+  }, error = function(e) cat(sprintf("  \u2717 Fig9_correlation_heatmap.pdf: %s\n", e$message)))
+  
+  tryCatch({
+    ggplot2::ggsave(file.path(OUT_DIR, "Fig9_correlation_heatmap.png"),
+                    p_heat, width = FIG9_W, height = FIG9_H,
+                    units = "in", dpi = 600L, device = "png")
+    cat("  \u2713 Fig9_correlation_heatmap.png (600 DPI)\n")
+  }, error = function(e) cat(sprintf("  \u2717 Fig9_correlation_heatmap.png: %s\n", e$message)))
 }
 
 # ============================================================================

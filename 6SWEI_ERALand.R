@@ -4,7 +4,7 @@
 # Output naming matches SPI_ERALand.R convention
 ##############################################
 # ---- Libraries ----
-  library(terra)
+library(terra)
 library(ncdf4)
 library(zoo)
 library(writexl)
@@ -14,8 +14,10 @@ setwd("D:/Nechako_Drought/Nechako")
 out_dir <- "swei_results_seasonal"
 if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 # ---- Load Basin Boundary ----
-basin_path <- "Spatial/nechakoBound_dissolve.shp"
-basin <- if (file.exists(basin_path)) vect(basin_path) else NULL
+basin_path <- "Spatial/nechakoBound_dissolve.kmz"
+basin <- if (file.exists(basin_path)) {
+  v <- vect(basin_path); if (nrow(v) > 1L) v <- aggregate(v); v
+} else NULL
 if (!is.null(basin)) {
   cat("✓ Basin boundary loaded\n")
 } else {
@@ -107,11 +109,11 @@ cat(sprintf("Processing %d basin pixels...\n", n_pixels))
 swe_smoothed <- matrix(NA, nrow = nrow(swe_matrix), ncol = ncol(swe_matrix))
 for (i in 1:nrow(swe_matrix)) {
   swe_smoothed[i, ] <- zoo::rollapply(swe_matrix[i, ],
-                                        width = 3,
-                                        FUN = sum,
-                                        align = "right",
-                                        fill = NA,
-                                        na.rm = FALSE)   # NA if any of the three months is NA
+                                      width = 3,
+                                      FUN = sum,
+                                      align = "right",
+                                      fill = NA,
+                                      na.rm = FALSE)   # NA if any of the three months is NA
 }
 cat("✓ 3-month moving average applied to SWE values\n")
 

@@ -121,9 +121,10 @@ DURATION_CLASSES <- list(
 # Scale 2 may not have pre-computed NetCDF files; build_sw08_catalog() will warn
 # and skip gracefully if the files are absent.
 INDICES_TO_ANALYZE <- list(
-  list(index = "spi",  scales = c(1, 2, 3)),
-  list(index = "spei", scales = c(1, 2, 3)),
-  list(index = "swei", scales = c(SWEI_SCALE))
+  list(index = "spi",      scales = c(1, 2, 3)),
+  list(index = "spei",     scales = c(1, 2, 3)),     # Penman-Monteith PET
+  list(index = "spei_thw", scales = c(1, 2, 3)),     # Thornthwaite PET (new)
+  list(index = "swei",     scales = c(SWEI_SCALE))
 )
 
 # Significance level for return period
@@ -248,18 +249,25 @@ build_sw08_catalog <- function(index_type, scale,
   min_dur  <- as.integer(min_duration)
   
   # ── locate NetCDF files (reuse utils finder functions) ─────────────────────
+  # spei_thw shares file naming with spei (prefix "spei_") but lives in the
+  # Thornthwaite output directory produced by 3SPEI_ERALand.R.
   seas_dir <- switch(index_type,
-                     spi  = SPI_SEAS_DIR,
-                     spei = SPEI_SEAS_DIR,
-                     swei = SWEI_SEAS_DIR,
+                     spi      = SPI_SEAS_DIR,
+                     spei     = SPEI_SEAS_DIR,
+                     spei_thw = SPEI_THW_SEAS_DIR,          # Thornthwaite (new)
+                     swei     = SWEI_SEAS_DIR,
                      stop("Unknown index_type: ", index_type)
   )
+  
+  # For spei_thw the NC files are named "spei_XX_monthXX_MMM.nc" (same prefix
+  # as PM SPEI) so pass "spei" as the pattern argument, not "spei_thw".
+  nc_pattern_type <- if (index_type == "spei_thw") "spei" else index_type
   
   files <- tryCatch({
     if (index_type == "swei")
       find_swei_seasonal_files(seas_dir)
     else
-      find_seasonal_nc_files(seas_dir, index_type, scale)
+      find_seasonal_nc_files(seas_dir, nc_pattern_type, scale)
   }, error = function(e) character(0))
   
   if (length(files) == 0L) {
@@ -1810,7 +1818,11 @@ cat("PART 4d: Kendall RP — multi-index comparison\n")
 cat("══════════════════════════════════════\n")
 
 # ── Indices to analyse ────────────────────────────────────────────────────────
-MULTI_INDICES <- c("spi_01", "spi_02", "spi_03", "spei_01", "spei_02", "spei_03")
+MULTI_INDICES <- c(
+  "spi_01", "spi_02", "spi_03",
+  "spei_01", "spei_02", "spei_03",
+  "spei_thw_01", "spei_thw_02", "spei_thw_03"   # Thornthwaite (new)
+)
 
 # Keep only those actually present in master_events
 available_idx <- unique(master_events$index_label)
@@ -1818,12 +1830,40 @@ MULTI_INDICES <- MULTI_INDICES[MULTI_INDICES %in% available_idx]
 if (length(MULTI_INDICES) == 0) {
   cat("  WARNING: none of the requested indices found in master_events — skipping Part 4d\n")
 } else {
-  missing_idx <- setdiff(c("spi_01","spi_02","spi_03","spei_01","spei_02","spei_03"), available_idx)
+  missing_idx <- setdiff(
+    c("spi_01","spi_02","spi_03",
+      "spei_01","spei_02","spei_03",
+      "spei_thw_01","spei_thw_02","spei_thw_03"),
+    available_idx)
   if (length(missing_idx))
     cat(sprintf("  NOTE: not found in catalog (skipped): %s\n",
                 paste(missing_idx, collapse = ", ")))
   cat(sprintf("  Analysing: %s\n", paste(MULTI_INDICES, collapse = ", ")))
 }
+
+# ── Pretty display labels for index_label codes ───────────────────────────────
+# spei_thw_01 → "SPEI₀-1 (Thw)"  |  spei_01 → "SPEIₚₘ-1"  |  spi_01 → "SPI-1"
+pretty_index_label <- function(idx_label) {
+  parts <- strsplit(idx_label, "_")[[1]]
+  # Detect Thornthwaite variant (3-part: "spei" "thw" "XX")
+  if (length(parts) == 3 && parts[1] == "spei" && parts[2] == "thw") {
+    sc <- as.integer(parts[3])
+    return(sprintf("SPEI\u2080-%d (Thw)", sc))
+  }
+  # Standard 2-part: "spi"/"spei" + scale
+  index_name <- toupper(parts[1])
+  sc <- as.integer(parts[length(parts)])
+  if (index_name == "SPEI")
+    return(sprintf("SPEI\u209a\u2098-%d (PM)", sc))
+  sprintf("%s-%d", index_name, sc)
+}
+
+# Colour palette: SPI = reds, SPEI-PM = blues, SPEI-Thw = oranges
+MULTI_INDEX_COLOURS <- c(
+  spi_01 = "#fc8d59", spi_02 = "#d7301f", spi_03 = "#7f0000",
+  spei_01 = "#74add1", spei_02 = "#4575b4", spei_03 = "#313695",
+  spei_thw_01 = "#fee08b", spei_thw_02 = "#f46d43", spei_thw_03 = "#a50026"
+)
 
 # ── Helper: re-usable log-logistic d/p (defined in Part 4c; re-declare here
 #    in case Part 4c was skipped or its tryCatch silently failed) ─────────────
@@ -2003,7 +2043,7 @@ for (idx in MULTI_INDICES) {
 # ── Summary table ─────────────────────────────────────────────────────────────
 multi_tbl <- do.call(rbind, lapply(multi_results, function(r) {
   data.frame(
-    Index       = gsub("_", "-", toupper(r$index)),
+    Index       = pretty_index_label(r$index),
     N_events    = r$n_ev    %||% NA,
     Tau_emp     = r$tau_emp %||% NA,
     Best_copula = r$best_cop %||% NA,
@@ -2038,7 +2078,7 @@ if (length(valid_res) >= 2) {
   # ── Panel A: T_K point + CI across indices (log y-axis) ──────────────────
   plot_df <- do.call(rbind, lapply(valid_res, function(r) {
     data.frame(
-      index   = gsub("_", "-", toupper(r$index)),
+      index   = pretty_index_label(r$index),
       TK      = r$TK,
       ci_lo   = r$ci_lo,
       ci_hi   = pmin(r$ci_hi, 5e4),   # cap display at 50 000 yr
@@ -2216,7 +2256,7 @@ cat("═════════════════════════
 
 # Load basin as SpatVector for raster extraction
 basin_vect <- tryCatch(
-  terra::vect(BASIN_SHP),
+  load_basin_vect(BASIN_SHP),
   error = function(e) NULL
 )
 
@@ -2568,7 +2608,7 @@ if (file.exists(ts_rds_file)) {
       colnames(df_sev)[3]  <- "severity"
       
       basin_sf_plot <- tryCatch(
-        sf::st_as_sf(terra::vect(BASIN_SHP)),
+        sf::st_as_sf(load_basin_vect(BASIN_SHP)),
         error = function(e) NULL
       )
       
@@ -2775,6 +2815,237 @@ openxlsx::saveWorkbook(wb, excel_file, overwrite = TRUE)
 cat(sprintf("✓ Saved: %s\n", basename(excel_file)))
 
 ####################################################################################
+# PART 4e – MANUSCRIPT TABLES 1a AND 1c
+#
+# These two tables are companion pieces to Table 1b (SPEI-PM-3 top events,
+# already in the MS) and are required by the expanded Results Section 4.3
+# that now includes SPI-1/2 and SPEI-Thw-1/2/3.
+#
+# TABLE 1a — Top events for SPI-1 and SPI-2 (precipitation-only indices).
+#   Purpose: documents how the 2022–2025 drought ranks at short accumulation
+#   scales in the precipitation-only record, complementing the SPI-3 finding
+#   (21-month continuous event, rank 1).
+#   Source: ranked_catalog filtered to index_label %in% c("spi_01","spi_02").
+#   Output: Table_1a_SPI_01_02_TopEvents.csv  (top 10 per scale, side by side)
+#           Sheet "Table_1a_SPI_TopEvents" added to Drought_Ranking_Summary.xlsx
+#
+# TABLE 1c — Top events for SPEI-Thw-1, -2, -3 (Thornthwaite SPEI).
+#   Purpose: quantifies how Thornthwaite-based severity scores compare to PM-based
+#   scores (Table 1b) and supports the decomposition finding that SPEI-Thw ≥ SPEI-PM
+#   in drought severity (thermodynamic fraction ≥ 100% at scales 1 and 2).
+#   Source: ranked_catalog filtered to index_label matching "spei_thw_0X".
+#   Output: Table_1c_SPEI_Thw_TopEvents.csv
+#           Sheet "Table_1c_SPEI_Thw_TopEvents" added to Drought_Ranking_Summary.xlsx
+#
+# COLUMN DEFINITIONS (identical to Table 1b):
+#   Rank              — composite severity rank within the index's own catalog
+#   Start_date        — onset month of the event
+#   End_date          — termination month
+#   Start_year        — calendar year of onset (used as the event label)
+#   Duration_months   — number of consecutive sub-threshold months
+#   Duration_class    — D3-6 Short-term / D7-12 Medium-term / D12+ Long-term
+#   Mean_intensity    — mean deficit below x₀ = −0.5 over event months [index units]
+#   Severity          — Mean_intensity × Duration_months [index-units·months]
+#   Return_period_yr  — Weibull empirical return period (n+1)/rank [years]
+#   Percentile_rank   — 100 × (1 − rank/(n+1)) [%]
+#   In_2022_2025      — logical flag; TRUE if event overlaps the 2022–2025 window
+####################################################################################
+cat("\n══════════════════════════════════════\n")
+cat("PART 4e: Manuscript Tables 1a and 1c\n")
+cat("══════════════════════════════════════\n")
+
+# ── Helper: extract top-N events for a set of index labels, add display columns ──
+make_ms_table <- function(catalog, index_labels, n_top = 10L) {
+  sub <- catalog %>%
+    dplyr::filter(index_label %in% index_labels,
+                  duration_class != "D1-2 (Sub-threshold)") %>%
+    dplyr::arrange(index_label, rank_by_severity)
+  
+  # Pretty index label for the table header column
+  sub$Index <- vapply(sub$index_label, function(lbl) {
+    parts <- strsplit(lbl, "_")[[1]]
+    if (length(parts) == 3L && parts[2] == "thw") {
+      sprintf("SPEI\u2080-%d (Thw)", as.integer(parts[3]))
+    } else if (parts[1] == "spei") {
+      sprintf("SPEI\u209a\u2098-%d (PM)", as.integer(parts[2]))
+    } else {
+      sprintf("SPI-%d", as.integer(parts[2]))
+    }
+  }, character(1L))
+  
+  # Take top n_top per index_label
+  out <- sub %>%
+    dplyr::group_by(index_label) %>%
+    dplyr::slice_head(n = n_top) %>%
+    dplyr::ungroup() %>%
+    dplyr::select(
+      Index,
+      Rank          = rank_by_severity,
+      Start_date    = start_date,
+      End_date      = end_date,
+      Start_year    = start_year,
+      Duration_months = duration_months,
+      Duration_class  = duration_class,
+      Mean_intensity  = mean_int,
+      Severity        = severity,
+      Return_period_yr = return_period_years,
+      Percentile_rank  = percentile_rank,
+      In_2022_2025     = is_recent
+    ) %>%
+    dplyr::mutate(
+      Mean_intensity   = round(Mean_intensity,   6L),
+      Severity         = round(Severity,         6L),
+      Return_period_yr = round(Return_period_yr, 2L),
+      Percentile_rank  = round(Percentile_rank,  2L)
+    )
+  out
+}
+
+# ── Styled Excel sheet writer ─────────────────────────────────────────────────
+write_ms_table_sheet <- function(wb, sheet_name, tbl) {
+  openxlsx::addWorksheet(wb, sheet_name)
+  openxlsx::writeData(wb, sheet_name, tbl)
+  
+  hdr_style <- openxlsx::createStyle(
+    textDecoration = "bold", fgFill = "#BDD7EE",
+    halign = "center", border = "Bottom",
+    borderColour = "#2E75B6", borderStyle = "medium")
+  openxlsx::addStyle(wb, sheet_name, hdr_style,
+                     rows = 1L, cols = seq_len(ncol(tbl)), stack = TRUE)
+  
+  # Highlight 2022-2025 rows in yellow
+  for (rw in which(tbl$In_2022_2025)) {
+    openxlsx::addStyle(wb, sheet_name,
+                       openxlsx::createStyle(fgFill = "#FFEB9C"),
+                       rows = rw + 1L, cols = seq_len(ncol(tbl)),
+                       stack = TRUE)
+  }
+  
+  openxlsx::setColWidths(wb, sheet_name,
+                         cols = seq_len(ncol(tbl)),
+                         widths = c(18, 6, 12, 12, 10, 16, 22, 16, 12, 16, 15, 13))
+  invisible(wb)
+}
+
+tryCatch({
+  
+  # ── TABLE 1a: SPI-1 and SPI-2 ───────────────────────────────────────────────
+  cat("  Building Table 1a (SPI-1/2 top events)...\n")
+  
+  spi_labels <- c("spi_01", "spi_02")
+  spi_present <- spi_labels[spi_labels %in% unique(ranked_catalog$index_label)]
+  
+  if (length(spi_present) == 0L) {
+    cat("  \u26a0 Table 1a: no SPI-01/02 events in catalog — skipping\n")
+  } else {
+    tbl_1a <- make_ms_table(ranked_catalog, spi_present, n_top = 10L)
+    
+    csv_1a <- file.path(RANKING_DIR, "Table_1a_SPI_01_02_TopEvents.csv")
+    write.csv(tbl_1a, csv_1a, row.names = FALSE)
+    cat(sprintf("  \u2713 Table 1a saved: %s  (%d rows)\n",
+                basename(csv_1a), nrow(tbl_1a)))
+    
+    # Console preview
+    cat("\n  Table 1a preview (top 3 per index):\n")
+    preview_1a <- tbl_1a %>%
+      dplyr::group_by(Index) %>%
+      dplyr::slice_head(n = 3L) %>%
+      dplyr::ungroup() %>%
+      dplyr::select(Index, Rank, Start_date, End_date,
+                    Duration_months, Severity, In_2022_2025)
+    print(as.data.frame(preview_1a), row.names = FALSE)
+    
+    # Add to Excel workbook
+    wb_1a_path <- file.path(RANKING_DIR, "Drought_Ranking_Summary.xlsx")
+    if (file.exists(wb_1a_path)) {
+      wb_loaded <- tryCatch(openxlsx::loadWorkbook(wb_1a_path),
+                            error = function(e) NULL)
+      if (!is.null(wb_loaded)) {
+        # Remove sheet if it exists (overwrite)
+        if ("Table_1a_SPI_TopEvents" %in% names(wb_loaded))
+          openxlsx::removeWorksheet(wb_loaded, "Table_1a_SPI_TopEvents")
+        write_ms_table_sheet(wb_loaded, "Table_1a_SPI_TopEvents", tbl_1a)
+        openxlsx::saveWorkbook(wb_loaded, wb_1a_path, overwrite = TRUE)
+        cat("  \u2713 Table_1a_SPI_TopEvents sheet added to Drought_Ranking_Summary.xlsx\n")
+      }
+    }
+  }
+  
+  # ── TABLE 1c: SPEI-Thw-1, -2, -3 ───────────────────────────────────────────
+  cat("\n  Building Table 1c (SPEI-Thw-1/2/3 top events)...\n")
+  
+  thw_labels <- c("spei_thw_01", "spei_thw_02", "spei_thw_03")
+  thw_present <- thw_labels[thw_labels %in% unique(ranked_catalog$index_label)]
+  
+  if (length(thw_present) == 0L) {
+    cat("  \u26a0 Table 1c: no SPEI-Thw events in catalog — skipping\n")
+    cat("    (Run w5 after confirming spei_thw is in INDICES_TO_ANALYZE)\n")
+  } else {
+    tbl_1c <- make_ms_table(ranked_catalog, thw_present, n_top = 10L)
+    
+    csv_1c <- file.path(RANKING_DIR, "Table_1c_SPEI_Thw_TopEvents.csv")
+    write.csv(tbl_1c, csv_1c, row.names = FALSE)
+    cat(sprintf("  \u2713 Table 1c saved: %s  (%d rows)\n",
+                basename(csv_1c), nrow(tbl_1c)))
+    
+    # Console preview
+    cat("\n  Table 1c preview (top 3 per index):\n")
+    preview_1c <- tbl_1c %>%
+      dplyr::group_by(Index) %>%
+      dplyr::slice_head(n = 3L) %>%
+      dplyr::ungroup() %>%
+      dplyr::select(Index, Rank, Start_date, End_date,
+                    Duration_months, Severity, In_2022_2025)
+    print(as.data.frame(preview_1c), row.names = FALSE)
+    
+    # ── Side-by-side comparison: SPEI-Thw vs SPEI-PM (scale 3 only) ──────────
+    # Produces a CSV directly usable as a manuscript comparison table showing
+    # how Thornthwaite severity exceeds PM severity for the same event.
+    if ("spei_03" %in% unique(ranked_catalog$index_label) &&
+        "spei_thw_03" %in% unique(ranked_catalog$index_label)) {
+      
+      tbl_pm3  <- make_ms_table(ranked_catalog, "spei_03",      n_top = 10L)
+      tbl_thw3 <- make_ms_table(ranked_catalog, "spei_thw_03",  n_top = 10L)
+      
+      # Join on Start_year to align matched events
+      comp <- dplyr::inner_join(
+        tbl_pm3  %>% dplyr::select(Start_year, PM_Severity   = Severity,
+                                   PM_Rank = Rank, PM_Duration = Duration_months),
+        tbl_thw3 %>% dplyr::select(Start_year, Thw_Severity  = Severity,
+                                   Thw_Rank = Rank, Thw_Duration = Duration_months),
+        by = "Start_year") %>%
+        dplyr::mutate(
+          Thw_vs_PM_ratio = round(Thw_Severity / PM_Severity, 3),
+          In_2022_2025    = Start_year %in% c(2022L, 2023L, 2024L, 2025L)) %>%
+        dplyr::arrange(PM_Rank)
+      
+      csv_comp <- file.path(RANKING_DIR, "Table_1bc_SPEI3_PM_vs_Thw_Comparison.csv")
+      write.csv(comp, csv_comp, row.names = FALSE)
+      cat(sprintf("  \u2713 PM vs Thw comparison saved: %s\n", basename(csv_comp)))
+    }
+    
+    # Add to Excel workbook
+    wb_1c_path <- file.path(RANKING_DIR, "Drought_Ranking_Summary.xlsx")
+    if (file.exists(wb_1c_path)) {
+      wb_loaded <- tryCatch(openxlsx::loadWorkbook(wb_1c_path),
+                            error = function(e) NULL)
+      if (!is.null(wb_loaded)) {
+        if ("Table_1c_SPEI_Thw_TopEvents" %in% names(wb_loaded))
+          openxlsx::removeWorksheet(wb_loaded, "Table_1c_SPEI_Thw_TopEvents")
+        write_ms_table_sheet(wb_loaded, "Table_1c_SPEI_Thw_TopEvents", tbl_1c)
+        openxlsx::saveWorkbook(wb_loaded, wb_1c_path, overwrite = TRUE)
+        cat("  \u2713 Table_1c_SPEI_Thw_TopEvents sheet added to Drought_Ranking_Summary.xlsx\n")
+      }
+    }
+  }
+  
+  cat("\n\u2550\u2550 PART 4e complete \u2550\u2550\n")
+  
+}, error = function(e) {
+  cat(sprintf("  \u26a0 Part 4e failed: %s\n", e$message))
+})
+
+####################################################################################
 # FINAL SUMMARY
 ####################################################################################
 ####################################################################################
@@ -2925,6 +3196,9 @@ cat("\nOUTPUT FILES:\n")
 cat("  SW08 ranked catalog : ", file.path(RANKING_DIR, "ranked_event_catalog_SW08.csv"), "\n")
 cat("  SW08 RP table       : ", file.path(RANKING_DIR, "return_period_by_duration_class_SW08.csv"), "\n")
 cat("  SW08 vs Hyst table  : ", file.path(RANKING_DIR, "Table_SW08_vs_Hyst_Comparison.csv"), "\n")
+cat("  Table 1a (SPI-1/2)  : ", file.path(RANKING_DIR, "Table_1a_SPI_01_02_TopEvents.csv"), "\n")
+cat("  Table 1c (Thw-1/2/3): ", file.path(RANKING_DIR, "Table_1c_SPEI_Thw_TopEvents.csv"), "\n")
+cat("  Table 1b/c compare  : ", file.path(RANKING_DIR, "Table_1bc_SPEI3_PM_vs_Thw_Comparison.csv"), "\n")
 cat("  Excel summary       : ", file.path(RANKING_DIR, "Drought_Ranking_Summary.xlsx"), "\n")
 cat("  Figure 1            : ", file.path(RANKING_DIR, "Fig1_Top_Droughts_By_Severity.png"), "\n")
 cat("  Figure 2            : ", file.path(RANKING_DIR, "Fig2_Drought_Severity_Distribution.png"), "\n")

@@ -62,7 +62,7 @@ TREND_END_YR   <- NULL
 # ── BASIN & TEMPLATE RASTER ──────────────────────────────────────────────────────
 ####################################################################################
 cat("Loading basin & template raster...\n")
-basin_shp        <- terra::vect(BASIN_SHP)
+basin_shp        <- load_basin_vect(BASIN_SHP)
 spi_sample_files <- find_seasonal_nc_files(SPI_SEAS_DIR, "spi", SPI_SCALES[1])
 if (!length(spi_sample_files))
   stop("No seasonal SPI files found to determine template CRS")

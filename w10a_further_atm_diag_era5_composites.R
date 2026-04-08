@@ -54,6 +54,25 @@ suppressPackageStartupMessages({
 })
 
 # ==============================================================================
+#  NAMESPACE CONFLICT RESOLUTION
+#
+#  terra exports `select` and `filter` as S4 generics (for SpatRaster /
+#  SpatVector).  When terra is loaded before dplyr — which happens whenever
+#  this script is sourced in a session that already ran 3SPEI_ERALand.R or
+#  w9_atmospheric_diagnostics.R — R's S4 dispatch runs *before* consulting the
+#  search path, so terra::select intercepts all select() calls, including those
+#  on data frames and tibbles, producing the cryptic error:
+#    "Error in select(., ...) : unused arguments (...)"
+#
+#  Pinning the names to dplyr functions in the global environment forces R to
+#  resolve them as S3 generics from dplyr regardless of S4 dispatch order.
+#  This is the standard, recommended workaround for the terra/dplyr conflict
+#  (see https://github.com/rspatial/terra/issues/216).
+# ==============================================================================
+select <- dplyr::select
+filter <- dplyr::filter
+
+# ==============================================================================
 #  CONFIGURATION  —  must match w9_atmospheric_diagnostics.R
 # ==============================================================================
 WD_PATH  <- "D:/Nechako_Drought/Nechako/"
@@ -648,13 +667,33 @@ z500_zoom   <- tibble(date = base_date_index$date, z500_ridge = z500_ridge_ts,
                       slp_nwbc = slp_nwbc_ts, sst_nepac = sst_nepac_ts) %>%
   filter(date >= zoom_start, date <= zoom_end)
 
+# ── Panel 4: SPEI-3 (PM) basin mean ──────────────────────────────────────────
+# SPEI3 is already loaded in all_indices; fall back gracefully if missing.
+spei3_zoom <- if ("SPEI3" %in% names(all_indices)) {
+  all_indices[["SPEI3"]] %>%
+    filter(date >= zoom_start, date <= zoom_end) %>%
+    rename(spei3 = value)
+} else {
+  warning("SPEI3 not found in loaded indices — panel 4 will be blank.")
+  tibble(date = z500_zoom$date, spei3 = NA_real_)
+}
+
 drought_shade  <- annotate("rect", xmin = as.Date(sprintf("%d-01-01", DROUGHT_FOCUS_START)),
                            xmax = as.Date(sprintf("%d-12-31", DROUGHT_FOCUS_END)),
                            ymin = -Inf, ymax = Inf, fill = "#fee08b", alpha = 0.45)
 drought_border <- annotate("rect", xmin = as.Date(sprintf("%d-01-01", DROUGHT_FOCUS_START)),
                            xmax = as.Date(sprintf("%d-12-31", DROUGHT_FOCUS_END)),
                            ymin = -Inf, ymax = Inf, fill = NA, color = "#d73027", linewidth = 0.5, linetype = "dashed")
-x_sc <- scale_x_date(date_breaks = "1 year", date_labels = "%Y", expand = c(0.01, 0))
+
+# FIX: explicit limits cap the axis at Dec 2025, preventing the spurious
+# "2026" tick that date_breaks = "1 year" would otherwise add because the
+# data range extends right to 2025-12-31 (one day before 2026-01-01).
+x_sc <- scale_x_date(
+  date_breaks = "1 year",
+  date_labels = "%Y",
+  limits      = c(zoom_start, zoom_end),
+  expand      = c(0.01, 0)
+)
 base_thm <- theme_bw(base_size = 11) + theme(panel.grid.minor = element_blank(),
                                              plot.title = element_text(face = "bold"),
                                              axis.text.x = element_text(size = 9))
@@ -671,6 +710,31 @@ make_zoom_panel <- function(df, var, ylab) {
     x_sc + labs(title = NULL, y = ylab, x = NULL) + base_thm
 }
 
+# ── SPEI-3 panel: bars + 6-month smoothed line + onset/moderate thresholds ───
+p21_spei3 <- ggplot(spei3_zoom, aes(x = date, y = spei3)) +
+  drought_shade + drought_border +
+  geom_hline(yintercept =  0.0, color = "grey40",  linewidth = 0.4) +
+  geom_hline(yintercept = -1.0, color = "#b2182b",  linewidth = 0.5, linetype = "dashed") +
+  geom_hline(yintercept = -1.5, color = "#b2182b",  linewidth = 0.4, linetype = "dotted") +
+  geom_col(aes(fill = spei3 > 0), alpha = 0.5, width = 25) +
+  scale_fill_manual(values = c("TRUE" = "#4575b4", "FALSE" = "#d73027"), guide = "none") +
+  geom_line(color = "grey15", linewidth = 0.8,
+            data = spei3_zoom %>% mutate(sm = rollmean(spei3, 6, fill = NA, align = "center")),
+            aes(y = sm)) +
+  annotate("text",
+           x     = zoom_start + 45,
+           y     = -1.0 + 0.10,
+           label = "Moderate drought (\u22121.0)",
+           hjust = 0, size = 2.8, color = "#b2182b") +
+  annotate("text",
+           x     = zoom_start + 45,
+           y     = -1.5 + 0.10,
+           label = "Severe drought (\u22121.5)",
+           hjust = 0, size = 2.8, color = "#b2182b") +
+  x_sc +
+  labs(y = "SPEI-3 (PM)\nBasin mean", x = NULL) +
+  base_thm
+
 p21 <- (make_zoom_panel(z500_zoom, "z500_ridge",
                         sprintf("Z500 Anom (m)\n%d\u2013%d W, %d\u2013%d N",
                                 abs(RIDGE_LON_MIN), abs(RIDGE_LON_MAX), RIDGE_LAT_MIN, RIDGE_LAT_MAX)) /
@@ -678,7 +742,8 @@ p21 <- (make_zoom_panel(z500_zoom, "z500_ridge",
           make_zoom_panel(z500_zoom, "sst_nepac",
                           sprintf("SST Anom (\u00b0C)\n%d\u2013%d W, %d\u2013%d N",
                                   abs(SST_MEAN_LON_MIN), abs(SST_MEAN_LON_MAX),
-                                  SST_MEAN_LAT_MIN, SST_MEAN_LAT_MAX))) +
+                                  SST_MEAN_LAT_MIN, SST_MEAN_LAT_MAX)) /
+          p21_spei3) +
   plot_annotation(
     title    = "Atmospheric & Oceanic Time Series \u2014 2019\u20132025 Drought Context",
     subtitle = sprintf("Area-average anomalies.  Ref: %d\u2013%d.  Line = 6-month centred mean.",
@@ -686,8 +751,9 @@ p21 <- (make_zoom_panel(z500_zoom, "z500_ridge",
     theme    = theme(plot.title = element_text(face = "bold", size = 13),
                      plot.subtitle = element_text(size = 9))
   )
+# Height bumped from 10 → 13 to accommodate the extra panel at similar aspect ratio
 ggsave(file.path(drought_fig_dir, "21_atmos_ocean_timeseries_zoom.png"),
-       p21, width = FIGURE_WIDTH_STD, height = 10, dpi = FIGURE_DPI)
+       p21, width = FIGURE_WIDTH_STD, height = 13, dpi = FIGURE_DPI)
 cat("Saved.\n\n")
 
 # ==============================================================================
@@ -1412,5 +1478,5 @@ cat("   {SW_q10,Alt2T}/Tables/{INDEX}/    Tables T1-T5\n")
 cat("   {SW_q10,Alt2T}/Tables/            Table T6\n")
 cat(sprintf(" composite_results/               B1 composites\n"))
 cat(sprintf(" bootstrap_results/               B3 significance maps\n"))
-cat("\n Next (independent): run w10b_index_skill.R\n")
+cat("\n Next (independent): run w10b_further_atm_diag_index_skill.R\n")
 cat("==============================================================\n")
