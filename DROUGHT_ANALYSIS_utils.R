@@ -6,10 +6,22 @@ WD_PATH <- Sys.getenv("NECHAKO_WD", "D:/Nechako_Drought/Nechako/")
 BASIN_SHP       <- file.path(WD_PATH, "Spatial/nechakoBound_dissolve.kmz")
 
 ## Helper: load basin as a single dissolved SpatVector (terra).
-## KMZ files may contain multiple polygon features; aggregate() merges them
-## into one before any masking, rasterizing, or area calculations.
+## terra::vect() cannot read KMZ directly on Windows (missing GDAL KMZ driver).
+## This helper unzips KMZ to a temp dir, reads the inner .kml (which terra
+## handles fine), then aggregates any multi-feature result into one polygon.
 load_basin_vect <- function(path = BASIN_SHP) {
-  v <- terra::vect(path)
+  ext <- tolower(tools::file_ext(path))
+  if (ext == "kmz") {
+    tmp <- tempfile()
+    dir.create(tmp, showWarnings = FALSE)
+    on.exit(unlink(tmp, recursive = TRUE), add = TRUE)
+    utils::unzip(path, exdir = tmp)
+    kml <- list.files(tmp, pattern = "\\.kml$", full.names = TRUE, recursive = TRUE)
+    if (!length(kml)) stop("load_basin_vect: no .kml found inside ", basename(path))
+    v <- terra::vect(kml[1])
+  } else {
+    v <- terra::vect(path)
+  }
   if (nrow(v) > 1L) v <- terra::aggregate(v)
   v
 }
@@ -369,7 +381,13 @@ detect_drought_events  <- function(df,
 #' Load basin shapefile and reproject to equal-area CRS
 load_basin <- function(shp_path = BASIN_SHP, crs = EQUAL_AREA_CRS) {
   if (!file.exists(shp_path)) stop("Basin file not found: ", shp_path)
-  b <- sf::st_read(shp_path, quiet = TRUE)
+  if (tolower(tools::file_ext(shp_path)) == "kmz") {
+    kml_file <- unzip(shp_path, exdir = tempdir())[1]
+    on.exit(unlink(kml_file), add = TRUE)
+    b <- sf::st_read(kml_file, quiet = TRUE)
+  } else {
+    b <- sf::st_read(shp_path, quiet = TRUE)
+  }
   if (nrow(b) > 1L) b <- sf::st_as_sf(sf::st_union(b))
   if (sf::st_crs(b)$input != crs) b <- sf::st_transform(b, crs)
   cat(sprintf("✓ Basin loaded (%d polygon(s) → dissolved, CRS: %s)\n", nrow(b), crs))

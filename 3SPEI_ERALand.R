@@ -52,8 +52,12 @@ if (!dir.exists(out_dir_thw)) dir.create(out_dir_thw, recursive = TRUE)
 terraOptions(progress = 0)
 
 # ---- Load Basin Boundary ----
-basin <- vect(basin_path)
+tmp <- tempfile(); dir.create(tmp, showWarnings = FALSE)
+utils::unzip(basin_path, exdir = tmp)
+kml <- list.files(tmp, pattern = "\\.kml$", full.names = TRUE, recursive = TRUE)[1]
+basin <- vect(kml)
 if (nrow(basin) > 1L) basin <- aggregate(basin)
+unlink(tmp, recursive = TRUE)
 cat("Basin boundary loaded\n")
 
 # ---- Load Data ----

@@ -29,7 +29,8 @@ load_basin_boundary <- function(basin_path) {
                  normalizePath(basin_path)))
   }
   
-  basin <- vect(basin_path)
+  kml_file <- unzip(basin_path, exdir = tempdir())[1]
+  basin <- vect(kml_file); unlink(kml_file)
   if (nrow(basin) > 1L) basin <- aggregate(basin)
   cat(sprintf("OK: Basin loaded: %s\n", basename(basin_path)))
   cat(sprintf("  -> Geometry: %s | Features: %d | CRS: %s\n",

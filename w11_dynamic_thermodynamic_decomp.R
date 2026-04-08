@@ -84,8 +84,14 @@ if (is.null(dates) || all(is.na(dates))) {
 month_nums <- as.integer(format(dates, "%m"))
 year_nums  <- as.integer(format(dates, "%Y"))
 # Load basin boundary for masking
-basin <- vect("Spatial/nechakoBound_dissolve.kmz")
-if (nrow(basin) > 1L) basin <- aggregate(basin)
+local({
+  tmp <- tempfile(); dir.create(tmp, showWarnings = FALSE)
+  utils::unzip("Spatial/nechakoBound_dissolve.kmz", exdir = tmp)
+  kml <- list.files(tmp, pattern = "\\.kml$", full.names = TRUE, recursive = TRUE)[1]
+  basin <<- vect(kml)
+  if (nrow(basin) > 1L) basin <<- aggregate(basin)
+  unlink(tmp, recursive = TRUE)
+})
 target_crs <- "EPSG:3005"
 if (!same.crs(basin, target_crs)) basin <- project(basin, target_crs)
 # Get basin mask from first SPEI file (non-NA pixels)

@@ -112,7 +112,13 @@ basin_files <- c(
 for (bf in basin_files) {
   if (file.exists(bf)) {
     tryCatch({
-      basin_boundary <- st_read(bf, quiet = TRUE)
+      if (tolower(tools::file_ext(bf)) == "kmz") {
+        kml_file <- unzip(bf, exdir = tempdir())[1]
+        basin_boundary <- st_read(kml_file, quiet = TRUE)
+        unlink(kml_file)
+      } else {
+        basin_boundary <- st_read(bf, quiet = TRUE)
+      }
       if (nrow(basin_boundary) > 1L)
         basin_boundary <- sf::st_as_sf(sf::st_union(basin_boundary))
       basin_boundary <- st_transform(basin_boundary, "EPSG:3005")

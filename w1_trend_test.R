@@ -907,7 +907,7 @@ process_index <- function(index_type, scales, find_fn, seas_dir) {
     # Edge pixels that only partially overlap the basin are down-weighted
     # proportionally, rather than being counted at their full cell area.
     cat("  → Computing fractional-coverage area weights...\n")
-    basin_v        <- terra::project(terra::vect(BASIN_SHP), terra::crs(r_tmpl))
+    basin_v        <- terra::project(load_basin_vect(BASIN_SHP), terra::crs(r_tmpl))
     cell_area_rast <- terra::cellSize(r_tmpl, unit = "m")
     cover_rast     <- terra::rasterize(basin_v, r_tmpl, cover = TRUE)
     area_all       <- as.numeric(terra::values(cell_area_rast, na.rm = FALSE))

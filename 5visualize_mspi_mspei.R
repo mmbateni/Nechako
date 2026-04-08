@@ -545,7 +545,8 @@ if (file.exists(mspi_nc_file) && file.exists(mspei_nc_file) && file.exists(basin
     mspei_times <- seq(as.Date("1950-01-01"), by = "month", length.out = nlyr(mspei_rast))
   }
   
-  basin <- vect(basin_path)
+  kml_file <- unzip(basin_path, exdir = tempdir())[1]
+  basin <- vect(kml_file); unlink(kml_file)
   if (nrow(basin) > 1L) basin <- aggregate(basin)
   if (!same.crs(mspi_rast, basin)) {
     basin <- project(basin, crs(mspi_rast))
