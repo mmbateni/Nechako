@@ -20,7 +20,11 @@ if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 # ---- Load Basin Boundary ----
 basin_path <- "Spatial/nechakoBound_dissolve.kmz"
 basin <- if (file.exists(basin_path)) {
-  v <- vect(basin_path); if (nrow(v) > 1L) v <- aggregate(v); v
+  tmp <- tempfile(); dir.create(tmp, showWarnings = FALSE)
+  utils::unzip(basin_path, exdir = tmp)
+  kml <- list.files(tmp, pattern = "\\.kml$", full.names = TRUE, recursive = TRUE)[1]
+  v <- vect(kml); if (nrow(v) > 1L) v <- aggregate(v)
+  unlink(tmp, recursive = TRUE); v
 } else NULL
 
 if (!is.null(basin)) {
