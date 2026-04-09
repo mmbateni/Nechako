@@ -1,6 +1,7 @@
 ####################################################################################
 # NECHAKO RIVER BASIN — COMPREHENSIVE OVERVIEW MAP
 # Elevation · Hillshade · Rivers · Lakes · Prince George · Kenney Dam
+# Nechako River · Nechako Reservoir · Kemano Powerhouse
 #
 # Data sources (automatic, no manual downloads needed):
 #   • DEM       : AWS Terrain Tiles via elevatr (z = 8, ~300 m)
@@ -241,19 +242,35 @@ if ("AREA_HA" %in% names(lakes_sf)) {
 cat("── Building points of interest ──\n")
 poi_df <- data.frame(
   name = c("Prince George", "Vanderhoof",
-           "Kenney Dam", "Skins Lake Spillway"),
+           "Kenney Dam", "Skins Lake Spillway",
+           "Kemano Powerhouse"),
   lon  = c(-122.7497, -124.0116,
-           -125.020,  -125.970),
+           -125.020,  -125.970,
+           -127.882),
   lat  = c(  53.9171,   54.0117,
-             53.730,    53.771),
+             53.730,    53.771,
+             53.558),
   type = c("City",  "Town",
-           "Dam",   "Spillway")
+           "Dam",   "Spillway",
+           "Powerhouse")
 )
 poi_sf <- st_as_sf(poi_df, coords = c("lon", "lat"), crs = 4326)
 
-cities_sf    <- filter(poi_sf, type %in% c("City", "Town"))
-dams_sf      <- filter(poi_sf, type == "Dam")
-spillways_sf <- filter(poi_sf, type == "Spillway")
+cities_sf       <- filter(poi_sf, type %in% c("City", "Town"))
+dams_sf         <- filter(poi_sf, type == "Dam")
+spillways_sf    <- filter(poi_sf, type == "Spillway")
+powerhouses_sf  <- filter(poi_sf, type == "Powerhouse")
+
+# ── Manual feature labels (Nechako River & Nechako Reservoir) ─────────────────
+# These are placed at representative centre-points along each feature.
+# The Nechako Reservoir occupies the flooded valley west of Kenney Dam;
+# the Nechako River runs east from the dam to Prince George.
+manual_labels_df <- data.frame(
+  lon   = c(-125.85,  -124.35),
+  lat   = c(  53.72,    53.92),
+  label = c("Nechako\nReservoir", "Nechako River"),
+  stringsAsFactors = FALSE
+)
 
 # ── 8. COLOUR PALETTES ──────────────────────────────────────────────────────────
 n_col <- 512
@@ -389,7 +406,25 @@ main_map <- ggplot() +
           shape = 24, fill = "#9b59b6", color = "black",
           size  = 3.2, stroke = 1.0, inherit.aes = FALSE) +
   
-  # ── POI labels (white fill — constant, never mapped, no legend) ──────────────
+  # ── Kemano Powerhouse ─────────────────────────────────────────────────────────
+  # Lightning-bolt symbol (shape 8 = asterisk used as proxy; filled square
+  # shape 22 with a distinct yellow-green fill makes it clearly distinct from Dam)
+  geom_sf(data  = powerhouses_sf,
+          shape = 23, fill = "#f1c40f", color = "black",
+          size  = 3.5, stroke = 1.0, inherit.aes = FALSE) +
+  
+  # ── Nechako River & Nechako Reservoir labels (italic water text) ──────────────
+  geom_text(
+    data        = manual_labels_df,
+    aes(x = lon, y = lat, label = label),
+    fontface    = "italic",
+    colour      = "#1a6699",
+    size        = 2.9,
+    lineheight  = 0.85,
+    inherit.aes = FALSE
+  ) +
+  
+  # ── POI labels (white fill) ────────────────────────────────────────────────────
   ggrepel::geom_label_repel(
     data          = poi_df,
     aes(x = lon, y = lat, label = name),
@@ -477,7 +512,10 @@ main_map <- ggplot() +
       "Elevation: AWS Terrain Tiles via elevatr (z = 8, ~300 m)",
       "  |  Rivers & Lakes: BC Freshwater Atlas via bcdata (or OpenStreetMap)",
       "\nHillshade: azimuth 315°, altitude 40°",
-      "  |  Basin boundary: Nechako watershed (WGS84 / EPSG:4326)"
+      "  |  Basin boundary: Nechako watershed (WGS84 / EPSG:4326)",
+      "\n\u25a0 Orange = Kenney Dam  \u25b2 Purple = Skins Lake Spillway",
+      "  \u25c6 Yellow = Kemano Powerhouse",
+      "  \u25cf Red = Prince George  \u25cf Amber = Vanderhoof"
     )
   ) +
   
