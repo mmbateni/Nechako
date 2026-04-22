@@ -1,2 +1,0 @@
-# Nechako
-Nechako Drought Project
