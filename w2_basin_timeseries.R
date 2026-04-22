@@ -761,38 +761,37 @@ tryCatch({
 }, error = function(e) cat(sprintf("  \u26a0 Version C failed: %s\n", e$message)))
 
 ################################################################################
-# PART 4c – SPATIAL REPRESENTATIVENESS MAPS  (SPEI-1/2/3 × PM + Thornthwaite)
+# PART 4c – SPATIAL REPRESENTATIVENESS FIGURE  (fig3)
 #
-# Outputs two figures:
+# Output:
+#   Fig4c_Pearson_r_SPEI_PM_SPI.pdf/.png
 #
-#   Fig4c_Pearson_r_SPEI123_PM_Thw.pdf/.png
-#       2-row × 3-column grid of Pearson r maps.
-#       Row 1 = SPEI PM  (Penman-Monteith),  columns = scales 1, 2, 3
-#       Row 2 = SPEI Thw (Thornthwaite),     columns = scales 1, 2, 3
-#       Each panel is a per-pixel correlation with the basin-mean time series.
-#       Annotated with median r and % pixels ≥ 0.80.
-#
-#   Fig4c_SD_SpatialSD_SPEI3_PM.pdf/.png
-#       3-panel supplementary figure for SPEI-3 PM only:
-#       (a) Temporal SD map   (b) Annual spatial SD bar chart
-#       (c) histogram of r values across all 6 combinations
+#   Layout:
+#     Rows 1-2: 2x3 Pearson r maps
+#       Row 1 (a-c): SPEI_PM scales 1, 2, 3  (Blues palette)
+#       Row 2 (d-f): SPI     scales 1, 2, 3  (Greens palette)
+#     Bottom row: 2 density panels side by side
+#       (c) Pixel Pearson r — Penman-Monteith PET (SPEI-1/2/3 PM)
+#       (l) Pixel Pearson r — SPI (scales 1, 2, 3)
 #
 # All panels use ggplot2 + patchwork (no terra::plot).
 ################################################################################
 cat("\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n")
-cat("PART 4c: Spatial representativeness \u2014 SPEI-1/2/3 \u00d7 PM + Thornthwaite\n")
+cat("PART 4c: Spatial representativeness \u2014 SPEI-PM + SPI Pearson r maps\n")
 cat("\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n")
 
 tryCatch({
   
-  # ── Helper: load all 12 per-month CSVs for one scale × directory ───────────
-  load_pixel_mat <- function(scale, seas_dir) {
-    month_list  <- vector("list", 12L)
-    coords_out  <- NULL
-    year_out    <- NULL
+  # ── Helper: load 12 per-month CSVs for one scale x directory x prefix ──────
+  # prefix: "spei" or "spi"
+  load_pixel_mat <- function(scale, seas_dir, prefix = "spei") {
+    month_list <- vector("list", 12L)
+    coords_out <- NULL
+    year_out   <- NULL
     for (m in seq_len(12L)) {
       csv_f <- file.path(seas_dir,
-                         sprintf("spei_%02d_month%02d_%s.csv", scale, m, MONTH_NAMES_3[m]))
+                         sprintf("%s_%02d_month%02d_%s.csv",
+                                 prefix, scale, m, MONTH_NAMES_3[m]))
       if (!file.exists(csv_f)) next
       df_m <- tryCatch(data.table::fread(csv_f, data.table = FALSE),
                        error = function(e) NULL)
@@ -805,43 +804,22 @@ tryCatch({
     }
     valid <- which(!sapply(month_list, is.null))
     if (!length(valid) || is.null(coords_out)) return(NULL)
-    list(mat    = do.call(cbind, month_list[valid]),
-         coords = coords_out,
-         yr_int = as.integer(year_out),
-         yr_chr = year_out,
+    list(mat         = do.call(cbind, month_list[valid]),
+         coords      = coords_out,
+         yr_int      = as.integer(year_out),
+         yr_chr      = year_out,
          valid_months = valid,
-         month_list = month_list)
+         month_list  = month_list)
   }
   
-  # ── Helper: compute metrics from a loaded pixel matrix ────────────────────
-  compute_metrics <- function(obj) {
+  # ── Helper: per-pixel Pearson r with basin mean ────────────────────────────
+  compute_r <- function(obj) {
     mat  <- obj$mat
     bavg <- colMeans(mat, na.rm = TRUE)
-    r_v  <- vapply(seq_len(nrow(mat)), function(i) {
-      xi <- mat[i,]; ok <- !is.na(xi) & !is.na(bavg)
+    vapply(seq_len(nrow(mat)), function(i) {
+      xi <- mat[i, ]; ok <- !is.na(xi) & !is.na(bavg)
       if (sum(ok) < 10L) NA_real_ else cor(xi[ok], bavg[ok])
     }, numeric(1L))
-    sd_v <- apply(mat, 1, sd, na.rm = TRUE)
-    
-    # Annual spatial SD
-    yr_chr <- obj$yr_chr
-    n_yrs  <- length(yr_chr)
-    n_pix  <- nrow(mat)
-    ann_m  <- matrix(0, n_pix, n_yrs)
-    vm     <- obj$valid_months
-    ml     <- obj$month_list
-    for (m in vm) {
-      mm <- ml[[m]]
-      cy <- intersect(colnames(mm), yr_chr)
-      ann_m[, match(cy, yr_chr)] <- ann_m[, match(cy, yr_chr)] +
-        mm[, match(cy, colnames(mm)), drop = FALSE] / length(vm)
-    }
-    spat_sd <- apply(ann_m, 2, sd, na.rm = TRUE)
-    
-    list(r = r_v, sd = sd_v, spat_sd = spat_sd,
-         med_r = median(r_v, na.rm = TRUE),
-         pct80 = 100 * mean(r_v >= 0.80, na.rm = TRUE),
-         mean_spat_sd = mean(spat_sd, na.rm = TRUE))
   }
   
   # ── CRS helper ────────────────────────────────────────────────────────────
@@ -858,296 +836,234 @@ tryCatch({
   # ── Shared map theme ──────────────────────────────────────────────────────
   theme_map4c <- ggplot2::theme_bw(base_size = 8.5) +
     ggplot2::theme(
-      axis.title      = ggplot2::element_blank(),
-      axis.text       = ggplot2::element_text(size = 6),
-      plot.title      = ggplot2::element_text(size = 8, face = "bold", hjust = 0.5),
-      plot.subtitle   = ggplot2::element_text(size = 7, colour = "grey30",
-                                              hjust = 0.5,
-                                              margin = ggplot2::margin(t = 1, b = 2)),
+      axis.title        = ggplot2::element_blank(),
+      axis.text         = ggplot2::element_text(size = 6),
+      plot.title        = ggplot2::element_text(size = 8, face = "bold", hjust = 0.5),
+      plot.subtitle     = ggplot2::element_text(size = 7, colour = "grey30",
+                                                hjust = 0.5,
+                                                margin = ggplot2::margin(t = 1, b = 2)),
       legend.key.height = ggplot2::unit(1.1, "cm"),
       legend.key.width  = ggplot2::unit(0.32, "cm"),
-      legend.text     = ggplot2::element_text(size = 6.5),
-      legend.title    = ggplot2::element_text(size = 7),
-      panel.grid      = ggplot2::element_blank(),
-      plot.margin     = ggplot2::margin(2, 2, 2, 2)
-    )
+      legend.text       = ggplot2::element_text(size = 6.5),
+      legend.title      = ggplot2::element_text(size = 7),
+      panel.grid        = ggplot2::element_blank(),
+      plot.margin       = ggplot2::margin(2, 2, 2, 2))
   
-  # ── Build one Pearson-r map panel ─────────────────────────────────────────
-  make_r_panel <- function(scale, pet_type) {
-    seas_dir <- if (pet_type == "PM") SPEI_PM_DIR else SPEI_THW_DIR
-    obj <- load_pixel_mat(scale, seas_dir)
-    if (is.null(obj))
-      return(ggplot2::ggplot() +
-               ggplot2::annotate("text", x=0.5, y=0.5,
-                                 label = sprintf("No data\nSPEI-%d %s", scale, pet_type),
-                                 size = 3, colour = "grey50") +
-               ggplot2::theme_void())
-    
-    mt       <- compute_metrics(obj)
-    basin_sf <- detect_basin_sf(obj$coords)
-    pet_lab  <- if (pet_type == "PM") "SPEI\u209a\u2098" else "SPEI\u2080"
-    r_min    <- max(0.40, floor(min(mt$r, na.rm = TRUE) * 10) / 10)
-    
-    df_r <- data.frame(lon = obj$coords$lon, lat = obj$coords$lat, r = mt$r)
-    
-    p <- ggplot2::ggplot(df_r[!is.na(df_r$r), ],
-                         ggplot2::aes(x = lon, y = lat, fill = r)) +
+  # ── Helper: build one Pearson r map panel ────────────────────────────────
+  # palette: "Blues" for SPEI PM, "Greens" for SPI
+  make_map_panel <- function(r_v, coords, basin_sf, title_str, subtitle_str,
+                             palette = "Blues") {
+    r_min <- max(0.40, floor(min(r_v, na.rm = TRUE) * 10) / 10)
+    df_r  <- data.frame(lon = coords$lon, lat = coords$lat, r = r_v)
+    ggplot2::ggplot(df_r[!is.na(df_r$r), ],
+                    ggplot2::aes(x = lon, y = lat, fill = r)) +
       ggplot2::geom_tile() +
       ggplot2::scale_fill_distiller(
-        palette = "Blues", direction = 1,
-        name    = "Pearson r",
-        limits  = c(r_min, 1.0),
-        breaks  = seq(r_min, 1.0, by = 0.1),
-        oob     = scales::squish) +
+        palette   = palette, direction = 1,
+        name      = "Pearson r",
+        limits    = c(r_min, 1.0),
+        breaks    = seq(r_min, 1.0, by = 0.1),
+        oob       = scales::squish) +
       {if (!is.null(basin_sf))
-        ggplot2::geom_sf(data = basin_sf, fill = NA,
-                         colour = "black", linewidth = 0.55,
-                         inherit.aes = FALSE)} +
+        ggplot2::geom_sf(data = basin_sf, fill = NA, colour = "black",
+                         linewidth = 0.55, inherit.aes = FALSE)} +
       ggplot2::coord_sf(expand = FALSE) +
-      ggplot2::labs(
-        title    = sprintf("%s-%d  (%s)",  pet_lab, scale,
-                           if (pet_type=="PM") "Penman-Monteith" else "Thornthwaite"),
-        subtitle = sprintf("median r = %.3f  |  %.0f%% \u2265 0.80",
-                           mt$med_r, mt$pct80)) +
+      ggplot2::labs(title = title_str, subtitle = subtitle_str) +
       theme_map4c
-    
-    list(plot = p, metrics = mt, obj = obj)
   }
   
-  # ── Run all 6 combinations ─────────────────────────────────────────────────
-  combos <- list(
-    list(sc=1, pet="PM"),  list(sc=2, pet="PM"),  list(sc=3, pet="PM"),
-    list(sc=1, pet="Thw"), list(sc=2, pet="Thw"), list(sc=3, pet="Thw")
-  )
-  
-  results <- lapply(combos, function(cb) {
-    cat(sprintf("  Building SPEI-%d %s...\n", cb$sc, cb$pet))
-    make_r_panel(cb$sc, cb$pet)
-  })
-  
-  panels_pm  <- lapply(results[1:3], `[[`, "plot")
-  panels_thw <- lapply(results[4:6], `[[`, "plot")
-  
-  # Check we have at least some panels
-  any_data <- any(!sapply(results, is.null))
-  if (!any_data) { cat("  \u26a0 No data for any combination\n"); stop("no_data") }
-  
-  # ── Figure 1: flat 6-panel Pearson r map (2 rows × 3 cols) ──────────────────
-  # Labels: (a)-(c) = PM scales 1-3,  (d)-(f) = Thornthwaite scales 1-3
-  panel_labels <- c("(a)", "(b)", "(c)", "(d)", "(e)", "(f)")
-  all_six_plots <- lapply(seq_along(results), function(k) {
-    cb  <- combos[[k]]
-    res <- results[[k]]
-    pet_str <- if (cb$pet == "PM") "Penman-Monteith" else "Thornthwaite"
-    sub_str <- if (!is.null(res))
-      sprintf("median r = %.3f  |  %.0f%% \u2265 0.80",
-              res$metrics$med_r, res$metrics$pct80)
-    else "no data"
-    
-    if (is.null(res))
+  # ── Helper: build one r-density panel ─────────────────────────────────────
+  make_density_panel <- function(r_list, combo_names, col_pal,
+                                 panel_lab, title_str) {
+    df <- do.call(rbind, lapply(seq_along(r_list), function(k) {
+      rv <- r_list[[k]]
+      if (is.null(rv)) return(NULL)
+      data.frame(r = rv, combo = combo_names[k], stringsAsFactors = FALSE)
+    }))
+    if (is.null(df) || !nrow(df))
       return(ggplot2::ggplot() +
-               ggplot2::annotate("text", x=0.5, y=0.5,
-                                 label=sprintf("No data\nSPEI-%d %s", cb$sc, cb$pet),
-                                 size=3, colour="grey50") + ggplot2::theme_void())
+               ggplot2::annotate("text", x = 0.5, y = 0.5,
+                                 label = "No data", size = 3, colour = "grey50") +
+               ggplot2::theme_void())
     
-    # re-use the plot but override title to include panel label + PET method
-    pet_lab <- if (cb$pet == "PM") "SPEI\u209a\u2098" else "SPEI\u2080"
-    p <- res$plot +
+    df    <- df[!is.na(df$r), ]
+    df$combo <- factor(df$combo, levels = combo_names)
+    med_df <- do.call(rbind, lapply(combo_names, function(g) {
+      x <- df$r[df$combo == g]
+      data.frame(combo = g, med_r = median(x, na.rm = TRUE),
+                 stringsAsFactors = FALSE)
+    }))
+    med_df$combo <- factor(med_df$combo, levels = combo_names)
+    
+    ggplot2::ggplot(df, ggplot2::aes(x = r, colour = combo, fill = combo)) +
+      ggplot2::geom_density(alpha = 0.18, linewidth = 0.80) +
+      ggplot2::geom_vline(data = med_df,
+                          ggplot2::aes(xintercept = med_r, colour = combo),
+                          linetype = "solid", linewidth = 0.60,
+                          show.legend = FALSE) +
+      ggplot2::geom_text(data = med_df,
+                         ggplot2::aes(x = med_r, y = Inf,
+                                      label = sprintf("%.2f", med_r),
+                                      colour = combo),
+                         vjust = 1.5, hjust = -0.10, size = 2.4,
+                         show.legend = FALSE) +
+      ggplot2::scale_colour_manual(values = col_pal, name = NULL) +
+      ggplot2::scale_fill_manual(values   = col_pal, name = NULL) +
+      ggplot2::scale_x_continuous(limits = c(0.4, 1.01),
+                                  breaks = seq(0.4, 1.0, by = 0.1)) +
       ggplot2::labs(
-        title    = sprintf("%s  %s-%d  (%s)",
-                           panel_labels[k], pet_lab, cb$sc, pet_str),
-        subtitle = sub_str)
-    p
+        title    = sprintf("%s  %s", panel_lab, title_str),
+        subtitle = "Solid vertical lines = median r per scale",
+        x        = "Pearson r  (pixel vs basin mean)",
+        y        = "Density") +
+      ggplot2::theme_classic(base_size = 9) +
+      ggplot2::theme(
+        plot.title       = ggplot2::element_text(size = 8, face = "bold", hjust = 0),
+        plot.subtitle    = ggplot2::element_text(size = 7, colour = "grey40", hjust = 0),
+        legend.text      = ggplot2::element_text(size = 7.5),
+        legend.position  = "bottom",
+        legend.key.size  = ggplot2::unit(0.35, "cm"),
+        axis.text        = ggplot2::element_text(size = 7),
+        plot.margin      = ggplot2::margin(3, 6, 2, 4))
+  }
+  
+  # ── 1. Compute SPEI PM Pearson r for scales 1, 2, 3 ──────────────────────
+  spei_scales <- c(1L, 2L, 3L)
+  spei_r_list <- vector("list", 3L)
+  spei_plots  <- vector("list", 3L)
+  spei_labels <- c("(a)", "(b)", "(c)")
+  
+  for (k in seq_along(spei_scales)) {
+    sc  <- spei_scales[k]
+    cat(sprintf("  Loading SPEI-PM-%d...\n", sc))
+    obj <- tryCatch(load_pixel_mat(sc, SPEI_PM_DIR, prefix = "spei"),
+                    error = function(e) NULL)
+    if (is.null(obj)) { cat(sprintf("    No data\n")); next }
+    rv       <- compute_r(obj)
+    bsf      <- detect_basin_sf(obj$coords)
+    med_r    <- median(rv, na.rm = TRUE)
+    pct80    <- 100 * mean(rv >= 0.80, na.rm = TRUE)
+    spei_r_list[[k]] <- rv
+    spei_plots[[k]]  <- make_map_panel(
+      rv, obj$coords, bsf,
+      title_str    = sprintf("%s  SPEI\u209a\u2098-%d  (Penman-Monteith)", spei_labels[k], sc),
+      subtitle_str = sprintf("median r = %.3f  |  %.0f%% \u2265 0.80", med_r, pct80),
+      palette      = "Blues")
+  }
+  
+  # ── 2. Compute SPI Pearson r for scales 1, 2, 3 ──────────────────────────
+  spi_scales <- c(1L, 2L, 3L)
+  spi_r_list <- vector("list", 3L)
+  spi_plots  <- vector("list", 3L)
+  spi_labels <- c("(d)", "(e)", "(f)")
+  
+  for (k in seq_along(spi_scales)) {
+    sc  <- spi_scales[k]
+    cat(sprintf("  Loading SPI-%d...\n", sc))
+    obj <- tryCatch(load_pixel_mat(sc, SPI_SEAS_DIR, prefix = "spi"),
+                    error = function(e) NULL)
+    if (is.null(obj)) { cat(sprintf("    No data\n")); next }
+    rv       <- compute_r(obj)
+    bsf      <- detect_basin_sf(obj$coords)
+    med_r    <- median(rv, na.rm = TRUE)
+    pct80    <- 100 * mean(rv >= 0.80, na.rm = TRUE)
+    spi_r_list[[k]] <- rv
+    spi_plots[[k]]  <- make_map_panel(
+      rv, obj$coords, bsf,
+      title_str    = sprintf("%s  SPI-%d", spi_labels[k], sc),
+      subtitle_str = sprintf("median r = %.3f  |  %.0f%% \u2265 0.80", med_r, pct80),
+      palette      = "Greens")
+  }
+  
+  any_spei <- any(!sapply(spei_plots, is.null))
+  any_spi  <- any(!sapply(spi_plots,  is.null))
+  if (!any_spei && !any_spi) { cat("  No data for any combination\n"); stop("no_data") }
+  
+  # ── 3. Density panel (c): SPEI-PM r values for scales 1, 2, 3 ────────────
+  col_spei_pm <- c("SPEI-1 PM" = "#1f77b4",
+                   "SPEI-2 PM" = "#6baed6",
+                   "SPEI-3 PM" = "#2ca02c")
+  pc_pm <- make_density_panel(
+    r_list      = spei_r_list,
+    combo_names = names(col_spei_pm),
+    col_pal     = col_spei_pm,
+    panel_lab   = "(c)",
+    title_str   = "Pixel Pearson r \u2014 Penman-Monteith PET")
+  
+  # ── 4. Density panel (l): SPI r values for scales 1, 2, 3 ────────────────
+  col_spi <- c("SPI-1" = "#1b7837",
+               "SPI-2" = "#5aae61",
+               "SPI-3" = "#a6d96a")
+  pl_spi <- make_density_panel(
+    r_list      = spi_r_list,
+    combo_names = names(col_spi),
+    col_pal     = col_spi,
+    panel_lab   = "(l)",
+    title_str   = "Pixel Pearson r \u2014 SPI (scales 1, 2, 3)")
+  
+  # ── 5. Assemble figure ────────────────────────────────────────────────────
+  # Top block : 2x3 Pearson r maps  (Row 1: SPEI PM, Row 2: SPI)
+  # Bottom row: 2 density panels side by side
+  top_plots <- c(spei_plots, spi_plots)
+  # Replace any NULL with blank placeholder
+  top_plots <- lapply(top_plots, function(p) {
+    if (is.null(p))
+      ggplot2::ggplot() + ggplot2::theme_void()
+    else p
   })
   
-  fig4c_6panel <- patchwork::wrap_plots(all_six_plots, nrow = 2, ncol = 3,
-                                        guides = "collect") +
+  fig_maps <- patchwork::wrap_plots(top_plots, nrow = 2, ncol = 3,
+                                    guides = "collect") &
+    ggplot2::theme(legend.position = "right")
+  
+  fig_dens <- (pc_pm | pl_spi) +
+    patchwork::plot_layout(guides = "keep")
+  
+  fig4c <- fig_maps / fig_dens +
+    patchwork::plot_layout(heights = c(2, 1)) +
     patchwork::plot_annotation(
-      title    = paste0("Pixel-to-basin-mean Pearson r \u2014 SPEI 1, 2, 3",
-                        " (Penman-Monteith vs Thornthwaite)  \u2014  Nechako River Basin"),
+      title    = paste0(
+        "Pixel-to-basin-mean Pearson r \u2014 SPEI 1,2,3 (PM \u0026 Thw)",
+        " + SPI 1,2,3 \u2014 Nechako River Basin"),
       subtitle = paste0(
-        "Each pixel coloured by its temporal Pearson r with the basin-mean SPEI time series.",
-        "  Row 1: Penman-Monteith PET.  Row 2: Thornthwaite PET.\n",
-        "r \u2248 1 everywhere \u2192 the single basin mean faithfully represents",
-        " drought variability at every point in the basin."),
+        "Rows 1\u20132: SPEI Pearson r maps (Penman-Monteith / Thornthwaite PET).",
+        "  Row 3: SPI Pearson r maps.  Colour palette: Blues (SPEI), Greens (SPI).\n",
+        "Bottom row: SPI-3 pixel drought frequency (j), annual cross-pixel IQR (k),",
+        " and pixel r-density for SPI-1/2/3 (l)."),
       theme = ggplot2::theme(
         plot.title    = ggplot2::element_text(size = 10, face = "bold", hjust = 0.5),
         plot.subtitle = ggplot2::element_text(size = 8.5, colour = "grey30", hjust = 0,
-                                              margin = ggplot2::margin(b = 6)),
-        legend.position = "right"))
+                                              margin = ggplot2::margin(b = 6))))
   
   for (ext in c("pdf", "png")) {
-    out_r <- file.path(BASIN_PLOT_DIR,
-                       paste0("Fig4c_Pearson_r_SPEI123_PM_Thw.", ext))
+    out_f <- file.path(BASIN_PLOT_DIR,
+                       paste0("Fig4c_Pearson_r_SPEI_PM_SPI.", ext))
     tryCatch(
-      ggplot2::ggsave(out_r, fig4c_6panel,
-                      width  = 14, height = 9.5, units = "in",
-                      dpi = if (ext == "png") 300 else "print",
+      ggplot2::ggsave(out_f, fig4c,
+                      width  = 14, height = 13, units = "in",
+                      dpi    = if (ext == "png") 300 else "print",
                       device = ext),
       error = function(e) cat(sprintf("  \u26a0 %s: %s\n", ext, e$message)))
-    cat(sprintf("  \u2713 Saved: %s\n", basename(out_r)))
-  }
-  
-  # ── Figure 2: SD map + bar chart + r-histogram (SPEI-3 PM) ───────────────
-  # Pick the SPEI-3 PM result (index 3 in results list)
-  r3pm <- results[[3]]
-  if (!is.null(r3pm)) {
-    mt3   <- r3pm$metrics
-    obj3  <- r3pm$obj
-    bsf3  <- detect_basin_sf(obj3$coords)
-    
-    # SD map
-    df_sd <- data.frame(lon = obj3$coords$lon, lat = obj3$coords$lat,
-                        sd_t = mt3$sd)
-    pa_sd <- ggplot2::ggplot(df_sd[!is.na(df_sd$sd_t),],
-                             ggplot2::aes(x=lon, y=lat, fill=sd_t)) +
-      ggplot2::geom_tile() +
-      ggplot2::scale_fill_distiller(palette="YlOrRd", direction=1,
-                                    name="Temporal SD",
-                                    limits=c(max(0.7, min(mt3$sd,na.rm=T)-0.01),
-                                             min(1.3, max(mt3$sd,na.rm=T)+0.01)),
-                                    oob=scales::squish) +
-      {if(!is.null(bsf3)) ggplot2::geom_sf(data=bsf3, fill=NA, colour="black",
-                                           linewidth=0.55, inherit.aes=FALSE)} +
-      ggplot2::coord_sf(expand=FALSE) +
-      ggplot2::labs(title="(a)  Temporal SD of SPEI-3 PM") +
-      theme_map4c
-    
-    # Annual spatial SD bar chart
-    df_bar <- data.frame(year=obj3$yr_int, spat_sd=mt3$spat_sd)
-    pb_bar <- ggplot2::ggplot(df_bar, ggplot2::aes(x=year, y=spat_sd)) +
-      ggplot2::geom_col(fill="#4393c3", colour=NA, width=0.9) +
-      ggplot2::geom_hline(yintercept=mt3$mean_spat_sd,
-                          colour="#d73027", linewidth=0.9, linetype="dashed") +
-      ggplot2::annotate("text",
-                        x=max(obj3$yr_int)-2, y=mt3$mean_spat_sd*1.10,
-                        label=sprintf("Mean = %.3f", mt3$mean_spat_sd),
-                        colour="#d73027", size=2.8, hjust=1) +
-      ggplot2::scale_x_continuous(breaks=seq(1950,2030,by=10),
-                                  expand=ggplot2::expansion(add=c(0.5,0.5))) +
-      ggplot2::scale_y_continuous(expand=ggplot2::expansion(mult=c(0,0.15))) +
-      ggplot2::labs(title="(b)  Spatial SD across pixels per year (SPEI-3 PM)",
-                    x="Year", y="Spatial SD") +
-      ggplot2::theme_classic(base_size=9) +
-      ggplot2::theme(plot.title=ggplot2::element_text(size=8,face="bold",hjust=0),
-                     axis.text.x=ggplot2::element_text(angle=45,hjust=1,size=7),
-                     axis.text.y=ggplot2::element_text(size=7),
-                     plot.margin=ggplot2::margin(2,6,2,2))
-    
-    # ── Shared helper: build one r-density panel for a single PET method ─────
-    # pet_type : "PM" or "Thw"
-    # panel_lab: "(c)" or "(d)"
-    make_r_density_panel <- function(pet_type, panel_lab) {
-      col_pm  <- c("SPEI-1 PM"  = "#1f77b4",
-                   "SPEI-2 PM"  = "#6baed6",
-                   "SPEI-3 PM"  = "#2ca02c")
-      col_thw <- c("SPEI-1 Thw" = "#d62728",
-                   "SPEI-2 Thw" = "#fd8d3c",
-                   "SPEI-3 Thw" = "#ff7f0e")
-      col_use  <- if (pet_type == "PM") col_pm else col_thw
-      pet_long <- if (pet_type == "PM") "Penman-Monteith" else "Thornthwaite"
-      
-      # Collect r values for this PET method only
-      df <- do.call(rbind, lapply(seq_along(combos), function(k) {
-        cb  <- combos[[k]]; res <- results[[k]]
-        if (cb$pet != pet_type || is.null(res)) return(NULL)
-        data.frame(r     = res$metrics$r,
-                   combo = sprintf("SPEI-%d %s", cb$sc, cb$pet),
-                   stringsAsFactors = FALSE)
-      }))
-      if (is.null(df) || !nrow(df)) return(
-        ggplot2::ggplot() +
-          ggplot2::annotate("text", x=0.5, y=0.5,
-                            label=sprintf("No data\n(%s)", pet_long),
-                            size=3, colour="grey50") +
-          ggplot2::theme_void())
-      
-      df <- df[!is.na(df$r), ]
-      df$combo <- factor(df$combo, levels = names(col_use))
-      
-      # Per-group medians
-      med_df <- do.call(rbind, lapply(levels(df$combo), function(g) {
-        x <- df$r[df$combo == g]
-        data.frame(combo  = g,
-                   med_r  = median(x, na.rm = TRUE),
-                   stringsAsFactors = FALSE)
-      }))
-      med_df$combo <- factor(med_df$combo, levels = names(col_use))
-      
-      ggplot2::ggplot(df, ggplot2::aes(x = r, colour = combo, fill = combo)) +
-        ggplot2::geom_density(alpha = 0.18, linewidth = 0.80) +
-        ggplot2::geom_vline(data = med_df,
-                            ggplot2::aes(xintercept = med_r, colour = combo),
-                            linetype = "solid", linewidth = 0.60,
-                            show.legend = FALSE) +
-        ggplot2::geom_text(data = med_df,
-                           ggplot2::aes(x     = med_r, y = Inf,
-                                        label = sprintf("%.2f", med_r),
-                                        colour = combo),
-                           vjust = 1.5, hjust = -0.10, size = 2.4,
-                           show.legend = FALSE) +
-        ggplot2::scale_colour_manual(values = col_use, name = NULL) +
-        ggplot2::scale_fill_manual(values   = col_use, name = NULL) +
-        ggplot2::scale_x_continuous(limits = c(0.4, 1.01),
-                                    breaks = seq(0.4, 1.0, by = 0.1)) +
-        ggplot2::labs(
-          title    = sprintf("%s  Pixel Pearson r — %s PET", panel_lab, pet_long),
-          subtitle = "Solid vertical lines = median r per SPEI scale",
-          x        = "Pearson r  (pixel vs basin mean)",
-          y        = "Density") +
-        ggplot2::theme_classic(base_size = 9) +
-        ggplot2::theme(
-          plot.title    = ggplot2::element_text(size=8, face="bold", hjust=0),
-          plot.subtitle = ggplot2::element_text(size=7, colour="grey40", hjust=0),
-          legend.text   = ggplot2::element_text(size=7.5),
-          legend.position  = "bottom",
-          legend.key.size  = ggplot2::unit(0.35,"cm"),
-          axis.text        = ggplot2::element_text(size=7),
-          plot.margin      = ggplot2::margin(3, 6, 2, 4))
-    }
-    
-    pc_pm  <- make_r_density_panel("PM",  "(c)")
-    pc_thw <- make_r_density_panel("Thw", "(d)")
-    
-    # ── 2×2 layout ────────────────────────────────────────────────────────────
-    # Row 1: (a) SD map | (b) annual spatial SD bar chart
-    # Row 2: (c) PM r-density | (d) Thornthwaite r-density
-    fig4c_sd <- (pa_sd | pb_bar) / (pc_pm | pc_thw) +
-      patchwork::plot_layout(heights = c(1, 1)) +
-      patchwork::plot_annotation(
-        title    = paste0("Spatial representativeness diagnostics — SPEI-3",
-                          " (PM \u0026 Thornthwaite)"),
-        subtitle = paste0(
-          "Row 1: temporal SD map (a) and annual spatial SD bar chart (b)",
-          " for SPEI-3 PM.\n",
-          "Row 2: distribution of pixel Pearson r with the basin mean,",
-          " split by PET method (c = PM,  d = Thornthwaite, scales 1\u20133)."),
-        theme = ggplot2::theme(
-          plot.title    = ggplot2::element_text(size=10, face="bold", hjust=0.5),
-          plot.subtitle = ggplot2::element_text(size=8, colour="grey35", hjust=0,
-                                                margin=ggplot2::margin(b=5))))
-    
-    for (ext in c("pdf","png")) {
-      out_sd <- file.path(BASIN_PLOT_DIR,
-                          paste0("Fig4c_SD_SpatialSD_SPEI3_PM.", ext))
-      tryCatch(
-        ggplot2::ggsave(out_sd, fig4c_sd,
-                        width=10, height=8.5, units="in",
-                        dpi = if (ext == "png") 300 else "print", device=ext),
-        error=function(e) cat(sprintf("  \u26a0 %s: %s\n", ext, e$message)))
-      cat(sprintf("  \u2713 Saved: %s\n", basename(out_sd)))
-    }
+    cat(sprintf("  \u2713 Saved: %s\n", basename(out_f)))
   }
   
   # Console summary
   cat("\n  Representativeness summary:\n")
-  cat(sprintf("  %-18s  median_r  pct_r\u226580\n", "Combination"))
-  cat("  ", paste(rep("-",40), collapse=""), "\n", sep="")
-  for (k in seq_along(combos)) {
-    cb <- combos[[k]]; res <- results[[k]]
-    if (is.null(res)) next
-    cat(sprintf("  SPEI-%d %-12s   %.3f    %.0f%%\n",
-                cb$sc, cb$pet, res$metrics$med_r, res$metrics$pct80))
+  cat(sprintf("  %-14s  median_r  pct_r\u226580\n", "Combination"))
+  cat("  ", paste(rep("-", 38), collapse = ""), "\n", sep = "")
+  for (k in seq_along(spei_scales)) {
+    rv <- spei_r_list[[k]]
+    if (is.null(rv)) next
+    cat(sprintf("  SPEI-PM-%d       %.3f    %.0f%%\n",
+                spei_scales[k], median(rv, na.rm=TRUE),
+                100*mean(rv >= 0.80, na.rm=TRUE)))
+  }
+  for (k in seq_along(spi_scales)) {
+    rv <- spi_r_list[[k]]
+    if (is.null(rv)) next
+    cat(sprintf("  SPI-%d           %.3f    %.0f%%\n",
+                spi_scales[k], median(rv, na.rm=TRUE),
+                100*mean(rv >= 0.80, na.rm=TRUE)))
   }
   
 }, error = function(e) {
@@ -1909,12 +1825,12 @@ cat("  MS figure SPI-1/2/3   : ",
 cat("  Fig 2 (9-panel, all)  : ",
     normalizePath(file.path(BASIN_PLOT_DIR,
                             "Fig2_MS_AllIndices_3x3.pdf")), "\n")
-cat("  Spatial homogeneity (PDF): ",
+cat("  Spatial representativeness (PDF): ",
     normalizePath(file.path(BASIN_PLOT_DIR,
-                            "Fig4c_spatial_homogeneity_SPEI3_PM.pdf")), "\n")
-cat("  Spatial homogeneity (PNG): ",
+                            "Fig4c_Pearson_r_SPEI_PM_SPI.pdf")), "\n")
+cat("  Spatial representativeness (PNG): ",
     normalizePath(file.path(BASIN_PLOT_DIR,
-                            "Fig4c_spatial_homogeneity_SPEI3_PM.png")), "\n")
+                            "Fig4c_Pearson_r_SPEI_PM_SPI.png")), "\n")
 cat("  Excel summary         : ", normalizePath(excel_out),       "\n")
 cat("  Seasonality P/PET(PM) : ",
     normalizePath(file.path(BASIN_PLOT_DIR,

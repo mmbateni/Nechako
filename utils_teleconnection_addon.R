@@ -26,9 +26,15 @@
 ####################################################################################
 
 ## ── A. CONFIGURATION ─────────────────────────────────────────────────────────
-
-WD_PATH <- "D:/Nechako_Drought/Nechako/"
-TELE_DIR <- file.path(WD_PATH, "teleconnections")
+## WD_PATH and TELE_DIR are defined in DROUGHT_ANALYSIS_utils.R.
+## This file must be sourced AFTER that one.  The guard below gives a clear
+## error if the sourcing order is wrong, rather than silently overwriting
+## the env-var-based WD_PATH with a hard-coded Windows path.
+if (!exists("WD_PATH", envir = .GlobalEnv, inherits = FALSE))
+  stop("utils_teleconnection_addon.R must be sourced AFTER DROUGHT_ANALYSIS_utils.R\n",
+       "  Add:  source(\"DROUGHT_ANALYSIS_utils.R\")  before this line.")
+if (!exists("TELE_DIR", envir = .GlobalEnv, inherits = FALSE))
+  stop("TELE_DIR not found.  Check that DROUGHT_ANALYSIS_utils.R is up to date.")
 
 TELE_URLS <- list(
   oni    = "https://www.cpc.ncep.noaa.gov/data/indices/oni.ascii.txt",

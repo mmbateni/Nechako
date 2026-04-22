@@ -5,23 +5,31 @@
 WD_PATH <- Sys.getenv("NECHAKO_WD", "D:/Nechako_Drought/Nechako/")
 BASIN_SHP       <- file.path(WD_PATH, "Spatial/nechakoBound_dissolve.kmz")
 
+## Private helper: unzip a KMZ file into a self-cleaning temp directory and
+## call FUN(kml_path), returning FUN's result.  The temp directory is deleted
+## by on.exit() when this function returns — so FUN must finish reading the
+## KML before .read_kmz() exits (which it always does, since FUN is called
+## synchronously inside the function body).
+.read_kmz <- function(kmz_path, FUN) {
+  tmp <- tempfile()
+  dir.create(tmp, showWarnings = FALSE)
+  on.exit(unlink(tmp, recursive = TRUE), add = TRUE)
+  utils::unzip(kmz_path, exdir = tmp)
+  kml <- list.files(tmp, pattern = "\\.kml$", full.names = TRUE, recursive = TRUE)
+  if (!length(kml))
+    stop(".read_kmz: no .kml file found inside ", basename(kmz_path))
+  FUN(kml[1])
+}
+
 ## Helper: load basin as a single dissolved SpatVector (terra).
 ## terra::vect() cannot read KMZ directly on Windows (missing GDAL KMZ driver).
-## This helper unzips KMZ to a temp dir, reads the inner .kml (which terra
-## handles fine), then aggregates any multi-feature result into one polygon.
+## .read_kmz() handles the unzip/cleanup; terra::vect() reads the inner KML.
 load_basin_vect <- function(path = BASIN_SHP) {
-  ext <- tolower(tools::file_ext(path))
-  if (ext == "kmz") {
-    tmp <- tempfile()
-    dir.create(tmp, showWarnings = FALSE)
-    on.exit(unlink(tmp, recursive = TRUE), add = TRUE)
-    utils::unzip(path, exdir = tmp)
-    kml <- list.files(tmp, pattern = "\\.kml$", full.names = TRUE, recursive = TRUE)
-    if (!length(kml)) stop("load_basin_vect: no .kml found inside ", basename(path))
-    v <- terra::vect(kml[1])
-  } else {
-    v <- terra::vect(path)
-  }
+  if (!file.exists(path)) stop("Basin file not found: ", path)
+  v <- if (tolower(tools::file_ext(path)) == "kmz")
+    .read_kmz(path, terra::vect)
+  else
+    terra::vect(path)
   if (nrow(v) > 1L) v <- terra::aggregate(v)
   v
 }
@@ -39,6 +47,12 @@ POINT_PLOT_DIR   <- file.path(WD_PATH,  "point_timeseries_plots/")
 GIF_DIR <- file.path(TREND_DIR, "drought_gifs/")
 CACHE_DIR <- file.path(WD_PATH, "temporal_drought/cache/")
 TELE_DIR <- file.path(WD_PATH, "teleconnections")
+
+## Figure output constants (used by save_figure() and all w* scripts)
+FIG_DPI         <- 300L   # PNG resolution
+FIG_WIDTH_WIDE  <- 14     # wide panel figures (inches)
+FIG_WIDTH_STD   <- 10     # standard single-panel figures (inches)
+FIG_HEIGHT_STD  <-  8     # standard figure height (inches)
 
 ## CRS and thresholds
 EQUAL_AREA_CRS  <- "EPSG:3005"
@@ -329,65 +343,78 @@ compute_layer_statistics  <- function(layer_idx, raster_file, basin_geom, thresh
 }
 
 ## F. DROUGHT EVENT DETECTION ────────────────────────────────────────
-detect_drought_events  <- function(df,
-                                   onset_threshold = DROUGHT_ONSET,
-                                   termination_threshold = DROUGHT_END,
-                                   min_duration = 1,
-                                   severe_thr = SEVERE_THRESHOLD,
-                                   extreme_thr = EXTREME_THRESHOLD) {
+detect_drought_events <- function(df,
+                                  onset_threshold       = DROUGHT_ONSET,
+                                  termination_threshold = DROUGHT_END,
+                                  min_duration          = 1,
+                                  severe_thr            = SEVERE_THRESHOLD,
+                                  extreme_thr           = EXTREME_THRESHOLD) {
   stopifnot(all(c("date", "value") %in% names(df)))
-  df  <- df[order(df$date), ]
+  df    <- df[order(df$date), ]
   vals  <- df$value
-  dates  <- df$date
-  events  <- data.frame(event_id = integer(),
-                        start_date = as.Date(character()),
-                        end_date = as.Date(character()),
-                        duration_months = integer(),
-                        min_value = numeric(),
-                        severity = character(),
-                        stringsAsFactors = FALSE)
-  in_drought  <- FALSE
-  start_idx  <- NA
-  classify_severity  <- function(min_v) {
-    if (min_v <= extreme_thr) "Extreme"
-    else if (min_v <= severe_thr) "Severe"
-    else "Moderate"
+  dates <- df$date
+  
+  ## Canonical empty frame — returned when there are no events
+  empty_events <- data.frame(
+    event_id        = integer(),
+    start_date      = as.Date(character()),
+    end_date        = as.Date(character()),
+    duration_months = integer(),
+    min_value       = numeric(),
+    severity        = character(),
+    stringsAsFactors = FALSE)
+  
+  classify_severity <- function(min_v) {
+    if      (min_v <= extreme_thr) "Extreme"
+    else if (min_v <= severe_thr)  "Severe"
+    else                           "Moderate"
   }
-  add_event  <- function(s, e) {
-    dur  <- e - s + 1
+  
+  ## Pre-allocated list accumulator — O(1) append, avoids the O(n²) rbind()
+  ## that the previous <<- closure caused by copying the growing data.frame
+  ## on every event.  do.call(rbind, event_list) is called once at the end.
+  event_list <- list()
+  
+  close_event <- function(s, e) {
+    dur <- e - s + 1L
     if (dur < min_duration) return()
-    mv  <- min(vals[s:e], na.rm = TRUE)
-    events  <<- rbind(events, data.frame(
-      event_id = nrow(events) + 1,
-      start_date = dates[s],
-      end_date = dates[e],
+    mv <- min(vals[s:e], na.rm = TRUE)
+    event_list[[length(event_list) + 1L]] <<- data.frame(
+      event_id        = length(event_list) + 1L,
+      start_date      = dates[s],
+      end_date        = dates[e],
       duration_months = dur,
-      min_value = mv,
-      severity = classify_severity(mv),
-      stringsAsFactors = FALSE))
+      min_value       = mv,
+      severity        = classify_severity(mv),
+      stringsAsFactors = FALSE)
   }
+  
+  in_drought <- FALSE
+  start_idx  <- NA_integer_
   for (i in seq_along(vals)) {
     if (!in_drought && !is.na(vals[i]) && vals[i] < onset_threshold) {
-      in_drought  <- TRUE; start_idx  <- i
+      in_drought <- TRUE
+      start_idx  <- i
     } else if (in_drought && !is.na(vals[i]) && vals[i] >= termination_threshold) {
-      add_event(start_idx, i-1); in_drought  <- FALSE
+      close_event(start_idx, i - 1L)
+      in_drought <- FALSE
     }
   }
-  if (in_drought) add_event(start_idx, length(vals))
-  events
+  if (in_drought) close_event(start_idx, length(vals))   # drought still open at end
+  
+  if (!length(event_list)) return(empty_events)
+  do.call(rbind, event_list)
 }
 
 ## F2. SPATIAL HELPERS (used by w4_trends_visualization.R) ──────────
-#' Load basin shapefile and reproject to equal-area CRS
+#' Load basin shapefile and reproject to equal-area CRS.
+#' KMZ files are handled via the shared .read_kmz() helper.
 load_basin <- function(shp_path = BASIN_SHP, crs = EQUAL_AREA_CRS) {
   if (!file.exists(shp_path)) stop("Basin file not found: ", shp_path)
-  if (tolower(tools::file_ext(shp_path)) == "kmz") {
-    kml_file <- unzip(shp_path, exdir = tempdir())[1]
-    on.exit(unlink(kml_file), add = TRUE)
-    b <- sf::st_read(kml_file, quiet = TRUE)
-  } else {
-    b <- sf::st_read(shp_path, quiet = TRUE)
-  }
+  b <- if (tolower(tools::file_ext(shp_path)) == "kmz")
+    .read_kmz(shp_path, function(kml) sf::st_read(kml, quiet = TRUE))
+  else
+    sf::st_read(shp_path, quiet = TRUE)
   if (nrow(b) > 1L) b <- sf::st_as_sf(sf::st_union(b))
   if (sf::st_crs(b)$input != crs) b <- sf::st_transform(b, crs)
   cat(sprintf("✓ Basin loaded (%d polygon(s) → dissolved, CRS: %s)\n", nrow(b), crs))
@@ -525,6 +552,55 @@ safe_pdf <- function(filename, width = 12, height = 8) {
   })
 }
 
+#' Unified figure-saving helper — replaces the scattered mix of pdf()/dev.off()
+#' and ggsave() calls across the w* scripts.
+#'
+#' Two modes:
+#'   ggplot2 mode  — pass a ggplot object to \code{plot_obj}; saves both
+#'                   <stem>.pdf and <stem>.png automatically.
+#'   base-R mode   — leave \code{plot_obj = NULL}; opens a pdf() device so
+#'                   the caller can draw with base graphics and close the
+#'                   device with dev.off() as usual.  No .png is written in
+#'                   this mode (base-R PNG requires a separate png() call).
+#'
+#' @param plot_obj  ggplot2 object, or NULL for base-R pdf output.
+#' @param stem      File path WITHOUT extension; .pdf and .png are appended.
+#' @param width     Figure width in inches  (default FIG_WIDTH_WIDE).
+#' @param height    Figure height in inches (default FIG_HEIGHT_STD).
+#' @param dpi       PNG resolution in ppi   (default FIG_DPI).
+#' @return Invisible NULL.
+save_figure <- function(plot_obj = NULL,
+                        stem,
+                        width  = FIG_WIDTH_WIDE,
+                        height = FIG_HEIGHT_STD,
+                        dpi    = FIG_DPI) {
+  pdf_path <- paste0(stem, ".pdf")
+  png_path <- paste0(stem, ".png")
+  
+  if (is.null(plot_obj)) {
+    ## Base-R mode: open a pdf device; caller draws, then calls dev.off()
+    safe_pdf(pdf_path, width = width, height = height)
+    return(invisible(NULL))
+  }
+  
+  ## ggplot2 mode: save both formats in one call
+  tryCatch(
+    ggplot2::ggsave(pdf_path, plot_obj,
+                    width = width, height = height, units = "in", device = "pdf"),
+    error = function(e) cat(sprintf("  ⚠ PDF save failed (%s): %s\n",
+                                    basename(pdf_path), e$message))
+  )
+  tryCatch(
+    ggplot2::ggsave(png_path, plot_obj,
+                    width = width, height = height, units = "in",
+                    dpi = dpi, device = "png"),
+    error = function(e) cat(sprintf("  ⚠ PNG save failed (%s): %s\n",
+                                    basename(png_path), e$message))
+  )
+  cat(sprintf("  ✓ Figure saved: %s (.pdf + .png)\n", basename(stem)))
+  invisible(NULL)
+}
+
 ## H. EXCEL SUMMARY EXPORT ───────────────────────────────────────────
 export_summary_excel <- function(timescales, index_types, ts_loader_fn, output_file) {
   wb <- openxlsx::createWorkbook()
@@ -562,5 +638,59 @@ export_summary_excel <- function(timescales, index_types, ts_loader_fn, output_f
   cat(sprintf("✓ Excel summary saved: %s\n", basename(output_file)))
   invisible(wb)
 }
+## I. W9 SHARED-STATE LOADER ─────────────────────────────────────────
+#' Load and validate the shared-state RDS written by w9_atmospheric_diagnostics.R.
+#'
+#' w10c calls readRDS() on this file and unpacks every key into its local
+#' environment.  If w9 is ever modified (keys renamed, added, or removed) the
+#' downstream scripts previously failed with obscure NULL-reference errors deep
+#' inside their analysis code.  This wrapper validates the schema up front and
+#' gives a clear, actionable error message instead.
+#'
+#' Required keys reflect the full set documented in w9 Section 5.  If w9 adds
+#' a new key that w10c depends on, add it to \code{required_keys} here.
+#'
+#' @param path  Full path to w9_shared_state.rds (produced by w9).
+#' @return The named list exactly as saved by w9, after schema validation.
+read_w9_state <- function(path) {
+  if (!file.exists(path))
+    stop("w9 shared-state RDS not found:\n  ", path,
+         "\n  Run w9_atmospheric_diagnostics.R first.")
+  
+  st <- readRDS(path)
+  
+  required_keys <- c(
+    ## Data objects
+    "base_date_index", "z500_ridge_ts", "slp_nwbc_ts", "sst_nepac_ts",
+    "map_layers",
+    ## Anomaly NetCDF paths
+    "anomaly_nc_z500", "anomaly_nc_slp", "anomaly_nc_sst",
+    ## Path scalars
+    "WD_PATH", "DATA_DIR", "OUT_DIR", "SPI_SEAS_DIR", "SPEI_SEAS_DIR",
+    ## Analysis window
+    "START_YEAR", "END_YEAR", "CLIM_START", "CLIM_END",
+    "RECENT_START", "RECENT_END",
+    "DROUGHT_FOCUS_START", "DROUGHT_FOCUS_END",
+    ## Spatial boxes
+    "RIDGE_LON_MIN", "RIDGE_LON_MAX", "RIDGE_LAT_MIN", "RIDGE_LAT_MAX",
+    "SST_MEAN_LON_MIN", "SST_MEAN_LON_MAX", "SST_MEAN_LAT_MIN", "SST_MEAN_LAT_MAX",
+    ## EOF domain (w10c)
+    "EOF_LON_MIN", "EOF_LON_MAX", "EOF_LAT_MIN", "EOF_LAT_MAX",
+    ## Plot settings
+    "FIGURE_DPI", "FIGURE_WIDTH_WIDE", "FIGURE_WIDTH_STD", "MONTH_LABELS"
+  )
+  
+  missing_keys <- setdiff(required_keys, names(st))
+  if (length(missing_keys))
+    stop("w9 shared-state is missing ", length(missing_keys), " required key(s):\n",
+         "  ", paste(missing_keys, collapse = ", "), "\n",
+         "  The RDS schema may have changed since w9 last ran.\n",
+         "  Re-run w9_atmospheric_diagnostics.R to regenerate the RDS.")
+  
+  cat(sprintf("✓ w9 shared state loaded (%d keys): %s\n",
+              length(st), basename(path)))
+  st
+}
+
 #source("utils_teleconnection_addon.R")
 cat("✓ DROUGHT_ANALYSIS_utils.R loaded\n")

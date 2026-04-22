@@ -1,6 +1,5 @@
 # ==============================================================================
 #   w1_trend_test.R  ·  SPATIAL TREND ANALYSIS FOR ALL INDICES
-# [FIXED VERSION]
 # ==============================================================================
 #   Computes per-pixel statistics for SPI, SPEI (multiple scales) and SWEI:
 #   • Mann-Kendall — Hamed & Rao (1998) variance-corrected (VC-HR98) + Sen's slope
@@ -8,18 +7,17 @@
 #     Tau is the standard concordance statistic; p-value is the H-R98 corrected one.
 #     Sen's slope is extracted directly from mmkh() (avoids the O(n²) matrix method).
 #   • Mann-Kendall (TFPW – Trend-Free Pre-Whitening, Yue et al. 2002)
-#     [BUGFIX 3] Sen's slope now computed on original series, not pre-whitened.
+#     Sen's slope now computed on original series, not pre-whitened.
 #   • Drought event count / mean duration / max intensity — TWO METHODS:
 #       Method 1 (S&W): single threshold DROUGHT_ONSET, no hysteresis, no min duration
 #         Intensity = mean(DROUGHT_ONSET - x)  [deficit below -1.0]
 #       Method 2 (Hyst): onset < DROUGHT_ONSET, termination >= DROUGHT_END,
 #                        scale-specific minimum duration
-#         [BUGFIX 4] Intensity = mean(DROUGHT_END - x) [deficit below 0.0, always >=0]
+#         Intensity = mean(DROUGHT_END - x) [deficit below 0.0, always >=0]
 #   • PELT regime-shift year  [BUGFIX 7: now actually called in process_index]
 #   • Wald-Wolfowitz runs test (drought event temporal clustering)
-#     [BUGFIX 6] Binarised on hysteresis drought events, not raw index vs 0
+#     Binarised on hysteresis drought events
 #   • n_spectral_peaks — AR1 red-noise significance test on periods >= 24 months
-#     [BUGFIX 5] Fully implemented; replaces placeholder 0L
 #
 # OUTPUT: {TREND_DIR}/{index}_{scale:02d}_results.csv  (one per index × scale)
 # Columns include tau_vc, p_value_vc (H-R98 corrected), p_fdr_vc (BH-FDR corrected),
@@ -79,6 +77,7 @@ cl         <- NULL
 if (N_CORES > 1) {
   if (is_windows) {
     cl <- parallel::makeCluster(N_CORES)
+    on.exit(parallel::stopCluster(cl), add = TRUE)  # guaranteed cleanup on error or normal exit
     parallel::clusterEvalQ(cl, {
       library(Kendall)
       library(trend)
@@ -1202,12 +1201,6 @@ if (dir.exists(mspei_dir)) {
   run_index_safe("mspei", MSPI_MSPEI_SCALE, find_mspi_mspei_files, mspei_dir)
 } else {
   cat("\n── MSPEI: directory not found, skipped ──\n")
-}
-
-# Shut down parallel cluster
-if (!is.null(cl)) {
-  parallel::stopCluster(cl)
-  cat("\n✓ Cluster stopped\n")
 }
 
 elapsed <- Sys.time() - total_start

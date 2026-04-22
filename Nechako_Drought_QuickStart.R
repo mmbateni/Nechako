@@ -14,9 +14,9 @@ library(terra)
 # Set your working directory
 setwd("D:/Nechako_Drought/monthly_data_direct")
 
-cat("="*70, "\n")
+strrep("=", 70) 
 cat("DATA VERIFICATION\n")
-cat("="*70, "\n\n")
+strrep("=", 70) 
 
 # --- Check 1: Verify input files exist ---
 cat("CHECK 1: Verifying input files...\n")
@@ -119,16 +119,15 @@ if (abs(k_c - test_t) < 0.01) {
 }
 cat("\n")
 
-cat("="*70, "\n")
+strrep("=", 70) 
 cat("DATA VERIFICATION COMPLETE\n")
-cat("="*70, "\n\n")
-
+strrep("=", 70) 
 #============================================================================
 # MINIMAL WORKING EXAMPLE: SINGLE MONTH ANALYSIS
 #============================================================================
-cat("="*70, "\n")
+strrep("=", 70) 
 cat("MINIMAL WORKING EXAMPLE: SINGLE MONTH ANALYSIS\n")
-cat("="*70, "\n\n")
+strrep("=", 70) 
 
 # Calculate PNPI for January 2000
 jan_2000_idx <- (2000 - 1950) * 12 + 1
@@ -179,9 +178,9 @@ cat("  Map saved to: minimal_example_drought_map.pdf\n\n")
 #============================================================================
 # RECOMMENDED WORKFLOW
 #============================================================================
-cat("="*70, "\n")
+strrep("=", 70) 
 cat("RECOMMENDED WORKFLOW\n")
-cat("="*70, "\n\n")
+strrep("=", 70) 
 cat("
 STEP-BY-STEP EXECUTION PLAN:
 
@@ -240,9 +239,9 @@ For help, see: Nechako_Drought_Methodology_Guide.R
 #============================================================================
 quick_diagnostic <- function() {
   cat("\n")
-  cat("="*70, "\n")
+  strrep("=", 70) 
   cat("QUICK DIAGNOSTIC CHECK\n")
-  cat("="*70, "\n\n")
+  strrep("=", 70) 
   
   cat("Checking for output files...\n")
   output_files <- c(
@@ -293,10 +292,8 @@ quick_diagnostic <- function() {
     cat(sprintf("  Max severity: %.1f%% deficit\n", max(pnwbi_data$severity)))
     cat(sprintf("  Max area: %.1f%%\n", max(pnwbi_data$area_pct)))
   }
-  cat("\n")
   cat("Diagnostic complete. Review drought_analysis/ folder for detailed results.\n")
-  cat("="*70, "\n")
-}
+  strrep("=", 70) }
 
 cat("\n\nYou can now proceed with the main analysis.\n")
 cat("Run: source('Nechako_Drought_SAF_Analysis.R')\n\n")

@@ -467,35 +467,66 @@ graphics.off()
 diag_dir <- "diagnostics"
 if (!dir.exists(diag_dir)) dir.create(diag_dir, showWarnings = FALSE)
 
+# Average days per calendar month (using 28.25 for Feb to account for leap years)
+days_per_month <- c(31, 28.25, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+
+# ---------------------------------------------------------------------------
+# Helper: render a plot function into the currently open PDF device AND save
+# an individual PNG file.
+#   name     : filename stem (no extension) for the PNG
+#   plot_fn  : zero-argument function containing all plotting calls
+#   width/height : inches (shared by PDF page and PNG canvas)
+#   res      : PNG resolution in dpi
+# ---------------------------------------------------------------------------
+save_plot <- function(name, plot_fn, width = 12, height = 8, res = 150) {
+  # 1. Draw into the already-open PDF device
+  plot_fn()
+  # 2. Also write an individual PNG
+  png_path <- file.path(diag_dir, paste0(name, ".png"))
+  tryCatch({
+    png(png_path, width = width, height = height, units = "in", res = res)
+    plot_fn()
+    dev.off()
+    log_event(sprintf("    PNG saved: %s", basename(png_path)))
+  }, error = function(e) {
+    if (dev.cur() > 1) dev.off()
+    log_event(sprintf("    WARNING: PNG failed for %s — %s", name, conditionMessage(e)))
+  })
+}
+
 tryCatch(
   pdf(file.path(diag_dir, "PET_diagnostics.pdf"), width = 12, height = 8),
   error = function(e) stop("Cannot write PDF: close it in your viewer first."))
 
 # A. PM time series
-log_event("... PM time series")
-par(mfrow = c(1, 1), mar = c(4, 4, 3, 1))
-plot(dates, pet_summary$mean_pet, type = "l", col = "blue", lwd = 2,
-     xlab = "Date", ylab = "PET (mm/day)",
-     main = "Basin-Average PET Time Series (Penman-Monteith)")
-grid()
-if (nrow(pet_summary) >= 12) {
-  ma_12 <- stats::filter(pet_summary$mean_pet, rep(1/12, 12), sides = 2)
-  lines(dates, ma_12, col = "red", lwd = 2)
-  legend("topleft", legend = c("Monthly PET", "12-month MA"),
-         col = c("blue", "red"), lwd = 2, bty = "n")
-}
+log_event("... A: PM time series")
+save_plot("A_PM_timeseries", function() {
+  par(mfrow = c(1, 1), mar = c(4, 4, 3, 1))
+  plot(dates, pet_summary$mean_pet, type = "l", col = "blue", lwd = 2,
+       xlab = "Date", ylab = "PET (mm/day)",
+       main = "Basin-Average PET Time Series (Penman-Monteith)")
+  grid()
+  if (nrow(pet_summary) >= 12) {
+    ma_12 <- stats::filter(pet_summary$mean_pet, rep(1/12, 12), sides = 2)
+    lines(dates, ma_12, col = "red", lwd = 2)
+    legend("topleft", legend = c("Monthly PET", "12-month MA"),
+           col = c("blue", "red"), lwd = 2, bty = "n")
+  }
+})
 
 # B. Seasonal cycle
-log_event("... Seasonal cycle")
-par(mfrow = c(1, 1), mar = c(4, 4, 3, 1))
-boxplot(mean_pet ~ month, data = pet_summary,
-        xlab = "Month", ylab = "PET (mm/day)",
-        main = "Seasonal Distribution of PET (PM)",
-        names = month.abb, col = "lightblue", border = "darkblue")
-grid()
+log_event("... B: Seasonal cycle boxplot")
+save_plot("B_seasonal_boxplot", function() {
+  par(mfrow = c(1, 1), mar = c(4, 4, 3, 1))
+  boxplot(mean_pet ~ month, data = pet_summary,
+          xlab = "Month", ylab = "PET (mm/day)",
+          main = "Seasonal Distribution of PET (PM)",
+          names = month.abb, col = "lightblue", border = "darkblue")
+  grid()
+})
 
 # C. Range validation
-log_event("... Range validation")
+log_event("... C: Range validation")
 anomalies <- pet_summary[pet_summary$mean_pet < 0 | pet_summary$mean_pet > 8, ]
 if (nrow(anomalies) > 0) {
   log_event(paste("WARNING:", nrow(anomalies), "months PET outside 0-8 mm/day"))
@@ -504,121 +535,132 @@ if (nrow(anomalies) > 0) {
   log_event("All PM PET values within expected range (0-8 mm/day)")
 }
 
-# D. Monthly climatology
-log_event("... Monthly climatology")
-par(mfrow = c(1, 1), mar = c(4, 4, 3, 1))
-plot(monthly_stats$month, monthly_stats$mean_pet, type = "b", pch = 19, col = "darkblue",
-     xlab = "Month", ylab = "Mean PET (mm/day)",
-     main = "Mean PM PET Climatology by Calendar Month",
-     xaxt = "n", ylim = c(0, max(monthly_stats$mean_pet, na.rm = TRUE) * 1.1))
-axis(1, at = 1:12, labels = month.abb)
-arrows(monthly_stats$month,
-       monthly_stats$mean_pet - monthly_stats$std_dev,
-       monthly_stats$month,
-       monthly_stats$mean_pet + monthly_stats$std_dev,
-       angle = 90, code = 3, length = 0.05, col = "gray50")
-grid()
+# D. Monthly climatology (PM only, mm/day)
+log_event("... D: Monthly climatology (PM)")
+save_plot("D_monthly_climatology_PM", function() {
+  par(mfrow = c(1, 1), mar = c(4, 4, 3, 1))
+  plot(monthly_stats$month, monthly_stats$mean_pet, type = "b", pch = 19, col = "darkblue",
+       xlab = "Month", ylab = "Mean PET (mm/day)",
+       main = "Mean PM PET Climatology by Calendar Month",
+       xaxt = "n", ylim = c(0, max(monthly_stats$mean_pet, na.rm = TRUE) * 1.1))
+  axis(1, at = 1:12, labels = month.abb)
+  arrows(monthly_stats$month,
+         monthly_stats$mean_pet - monthly_stats$std_dev,
+         monthly_stats$month,
+         monthly_stats$mean_pet + monthly_stats$std_dev,
+         angle = 90, code = 3, length = 0.05, col = "gray50")
+  grid()
+})
 
 # E. Inter-annual variability with Sen's slope
-log_event("... Inter-annual variability")
+log_event("... E: Inter-annual variability")
 annual_mean <- aggregate(mean_pet ~ year, data = pet_summary, FUN = mean, na.rm = TRUE)
-par(mfrow = c(1, 1), mar = c(4, 4, 3, 1))
-plot(annual_mean$year, annual_mean$mean_pet, type = "b", pch = 19, col = "darkgreen",
-     xlab = "Year", ylab = "Annual Mean PET (mm/day)", main = "Annual Mean PET Trend (PM)")
-grid()
-if (nrow(annual_mean) > 2) {
-  trend_lm   <- lm(mean_pet ~ year, data = annual_mean)
-  abline(trend_lm, col = "red", lwd = 2, lty = 2)
-  n <- nrow(annual_mean)
-  # Sen's slope via pairwise slopes
-  slopes_mat <- outer(seq_len(n), seq_len(n), function(i, j)
-    ifelse(j > i,
-           (annual_mean$mean_pet[j] - annual_mean$mean_pet[i]) /
-             (annual_mean$year[j]     - annual_mean$year[i]), NA))
-  sen_slope     <- median(slopes_mat, na.rm = TRUE)
-  sen_intercept <- median(annual_mean$mean_pet - sen_slope * annual_mean$year, na.rm = TRUE)
-  abline(a = sen_intercept, b = sen_slope, col = "blue", lwd = 2)
-  # Mann-Kendall
-  S     <- sum(sign(outer(annual_mean$mean_pet, annual_mean$mean_pet, "-")[lower.tri(matrix(0, n, n))]))
-  var_S <- n * (n - 1) * (2 * n + 5) / 18
-  Z     <- ifelse(S > 0, (S - 1) / sqrt(var_S), ifelse(S < 0, (S + 1) / sqrt(var_S), 0))
-  mk_p  <- 2 * pnorm(-abs(Z))
-  log_event(sprintf("Sen's slope: %.6f mm/day/year (MK p=%.3f)", sen_slope, mk_p))
-  legend("topleft",
-         legend = c(sprintf("LR: %.4f mm/day/yr (p=%.3f)",
-                            coef(trend_lm)[2], summary(trend_lm)$coefficients[2, 4]),
-                    sprintf("Sen: %.4f mm/day/yr (MK p=%.3f)", sen_slope, mk_p)),
-         col = c("red", "blue"), lwd = 2, lty = c(2, 1), bty = "n")
-}
+save_plot("E_interannual_trend_PM", function() {
+  par(mfrow = c(1, 1), mar = c(4, 4, 3, 1))
+  plot(annual_mean$year, annual_mean$mean_pet, type = "b", pch = 19, col = "darkgreen",
+       xlab = "Year", ylab = "Annual Mean PET (mm/day)", main = "Annual Mean PET Trend (PM)")
+  grid()
+  if (nrow(annual_mean) > 2) {
+    trend_lm   <- lm(mean_pet ~ year, data = annual_mean)
+    abline(trend_lm, col = "red", lwd = 2, lty = 2)
+    n <- nrow(annual_mean)
+    slopes_mat <- outer(seq_len(n), seq_len(n), function(i, j)
+      ifelse(j > i,
+             (annual_mean$mean_pet[j] - annual_mean$mean_pet[i]) /
+               (annual_mean$year[j]   - annual_mean$year[i]), NA))
+    sen_slope     <- median(slopes_mat, na.rm = TRUE)
+    sen_intercept <- median(annual_mean$mean_pet - sen_slope * annual_mean$year, na.rm = TRUE)
+    abline(a = sen_intercept, b = sen_slope, col = "blue", lwd = 2)
+    S     <- sum(sign(outer(annual_mean$mean_pet, annual_mean$mean_pet, "-")[lower.tri(matrix(0, n, n))]))
+    var_S <- n * (n - 1) * (2 * n + 5) / 18
+    Z     <- ifelse(S > 0, (S - 1) / sqrt(var_S), ifelse(S < 0, (S + 1) / sqrt(var_S), 0))
+    mk_p  <- 2 * pnorm(-abs(Z))
+    log_event(sprintf("Sen's slope: %.6f mm/day/year (MK p=%.3f)", sen_slope, mk_p))
+    legend("topleft",
+           legend = c(sprintf("LR: %.4f mm/day/yr (p=%.3f)",
+                              coef(trend_lm)[2], summary(trend_lm)$coefficients[2, 4]),
+                      sprintf("Sen: %.4f mm/day/yr (MK p=%.3f)", sen_slope, mk_p)),
+           col = c("red", "blue"), lwd = 2, lty = c(2, 1), bty = "n")
+  }
+})
 
 # F. PM sample spatial maps
-log_event("... PM spatial maps")
+log_event("... F: PM spatial maps")
 sample_months <- c(1, 256, 619, 910)
-if (nlyr(et0) >= 12) {
-  par(mfrow = c(2, 2), mar = c(2, 2, 3, 4))
-  for (idx in sample_months)
-    plot(et0[[idx]], col = rev(hcl.colors(100, "YlOrRd")),
-         main = sprintf("PET_PM %s", names(et0)[idx]))
-}
+save_plot("F_PM_spatial_maps", function() {
+  if (nlyr(et0) >= 12) {
+    par(mfrow = c(2, 2), mar = c(2, 2, 3, 4))
+    for (idx in sample_months)
+      plot(et0[[idx]], col = rev(hcl.colors(100, "YlOrRd")),
+           main = sprintf("PET_PM %s", names(et0)[idx]))
+  }
+})
 
 # F2. Thornthwaite vs. Penman-Monteith comparison
 # Scientific interpretation:
 #   Large PM-Thw summer bias  => radiation + wind also drive PET (not purely T)
 #   Small PM-Thw summer bias  => T dominates PET => Thornthwaite is good proxy
-log_event("... PM vs. Thornthwaite comparison")
+log_event("... F2: PM vs. Thornthwaite comparison")
 
 # F2a. Time series overlay
-par(mfrow = c(1, 1), mar = c(4, 4, 3, 1))
-y_lim <- range(c(pet_summary$mean_pet, pet_thw_summary$mean_pet), na.rm = TRUE)
-plot(dates, pet_summary$mean_pet, type = "l", col = "blue", lwd = 1.5,
-     ylim = y_lim, xlab = "Date", ylab = "PET (mm/day)",
-     main = "Basin-Average PET: Penman-Monteith vs. Thornthwaite")
-lines(dates, pet_thw_summary$mean_pet, col = "darkorange", lwd = 1.5, lty = 2)
-legend("topright",
-       legend = c("Penman-Monteith (ERA5)", "Thornthwaite (T-only)"),
-       col = c("blue", "darkorange"), lwd = 2, lty = c(1, 2), bty = "n")
-grid()
-
-# F2b. Seasonal cycle with error bars
-par(mfrow = c(1, 1), mar = c(4, 5, 3, 1))
-y_max <- max(c(monthly_stats$mean_pet, monthly_stats_thw$mean_pet), na.rm = TRUE) * 1.15
-plot(1:12, monthly_stats$mean_pet, type = "b", pch = 19, col = "blue", lwd = 2,
-     xlab = "Month", ylab = "Mean PET (mm/day)",
-     main = "Seasonal PET Climatology: PM vs. Thornthwaite",
-     xaxt = "n", ylim = c(0, y_max))
-axis(1, at = 1:12, labels = month.abb)
-lines(1:12, monthly_stats_thw$mean_pet, type = "b", pch = 17,
-      col = "darkorange", lwd = 2, lty = 2)
-suppressWarnings({
-  arrows(1:12,
-         monthly_stats$mean_pet - monthly_stats$std_dev,
-         1:12,
-         monthly_stats$mean_pet + monthly_stats$std_dev,
-         angle = 90, code = 3, length = 0.04, col = "blue")
-  arrows(1:12,
-         monthly_stats_thw$mean_pet - monthly_stats_thw$std_dev,
-         1:12,
-         monthly_stats_thw$mean_pet + monthly_stats_thw$std_dev,
-         angle = 90, code = 3, length = 0.04, col = "darkorange")
+save_plot("F2a_timeseries_PM_vs_Thw", function() {
+  par(mfrow = c(1, 1), mar = c(4, 4, 3, 1))
+  y_lim <- range(c(pet_summary$mean_pet, pet_thw_summary$mean_pet), na.rm = TRUE)
+  plot(dates, pet_summary$mean_pet, type = "l", col = "blue", lwd = 1.5,
+       ylim = y_lim, xlab = "Date", ylab = "PET (mm/day)",
+       main = "Basin-Average PET: Penman-Monteith vs. Thornthwaite")
+  lines(dates, pet_thw_summary$mean_pet, col = "darkorange", lwd = 1.5, lty = 2)
+  legend("topright",
+         legend = c("Penman-Monteith (ERA5)", "Thornthwaite (T-only)"),
+         col = c("blue", "darkorange"), lwd = 2, lty = c(1, 2), bty = "n")
+  grid()
 })
-legend("topleft",
-       legend = c("Penman-Monteith (ERA5)", "Thornthwaite (T-only)"),
-       col = c("blue", "darkorange"), lwd = 2, pch = c(19, 17), lty = c(1, 2), bty = "n")
-grid()
 
-# F2c. Bias bar chart: PM - Thornthwaite by month
-bias_monthly <- monthly_stats$mean_pet - monthly_stats_thw$mean_pet
-par(mfrow = c(1, 1), mar = c(4, 5, 3, 1))
-barplot(bias_monthly, names.arg = month.abb,
-        col    = ifelse(bias_monthly > 0, "#e31a1c", "#1f78b4"),
-        border = "white",
-        xlab = "Month", ylab = "PET bias (mm/day)",
-        main = "PM minus Thornthwaite PET\n(red = PM higher [radiation/wind contribution])")
-abline(h = 0, lwd = 1.5)
-grid(nx = NA, ny = NULL)
-legend("topleft",
-       legend = c("PM > Thornthwaite", "Thornthwaite > PM"),
-       fill = c("#e31a1c", "#1f78b4"), bty = "n")
+# F2b. Seasonal climatology with error bars — UNIT FIX: convert mm/day -> mm/month
+log_event("... F2b: Seasonal PET climatology PM vs Thw (mm/month)")
+pet_clim_pm  <- monthly_stats$mean_pet     * days_per_month
+pet_clim_thw <- monthly_stats_thw$mean_pet * days_per_month
+sd_pm        <- monthly_stats$std_dev      * days_per_month
+sd_thw       <- monthly_stats_thw$std_dev  * days_per_month
+
+save_plot("F2b_seasonal_climatology_PM_vs_Thw", function() {
+  par(mfrow = c(1, 1), mar = c(4, 5, 3, 1))
+  y_max <- max(c(pet_clim_pm, pet_clim_thw), na.rm = TRUE) * 1.15
+  plot(1:12, pet_clim_pm, type = "b", pch = 19, col = "blue", lwd = 2,
+       xlab = "Month", ylab = "Mean PET (mm/month)",
+       main = "Seasonal PET Climatology: PM vs. Thornthwaite",
+       xaxt = "n", ylim = c(0, y_max))
+  axis(1, at = 1:12, labels = month.abb)
+  lines(1:12, pet_clim_thw, type = "b", pch = 17, col = "darkorange", lwd = 2, lty = 2)
+  suppressWarnings({
+    arrows(1:12, pet_clim_pm  - sd_pm,  1:12, pet_clim_pm  + sd_pm,
+           angle = 90, code = 3, length = 0.04, col = "blue")
+    arrows(1:12, pet_clim_thw - sd_thw, 1:12, pet_clim_thw + sd_thw,
+           angle = 90, code = 3, length = 0.04, col = "darkorange")
+  })
+  legend("topleft",
+         legend = c("Penman-Monteith (ERA5)", "Thornthwaite (T-only)"),
+         col = c("blue", "darkorange"), lwd = 2, pch = c(19, 17), lty = c(1, 2), bty = "n")
+  grid()
+})
+
+# F2c. Bias bar chart — UNIT FIX: convert mm/day -> mm/month
+log_event("... F2c: Monthly PET bias PM minus Thw (mm/month)")
+bias_monthly <- (monthly_stats$mean_pet - monthly_stats_thw$mean_pet) * days_per_month
+
+save_plot("F2c_monthly_bias_PM_minus_Thw", function() {
+  par(mfrow = c(1, 1), mar = c(4, 5, 3, 1))
+  barplot(bias_monthly, names.arg = month.abb,
+          col    = ifelse(bias_monthly > 0, "#e31a1c", "#1f78b4"),
+          border = "white",
+          xlab = "Month", ylab = "PET bias (mm/month)",
+          main = "PM minus Thornthwaite PET\n(red = PM higher [radiation/wind contribution])")
+  abline(h = 0, lwd = 1.5)
+  grid(nx = NA, ny = NULL)
+  legend("topleft",
+         legend = c("PM > Thornthwaite", "Thornthwaite > PM"),
+         fill = c("#e31a1c", "#1f78b4"), bty = "n")
+})
 
 # F2d. Annual scatter
 annual_pm_thw <- merge(
@@ -627,61 +669,69 @@ annual_pm_thw <- merge(
   by = "year", suffixes = c("_pm", "_thw"))
 r_pm_thw <- cor(annual_pm_thw$mean_pet_pm, annual_pm_thw$mean_pet_thw,
                 use = "complete.obs")
-par(mfrow = c(1, 1), mar = c(4, 4, 3, 1))
-plot(annual_pm_thw$mean_pet_thw, annual_pm_thw$mean_pet_pm,
-     pch = 19, col = "#4393c3", cex = 0.9,
-     xlab = "Thornthwaite PET (mm/day)", ylab = "Penman-Monteith PET (mm/day)",
-     main = sprintf("Annual Mean PET: PM vs. Thornthwaite  (r = %.3f)", r_pm_thw))
-abline(0, 1, col = "black", lty = 2, lwd = 1.5)
-abline(lm(mean_pet_pm ~ mean_pet_thw, data = annual_pm_thw), col = "red", lwd = 2)
-legend("topleft", legend = c("1:1 line", "Linear fit"),
-       col = c("black", "red"), lty = c(2, 1), lwd = 2, bty = "n")
-grid()
+save_plot("F2d_annual_scatter_PM_vs_Thw", function() {
+  par(mfrow = c(1, 1), mar = c(4, 4, 3, 1))
+  plot(annual_pm_thw$mean_pet_thw, annual_pm_thw$mean_pet_pm,
+       pch = 19, col = "#4393c3", cex = 0.9,
+       xlab = "Thornthwaite PET (mm/day)", ylab = "Penman-Monteith PET (mm/day)",
+       main = sprintf("Annual Mean PET: PM vs. Thornthwaite  (r = %.3f)", r_pm_thw))
+  abline(0, 1, col = "black", lty = 2, lwd = 1.5)
+  abline(lm(mean_pet_pm ~ mean_pet_thw, data = annual_pm_thw), col = "red", lwd = 2)
+  legend("topleft", legend = c("1:1 line", "Linear fit"),
+         col = c("black", "red"), lty = c(2, 1), lwd = 2, bty = "n")
+  grid()
+})
 
 # F2e. Annual trend comparison
-par(mfrow = c(1, 1), mar = c(4, 4, 3, 1))
-y_r <- range(c(annual_pm_thw$mean_pet_pm, annual_pm_thw$mean_pet_thw), na.rm = TRUE)
-plot(annual_pm_thw$year, annual_pm_thw$mean_pet_pm, type = "b",
-     pch = 19, col = "blue", lwd = 1.5, ylim = y_r,
-     xlab = "Year", ylab = "Annual Mean PET (mm/day)",
-     main = "Annual PET Trends: PM vs. Thornthwaite")
-lines(annual_pm_thw$year, annual_pm_thw$mean_pet_thw,
-      type = "b", pch = 17, col = "darkorange", lwd = 1.5)
-lm_pm  <- lm(mean_pet_pm  ~ year, data = annual_pm_thw)
-lm_thw <- lm(mean_pet_thw ~ year, data = annual_pm_thw)
-abline(lm_pm,  col = "blue",       lty = 2, lwd = 2)
-abline(lm_thw, col = "darkorange", lty = 2, lwd = 2)
-legend("topleft",
-       legend = c(sprintf("PM: %+.4f mm/day/yr (p=%.3f)",
-                          coef(lm_pm)[2],  summary(lm_pm)$coefficients[2, 4]),
-                  sprintf("Thornthwaite: %+.4f mm/day/yr (p=%.3f)",
-                          coef(lm_thw)[2], summary(lm_thw)$coefficients[2, 4])),
-       col = c("blue", "darkorange"), pch = c(19, 17), lty = 1, lwd = 2, bty = "n")
-grid()
+save_plot("F2e_annual_trends_PM_vs_Thw", function() {
+  par(mfrow = c(1, 1), mar = c(4, 4, 3, 1))
+  y_r <- range(c(annual_pm_thw$mean_pet_pm, annual_pm_thw$mean_pet_thw), na.rm = TRUE)
+  plot(annual_pm_thw$year, annual_pm_thw$mean_pet_pm, type = "b",
+       pch = 19, col = "blue", lwd = 1.5, ylim = y_r,
+       xlab = "Year", ylab = "Annual Mean PET (mm/day)",
+       main = "Annual PET Trends: PM vs. Thornthwaite")
+  lines(annual_pm_thw$year, annual_pm_thw$mean_pet_thw,
+        type = "b", pch = 17, col = "darkorange", lwd = 1.5)
+  lm_pm  <- lm(mean_pet_pm  ~ year, data = annual_pm_thw)
+  lm_thw <- lm(mean_pet_thw ~ year, data = annual_pm_thw)
+  abline(lm_pm,  col = "blue",       lty = 2, lwd = 2)
+  abline(lm_thw, col = "darkorange", lty = 2, lwd = 2)
+  legend("topleft",
+         legend = c(sprintf("PM: %+.4f mm/day/yr (p=%.3f)",
+                            coef(lm_pm)[2],  summary(lm_pm)$coefficients[2, 4]),
+                    sprintf("Thornthwaite: %+.4f mm/day/yr (p=%.3f)",
+                            coef(lm_thw)[2], summary(lm_thw)$coefficients[2, 4])),
+         col = c("blue", "darkorange"), pch = c(19, 17), lty = 1, lwd = 2, bty = "n")
+  grid()
+})
 
 # F2f. Thornthwaite sample spatial maps
-if (nlyr(et0_thw) >= 12) {
-  par(mfrow = c(2, 2), mar = c(2, 2, 3, 4))
-  for (idx in sample_months)
-    if (idx <= nlyr(et0_thw))
-      plot(et0_thw[[idx]], col = rev(hcl.colors(100, "YlOrRd")),
-           main = sprintf("PET_Thw %s", names(et0_thw)[idx]))
-}
+save_plot("F2f_Thw_spatial_maps", function() {
+  if (nlyr(et0_thw) >= 12) {
+    par(mfrow = c(2, 2), mar = c(2, 2, 3, 4))
+    for (idx in sample_months)
+      if (idx <= nlyr(et0_thw))
+        plot(et0_thw[[idx]], col = rev(hcl.colors(100, "YlOrRd")),
+             main = sprintf("PET_Thw %s", names(et0_thw)[idx]))
+  }
+})
 
 # G. Distribution histogram (PM)
-log_event("... Distribution histogram")
-par(mfrow = c(1, 1), mar = c(4, 4, 3, 1))
-hist(pet_summary$mean_pet, breaks = 30, col = "skyblue", border = "white",
-     xlab = "PET (mm/day)", main = "Distribution of Basin-Mean PET (PM)", freq = FALSE)
-lines(density(pet_summary$mean_pet, na.rm = TRUE), col = "red", lwd = 2)
-curve(dnorm(x, mean(pet_summary$mean_pet, na.rm = TRUE),
-            sd(pet_summary$mean_pet,   na.rm = TRUE)),
-      add = TRUE, col = "blue", lwd = 2, lty = 2)
-legend("topright", legend = c("Kernel density", "Normal fit"),
-       col = c("red", "blue"), lwd = 2, lty = c(1, 2), bty = "n")
+log_event("... G: Distribution histogram")
+save_plot("G_distribution_histogram_PM", function() {
+  par(mfrow = c(1, 1), mar = c(4, 4, 3, 1))
+  hist(pet_summary$mean_pet, breaks = 30, col = "skyblue", border = "white",
+       xlab = "PET (mm/day)", main = "Distribution of Basin-Mean PET (PM)", freq = FALSE)
+  lines(density(pet_summary$mean_pet, na.rm = TRUE), col = "red", lwd = 2)
+  curve(dnorm(x, mean(pet_summary$mean_pet, na.rm = TRUE),
+              sd(pet_summary$mean_pet,   na.rm = TRUE)),
+        add = TRUE, col = "blue", lwd = 2, lty = 2)
+  legend("topright", legend = c("Kernel density", "Normal fit"),
+         col = c("red", "blue"), lwd = 2, lty = c(1, 2), bty = "n")
+})
 
 # H. QC summary table
-log_event("... QC summary table")
+log_event("... H: QC summary table")
 qc <- data.frame(
   Metric = c("Total Months",
              "PM Mean PET (mm/day)", "PM Min", "PM Max", "PM Std Dev",
@@ -704,18 +754,21 @@ qc <- data.frame(
     "ssrd/1e6  [J/m2/day -> MJ/m2/day]"
   )
 )
-par(mfrow = c(1, 1), mar = c(1, 1, 3, 1))
-plot(1, type = "n", axes = FALSE, xlab = "", ylab = "", xlim = c(0, 1), ylim = c(0, 1))
-title("Quality Control Summary", cex.main = 1.4)
-y0 <- 0.93; ys <- 0.075
-for (i in seq_len(nrow(qc))) {
-  text(0.04, y0 - (i - 1) * ys, qc$Metric[i], adj = 0, cex = 0.9, font = 2)
-  text(0.58, y0 - (i - 1) * ys, qc$Value[i],  adj = 0, cex = 0.9)
-}
-lines(c(0.04, 0.96), c(y0 + 0.02, y0 + 0.02), lwd = 2)
+save_plot("H_QC_summary_table", function() {
+  par(mfrow = c(1, 1), mar = c(1, 1, 3, 1))
+  plot(1, type = "n", axes = FALSE, xlab = "", ylab = "", xlim = c(0, 1), ylim = c(0, 1))
+  title("Quality Control Summary", cex.main = 1.4)
+  y0 <- 0.93; ys <- 0.075
+  for (i in seq_len(nrow(qc))) {
+    text(0.04, y0 - (i - 1) * ys, qc$Metric[i], adj = 0, cex = 0.9, font = 2)
+    text(0.58, y0 - (i - 1) * ys, qc$Value[i],  adj = 0, cex = 0.9)
+  }
+  lines(c(0.04, 0.96), c(y0 + 0.02, y0 + 0.02), lwd = 2)
+})
 
 dev.off()
 log_event("Diagnostic PDF saved.")
+log_event(sprintf("Individual PNGs saved in: %s/", diag_dir))
 
 # --- 8. FINISH ---
 log_event("==========================================")

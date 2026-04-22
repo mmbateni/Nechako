@@ -87,12 +87,8 @@ ATM_DIR  <- file.path(WD_PATH, "atmospheric_diagnostics")    # w9 output dir
 
 # ── Load w9 shared state (inherits all configuration scalars) ─────────────────
 rds_w9 <- file.path(ATM_DIR, "w9_shared_state.rds")
-if (!file.exists(rds_w9))
-  stop("w9 shared state not found: ", rds_w9,
-       "\n  Run w9_atmospheric_diagnostics.R first.")
-w9 <- readRDS(rds_w9)
-list2env(w9, envir = environment())   # unpack all w9 scalars into local scope
-cat("  w9 shared state loaded.\n")
+w9 <- read_w9_state(rds_w9)          # validates schema; stop() with clear message on mismatch
+list2env(w9, envir = environment())  # unpack all w9 scalars into local scope
 OUT_DIR  <- file.path(ATM_DIR, "eof_analysis")               # w10c outputs
 dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
 

@@ -20,16 +20,14 @@
 #     Sheffield & Wood (2008) Clim Dyn 31:79-105 — duration classes, I×D severity
 #     Yevjevich (1967) — threshold-level run method (theoretical basis)
 #
-# MODIFICATIONS (this version):
-#   [SW08 REWRITE] Part 0  — build_sw08_catalog(): reads raw NetCDF files,
+# MODIFICATIONS :
+#    Part 0  — build_sw08_catalog(): reads raw NetCDF files,
 #                            computes area-weighted basin average, applies SW08
 #                            event loop; replaces load_event_catalog().
-#   [SW08 REWRITE] Part 1  — catalogs now built on-the-fly (no w1 dependency).
-#   [NEW]          Part 3c — comparison table: hysteresis (old) vs SW08 (new)
+#    Part 1  — catalogs now built on-the-fly (no w1 dependency).
+#             Part 3c — comparison table: hysteresis (old) vs SW08 (new)
 #                            per index × duration class.
-#   [KEPT]         Parts 4b/4c/4d — Fig 3 MS, Kendall copula RP, multi-index.
-#   [NEW INDICES]  SPI-01 and SPEI-09 added to INDICES_TO_ANALYZE and
-#                  MULTI_INDICES.
+#            Parts 4b/4c/4d — Fig 3 MS, Kendall copula RP, multi-index.
 #
 # Outputs (RANKING_DIR):
 #   ranked_event_catalog_SW08.csv
