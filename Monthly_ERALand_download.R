@@ -1,5 +1,9 @@
 # ============================================================================
 # Download ERA5-Land Monthly Values
+# Due to a bug in ERA5-Land Data accumulated monthly variables, for
+# total_precipitation, potential_evaporation, and surface_solar_radiation_downwards 
+# product_type will be changed from "monthly_averaged_reanalysis" to 
+# "monthly_averaged_reanalysis_by_hour_of_day"  
 # ============================================================================
 # Load required libraries
 library(ecmwfr)  # For CDS API access
@@ -29,17 +33,17 @@ end_date <- "2025-12-31"
 
 # Variables needed for SPI and SPEI
 variables <- c(
-  "snow_cover",
-  "snow_depth_water_equivalent"
-  # "surface_solar_radiation_downwards",
-  # "10m_u_component_of_wind",
-  # "10m_v_component_of_wind",
+  #"snow_cover",
+  #"snow_depth_water_equivalent",
+   # "surface_solar_radiation_downwards",
+  "10m_u_component_of_wind",
+  "10m_v_component_of_wind",
   # "geopotential",
-  # "surface_pressure",
+  "surface_pressure",
   # "total_precipitation",
-  # "potential_evaporation",
-  # "2m_temperature",
-  # "2m_dewpoint_temperature",
+  # "potential_evaporation"
+  "2m_temperature",
+  "2m_dewpoint_temperature"
   # "skin_reservoir_content",
   # "volumetric_soil_water_layer_1",
   # "volumetric_soil_water_layer_2",
@@ -62,7 +66,7 @@ download_era5_variable <- function(variable, start_year, end_year) {
   # Construct request for monthly means dataset
   request <- list(
     dataset_short_name = "reanalysis-era5-land-monthly-means",
-    product_type = "monthly_averaged_reanalysis",
+    product_type = "monthly_averaged_reanalysis",  # corrected: avoids ERA5-Land bug (Sep 2022-Feb 2024)
     variable = variable,
     year = years,  # All years at once
     month = months,  # All months at once
