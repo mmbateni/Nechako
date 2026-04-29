@@ -1,6 +1,6 @@
-# ==============================================================================
+#==============================================================================
 #   w1_trend_test.R  ·  SPATIAL TREND ANALYSIS FOR ALL INDICES
-# ==============================================================================
+#==============================================================================
 #   Computes per-pixel statistics for SPI, SPEI (multiple scales) and SWEI:
 #   • Mann-Kendall — Hamed & Rao (1998) variance-corrected (VC-HR98) + Sen's slope
 #     Uses modifiedmk::mmkh() which adjusts Var(S) for lag-1…lag-(n-1) autocorrelation.
@@ -55,10 +55,13 @@
 # NOTE: Raw pixel time-series are NOT stored in the CSV (they live in the source
 #       NetCDF files). This keeps CSVs lightweight and avoids ~6 M redundant values.
 # Run BEFORE w4_trends_visualization.R
-# ==============================================================================
+#==============================================================================
+
 source("DROUGHT_ANALYSIS_utils.R")
+
 utils_load_packages(c("terra", "data.table", "Kendall", "trend", "modifiedmk",
                       "parallel", "lubridate", "changepoint"))
+
 if (!dir.exists(WD_PATH)) stop("Working directory not found: ", WD_PATH)
 setwd(WD_PATH)
 dir.create(TREND_DIR, showWarnings = FALSE, recursive = TRUE)
@@ -94,14 +97,6 @@ if (N_CORES > 1) {
 # ================================================================================
 # SCALE-SPECIFIC MINIMUM DURATION HELPER
 # ================================================================================
-# Returns the minimum event duration (months) for Method 2 (Hysteresis) given
-# the accumulation scale of the index.
-# Rationale:
-#   SPI/SPEI-1  is inherently noisy; require ≥ 2 months to avoid single-month spikes
-#   SPI/SPEI-3  smoothed over a season; ≥ 3 months = one full accumulation window
-#   SPI/SPEI-6  half-year smoothing; ≥ 4 months filters sub-seasonal noise
-#   SPI/SPEI-12 annual smoothing; ≥ 6 months = half an accumulation window
-#   Default (SWEI, etc.): 3 months
 get_min_duration <- function(scale,
                              min_duration_map     = list("1"  = 2L,
                                                          "3"  = 3L,
@@ -116,9 +111,8 @@ get_min_duration <- function(scale,
 # ================================================================================
 # VECTORISED STATISTICS FUNCTIONS
 # ================================================================================
-# --------------------------------------------------------------------------------
+
 # 1. Hamed-Rao (1998) Variance-Corrected Mann-Kendall + Sen's slope
-# --------------------------------------------------------------------------------
 vectorized_mann_kendall <- function(ts_matrix) {
   n_pix <- nrow(ts_matrix)
   
@@ -156,15 +150,7 @@ vectorized_mann_kendall <- function(ts_matrix) {
   )
 }
 
-# --------------------------------------------------------------------------------
-#   2. TFPW Mann-Kendall (Yue et al. 2002)
-# --------------------------------------------------------------------------------
-# BUGFIX 3: Sen's slope is now returned from the ORIGINAL series (sens_r, i.e.
-#   the `beta` estimate computed in step 2 of the algorithm). The previous code
-#   incorrectly re-ran sens.slope() on x_final (the blended pre-whitened series),
-#   which biases the magnitude toward zero for highly autocorrelated indices.
-#   Yue et al. (2002) use the pre-whitening only to obtain an unbiased p-value;
-#   the slope estimate itself should come from the unmodified original series.
+# 2. TFPW Mann-Kendall (Yue et al. 2002)
 vectorized_mann_kendall_tfpw <- function(ts_matrix) {
   n_pix <- nrow(ts_matrix)
   process_pixel_tfpw <- function(i) {
@@ -201,11 +187,9 @@ vectorized_mann_kendall_tfpw <- function(ts_matrix) {
       mk <- Kendall::MannKendall(x_final)
       
       # BUGFIX 3: slope comes from original series (beta), NOT from x_final.
-      # Using x_final would bias the slope toward zero because the
-      # pre-whitening removes a portion of the signal variance.
       list(tau      = as.numeric(mk$tau),
            pval     = as.numeric(mk$sl),
-           slope    = beta,           # ← original series Sen's slope
+           slope    = beta,
            filtered = FALSE)
     }, error = function(e) list(tau = NA, pval = NA, slope = NA, filtered = TRUE))
   }
@@ -227,37 +211,15 @@ vectorized_mann_kendall_tfpw <- function(ts_matrix) {
   )
 }
 
-# --------------------------------------------------------------------------------
-#   3. Drought event characteristics — unified for both methods
-# --------------------------------------------------------------------------------
-# Returns n_events, mean_duration, max_intensity per pixel.
-#
-# METHOD SELECTION via onset_thr / end_thr / min_duration:
-#   Method 1 (Sheffield & Wood 2008): end_thr = onset_thr, min_duration = 1L
-#     Entry : x < onset_thr  (single threshold = -1.0)
-#     Exit  : x >= onset_thr (same threshold — no hysteresis)
-#     Intensity: mean(onset_thr - x)  [deficit below -1.0; always positive]
-#
-#   Method 2 (Hysteresis): end_thr > onset_thr, min_duration from get_min_duration()
-#     Entry : x < onset_thr  (= -1.0)
-#     Exit  : x >= end_thr   (= 0.0)
-#     [BUGFIX 4] Intensity: mean(end_thr - x) = mean(-x)
-#       Using end_thr ensures intensity is always non-negative.
-#       Under the old code (onset_thr - x), months in the recovery zone
-#       (-1.0 <= x < 0.0) produced negative intensity contributions, which is
-#       physically meaningless and inflated mean_I toward zero or below.
-#
-# max_intensity is always min(x) during the event (most negative value),
-# unchanged for both methods.
+# 3. Drought event characteristics — unified for both methods
 vectorized_event_stats <- function(ts_matrix,
                                    onset_thr    = DROUGHT_ONSET,
                                    end_thr      = onset_thr,
                                    min_duration = 1L) {
   if (end_thr < onset_thr)
-    warning(sprintf(
-      "vectorized_event_stats: end_thr (%.2f) < onset_thr (%.2f). ",
-      "For hysteresis, end_thr should be >= onset_thr. Proceeding anyway.",
-      end_thr, onset_thr))
+    warning(sprintf("vectorized_event_stats: end_thr (%.2f) < onset_thr (%.2f). ",
+                    "For hysteresis, end_thr should be >= onset_thr. Proceeding anyway.",
+                    end_thr, onset_thr))
   
   n_pix <- nrow(ts_matrix)
   n_events      <- integer(n_pix)
@@ -295,10 +257,6 @@ vectorized_event_stats <- function(ts_matrix,
           seg  <- x[s_idx:(j - 1L)]
           durs <- c(durs, dur)
           ints <- c(ints, min(seg, na.rm = TRUE))
-          # BUGFIX 4: deficit measured from end_thr (not onset_thr)
-          # → always non-negative because the loop only reaches here when
-          #   the current month first satisfies v >= end_thr, so all prior
-          #   months in seg had v < end_thr.
           I_ev  <- mean(end_thr - seg, na.rm = TRUE)
           I_evs <- c(I_evs, I_ev)
           S_evs <- c(S_evs, I_ev * dur)
@@ -308,14 +266,12 @@ vectorized_event_stats <- function(ts_matrix,
       }
     }
     
-    # Close any event still open at end of record
     if (in_d && !is.na(s_idx)) {
       dur <- length(x) - s_idx + 1L
       if (dur >= min_duration) {
         seg  <- x[s_idx:length(x)]
         durs <- c(durs, dur)
         ints <- c(ints, min(seg, na.rm = TRUE))
-        # BUGFIX 4 (same fix for end-of-record event)
         I_ev  <- mean(end_thr - seg, na.rm = TRUE)
         I_evs <- c(I_evs, I_ev)
         S_evs <- c(S_evs, I_ev * dur)
@@ -358,11 +314,7 @@ vectorized_event_stats <- function(ts_matrix,
   )
 }
 
-# --------------------------------------------------------------------------------
-#   4. PELT regime-shift year
-# --------------------------------------------------------------------------------
-# NOTE: regime_shift_year is kept as the primary column name so that
-#       w4_trends_visualization.R (Fig 3, Panel B) works without modification.
+# 4. PELT regime-shift year
 vectorized_regime_shift_pelt <- function(ts_matrix, years, min_obs = 20L) {
   n_pix <- nrow(ts_matrix)
   n_yrs <- length(years)
@@ -411,28 +363,7 @@ vectorized_regime_shift_pelt <- function(ts_matrix, years, min_obs = 20L) {
   out
 }
 
-# --------------------------------------------------------------------------------
-#   5. Wald-Wolfowitz runs test — drought event temporal clustering
-# --------------------------------------------------------------------------------
-# BUGFIX 6: The binary sequence is now built from DROUGHT EVENTS defined by the
-#   two-threshold hysteresis method (onset_thr / end_thr / min_duration), exactly
-#   matching vectorized_event_stats() Method 2.  Each month that belongs to a
-#   qualifying drought event is coded 1; all other months are coded 0.
-#
-#   The previous implementation binarised the raw index at threshold = 0 (wet vs.
-#   dry), which tests general wet/dry clustering rather than whether *drought*
-#   events — as the script defines them — cluster in time.  That approach also
-#   ignores hysteresis and minimum-duration requirements entirely.
-#
-#   A "clustered" result (fewer runs than expected) means drought events tend to
-#   arrive in multi-event groups separated by long dry spells; "dispersed" means
-#   they are more regularly spaced than random.
-#
-# Arguments:
-#   ts_matrix    — pixels × months matrix
-#   onset_thr    — drought onset threshold  (default: DROUGHT_ONSET = -1.0)
-#   end_thr      — drought termination threshold (default: DROUGHT_END = 0.0)
-#   min_duration — minimum qualifying event length (months)
+# 5. Wald-Wolfowitz runs test — drought event temporal clustering
 vectorized_runs_test <- function(ts_matrix,
                                  onset_thr    = DROUGHT_ONSET,
                                  end_thr      = onset_thr,
@@ -449,8 +380,6 @@ vectorized_runs_test <- function(ts_matrix,
     x <- x[!is.na(x)]
     if (length(x) < 10L) next
     
-    # ── Build drought binary indicator using hysteresis + min_duration ──────────
-    # Mirrors the state machine in vectorized_event_stats exactly.
     b     <- integer(length(x))
     in_d  <- FALSE
     s_idx <- NA_integer_
@@ -467,16 +396,14 @@ vectorized_runs_test <- function(ts_matrix,
         s_idx <- NA_integer_
       }
     }
-    # Close open event at end of record
     if (in_d && !is.na(s_idx)) {
       dur <- length(x) - s_idx + 1L
       if (dur >= min_duration) b[s_idx:length(x)] <- 1L
     }
     
-    # ── Wald-Wolfowitz runs test on drought binary series ───────────────────────
     n  <- length(b)
-    n1 <- sum(b)        # drought months
-    n0 <- n - n1        # non-drought months
+    n1 <- sum(b)
+    n0 <- n - n1
     if (n1 == 0L || n0 == 0L) next
     
     nr <- length(rle(b)$lengths)
@@ -495,30 +422,7 @@ vectorized_runs_test <- function(ts_matrix,
   res
 }
 
-# --------------------------------------------------------------------------------
-#   6. Spectral peak detection — drought-band frequencies
-# --------------------------------------------------------------------------------
-# BUGFIX 5: Fully implements spectral peak counting; replaces the placeholder 0L.
-#
-# METHOD:
-#   For each pixel, the monthly time series is demeaned and linearly detrended,
-#   then a smoothed periodogram (modified Daniell smoother, spans = c(3,5)) is
-#   computed.  An AR(1) red-noise null spectrum is fitted to the periodogram
-#   using the lag-1 autocorrelation of the detrended series, then scaled to
-#   match the observed mean spectral power.  Periodogram bins whose power exceeds
-#   the chi-squared (sig_level) quantile of the red-noise spectrum are flagged as
-#   significant; contiguous runs of significant bins are counted as one peak.
-#
-#   Only periods >= min_period_months (default 24 months / 2 years) are examined,
-#   excluding weather noise and focusing on multi-year drought cycles
-#   (e.g. ENSO 24-84 mo, PDO 120-360 mo).
-#
-# Requires ≥ 48 valid observations (4 years). Uses only base-R stats::spectrum().
-#
-# Arguments:
-#   ts_matrix          — pixels × months matrix
-#   min_period_months  — shortest period of interest (default 24)
-#   sig_level          — chi-squared significance threshold (default 0.95)
+# 6. Spectral peak detection — drought-band frequencies
 vectorized_spectral_peaks <- function(ts_matrix,
                                       min_period_months = 24L,
                                       sig_level         = 0.95) {
@@ -529,20 +433,17 @@ vectorized_spectral_peaks <- function(ts_matrix,
     x <- x[!is.na(x)]
     if (length(x) < 48L) return(0L)
     
-    # Demean and linearly detrend
     n   <- length(x)
     t_s <- seq_len(n)
     cf  <- lm.fit(cbind(1, t_s), x)$coefficients
     x_dt <- x - (cf[1] + cf[2] * t_s)
     
     tryCatch({
-      # Smoothed periodogram (spans reduce variance; taper reduces spectral leakage)
       spec_r <- stats::spectrum(x_dt, spans = c(3L, 5L), taper = 0.1,
                                 plot = FALSE, na.action = na.omit)
-      freq   <- spec_r$freq        # cycles per month
+      freq   <- spec_r$freq
       spower <- spec_r$spec
       
-      # Filter to drought-relevant periods only
       period <- 1.0 / freq
       keep   <- is.finite(period) & period >= min_period_months
       if (!any(keep)) return(0L)
@@ -550,28 +451,21 @@ vectorized_spectral_peaks <- function(ts_matrix,
       f_k <- freq[keep]
       p_k <- spower[keep]
       
-      # AR(1) red-noise background spectrum
-      # r1 = lag-1 autocorrelation of detrended series
       r1 <- tryCatch(
         stats::cor(x_dt[-n], x_dt[-1], use = "complete.obs"),
         error = function(e) 0.0)
       if (is.na(r1) || !is.finite(r1)) r1 <- 0.0
       r1 <- max(-0.99, min(0.99, r1))
       
-      # Theoretical red-noise PSD: P(f) ∝ (1 - r1²) / (1 - 2r1·cos(2πf) + r1²)
       rn_raw <- (1.0 - r1^2) / (1.0 - 2.0 * r1 * cos(2.0 * pi * f_k) + r1^2)
-      # Scale to match empirical mean power in the drought-band
       rn_scl <- rn_raw * (mean(p_k) / mean(rn_raw))
       
-      # Chi-squared significance threshold
-      # spec_r$df gives the actual degrees of freedom from the Daniell smoother
       dof       <- if (!is.null(spec_r$df)) spec_r$df else 2.0
       threshold <- rn_scl * stats::qchisq(sig_level, dof) / dof
       
-      # Count contiguous groups of bins above threshold (= distinct spectral peaks)
       above <- p_k > threshold
       if (!any(above)) return(0L)
-      as.integer(sum(rle(above)$values))   # number of TRUE runs
+      as.integer(sum(rle(above)$values))
       
     }, error = function(e) 0L)
   }
@@ -588,9 +482,7 @@ vectorized_spectral_peaks <- function(ts_matrix,
   data.table::data.table(n_spectral_peaks = as.integer(unlist(res)))
 }
 
-# ================================================================================
-#   FUNCTION 7 — Basin-level % area in drought time series + MK trend
-# ================================================================================
+# FUNCTION 7 — Basin-level % area in drought time series + MK trend
 compute_basin_extent_and_class_trends <- function(ts_matrix, n_years, index_label,
                                                   out_dir,
                                                   onset_thr    = DROUGHT_ONSET,
@@ -635,7 +527,7 @@ compute_basin_extent_and_class_trends <- function(ts_matrix, n_years, index_labe
     date      = date_seq[seq_len(n_col)],
     year      = yr_seq[seq_len(n_col)],
     month     = mo_seq[seq_len(n_col)],
-    pct_area  = pct_area,
+    pct_area  <- pct_area,
     row.names = NULL
   )
   write.csv(extent_ts,
@@ -734,7 +626,6 @@ compute_basin_extent_and_class_trends <- function(ts_matrix, n_years, index_labe
     )
   }
   
-  # Figure: basin extent time series with MK annotation
   extent_annual$trend_line <- NA_real_
   if (!is.na(mk_ext$sens_slope) && !is.na(mk_ext$tau)) {
     mid  <- median(seq_along(x_clean))
@@ -843,21 +734,13 @@ process_index <- function(index_type, scales, find_fn, seas_dir) {
     n_pix   <- length(lon_vec)
     
     # [3/5] Build time-series matrix
-    # ── BUGFIX 1: Detect single-file mode for MSPI/MSPEI ──────────────────────
-    # Standard SPI/SPEI: 12 files, one per calendar month, each with n_years
-    #   layers.  Matrix layout: col = (year-1)*12 + month.
-    # Single-file indices (MSPI, MSPEI): 1 file with all n_years*12 months
-    #   stored as sequential layers.  The old code treated each layer as a year,
-    #   allocating a 912×12=10944 matrix and filling only every 12th column,
-    #   leaving 91.8% of cells as NA.  The fix: if a single file has > 12 layers,
-    #   its layers are already in month order — copy them directly column by column.
     cat("[3/5] Building time-series matrix...\n")
     
     n_files         <- length(stacks)
     n_lyrs_per_file <- terra::nlyr(stacks[[1]])
     
     if (n_files == 1L && n_lyrs_per_file > 12L) {
-      # ── Single-file mode ───────────────────────────────────────────────────
+      # Single-file mode
       n_months_total <- n_lyrs_per_file
       dates_all      <- extract_dates_from_nc(files[1], n_months_total)
       years          <- sort(unique(as.integer(format(dates_all, "%Y"))))
@@ -872,7 +755,7 @@ process_index <- function(index_type, scales, find_fn, seas_dir) {
       dates_ts <- dates_all
       
     } else {
-      # ── Standard multi-file mode ───────────────────────────────────────────
+      # Standard multi-file mode
       dates_m1 <- extract_dates_from_nc(files[1], n_lyrs_per_file)
       years    <- as.integer(format(dates_m1, "%Y"))
       n_years  <- length(years)
@@ -899,19 +782,14 @@ process_index <- function(index_type, scales, find_fn, seas_dir) {
     cat(sprintf("  Valid pixels: %d  |  %.1f%% non-NA values\n",
                 n_pix, 100 * sum(!is.na(ts_mat)) / length(ts_mat)))
     
-    # Cell area weights — fractional coverage for boundary pixels
-    # Each pixel's effective weight = full cell area × fraction of that cell
-    # that actually lies inside the basin polygon (0–1, via cover = TRUE).
-    # Interior pixels get cover = 1.0 (unchanged from the old approach).
-    # Edge pixels that only partially overlap the basin are down-weighted
-    # proportionally, rather than being counted at their full cell area.
+    # Cell area weights
     cat("  → Computing fractional-coverage area weights...\n")
     basin_v        <- terra::project(load_basin_vect(BASIN_SHP), terra::crs(r_tmpl))
     cell_area_rast <- terra::cellSize(r_tmpl, unit = "m")
     cover_rast     <- terra::rasterize(basin_v, r_tmpl, cover = TRUE)
     area_all       <- as.numeric(terra::values(cell_area_rast, na.rm = FALSE))
     cover_all      <- as.numeric(terra::values(cover_rast,     na.rm = FALSE))
-    cover_all[is.na(cover_all)] <- 0   # pixels fully outside basin → weight 0
+    cover_all[is.na(cover_all)] <- 0
     eff_area_all   <- area_all * cover_all
     area_valid     <- eff_area_all[valid_pix]
     bad_w <- is.na(area_valid) | !is.finite(area_valid) | area_valid <= 0
@@ -927,7 +805,7 @@ process_index <- function(index_type, scales, find_fn, seas_dir) {
                 min(area_valid), max(area_valid), median(area_valid)))
     cat(sprintf("  ✓ Boundary pixels with partial coverage: %d\n", n_partial))
     
-    # Area-weighted basin average (computed once, reused below)
+    # Area-weighted basin average
     cat("  → Computing area-weighted basin average time series...\n")
     basin_avg_vec <- vapply(seq_len(ncol(ts_mat)), function(t) {
       v  <- ts_mat[, t]
@@ -995,12 +873,12 @@ process_index <- function(index_type, scales, find_fn, seas_dir) {
                 mean(results$mean_I_hyst, na.rm = TRUE),
                 mean(results$mean_S_hyst, na.rm = TRUE)))
     
-    # PELT regime-shift detection (was defined but never called before)
+    # PELT regime-shift detection
     cat("  → PELT regime-shift detection...    ")
     results <- cbind(results, vectorized_regime_shift_pelt(ts_mat, years))
     cat("✓\n")
     
-    # Wald-Wolfowitz runs test on hysteresis-defined drought events
+    # Wald-Wolfowitz runs test
     cat(sprintf("  → Runs test [Hyst drought clusters, min_dur=%d m]...    ", min_dur))
     results <- cbind(results, vectorized_runs_test(ts_mat,
                                                    onset_thr    = DROUGHT_ONSET,
@@ -1008,7 +886,7 @@ process_index <- function(index_type, scales, find_fn, seas_dir) {
                                                    min_duration = min_dur))
     cat("✓\n")
     
-    # Spectral peak detection (drought-band periods >= 24 months)
+    # Spectral peak detection
     cat("  → Spectral peak detection (periods >= 24 mo, AR1 red-noise test)...    ")
     results <- cbind(results, vectorized_spectral_peaks(ts_mat))
     n_pix_with_peaks <- sum(results$n_spectral_peaks > 0L, na.rm = TRUE)
@@ -1122,6 +1000,13 @@ process_index <- function(index_type, scales, find_fn, seas_dir) {
       write_d12p_nc(results$n_events_D12p_hyst, "Hyst", "Hyst_longterm_droughts")
     }
     
+    # === ADD THIS BLOCK: Save pixel time-series RDS for w5 Part 5b ===
+    ts_rds_path <- file.path(TREND_DIR, sprintf("%s_%02d_timeseries.rds", index_type, sc))
+    saveRDS(list(ts_mat = ts_mat, lon = lon_vec, lat = lat_vec, 
+                 record_start_year = min(years)), ts_rds_path)
+    cat(sprintf("  ✅ Time-series RDS saved: %s\n", basename(ts_rds_path)))
+    # ================================================================
+    
     rm(ts_mat, stacks)
     invisible(gc())
   }
@@ -1134,6 +1019,7 @@ cat("\n╔═══════════════════════�
 cat("║  DROUGHT TREND TEST  (w1)  [FIXED VERSION]     ║\n")
 cat("║  Dual methods: S&W single-threshold + Hyst     ║\n")
 cat("╚════════════════════════════════════════════════╝\n\n")
+
 cat(sprintf("  Method 1 (S&W)  : onset = %.1f, exit = %.1f, no min duration\n",
             DROUGHT_ONSET, DROUGHT_ONSET))
 cat(sprintf("  Method 2 (Hyst) : onset = %.1f, exit = %.1f, scale-specific min duration\n",
@@ -1159,12 +1045,10 @@ cat("\n── SPEI ──\n")
 run_index_safe("spei", SPEI_SCALES, find_seasonal_nc_files, SPEI_SEAS_DIR)
 
 # BUGFIX 2: find_swei_seasonal_files() in DROUGHT_ANALYSIS_utils.R does not
-# accept a `scale` argument.  The old wrapper passed `scale` directly, causing
-# "argument 'scale' is missing, with no default" on every SWEI call.
-# Fix: call find_swei_seasonal_files(data_dir) without the scale argument.
+# accept a `scale` argument.
 find_swei_nc_safe <- function(data_dir, index_type, scale) {
   tryCatch(
-    find_swei_seasonal_files(data_dir),   # ← scale not forwarded
+    find_swei_seasonal_files(data_dir),
     error = function(e) {
       cat(sprintf("  ⚠ SWEI file finder error: %s\n", conditionMessage(e)))
       character(0)
@@ -1175,7 +1059,7 @@ find_swei_nc_safe <- function(data_dir, index_type, scale) {
 cat("\n── SWEI ──\n")
 run_index_safe("swei", SWEI_SCALE, find_swei_nc_safe, SWEI_SEAS_DIR)
 
-# MSPI / MSPEI (optional) — single-file mode handled automatically in process_index
+# MSPI / MSPEI (optional)
 find_mspi_mspei_files <- function(data_dir, index_type, scale) {
   pattern <- sprintf("%s_monthly_.*\\.nc$", tolower(index_type))
   files   <- list.files(data_dir, pattern = pattern, full.names = TRUE)

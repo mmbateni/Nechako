@@ -59,12 +59,85 @@ basin <- vect(kml)
 if (nrow(basin) > 1L) basin <- aggregate(basin)
 unlink(tmp, recursive = TRUE)
 cat("Basin boundary loaded\n")
-
+##############################################
 # ---- Load Data ----
 cat("\n===== LOADING INPUT DATA =====\n")
 precip <- rast("monthly_data_direct/total_precipitation_monthly.nc")
+# ── PRECIPITATION UNIT VERIFICATION (run before days-in-month scaling) ─────────
+# ERA5-Land "tp" from CDS monthly averaged reanalysis = mean daily rate (m/day).
+# Standard preprocessing converts to mm/day (*1000).
+# Expected summer (July) basin range for Nechako: ~1 to 4 mm/day.
+# If values are ~0.001-0.004 -> still in m/day (need *1000)
+# If values are ~30-120      -> already mm/month total (do NOT multiply by days again)
+
+precip_dates_raw <- as.Date(time(precip))
+if (is.null(precip_dates_raw) || all(is.na(precip_dates_raw))) {
+  precip_dates_raw <- seq(as.Date("1950-01-01"), by = "month", length.out = nlyr(precip))
+}
+july_idx_p <- which(as.integer(format(precip_dates_raw, "%m")) == 7)[1]
+
+if (!is.na(july_idx_p)) {
+  precip_july      <- precip[[july_idx_p]]
+  precip_july_vals <- values(precip_july, mat = FALSE)
+  precip_july_vals <- precip_july_vals[is.finite(precip_july_vals)]
+  mean_p           <- mean(precip_july_vals, na.rm = TRUE)
+  
+  cat(sprintf("\n── PRECIPITATION UNIT CHECK (July layer %d) ────────────────\n", july_idx_p))
+  cat(sprintf("  Min  : %10.4f\n", min(precip_july_vals)))
+  cat(sprintf("  Mean : %10.4f\n", mean_p))
+  cat(sprintf("  Max  : %10.4f\n", max(precip_july_vals)))
+  cat("  Expected if mm/day   : ~0.5 to 5\n")
+  cat("  Expected if m/day    : ~0.0005 to 0.005  → multiply by 1000\n")
+  cat("  Expected if mm/month : ~15 to 150         → do NOT multiply by days again\n")
+  
+  if (mean_p < 0.01) {
+    cat("  ⚠ WARNING: Precip appears to be in m/day — add: precip <- precip * 1000\n")
+  } else if (mean_p > 20) {
+    cat("  ⚠ WARNING: Precip appears to be in mm/month — days_in_month multiplication will double-count\n")
+  } else {
+    cat("  ✓ Precip units look consistent with mm/day\n")
+  }
+  cat("────────────────────────────────────────────────────\n\n")
+} else {
+  cat("  ⚠ Could not find a July layer in Precip raster — check time axis\n")
+}
+#
 pet    <- rast("monthly_data_direct/potential_evapotranspiration_monthly.nc")
-precip <- precip * 1000   # m -> mm
+# ── PET unit verification (run before any WB computation) ──────────────────
+# ERA5-Land PET from CDS "monthly averaged reanalysis" = mean daily rate (m/day)
+# 2preq_PET_ERALand_modified.R should have converted to mm/day (*1000).
+# Expected summer (July) basin range: ~0.5 to ~5 mm/day for a boreal basin.
+# If values are ~0.001-0.005 -> still in m/day (need *1000)
+# If values are ~30-150      -> mm/month total (already multiplied by days somewhere)
+pet_dates_raw <- as.Date(time(pet))
+if (is.null(pet_dates_raw) || all(is.na(pet_dates_raw))) {
+  # Fall back: assume same time axis as precip
+  pet_dates_raw <- seq(as.Date("1950-01-01"), by = "month", length.out = nlyr(pet))
+}
+july_idx <- which(as.integer(format(pet_dates_raw, "%m")) == 7)[1]
+
+if (!is.na(july_idx)) {
+  pet_july      <- pet[[july_idx]]
+  pet_july_vals <- values(pet_july, mat = FALSE)
+  pet_july_vals <- pet_july_vals[is.finite(pet_july_vals)]
+  cat(sprintf("\n── PET UNIT CHECK (July layer %d) ──────────────────────\n", july_idx))
+  cat(sprintf("  Min  : %10.4f\n", min(pet_july_vals)))
+  cat(sprintf("  Mean : %10.4f\n", mean(pet_july_vals)))
+  cat(sprintf("  Max  : %10.4f\n", max(pet_july_vals)))
+  cat("  Expected if mm/day  : ~0.5 to 5\n")
+  cat("  Expected if m/day   : ~0.0005 to 0.005  → multiply by 1000\n")
+  cat("  Expected if mm/month: ~15 to 150         → do NOT multiply by days again\n")
+  if (mean(pet_july_vals, na.rm = TRUE) < 0.01) {
+    cat("  ⚠ WARNING: PET appears to be in m/day — add: pet <- pet * 1000\n")
+  } else if (mean(pet_july_vals, na.rm = TRUE) > 20) {
+    cat("  ⚠ WARNING: PET appears to be in mm/month — days_in_month multiplication will double-count\n")
+  } else {
+    cat("  ✓ PET units look consistent with mm/day\n")
+  }
+  cat("────────────────────────────────────────────────────\n\n")
+} else {
+  cat("  ⚠ Could not find a July layer in PET raster — check time axis\n")
+}
 
 # Thornthwaite PET (temperature-only, from 2preq_PET_ERALand_modified.R)
 pet_thw_file <- "monthly_data_direct/potential_evapotranspiration_thornthwaite_monthly.nc"
@@ -74,7 +147,7 @@ if (!file.exists(pet_thw_file))
 pet_thw <- rast(pet_thw_file)
 cat("Penman-Monteith PET loaded\n")
 cat("Thornthwaite PET loaded\n")
-
+##############################################
 # Align both PET grids to precipitation grid
 if (!same.crs(precip, pet))     pet     <- project(pet,     precip, method = "bilinear")
 if (!same.crs(precip, pet_thw)) pet_thw <- project(pet_thw, precip, method = "bilinear")

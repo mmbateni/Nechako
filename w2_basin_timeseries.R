@@ -35,9 +35,11 @@
 #   Step 3 — This script reads those authoritative CSVs.
 #             Do NOT recompute averages here.
 ####################################################################################
+
 source("DROUGHT_ANALYSIS_utils.R")
 utils_load_packages(c("terra", "ggplot2", "lubridate", "dplyr",
-                      "data.table", "patchwork", "openxlsx", "zoo"))
+                      "data.table", "patchwork", "openxlsx", "zoo",
+                      "RColorBrewer", "scales", "sf"))
 
 if (!dir.exists(WD_PATH)) stop("Working directory not found: ", WD_PATH)
 setwd(WD_PATH)
@@ -193,7 +195,10 @@ write_basin_ts_csv <- function(idx, sc) {
 }
 
 cat("\n  SPI & SPEI...\n")
-for (idx in c("spi", "spei")) for (sc in SPI_SCALES) write_basin_ts_csv(idx, sc)
+for (idx in c("spi", "spei")) {
+  scales <- if (idx == "spi") SPI_SCALES else SPEI_SCALES
+  for (sc in scales) write_basin_ts_csv(idx, sc)
+}
 
 cat("\n  SWEI...\n")
 write_basin_ts_csv("swei", SWEI_SCALE)
@@ -243,6 +248,13 @@ make_basin_ts_plot <- function(df, idx, sc) {
     nrow(detect_drought_events(data.frame(date = df$date, value = df$value))),
     error = function(e) NA_integer_)
   
+  ## Dynamic y-axis: expand 10% beyond the observed min/max,
+  ## but never narrower than ±3.5 (the standard SPI display range).
+  y_min  <- min(df$value, na.rm = TRUE)
+  y_max  <- max(df$value, na.rm = TRUE)
+  y_lo   <- min(-3.5, floor(y_min * 1.10))   # at least -3.5; expand below if needed
+  y_hi   <- max( 3.5, ceiling(y_max * 1.10)) # at least +3.5; expand above if needed
+  
   ggplot2::ggplot(df, ggplot2::aes(date, value)) +
     drought_band_layers() +
     ggplot2::geom_hline(yintercept = 0,
@@ -256,8 +268,8 @@ make_basin_ts_plot <- function(df, idx, sc) {
       fill = "#c0392b", alpha = 0.35) +
     ggplot2::geom_line(color = idx_color, linewidth = 0.6) +
     shared_ts_theme(14) +
-    ggplot2::scale_x_date(date_breaks = "5 years", date_labels = "%Y") +
-    ggplot2::coord_cartesian(ylim = c(-3.5, 3.5)) +
+    ggplot2::scale_x_date(breaks = seq(as.Date("1950-01-01"), as.Date("2025-12-31"), by = "5 years"), date_labels = "%Y") +
+    ggplot2::coord_cartesian(ylim = c(y_lo, y_hi)) +
     ggplot2::labs(
       title    = sprintf("%s-%02d  Basin-Averaged Time Series (Area-Weighted)",
                          toupper(idx), sc),
@@ -269,7 +281,8 @@ make_basin_ts_plot <- function(df, idx, sc) {
 
 cat("\n  SPI & SPEI...\n")
 for (idx in c("spi", "spei")) {
-  for (sc in SPI_SCALES) {
+  scales <- if (idx == "spi") SPI_SCALES else SPEI_SCALES
+  for (sc in scales) {
     tryCatch({
       df  <- load_flat_csv(idx, sc)
       out <- file.path(BASIN_PLOT_DIR,
@@ -336,6 +349,7 @@ cat("═════════════════════════
 # ── Directory paths for the two SPEI variants ──────────────────────────────────
 SPEI_PM_DIR  <- file.path(WD_PATH, "spei_results_seasonal")
 SPEI_THW_DIR <- file.path(WD_PATH, "spei_results_seasonal_thw")
+SPI_SEAS_DIR <- file.path(WD_PATH, "spi_results_seasonal")   # used by Part 4c + 4e
 MONTH_NAMES_3 <- c("Jan","Feb","Mar","Apr","May","Jun",
                    "Jul","Aug","Sep","Oct","Nov","Dec")
 
@@ -365,14 +379,27 @@ load_spei_seasonal_csvs <- function(scale, seas_dir) {
       # Columns: lon, lat, then one column per year (e.g. "1950", "1951", …)
       year_cols <- setdiff(names(df), c("lon", "lat"))
       year_cols <- year_cols[grepl("^[0-9]{4}$", year_cols)]
-      if (!length(year_cols)) return(NULL)
+      if (!length(year_cols)) next   # skip this month; don't abort the whole function
       
       years_int <- as.integer(year_cols)
       
-      # Area-weighted basin mean: equal-area projection → simple colMeans over
-      # non-NA pixels is a close approximation; proper weighting requires the
-      # raster template.  Use colMeans (pixels already masked to basin).
-      vals <- colMeans(df[, year_cols, drop = FALSE], na.rm = TRUE)
+      # Area-weighted basin mean.
+      # • Geographic coords (degrees, max|lon| ≤ 200): weight each pixel by
+      #   cos(lat) — exact for a regular lat/lon grid on a sphere.
+      # • Equal-area projected coords (metres, max|lon| > 200): all pixels
+      #   carry the same area, so a simple column mean is correct.
+      mat_yr <- as.matrix(df[, year_cols, drop = FALSE])
+      is_geo <- max(abs(df$lon), na.rm = TRUE) <= 200
+      if (is_geo) {
+        w <- cos(df$lat * pi / 180)
+        vals <- apply(mat_yr, 2, function(x) {
+          ok <- is.finite(x)
+          if (!any(ok)) return(NA_real_)
+          sum(x[ok] * w[ok]) / sum(w[ok])
+        })
+      } else {
+        vals <- colMeans(mat_yr, na.rm = TRUE)
+      }
       vals[is.nan(vals)] <- NA_real_
       
       month_rows[[m]] <- data.frame(
@@ -421,8 +448,8 @@ make_spei_panel_v2 <- function(sc, panel_lab, pet_type = "PM",
                                show_xlab = FALSE, is_first = FALSE) {
   seas_dir  <- if (pet_type == "PM") SPEI_PM_DIR else SPEI_THW_DIR
   col_line  <- if (pet_type == "PM") "#1f77b4" else "#d62728"
-  pet_label <- if (pet_type == "PM") "SPEI\u209a\u2098 (Penman-Monteith)"
-  else                  "SPEI\u2080 (Thornthwaite)"
+  pet_label <- if (pet_type == "PM") "SPEI-PM (Penman-Monteith)"
+  else                  "SPEI-T (Thornthwaite)"
   
   # Try authoritative basin-avg CSV first; fall back to per-month seasonal CSVs
   df <- tryCatch(load_flat_csv("spei", sc), error = function(e) NULL)
@@ -486,11 +513,11 @@ make_spei_panel_v2 <- function(sc, panel_lab, pet_type = "PM",
                       hjust = 0, vjust = 1, colour = "grey10") +
     ggplot2::annotate("text",
                       x = as.Date("1951-01-01"), y = THR_EVENT + 0.08,
-                      label = "x\u2080 = \u22120.5", size = 2.4,
+                      label = "x₀ = −0.5", size = 2.4,
                       hjust = 0, colour = "grey30") +
     ggplot2::annotate("text",
                       x = HIGHLIGHT_START + 365, y = yhi * 0.97,
-                      label = "2022\u20132025", size = 2.4, hjust = 0.5,
+                      label = "2022–2025", size = 2.4, hjust = 0.5,
                       colour = "grey30", fontface = "italic") +
     ggplot2::scale_x_date(
       date_breaks = "10 years", date_labels = "%Y",
@@ -531,7 +558,7 @@ make_spei_panel_v2 <- function(sc, panel_lab, pet_type = "PM",
                         colour = "#d73027", linewidth = 0.6) +
       ggplot2::annotate("text",
                         x = as.Date("2024-06-01"), y = -0.35,
-                        label = "Persistent below \u22120.5",
+                        label = "Persistent below −0.5",
                         size = 2.3, hjust = 0.5,
                         colour = "#d73027", fontface = "italic")
   }
@@ -607,19 +634,19 @@ make_spei_overlay_panel <- function(sc, panel_lab, show_xlab = FALSE,
   if (!is.null(df_pm))
     p <- p + ggplot2::geom_line(
       data = df_pm, ggplot2::aes(x = date, y = value,
-                                 colour = "SPEI\u209a\u2098 (Penman-Monteith)"),
+                                 colour = "SPEI-PM (Penman-Monteith)"),
       linewidth = 0.65, inherit.aes = FALSE)
   
   if (!is.null(df_thw))
     p <- p + ggplot2::geom_line(
       data = df_thw, ggplot2::aes(x = date, y = value,
-                                  colour = "SPEI\u2080 (Thornthwaite)"),
+                                  colour = "SPEI-T (Thornthwaite)"),
       linewidth = 0.55, linetype = "solid", alpha = 0.75, inherit.aes = FALSE)
   
   p <- p +
     ggplot2::scale_colour_manual(
-      values = c("SPEI\u209a\u2098 (Penman-Monteith)" = "#1f77b4",
-                 "SPEI\u2080 (Thornthwaite)"          = "#d62728"),
+      values = c("SPEI-PM (Penman-Monteith)" = "#1f77b4",
+                 "SPEI-T (Thornthwaite)"          = "#d62728"),
       name   = "PET method",
       guide  = if (is_first)
         ggplot2::guide_legend(title.position = "top", nrow = 1,
@@ -631,13 +658,13 @@ make_spei_overlay_panel <- function(sc, panel_lab, show_xlab = FALSE,
                       hjust = 0, vjust = 1, colour = "grey10") +
     ggplot2::annotate("text",
                       x = as.Date("1951-01-01"), y = THR_EVENT + 0.08,
-                      label = "x\u2080 = \u22120.5", size = 2.4,
+                      label = "x₀ = −0.5", size = 2.4,
                       hjust = 0, colour = "grey30") +
     ggplot2::annotate("text",
                       x = HIGHLIGHT_START + 365, y = yhi * 0.97,
-                      label = "2022\u20132025", size = 2.4, hjust = 0.5,
+                      label = "2022–2025", size = 2.4, hjust = 0.5,
                       colour = "grey30", fontface = "italic") +
-    ggplot2::scale_x_date(date_breaks = "10 years", date_labels = "%Y",
+    ggplot2::scale_x_date(breaks = seq(as.Date("1950-01-01"), as.Date("2025-12-31"), by = "5 years"), date_labels = "%Y", 
                           expand = ggplot2::expansion(add = c(0, 0))) +
     ggplot2::scale_y_continuous(limits = c(ylo, yhi),
                                 breaks = c(-2, -1.5, -1, -0.5, 0, 1, 2),
@@ -672,7 +699,7 @@ make_spei_overlay_panel <- function(sc, panel_lab, show_xlab = FALSE,
                         colour = "#d73027", linewidth = 0.6) +
       ggplot2::annotate("text",
                         x = as.Date("2024-06-01"), y = -0.35,
-                        label = "Persistent below \u22120.5",
+                        label = "Persistent below −0.5",
                         size = 2.3, hjust = 0.5,
                         colour = "#d73027", fontface = "italic")
   }
@@ -701,18 +728,18 @@ save_spei_fig <- function(panels, title_str, subtitle_str, base_name) {
       ggplot2::ggsave(out, fig, width = 7.0, height = 9.0, units = "in",
                       dpi = if (ext == "png") 300 else "print",
                       device = ext),
-      error = function(e) cat(sprintf("  \u26a0 %s: %s\n", ext, e$message)))
-    cat(sprintf("  \u2713 Saved: %s\n", basename(out)))
+      error = function(e) cat(sprintf("  ⚠ %s: %s\n", ext, e$message)))
+    cat(sprintf("  ✓ Saved: %s\n", basename(out)))
   }
   invisible(fig)
 }
 
 common_subtitle <- paste0(
   "Fill: drought category  |  ",
-  "Dashed: event threshold (x\u2080 = \u22120.5, 31st percentile)  |  ",
-  "Dotted: moderate drought (\u22121.0)  |  ",
-  "Grey band: 2022\u20132025  |  ",
-  "Red segment: persistent sub-threshold anomaly 2023\u20132025 (SPEI-3)")
+  "Dashed: event threshold (x₀ = −0.5, 31st percentile)  |  ",
+  "Dotted: moderate drought (−1.0)  |  ",
+  "Grey band: 2022–2025  |  ",
+  "Red segment: persistent sub-threshold anomaly 2023–2025 (SPEI-3)")
 
 tryCatch({
   # ── Version A: PM only ─────────────────────────────────────────────────────
@@ -723,26 +750,26 @@ tryCatch({
     make_spei_panel_v2(3, "(c)", "PM", show_xlab = TRUE,  is_first = FALSE)
   )
   save_spei_fig(pm_panels,
-                "Basin-averaged SPEI\u209a\u2098 (Penman-Monteith PET) \u2014 Nechako River Basin (1950\u20132025)",
+                "Basin-averaged SPEI-PM (Penman-Monteith PET) — Nechako River Basin (1950–2025)",
                 common_subtitle,
                 "Fig4_MS_SPEI_123_PM_timeseries")
-  cat("  \u2713 Version A complete\n")
-}, error = function(e) cat(sprintf("  \u26a0 Version A failed: %s\n", e$message)))
+  cat("  ✓ Version A complete\n")
+}, error = function(e) cat(sprintf("  ⚠ Version A failed: %s\n", e$message)))
 
 tryCatch({
   # ── Version B: Thornthwaite only ──────────────────────────────────────────
-  cat("  Building Version B: SPEI\u2080 (Thornthwaite)...\n")
+  cat("  Building Version B: SPEI-T (Thornthwaite)...\n")
   thw_panels <- list(
     make_spei_panel_v2(1, "(a)", "Thw", show_xlab = FALSE, is_first = TRUE),
     make_spei_panel_v2(2, "(b)", "Thw", show_xlab = FALSE, is_first = FALSE),
     make_spei_panel_v2(3, "(c)", "Thw", show_xlab = TRUE,  is_first = FALSE)
   )
   save_spei_fig(thw_panels,
-                "Basin-averaged SPEI\u2080 (Thornthwaite PET) \u2014 Nechako River Basin (1950\u20132025)",
+                "Basin-averaged SPEI-T (Thornthwaite PET) — Nechako River Basin (1950–2025)",
                 common_subtitle,
                 "Fig4_MS_SPEI_123_Thw_timeseries")
-  cat("  \u2713 Version B complete\n")
-}, error = function(e) cat(sprintf("  \u26a0 Version B failed: %s\n", e$message)))
+  cat("  ✓ Version B complete\n")
+}, error = function(e) cat(sprintf("  ⚠ Version B failed: %s\n", e$message)))
 
 tryCatch({
   # ── Version C: Overlay (PM + Thornthwaite on same axes) ───────────────────
@@ -753,225 +780,357 @@ tryCatch({
     make_spei_overlay_panel(3, "(c)", show_xlab = TRUE,  is_first = FALSE)
   )
   save_spei_fig(ov_panels,
-                "Basin-averaged SPEI \u2014 Nechako River Basin (1950\u20132025)",
+                "Basin-averaged SPEI — Nechako River Basin (1950–2025)",
                 paste0(common_subtitle,
                        "  |  Blue = PM;  Red = Thornthwaite"),
                 "Fig4_MS_SPEI_123_overlay_timeseries")
-  cat("  \u2713 Version C complete\n")
-}, error = function(e) cat(sprintf("  \u26a0 Version C failed: %s\n", e$message)))
+  cat("  ✓ Version C complete\n")
+}, error = function(e) cat(sprintf("  ⚠ Version C failed: %s\n", e$message)))
 
 ################################################################################
 # PART 4c – SPATIAL REPRESENTATIVENESS FIGURE  (fig3)
-#
 # Output:
 #   Fig4c_Pearson_r_SPEI_PM_SPI.pdf/.png
-#
-#   Layout:
-#     Rows 1-2: 2x3 Pearson r maps
-#       Row 1 (a-c): SPEI_PM scales 1, 2, 3  (Blues palette)
-#       Row 2 (d-f): SPI     scales 1, 2, 3  (Greens palette)
-#     Bottom row: 2 density panels side by side
-#       (c) Pixel Pearson r — Penman-Monteith PET (SPEI-1/2/3 PM)
-#       (l) Pixel Pearson r — SPI (scales 1, 2, 3)
-#
+# Layout:
+#   Rows 1-2: 2x3 Pearson r maps
+# Row 1 (a-c): SPEI_PM scales 1, 2, 3  (Blues palette)
+# Row 2 (d-f): SPI     scales 1, 2, 3  (Greens palette)
+# Bottom row: 2 density panels side by side
+# (g) Pixel Pearson r — Penman-Monteith PET (SPEI-1/2/3 PM)
+# (h) Pixel Pearson r — SPI (scales 1, 2, 3)
 # All panels use ggplot2 + patchwork (no terra::plot).
 ################################################################################
-cat("\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n")
-cat("PART 4c: Spatial representativeness \u2014 SPEI-PM + SPI Pearson r maps\n")
-cat("\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n")
+cat("\n══════════════════════════════════════════════════════════════\n")
+cat("PART 4c: Spatial representativeness — SPEI-PM + SPI Pearson r maps\n")
+cat("══════════════════════════════════════════════════════════════\n")
+
+## Helper: detect basin boundary and return sf object in specified CRS
+detect_basin_sf <- function(coords_df, target_crs = "EPSG:3005") {
+  tryCatch({
+    # Convert SpatVector to sf if needed
+    if (inherits(basin_shp, "SpatVector")) {
+      basin_sf <- sf::st_as_sf(basin_shp)
+    } else {
+      basin_sf <- basin_shp
+    }
+    
+    is_projected <- max(abs(coords_df$lon), na.rm = TRUE) > 200
+    if (is_projected) {
+      basin_sf <- sf::st_transform(basin_sf, "EPSG:3005")
+    } else {
+      basin_sf <- sf::st_transform(basin_sf, "EPSG:4326")
+    }
+    basin_sf
+  }, error = function(e) {
+    cat(sprintf("  ⚠ detect_basin_sf failed: %s\n", e$message))
+    NULL
+  })
+}
+
+## Helper: build one Pearson r map panel ────────────────────────────────
+## Transform coordinates to WGS84 (degrees) using terra::crds()
+transform_coords_to_degrees <- function(coords_df) {
+  # Check if coordinates appear to be projected (large values > 200)
+  is_proj <- max(abs(coords_df$lon), na.rm = TRUE) > 200
+  
+  if (is_proj && requireNamespace("terra", quietly = TRUE)) {
+    tryCatch({
+      src_crs <- terra::crs(basin_proj)
+      v      <- terra::vect(coords_df, geom = c("lon", "lat"), crs = src_crs)
+      v_4326 <- terra::project(v, "EPSG:4326")
+      crds   <- terra::crds(v_4326)
+      return(data.frame(lon = crds[, "x"], lat = crds[, "y"]))
+    }, error = function(e) {
+      cat(sprintf("  ⚠ Coordinate transformation failed: %s\n", e$message))
+      return(coords_df)
+    })
+  }
+  return(coords_df)
+}
+
+make_map_panel <- function(r_v, coords, basin_sf, title_str, subtitle_str,
+                           palette = "Blues") {
+  ## 1. Transform pixel coordinates to degrees (WGS84)
+  lon_lat_df <- transform_coords_to_degrees(coords)
+  
+  ## 2. Create a terra raster from point data for reliable rendering
+  ##    This ensures a regular grid in WGS84
+  df_points <- data.frame(lon = lon_lat_df$lon, lat = lon_lat_df$lat, r = r_v)
+  df_points <- df_points[!is.na(df_points$r), ]
+  if (!nrow(df_points)) return(ggplot2::ggplot() + ggplot2::theme_void())
+  
+  ## Create SpatVector from points
+  v_points <- terra::vect(df_points, geom = c("lon", "lat"), crs = "EPSG:4326")
+  
+  ## Rasterize to a regular grid
+  ## Determine resolution from the point spacing
+  lon_u <- sort(unique(df_points$lon))
+  lat_u <- sort(unique(df_points$lat))
+  x_res <- if (length(lon_u) > 2) median(diff(lon_u)) else 0.1
+  y_res <- if (length(lat_u) > 2) median(diff(lat_u)) else 0.1
+  
+  ## Create raster template
+  r_template <- terra::rast(
+    xmin = min(df_points$lon) - x_res/2,
+    xmax = max(df_points$lon) + x_res/2,
+    ymin = min(df_points$lat) - y_res/2,
+    ymax = max(df_points$lat) + y_res/2,
+    resolution = c(x_res, y_res),
+    crs = "EPSG:4326"
+  )
+  
+  ## Rasterize points (nearest neighbor)
+  r_raster <- terra::rasterize(v_points, r_template, field = "r", method = "nearest")
+  
+  ## Convert raster to data frame for geom_raster
+  df_raster <- as.data.frame(r_raster, xy = TRUE, na.rm = TRUE)
+  names(df_raster) <- c("lon", "lat", "r")
+  
+  ## 3. Transform basin outline to WGS84 and create a proper group variable.
+  basin_df <- NULL
+  if (!is.null(basin_sf)) {
+    tryCatch({
+      basin_4326   <- sf::st_transform(basin_sf, "EPSG:4326")
+      basin_coords <- sf::st_coordinates(basin_4326)
+      basin_df     <- as.data.frame(basin_coords)
+      ## Build a unique group per ring × polygon combination
+      l2_col       <- if ("L2" %in% names(basin_df)) basin_df$L2 else rep(1L, nrow(basin_df))
+      basin_df$grp <- interaction(basin_df$L1, l2_col, drop = TRUE)
+    }, error = function(e) NULL)
+  }
+  
+  ## 4. Axis limits with small padding (3%)
+  x_lim <- range(df_raster$lon, na.rm = TRUE)
+  y_lim <- range(df_raster$lat, na.rm = TRUE)
+  x_pad <- diff(x_lim) * 0.03
+  y_pad <- diff(y_lim) * 0.03
+  
+  ## 5. Correct aspect ratio for geographic (lon/lat) coordinates.
+  ##    FIXED: Account for both latitude distortion AND data range
+  mid_lat_rad <- mean(y_lim) * pi / 180
+  asp_ratio   <- diff(y_lim) / diff(x_lim) / cos(mid_lat_rad)
+  
+  ## 6. Colour scale
+  r_min <- max(0.40, floor(min(df_raster$r, na.rm = TRUE) * 10) / 10)
+  if (palette == "Blues") {
+    col_low  <- "#c6dbef"  # Blues[2]
+    col_high <- "#08519c"  # Blues[9]
+  } else if (palette == "Greens") {
+    col_low  <- "#bae4bc"  # Greens[2]
+    col_high <- "#005824"  # Greens[9]
+  } else {
+    brewer_cols <- RColorBrewer::brewer.pal(9, palette)
+    col_low  <- brewer_cols[2]
+    col_high <- brewer_cols[9]
+  }
+  
+  ## 7. Build plot using geom_raster (not geom_tile)
+  p <- ggplot2::ggplot(df_raster, ggplot2::aes(x = lon, y = lat, fill = r)) +
+    ## Raster with guaranteed regular grid
+    ggplot2::geom_raster() +
+    ## Fill scale
+    ggplot2::scale_fill_gradient(
+      low    = col_low,
+      high   = col_high,
+      limits = c(r_min, 1),
+      name   = "Pearson r",
+      breaks = seq(r_min, 1, by = 0.10),
+      oob    = scales::squish,
+      guide  = "none") +
+    ## Basin outline
+    {if (!is.null(basin_df))
+      ggplot2::geom_path(data = basin_df,
+                         ggplot2::aes(x = X, y = Y, group = grp),
+                         colour = "black", linewidth = 0.6,
+                         inherit.aes = FALSE)} +
+    ggplot2::coord_cartesian(
+      xlim = c(x_lim[1] - x_pad, x_lim[2] + x_pad),
+      ylim = c(y_lim[1] - y_pad, y_lim[2] + y_pad)) +
+    ggplot2::scale_x_continuous(labels = function(x) sprintf("%.1f°", x)) +
+    ggplot2::scale_y_continuous(labels = function(x) sprintf("%.1f°", x)) +
+    ggplot2::labs(title = title_str, subtitle = subtitle_str) +
+    theme_map4c +
+    ggplot2::theme(aspect.ratio = asp_ratio)
+  
+  return(p)
+}
 
 tryCatch({
-  
-  # ── Helper: load 12 per-month CSVs for one scale x directory x prefix ──────
-  # prefix: "spei" or "spi"
-  load_pixel_mat <- function(scale, seas_dir, prefix = "spei") {
-    month_list <- vector("list", 12L)
-    coords_out <- NULL
-    year_out   <- NULL
+  ## Helper: load 12 per-month CSVs for one scale x directory x prefix ──────
+  load_pixel_mat   <- function(scale, seas_dir, prefix = "spei") {
+    month_list   <- vector("list", 12L)
+    coords_out   <- NULL
+    year_out     <- NULL
     for (m in seq_len(12L)) {
-      csv_f <- file.path(seas_dir,
-                         sprintf("%s_%02d_month%02d_%s.csv",
-                                 prefix, scale, m, MONTH_NAMES_3[m]))
+      csv_f   <- file.path(seas_dir,
+                           sprintf("%s_%02d_month%02d_%s.csv",
+                                   prefix, scale, m, MONTH_NAMES_3[m]))
       if (!file.exists(csv_f)) next
-      df_m <- tryCatch(data.table::fread(csv_f, data.table = FALSE),
-                       error = function(e) NULL)
+      df_m   <- tryCatch(data.table::fread(csv_f, data.table = FALSE),
+                         error = function(e) NULL)
       if (is.null(df_m)) next
-      yr_c <- setdiff(names(df_m), c("lon", "lat"))
-      yr_c <- yr_c[grepl("^[0-9]{4}$", yr_c)]
+      yr_c   <- setdiff(names(df_m), c("lon", "lat"))
+      yr_c   <- yr_c[grepl("^[0-9]{4}$", yr_c)]
       if (!length(yr_c)) next
-      if (is.null(coords_out)) { coords_out <- df_m[, c("lon","lat")]; year_out <- yr_c }
-      month_list[[m]] <- as.matrix(df_m[, yr_c, drop = FALSE])
+      if (is.null(coords_out)) { coords_out   <- df_m[, c("lon", "lat")]; year_out   <- yr_c }
+      month_list[[m]]   <- as.matrix(df_m[, yr_c, drop = FALSE])
     }
-    valid <- which(!sapply(month_list, is.null))
+    valid   <- which(!sapply(month_list, is.null))
     if (!length(valid) || is.null(coords_out)) return(NULL)
     list(mat         = do.call(cbind, month_list[valid]),
          coords      = coords_out,
-         yr_int      = as.integer(year_out),
+         year_int    = as.integer(year_out),
          yr_chr      = year_out,
          valid_months = valid,
          month_list  = month_list)
   }
   
-  # ── Helper: per-pixel Pearson r with basin mean ────────────────────────────
+  ## Helper: per-pixel Pearson r with basin mean ────────────────────────────
+  ## The reference basin mean must be area-weighted for the same reason as the
+  ## fallback loaders: cos(lat) weighting for geographic coords, plain mean
+  ## for equal-area projected coords.
   compute_r <- function(obj) {
-    mat  <- obj$mat
-    bavg <- colMeans(mat, na.rm = TRUE)
+    mat    <- obj$mat
+    coords <- obj$coords
+    is_geo <- max(abs(coords$lon), na.rm = TRUE) <= 200
+    if (is_geo) {
+      w    <- cos(coords$lat * pi / 180)
+      bavg <- apply(mat, 2, function(x) {
+        ok <- is.finite(x)
+        if (!any(ok)) return(NA_real_)
+        sum(x[ok] * w[ok]) / sum(w[ok])
+      })
+    } else {
+      bavg <- colMeans(mat, na.rm = TRUE)
+    }
     vapply(seq_len(nrow(mat)), function(i) {
       xi <- mat[i, ]; ok <- !is.na(xi) & !is.na(bavg)
       if (sum(ok) < 10L) NA_real_ else cor(xi[ok], bavg[ok])
     }, numeric(1L))
   }
   
-  # ── CRS helper ────────────────────────────────────────────────────────────
-  detect_basin_sf <- function(coords) {
-    is_proj <- max(abs(coords$lon), na.rm = TRUE) > 200
-    tryCatch({
-      b <- sf::st_read(BASIN_SHP, quiet = TRUE)
-      if (nrow(b) > 1L) b <- sf::st_as_sf(sf::st_union(b))
-      if (is_proj) sf::st_transform(b, terra::crs(basin_proj))
-      else         sf::st_transform(b, "EPSG:4326")
-    }, error = function(e) NULL)
-  }
-  
-  # ── Shared map theme ──────────────────────────────────────────────────────
-  theme_map4c <- ggplot2::theme_bw(base_size = 8.5) +
+  ## Shared map theme ──────────────────────────────────────────────────────
+  theme_map4c <- ggplot2::theme_bw(base_size = 10.5) +
     ggplot2::theme(
       axis.title        = ggplot2::element_blank(),
-      axis.text         = ggplot2::element_text(size = 6),
-      plot.title        = ggplot2::element_text(size = 8, face = "bold", hjust = 0.5),
-      plot.subtitle     = ggplot2::element_text(size = 7, colour = "grey30",
+      axis.text         = ggplot2::element_text(size = 7),
+      axis.text.x       = ggplot2::element_text(size = 7, angle = 45, hjust = 1, vjust = 1),
+      axis.text.y       = ggplot2::element_text(size = 7),
+      plot.title        = ggplot2::element_text(size = 9, face = "bold", hjust = 0.5,
+                                                margin = ggplot2::margin(b = 2)),
+      plot.subtitle     = ggplot2::element_text(size = 7.5, colour = "grey30",
                                                 hjust = 0.5,
-                                                margin = ggplot2::margin(t = 1, b = 2)),
-      legend.key.height = ggplot2::unit(1.1, "cm"),
-      legend.key.width  = ggplot2::unit(0.32, "cm"),
-      legend.text       = ggplot2::element_text(size = 6.5),
-      legend.title      = ggplot2::element_text(size = 7),
+                                                lineheight = 0.9,
+                                                margin = ggplot2::margin(t = 0, b = 2)),
+      legend.key.height = ggplot2::unit(0.8, "cm"),
+      legend.key.width  = ggplot2::unit(0.25, "cm"),
+      legend.text       = ggplot2::element_text(size = 8),
+      legend.title      = ggplot2::element_text(size = 8.5),
+      legend.position   = "right",
       panel.grid        = ggplot2::element_blank(),
-      plot.margin       = ggplot2::margin(2, 2, 2, 2))
+      plot.margin       = ggplot2::margin(2, 3, 1, 3))
   
-  # ── Helper: build one Pearson r map panel ────────────────────────────────
-  # palette: "Blues" for SPEI PM, "Greens" for SPI
-  make_map_panel <- function(r_v, coords, basin_sf, title_str, subtitle_str,
-                             palette = "Blues") {
-    r_min <- max(0.40, floor(min(r_v, na.rm = TRUE) * 10) / 10)
-    df_r  <- data.frame(lon = coords$lon, lat = coords$lat, r = r_v)
-    ggplot2::ggplot(df_r[!is.na(df_r$r), ],
-                    ggplot2::aes(x = lon, y = lat, fill = r)) +
-      ggplot2::geom_tile() +
-      ggplot2::scale_fill_distiller(
-        palette   = palette, direction = 1,
-        name      = "Pearson r",
-        limits    = c(r_min, 1.0),
-        breaks    = seq(r_min, 1.0, by = 0.1),
-        oob       = scales::squish) +
-      {if (!is.null(basin_sf))
-        ggplot2::geom_sf(data = basin_sf, fill = NA, colour = "black",
-                         linewidth = 0.55, inherit.aes = FALSE)} +
-      ggplot2::coord_sf(expand = FALSE) +
-      ggplot2::labs(title = title_str, subtitle = subtitle_str) +
-      theme_map4c
-  }
-  
-  # ── Helper: build one r-density panel ─────────────────────────────────────
-  make_density_panel <- function(r_list, combo_names, col_pal,
-                                 panel_lab, title_str) {
-    df <- do.call(rbind, lapply(seq_along(r_list), function(k) {
-      rv <- r_list[[k]]
+  ## Helper: build one r-density panel ─────────────────────────────────────
+  make_density_panel  <- function(r_list, combo_names, col_pal,
+                                  panel_lab, title_str) {
+    df  <- do.call(rbind, lapply(seq_along(r_list), function(k) {
+      rv  <- r_list[[k]]
       if (is.null(rv)) return(NULL)
       data.frame(r = rv, combo = combo_names[k], stringsAsFactors = FALSE)
     }))
     if (is.null(df) || !nrow(df))
       return(ggplot2::ggplot() +
                ggplot2::annotate("text", x = 0.5, y = 0.5,
-                                 label = "No data", size = 3, colour = "grey50") +
+                                 label = "No data", size = 4, colour = "grey50") +
                ggplot2::theme_void())
-    
-    df    <- df[!is.na(df$r), ]
-    df$combo <- factor(df$combo, levels = combo_names)
-    med_df <- do.call(rbind, lapply(combo_names, function(g) {
-      x <- df$r[df$combo == g]
+    df      <- df[!is.na(df$r), ]
+    df$combo   <- factor(df$combo, levels = combo_names)
+    med_df   <- do.call(rbind, lapply(combo_names, function(g) {
+      x   <- df$r[df$combo == g]
       data.frame(combo = g, med_r = median(x, na.rm = TRUE),
                  stringsAsFactors = FALSE)
     }))
-    med_df$combo <- factor(med_df$combo, levels = combo_names)
-    
+    med_df$combo   <- factor(med_df$combo, levels = combo_names)
     ggplot2::ggplot(df, ggplot2::aes(x = r, colour = combo, fill = combo)) +
-      ggplot2::geom_density(alpha = 0.18, linewidth = 0.80) +
+      ggplot2::geom_density(alpha = 0.20, linewidth = 0.9) +
       ggplot2::geom_vline(data = med_df,
                           ggplot2::aes(xintercept = med_r, colour = combo),
-                          linetype = "solid", linewidth = 0.60,
+                          linetype = "solid", linewidth = 0.7,
                           show.legend = FALSE) +
+      ## Text: Placed at the very top of the panel (y=Inf), anchored slightly below edge
+      ## This ensures they sit in empty space reserved by expand() below
       ggplot2::geom_text(data = med_df,
                          ggplot2::aes(x = med_r, y = Inf,
                                       label = sprintf("%.2f", med_r),
                                       colour = combo),
-                         vjust = 1.5, hjust = -0.10, size = 2.4,
+                         vjust = 1.1, hjust = 0.5, size = 3.5,
                          show.legend = FALSE) +
       ggplot2::scale_colour_manual(values = col_pal, name = NULL) +
       ggplot2::scale_fill_manual(values   = col_pal, name = NULL) +
       ggplot2::scale_x_continuous(limits = c(0.4, 1.01),
                                   breaks = seq(0.4, 1.0, by = 0.1)) +
+      ## RESERVE ~60% OF TOP PANEL FOR LABELS to guarantee no curve overlap
+      ggplot2::scale_y_continuous(expand = ggplot2::expansion(mult = c(0.05, 0.70))) +
       ggplot2::labs(
         title    = sprintf("%s  %s", panel_lab, title_str),
         subtitle = "Solid vertical lines = median r per scale",
-        x        = "Pearson r  (pixel vs basin mean)",
+        x        = "Pearson r (pixel vs basin mean)",
         y        = "Density") +
-      ggplot2::theme_classic(base_size = 9) +
+      ggplot2::theme_classic(base_size = 11) +
       ggplot2::theme(
-        plot.title       = ggplot2::element_text(size = 8, face = "bold", hjust = 0),
-        plot.subtitle    = ggplot2::element_text(size = 7, colour = "grey40", hjust = 0),
-        legend.text      = ggplot2::element_text(size = 7.5),
+        plot.title       = ggplot2::element_text(size = 9.5, face = "bold", hjust = 0,
+                                                 margin = ggplot2::margin(b = 3)),
+        plot.subtitle    = ggplot2::element_text(size = 8.5, colour = "grey40", hjust = 0),
+        legend.text      = ggplot2::element_text(size = 9),
         legend.position  = "bottom",
-        legend.key.size  = ggplot2::unit(0.35, "cm"),
-        axis.text        = ggplot2::element_text(size = 7),
-        plot.margin      = ggplot2::margin(3, 6, 2, 4))
+        legend.key.size  = ggplot2::unit(0.4, "cm"),
+        axis.text        = ggplot2::element_text(size = 9),
+        plot.margin      = ggplot2::margin(2, 6, 2, 4))
   }
   
-  # ── 1. Compute SPEI PM Pearson r for scales 1, 2, 3 ──────────────────────
-  spei_scales <- c(1L, 2L, 3L)
-  spei_r_list <- vector("list", 3L)
-  spei_plots  <- vector("list", 3L)
-  spei_labels <- c("(a)", "(b)", "(c)")
-  
+  ## 1. Compute SPEI PM Pearson r for scales 1, 2, 3 ──────────────────────
+  spei_scales  <- c(1L, 2L, 3L)
+  spei_r_list  <- vector("list", 3L)
+  spei_plots   <- vector("list", 3L)
+  spei_labels  <- c("(a)", "(b)", "(c)")
   for (k in seq_along(spei_scales)) {
-    sc  <- spei_scales[k]
+    sc    <- spei_scales[k]
     cat(sprintf("  Loading SPEI-PM-%d...\n", sc))
-    obj <- tryCatch(load_pixel_mat(sc, SPEI_PM_DIR, prefix = "spei"),
-                    error = function(e) NULL)
+    obj   <- tryCatch(load_pixel_mat(sc, SPEI_PM_DIR, prefix = "spei"),
+                      error = function(e) NULL)
     if (is.null(obj)) { cat(sprintf("    No data\n")); next }
-    rv       <- compute_r(obj)
-    bsf      <- detect_basin_sf(obj$coords)
-    med_r    <- median(rv, na.rm = TRUE)
-    pct80    <- 100 * mean(rv >= 0.80, na.rm = TRUE)
-    spei_r_list[[k]] <- rv
-    spei_plots[[k]]  <- make_map_panel(
+    rv         <- compute_r(obj)
+    bsf        <- detect_basin_sf(obj$coords)
+    med_r      <- median(rv, na.rm = TRUE)
+    pct80      <- 100 * mean(rv >= 0.80, na.rm = TRUE)
+    spei_r_list[[k]]   <- rv
+    spei_plots[[k]]    <- make_map_panel(
       rv, obj$coords, bsf,
-      title_str    = sprintf("%s  SPEI\u209a\u2098-%d  (Penman-Monteith)", spei_labels[k], sc),
-      subtitle_str = sprintf("median r = %.3f  |  %.0f%% \u2265 0.80", med_r, pct80),
+      title_str    = sprintf("%s  SPEI-%d  (Penman-Monteith)", spei_labels[k], sc),
+      subtitle_str = sprintf("median r = %.3f\n%.0f%% ≥ 0.80", med_r, pct80),
       palette      = "Blues")
   }
   
-  # ── 2. Compute SPI Pearson r for scales 1, 2, 3 ──────────────────────────
-  spi_scales <- c(1L, 2L, 3L)
-  spi_r_list <- vector("list", 3L)
-  spi_plots  <- vector("list", 3L)
-  spi_labels <- c("(d)", "(e)", "(f)")
-  
+  ## 2. Compute SPI Pearson r for scales 1, 2, 3 ──────────────────────────
+  spi_scales  <- c(1L, 2L, 3L)
+  spi_r_list  <- vector("list", 3L)
+  spi_plots   <- vector("list", 3L)
+  spi_labels  <- c("(d)", "(e)", "(f)")
   for (k in seq_along(spi_scales)) {
-    sc  <- spi_scales[k]
+    sc    <- spi_scales[k]
     cat(sprintf("  Loading SPI-%d...\n", sc))
-    obj <- tryCatch(load_pixel_mat(sc, SPI_SEAS_DIR, prefix = "spi"),
-                    error = function(e) NULL)
+    obj   <- tryCatch(load_pixel_mat(sc, SPI_SEAS_DIR, prefix = "spi"),
+                      error = function(e) NULL)
     if (is.null(obj)) { cat(sprintf("    No data\n")); next }
-    rv       <- compute_r(obj)
-    bsf      <- detect_basin_sf(obj$coords)
-    med_r    <- median(rv, na.rm = TRUE)
-    pct80    <- 100 * mean(rv >= 0.80, na.rm = TRUE)
-    spi_r_list[[k]] <- rv
-    spi_plots[[k]]  <- make_map_panel(
+    rv         <- compute_r(obj)
+    bsf        <- detect_basin_sf(obj$coords)
+    med_r      <- median(rv, na.rm = TRUE)
+    pct80      <- 100 * mean(rv >= 0.80, na.rm = TRUE)
+    spi_r_list[[k]]   <- rv
+    spi_plots[[k]]    <- make_map_panel(
       rv, obj$coords, bsf,
       title_str    = sprintf("%s  SPI-%d", spi_labels[k], sc),
-      subtitle_str = sprintf("median r = %.3f  |  %.0f%% \u2265 0.80", med_r, pct80),
+      subtitle_str = sprintf("median r = %.3f\n%.0f%% ≥ 0.80", med_r, pct80),
       palette      = "Greens")
   }
   
@@ -979,98 +1138,95 @@ tryCatch({
   any_spi  <- any(!sapply(spi_plots,  is.null))
   if (!any_spei && !any_spi) { cat("  No data for any combination\n"); stop("no_data") }
   
-  # ── 3. Density panel (c): SPEI-PM r values for scales 1, 2, 3 ────────────
-  col_spei_pm <- c("SPEI-1 PM" = "#1f77b4",
-                   "SPEI-2 PM" = "#6baed6",
-                   "SPEI-3 PM" = "#2ca02c")
-  pc_pm <- make_density_panel(
+  ## 3. Density panel (g): SPEI-PM r values for scales 1, 2, 3 ────────────
+  col_spei_pm   <- c("SPEI-1 PM" = "#1f77b4",
+                     "SPEI-2 PM" = "#6baed6",
+                     "SPEI-3 PM" = "#2ca02c")
+  pc_pm   <- make_density_panel(
     r_list      = spei_r_list,
     combo_names = names(col_spei_pm),
     col_pal     = col_spei_pm,
-    panel_lab   = "(c)",
-    title_str   = "Pixel Pearson r \u2014 Penman-Monteith PET")
+    panel_lab   = "(g)",
+    title_str   = "Pixel Pearson r — Penman-Monteith PET")
   
-  # ── 4. Density panel (l): SPI r values for scales 1, 2, 3 ────────────────
-  col_spi <- c("SPI-1" = "#1b7837",
-               "SPI-2" = "#5aae61",
-               "SPI-3" = "#a6d96a")
-  pl_spi <- make_density_panel(
+  ## 4. Density panel (h): SPI r values for scales 1, 2, 3 ────────────────
+  col_spi   <- c("SPI-1" = "#1b7837",
+                 "SPI-2" = "#5aae61",
+                 "SPI-3" = "#a6d96a")
+  pl_spi   <- make_density_panel(
     r_list      = spi_r_list,
     combo_names = names(col_spi),
     col_pal     = col_spi,
-    panel_lab   = "(l)",
-    title_str   = "Pixel Pearson r \u2014 SPI (scales 1, 2, 3)")
+    panel_lab   = "(h)",
+    title_str   = "Pixel Pearson r — SPI (scales 1, 2, 3)")
   
-  # ── 5. Assemble figure ────────────────────────────────────────────────────
-  # Top block : 2x3 Pearson r maps  (Row 1: SPEI PM, Row 2: SPI)
-  # Bottom row: 2 density panels side by side
+  ## 5. Assemble figure ────────────────────────────────────────────────────
   top_plots <- c(spei_plots, spi_plots)
-  # Replace any NULL with blank placeholder
   top_plots <- lapply(top_plots, function(p) {
     if (is.null(p))
       ggplot2::ggplot() + ggplot2::theme_void()
     else p
   })
   
-  fig_maps <- patchwork::wrap_plots(top_plots, nrow = 2, ncol = 3,
-                                    guides = "collect") &
-    ggplot2::theme(legend.position = "right")
+  ## Ensure NO legends on map panels (override any defaults)
+  fig_maps <- patchwork::wrap_plots(top_plots, nrow = 2, ncol = 3) &
+    ggplot2::theme(legend.position = "none")
   
+  ## Density panels keep their legends
   fig_dens <- (pc_pm | pl_spi) +
     patchwork::plot_layout(guides = "keep")
   
-  fig4c <- fig_maps / fig_dens +
-    patchwork::plot_layout(heights = c(2, 1)) +
+  ## Combine: maps (no legends) + density plots (with their legends)
+  fig4c  <- fig_maps / fig_dens +
+    patchwork::plot_layout(heights = c(2, 0.7)) +
     patchwork::plot_annotation(
-      title    = paste0(
-        "Pixel-to-basin-mean Pearson r \u2014 SPEI 1,2,3 (PM \u0026 Thw)",
-        " + SPI 1,2,3 \u2014 Nechako River Basin"),
-      subtitle = paste0(
-        "Rows 1\u20132: SPEI Pearson r maps (Penman-Monteith / Thornthwaite PET).",
-        "  Row 3: SPI Pearson r maps.  Colour palette: Blues (SPEI), Greens (SPI).\n",
-        "Bottom row: SPI-3 pixel drought frequency (j), annual cross-pixel IQR (k),",
-        " and pixel r-density for SPI-1/2/3 (l)."),
+      title    = "Pixel-to-basin-mean Pearson r — SPEI 1,2,3 + SPI 1,2,3 — Nechako River Basin",
       theme = ggplot2::theme(
-        plot.title    = ggplot2::element_text(size = 10, face = "bold", hjust = 0.5),
-        plot.subtitle = ggplot2::element_text(size = 8.5, colour = "grey30", hjust = 0,
-                                              margin = ggplot2::margin(b = 6))))
+        plot.title    = ggplot2::element_text(size = 12, face = "bold", hjust = 0.5,
+                                              margin = ggplot2::margin(b = 4)),
+        plot.subtitle = ggplot2::element_blank(),
+        legend.position = "bottom",
+        legend.text     = ggplot2::element_text(size = 10),
+        legend.key.size = ggplot2::unit(0.45, "cm")))
   
+  ## Save with Climate Dynamics specs
   for (ext in c("pdf", "png")) {
-    out_f <- file.path(BASIN_PLOT_DIR,
-                       paste0("Fig4c_Pearson_r_SPEI_PM_SPI.", ext))
+    out_f   <- file.path(BASIN_PLOT_DIR,
+                         paste0("Fig4c_Pearson_r_SPEI_PM_SPI.", ext))
     tryCatch(
       ggplot2::ggsave(out_f, fig4c,
-                      width  = 14, height = 13, units = "in",
-                      dpi    = if (ext == "png") 300 else "print",
-                      device = ext),
-      error = function(e) cat(sprintf("  \u26a0 %s: %s\n", ext, e$message)))
-    cat(sprintf("  \u2713 Saved: %s\n", basename(out_f)))
+                      width  = 6.85,
+                      height = 9.21,
+                      units  = "in",
+                      dpi    = if (ext == "png") 600 else "print",
+                      device = ext,
+                      limitsize = FALSE),
+      error = function(e) cat(sprintf("  ⚠ %s: %s\n", ext, e$message)))
+    cat(sprintf("  ✓ Saved: %s\n", basename(out_f)))
   }
   
-  # Console summary
+  ## Console summary
   cat("\n  Representativeness summary:\n")
-  cat(sprintf("  %-14s  median_r  pct_r\u226580\n", "Combination"))
-  cat("  ", paste(rep("-", 38), collapse = ""), "\n", sep = "")
+  cat(sprintf("  %-14s  median_r  pct_r≥80\n", "Combination"))
+  cat("    ", paste(rep("-", 38), collapse = ""), "\n", sep = "")
   for (k in seq_along(spei_scales)) {
-    rv <- spei_r_list[[k]]
+    rv   <- spei_r_list[[k]]
     if (is.null(rv)) next
     cat(sprintf("  SPEI-PM-%d       %.3f    %.0f%%\n",
                 spei_scales[k], median(rv, na.rm=TRUE),
-                100*mean(rv >= 0.80, na.rm=TRUE)))
+                100 * mean(rv >= 0.80, na.rm=TRUE)))
   }
   for (k in seq_along(spi_scales)) {
-    rv <- spi_r_list[[k]]
+    rv   <- spi_r_list[[k]]
     if (is.null(rv)) next
     cat(sprintf("  SPI-%d           %.3f    %.0f%%\n",
                 spi_scales[k], median(rv, na.rm=TRUE),
-                100*mean(rv >= 0.80, na.rm=TRUE)))
+                100 * mean(rv >= 0.80, na.rm=TRUE)))
   }
-  
 }, error = function(e) {
   if (!identical(conditionMessage(e), "no_data"))
-    cat(sprintf("  \u26a0 Part 4c failed: %s\n", e$message))
+    cat(sprintf("  ⚠ Part 4c failed: %s\n", e$message))
 })
-
 
 ################################################################################
 # PART 4d – SEASONALITY FIGURE  (P vs PET(PM) — 12 monthly means)
@@ -1090,9 +1246,9 @@ tryCatch({
 #
 # OUTPUT  FigS_Seasonality_P_PET.pdf + .png  in BASIN_PLOT_DIR
 ################################################################################
-cat("\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n")
-cat("PART 4d: Seasonality figure \u2014 P vs PET(PM) (12 monthly means)\n")
-cat("\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n")
+cat("\n═══════════════════════════════════════════════════════════════════\n")
+cat("PART 4d: Seasonality figure — P vs PET(PM) (12 monthly means)\n")
+cat("═══════════════════════════════════════════════════════════════════\n")
 
 tryCatch({
   
@@ -1104,7 +1260,7 @@ tryCatch({
   if (!file.exists(PRECIP_NC_4d))
     stop(sprintf("Precip NetCDF not found: %s", PRECIP_NC_4d))
   if (!file.exists(PET_SEAS_CSV)) {
-    cat(sprintf("  \u26a0 PET CSV not found: %s\n", PET_SEAS_CSV))
+    cat(sprintf("  ⚠ PET CSV not found: %s\n", PET_SEAS_CSV))
     cat("    Run 2preq_PET_ERALand.R first, then re-run this script.\n")
     stop("pet_csv_missing_4d")
   }
@@ -1143,10 +1299,110 @@ tryCatch({
   pr_r <- terra::mask(pr_r, basin_4d)
   
   # days_in_month from actual dates
+  # days_in_month from actual dates
   fom_4d  <- as.Date(format(pr_dates, "%Y-%m-01"))
   fnm_4d  <- seq(fom_4d[1], by = "month", length.out = length(pr_dates) + 1)[-1]
   dim_4d  <- as.integer(fnm_4d - fom_4d)
-  pr_r    <- pr_r * dim_4d * 1000   # mm month⁻¹
+  
+  # ── PRECIPITATION UNIT CHECK (mirrors 1SPI_ERALand.R / 3SPEI_ERALand.R) ──────
+  # ERA5-Land "tp" from CDS:
+  #   "monthly averaged reanalysis" = mean daily rate → m/day  (raw, needs *1000 then *days)
+  #   "monthly aggregated"          = monthly total   → m/month (needs *1000 only)
+  #   Already-converted             = mm/day          (needs *days only)
+  #   Already-converted + totalled  = mm/month        (needs nothing)
+  #
+  # Decision thresholds on RAW July basin-mean:
+  #   < 0.005   → m/day    → multiply by days_in_month AND 1000   (→ mm/month)
+  #   0.005–20  → mm/day   → multiply by days_in_month ONLY        (→ mm/month)
+  #   20–500    → mm/month → DO NOT multiply (already monthly total)
+  #   > 500     → unknown unit error
+  #
+  # NOTE: the old threshold was ≤1 for mm/day, but ERA5-Land July basin means
+  # can exceed 1 mm/day (Nechako July ≈ 1.6 mm/day).  Raised to ≤20 mm/day
+  # to avoid mis-classifying valid mm/day values as mm/month.
+  # ─────────────────────────────────────────────────────────────────────────────
+  july_idx_4d <- which(as.integer(format(pr_dates, "%m")) == 7L)[1L]
+  
+  if (!is.na(july_idx_4d)) {
+    raw_july_vals <- terra::values(pr_r[[july_idx_4d]], mat = FALSE)
+    raw_july_vals <- raw_july_vals[is.finite(raw_july_vals)]
+    raw_mean_p    <- mean(raw_july_vals, na.rm = TRUE)
+    
+    cat(sprintf(
+      "\n── w2 Part 4d PRECIPITATION UNIT CHECK (July layer %d, BEFORE conversion) ──\n",
+      july_idx_4d))
+    cat(sprintf("  Raw Min  : %12.6f\n", min(raw_july_vals)))
+    cat(sprintf("  Raw Mean : %12.6f\n", raw_mean_p))
+    cat(sprintf("  Raw Max  : %12.6f\n", max(raw_july_vals)))
+    cat("  ── Thresholds ──────────────────────────────────────────────────────\n")
+    cat("  < 0.005        → m/day        → apply * days_in_month * 1000\n")
+    cat("  0.005 to 20    → mm/day       → apply * days_in_month  (NO *1000)\n")
+    cat("  20 to 500      → mm/month     → apply * 1              (NO further scaling)\n")
+    cat("  > 500          → already large; check source carefully\n")
+    cat("  ─────────────────────────────────────────────────────────────────────\n")
+    
+    if (raw_mean_p < 0.005) {
+      precip_unit_4d  <- "m/day"
+      precip_scale_4d <- dim_4d * 1000          # → mm/month
+      cat(sprintf(
+        "  ✓ DETECTED: m/day  →  applying * days_in_month * 1000 (→ mm/month)\n"))
+      cat(sprintf(
+        "  Expected July result: ~%.0f mm/month\n", raw_mean_p * 31 * 1000))
+      
+    } else if (raw_mean_p <= 20) {
+      precip_unit_4d  <- "mm/day"
+      precip_scale_4d <- dim_4d * 1            # → mm/month  (no *1000)
+      cat(sprintf(
+        "  ✓ DETECTED: mm/day →  applying * days_in_month ONLY (→ mm/month)\n"))
+      cat(sprintf(
+        "  Expected July result: ~%.0f mm/month\n", raw_mean_p * 31))
+      cat("  ⚠  NOTE: old w2 line was  pr_r * dim_4d * 1000  — that would be WRONG here.\n")
+      
+    } else if (raw_mean_p <= 500) {
+      precip_unit_4d  <- "mm/month"
+      precip_scale_4d <- rep(1L, length(dim_4d))   # no scaling
+      cat(sprintf(
+        "  ✓ DETECTED: mm/month → NO further scaling applied\n"))
+      cat("  ⚠  NOTE: applying * days_in_month * 1000 here would produce ~1000x inflated values.\n")
+      
+    } else {
+      precip_unit_4d  <- "UNKNOWN (>500)"
+      precip_scale_4d <- rep(1L, length(dim_4d))
+      cat(sprintf(
+        "  ✗ ERROR: raw mean = %.1f — unit unrecognised. No scaling applied.\n",
+        raw_mean_p))
+      cat("    Check your NetCDF source before continuing.\n")
+      warning(sprintf(
+        "[w2 Part 4d] Precipitation unit unrecognised (July mean = %.1f). Manual check required.",
+        raw_mean_p))
+    }
+    
+    # Post-conversion sanity check threshold (July should be 20–200 mm/month for Nechako)
+    expected_after <- raw_mean_p * mean(precip_scale_4d[as.integer(format(pr_dates, "%m")) == 7])
+    cat(sprintf(
+      "  Post-conversion July estimate: ~%.1f mm/month\n", expected_after))
+    if (expected_after < 5 || expected_after > 500) {
+      warning(sprintf(
+        "[w2 Part 4d] Post-conversion July precipitation (%.1f mm/month) is outside the\n",
+        expected_after),
+        "  expected range 5–500 mm/month for Nechako. Re-check unit conversion.")
+      cat(sprintf(
+        "  ✗ WARNING: %.1f mm/month is outside the expected range [5, 500] — review conversion!\n",
+        expected_after))
+    } else {
+      cat(sprintf(
+        "  ✓ Post-conversion value looks physically reasonable (5–500 mm/month range).\n"))
+    }
+    cat(sprintf("  Detected unit: %s\n", precip_unit_4d))
+    cat("────────────────────────────────────────────────────────────────────────\n\n")
+    
+  } else {
+    cat("  ⚠ w2 Part 4d: Could not find a July layer — defaulting to * dim_4d * 1000.\n")
+    precip_scale_4d <- dim_4d * 1000
+  }
+  
+  # Apply the auto-detected conversion
+  pr_r <- pr_r * precip_scale_4d   # → mm/month (scale factor chosen above)
   
   # Basin mean per layer
   pr_vals <- terra::global(pr_r, "mean", na.rm = TRUE)$mean
@@ -1188,8 +1444,8 @@ tryCatch({
   ai      <- round(ann_PET / ann_P, 2)
   nyrs    <- cm_prec_4d$n_yrs[1]
   
-  cat(sprintf("  Precip  : %d yrs, mean annual = %d mm yr\u207b\u00b9\n", nyrs, ann_P))
-  cat(sprintf("  PET(PM) : %d yrs, mean annual = %d mm yr\u207b\u00b9\n",
+  cat(sprintf("  Precip  : %d yrs, mean annual = %d mm yr⁻¹\n", nyrs, ann_P))
+  cat(sprintf("  PET(PM) : %d yrs, mean annual = %d mm yr⁻¹\n",
               cm_pet_4d$n_yrs[1], ann_PET))
   cat(sprintf("  Aridity index (PET/P) = %.2f\n", ai))
   
@@ -1218,7 +1474,7 @@ tryCatch({
     ggplot2::labs(
       title    = "(a)  Mean monthly precipitation and PET(PM)",
       subtitle = paste0(
-        nyrs, "-year mean (1950\u20132025)  |  Error bars = \u00b11 SD  |  ",
+        nyrs, "-year mean (1950–2025)  |  Error bars = ±1 SD  |  ",
         "Annual totals:  P = ", ann_P, " mm;  PET(PM) = ", ann_PET, " mm"),
       x = NULL) +
     ggplot2::theme_classic(base_size = 9.5) +
@@ -1268,7 +1524,7 @@ tryCatch({
                       label = "PET deficit", colour = COL_PET_4d,
                       size = 3.0, fontface = "italic") +
     ggplot2::labs(
-      title    = "(b)  Climatic water balance  P \u2212 PET(PM)",
+      title    = "(b)  Climatic water balance  P − PET(PM)",
       subtitle = "Blue = monthly surplus (P > PET);  red = monthly deficit (PET > P)",
       x        = "Calendar month") +
     ggplot2::theme_classic(base_size = 9.5) +
@@ -1284,10 +1540,10 @@ tryCatch({
   fig_seas_4d <- p4d_a / p4d_b +
     patchwork::plot_annotation(
       title    = paste0(
-        "Nechako River Basin \u2014 Seasonal cycle of precipitation ",
+        "Nechako River Basin — Seasonal cycle of precipitation ",
         "and PET(PM)"),
       subtitle = paste0(
-        "Each bar = mean of ", nyrs, " years (1950\u20132025).  ",
+        "Each bar = mean of ", nyrs, " years (1950–2025).  ",
         "Annual totals: P = ", ann_P, " mm;  PET(PM) = ", ann_PET, " mm;  ",
         "aridity index (PET/P) = ", ai, "."),
       theme = ggplot2::theme(
@@ -1306,13 +1562,13 @@ tryCatch({
                       units  = "in",
                       dpi    = if (ext == "png") 300 else "print",
                       device = ext),
-      error = function(e) cat(sprintf("  \u26a0 %s: %s\n", ext, e$message)))
-    cat(sprintf("  \u2713 Saved: %s\n", basename(out_seas)))
+      error = function(e) cat(sprintf("  ⚠ %s: %s\n", ext, e$message)))
+    cat(sprintf("  ✓ Saved: %s\n", basename(out_seas)))
   }
   
 }, error = function(e) {
   if (!identical(conditionMessage(e), "pet_csv_missing_4d"))
-    cat(sprintf("  \u26a0 Part 4d failed: %s\n", e$message))
+    cat(sprintf("  ⚠ Part 4d failed: %s\n", e$message))
 })
 
 ################################################################################
@@ -1333,8 +1589,8 @@ tryCatch({
 #   Fig2_MS_AllIndices_3x3.pdf/.png
 #       3 × 3 panel grid (the full Results Figure 2):
 #         Row 1: SPI-1,      SPI-2,      SPI-3
-#         Row 2: SPEIₚₘ-1,  SPEIₚₘ-2,  SPEIₚₘ-3
-#         Row 3: SPEI₀-1,   SPEI₀-2,   SPEI₀-3
+#         Row 2: SPEI-PM-1,  SPEI-PM-2,  SPEI-PM-3
+#         Row 3: SPEI-T-1,   SPEI-T-2,   SPEI-T-3
 #       Each panel produced by make_all_panel() below, a unified wrapper
 #       around the existing make_spei_panel_v2 / SPI data paths.
 #
@@ -1355,7 +1611,9 @@ cat("PART 4e: SPI-1/2/3 MS figure + 9-panel Results figure\n")
 cat("══════════════════════════════════════════════\n")
 
 # ── SPI per-month CSV directory (fallback path) ───────────────────────────────
-SPI_SEAS_DIR_4e <- file.path(WD_PATH, "spi_results_seasonal")
+# SPI_SEAS_DIR is already defined above (Part 4b block) as:
+#   file.path(WD_PATH, "spi_results_seasonal")
+SPI_SEAS_DIR_4e <- SPI_SEAS_DIR
 
 # ── Shared panel constants (mirror Part 4b) ────────────────────────────────────
 THR_EVENT_4e       <- -0.5
@@ -1390,16 +1648,29 @@ load_spi_seasonal_csvs <- function(scale, seas_dir = SPI_SEAS_DIR_4e) {
       df      <- data.table::fread(csv_file, data.table = FALSE)
       yr_cols <- setdiff(names(df), c("lon", "lat"))
       yr_cols <- yr_cols[grepl("^[0-9]{4}$", yr_cols)]
-      if (!length(yr_cols)) return(NULL)
+      if (!length(yr_cols)) next   # skip this month; don't abort the whole function
       yrs_int <- as.integer(yr_cols)
-      vals    <- colMeans(df[, yr_cols, drop = FALSE], na.rm = TRUE)
+      # Area-weighted basin mean (same logic as load_spei_seasonal_csvs):
+      # cos(lat) weighting for geographic coords; plain mean for equal-area projected.
+      mat_yr  <- as.matrix(df[, yr_cols, drop = FALSE])
+      is_geo  <- max(abs(df$lon), na.rm = TRUE) <= 200
+      if (is_geo) {
+        w    <- cos(df$lat * pi / 180)
+        vals <- apply(mat_yr, 2, function(x) {
+          ok <- is.finite(x)
+          if (!any(ok)) return(NA_real_)
+          sum(x[ok] * w[ok]) / sum(w[ok])
+        })
+      } else {
+        vals <- colMeans(mat_yr, na.rm = TRUE)
+      }
       vals[is.nan(vals)] <- NA_real_
       month_rows[[m]] <- data.frame(
         date  = as.Date(paste(yrs_int, m, "01", sep = "-")),
         value = as.numeric(vals),
         stringsAsFactors = FALSE)
     }, error = function(e)
-      cat(sprintf("    \u26a0 Could not read %s: %s\n",
+      cat(sprintf("    ⚠ Could not read %s: %s\n",
                   basename(csv_file), e$message)))
   }
   valid <- Filter(Negate(is.null), month_rows)
@@ -1441,13 +1712,13 @@ make_all_panel <- function(sc, panel_lab,
       df <- tryCatch(load_spei_seasonal_csvs(sc, SPEI_PM_DIR),
                      error = function(e) NULL)
     col_line  <- "#1f77b4"
-    pet_label <- sprintf("SPEI\u209a\u2098-%d  (Penman-Monteith)", sc)
+    pet_label <- sprintf("SPEI-PM-%d  (Penman-Monteith)", sc)
     
   } else {  # spei_thw
     df <- tryCatch(load_spei_seasonal_csvs(sc, SPEI_THW_DIR),
                    error = function(e) NULL)
     col_line  <- "#d62728"
-    pet_label <- sprintf("SPEI\u2080-%d  (Thornthwaite)", sc)
+    pet_label <- sprintf("SPEI-T-%d  (Thornthwaite)", sc)
   }
   
   if (is.null(df) || !nrow(df))
@@ -1505,11 +1776,11 @@ make_all_panel <- function(sc, panel_lab,
                       hjust = 0, vjust = 1, colour = "grey10") +
     ggplot2::annotate("text",
                       x = as.Date("1951-01-01"), y = THR_EVENT_4e + 0.08,
-                      label = "x\u2080 = \u22120.5", size = 2.4,
+                      label = "x₀ = −0.5", size = 2.4,
                       hjust = 0, colour = "grey30") +
     ggplot2::annotate("text",
                       x = HIGHLIGHT_START_4e + 365, y = yhi * 0.97,
-                      label = "2022\u20132025", size = 2.4, hjust = 0.5,
+                      label = "2022–2025", size = 2.4, hjust = 0.5,
                       colour = "grey30", fontface = "italic") +
     ggplot2::scale_x_date(
       date_breaks = "10 years", date_labels = "%Y",
@@ -1550,7 +1821,7 @@ make_all_panel <- function(sc, panel_lab,
                         colour = "#d73027", linewidth = 0.6) +
       ggplot2::annotate("text",
                         x = as.Date("2024-06-01"), y = -0.35,
-                        label = "Persistent below \u22120.5",
+                        label = "Persistent below −0.5",
                         size = 2.3, hjust = 0.5,
                         colour = "#d73027", fontface = "italic")
   }
@@ -1579,18 +1850,18 @@ save_3panel_fig <- function(panels, title_str, subtitle_str, base_name) {
       ggplot2::ggsave(out, fig, width = 7.0, height = 9.0, units = "in",
                       dpi = if (ext == "png") 300 else "print",
                       device = ext),
-      error = function(e) cat(sprintf("  \u26a0 %s: %s\n", ext, e$message)))
-    cat(sprintf("  \u2713 Saved: %s\n", basename(out)))
+      error = function(e) cat(sprintf("  ⚠ %s: %s\n", ext, e$message)))
+    cat(sprintf("  ✓ Saved: %s\n", basename(out)))
   }
   invisible(fig)
 }
 
 common_subtitle_4e <- paste0(
   "Fill: drought category  |  ",
-  "Dashed: event threshold (x\u2080 = \u22120.5)  |  ",
-  "Dotted: moderate drought (\u22121.0)  |  ",
-  "Grey band: 2022\u20132025  |  ",
-  "Red segment: persistent sub-threshold anomaly 2023\u20132025 (scale-3 panel)")
+  "Dashed: event threshold (x₀ = −0.5)  |  ",
+  "Dotted: moderate drought (−1.0)  |  ",
+  "Grey band: 2022–2025  |  ",
+  "Red segment: persistent sub-threshold anomaly 2023–2025 (scale-3 panel)")
 
 # ── Figure A: SPI-1 / SPI-2 / SPI-3 ──────────────────────────────────────────
 tryCatch({
@@ -1602,18 +1873,18 @@ tryCatch({
   )
   save_3panel_fig(
     spi_panels,
-    "Basin-averaged SPI (precipitation only) \u2014 Nechako River Basin (1950\u20132025)",
+    "Basin-averaged SPI (precipitation only) — Nechako River Basin (1950–2025)",
     common_subtitle_4e,
     "Fig4e_MS_SPI_123_timeseries")
-  cat("  \u2713 SPI-1/2/3 figure complete\n")
-}, error = function(e) cat(sprintf("  \u26a0 SPI-1/2/3 figure failed: %s\n", e$message)))
+  cat("  ✓ SPI-1/2/3 figure complete\n")
+}, error = function(e) cat(sprintf("  ⚠ SPI-1/2/3 figure failed: %s\n", e$message)))
 
 # ── Figure B: 9-panel comprehensive Results figure ────────────────────────────
 #
 #  Layout (3 rows × 3 columns, reading order):
 #    Row 1: SPI-1       SPI-2       SPI-3        (green lines)
-#    Row 2: SPEIₚₘ-1   SPEIₚₘ-2   SPEIₚₘ-3    (blue lines)
-#    Row 3: SPEI₀-1    SPEI₀-2    SPEI₀-3      (red lines)
+#    Row 2: SPEI-PM-1   SPEI-PM-2   SPEI-PM-3    (blue lines)
+#    Row 3: SPEI-T-1    SPEI-T-2    SPEI-T-3      (red lines)
 #  Panel labels: (a)–(i)
 tryCatch({
   cat("  Building 9-panel combined Results figure...\n")
@@ -1633,7 +1904,7 @@ tryCatch({
                      show_xlab  = last_row,
                      is_first   = (k == 1L)),
       error = function(e) {
-        cat(sprintf("    \u26a0 Panel %s failed: %s\n", label_grid[k], e$message))
+        cat(sprintf("    ⚠ Panel %s failed: %s\n", label_grid[k], e$message))
         ggplot2::ggplot() +
           ggplot2::annotate("text", x = 0.5, y = 0.5,
                             label = sprintf("No data\n%s", label_grid[k]),
@@ -1646,9 +1917,9 @@ tryCatch({
                                  guides = "collect") +
     patchwork::plot_annotation(
       title    = paste0(
-        "Basin-averaged drought indices \u2014 Nechako River Basin (1950\u20132025)\n",
-        "SPI (row 1)  |  SPEI\u209a\u2098 / Penman-Monteith (row 2)  |  ",
-        "SPEI\u2080 / Thornthwaite (row 3)"),
+        "Basin-averaged drought indices — Nechako River Basin (1950–2025)\n",
+        "SPI (row 1)  |  SPEI-PM / Penman-Monteith (row 2)  |  ",
+        "SPEI-T / Thornthwaite (row 3)"),
       subtitle = paste0(
         "Columns: 1-month, 2-month, 3-month accumulation scales.  ",
         common_subtitle_4e),
@@ -1671,13 +1942,13 @@ tryCatch({
                       width  = 16, height = 13, units = "in",
                       dpi    = if (ext == "png") 300 else "print",
                       device = ext),
-      error = function(e) cat(sprintf("  \u26a0 %s: %s\n", ext, e$message)))
-    cat(sprintf("  \u2713 Saved: %s\n", basename(out_9)))
+      error = function(e) cat(sprintf("  ⚠ %s: %s\n", ext, e$message)))
+    cat(sprintf("  ✓ Saved: %s\n", basename(out_9)))
   }
-  cat("  \u2713 9-panel combined figure complete\n")
-}, error = function(e) cat(sprintf("  \u26a0 9-panel figure failed: %s\n", e$message)))
+  cat("  ✓ 9-panel combined figure complete\n")
+}, error = function(e) cat(sprintf("  ⚠ 9-panel figure failed: %s\n", e$message)))
 
-cat("\n\u2550\u2550 PART 4e complete \u2550\u2550\n")
+cat("\n══ PART 4e complete ══\n")
 
 ################################################################################
 # PART 5 – EXCEL SUMMARY (statistics + drought event counts + correlations)
@@ -1714,7 +1985,8 @@ export_basin_excel <- function(output_file) {
   ## ── Sheet 1: Summary Statistics ─────────────────────────────────────────────
   stats_rows <- list()
   for (idx in c("spi", "spei")) {
-    for (sc in SPI_SCALES) {
+    scales <- if (idx == "spi") SPI_SCALES else SPEI_SCALES
+    for (sc in scales) {
       r <- tryCatch(make_stats_row(idx, sc),
                     error = function(e) {
                       cat(sprintf("  ⚠ Stats %s-%02d: %s\n",
@@ -1806,6 +2078,7 @@ export_basin_excel(excel_out)
 cat("\n╔══════════════════════════════════════════════╗\n")
 cat("║  w2_basin_timeseries.R  DONE                 ║\n")
 cat("╚══════════════════════════════════════════════╝\n\n")
+
 cat("Outputs:\n")
 cat("  Per-index flat CSVs   : ", normalizePath(BASIN_TS_DIR),   "\n")
 cat("  Combined long CSV     : ", normalizePath(BASIN_PLOT_DIR),  "\n")

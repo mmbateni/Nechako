@@ -380,7 +380,7 @@ years  <- as.integer(format(dates, "%Y"))
 months <- as.integer(format(dates, "%m"))
 
 # ── Unit conversions ─────────────────────────────────────────────────────────────
-precip_full <- precip_full * 1000    # m → mm/day
+precip_full <- precip_full * 1    # mm→ mm/day
 month_days_base  <- c(31,28,31,30,31,30,31,31,30,31,30,31)
 is_leap <- function(yr) (yr%%4==0) & (yr%%100!=0 | yr%%400==0)
 days_in_month <- month_days_base[months]

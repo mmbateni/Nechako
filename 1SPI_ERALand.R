@@ -68,6 +68,44 @@ if (length(dates) != nlyr(full_raster)) stop("Time mismatch")
 precip <- full_raster
 terra::time(precip) <- dates
 
+# ── PRECIPITATION UNIT VERIFICATION  ─────────
+# ERA5-Land "tp" from CDS monthly averaged reanalysis = mean daily rate (m/day).
+# Standard preprocessing converts to mm/day (*1000).
+# Expected summer (July) basin range for Nechako: ~1 to 4 mm/day.
+# If values are ~0.001-0.004 -> still in m/day (need *1000)
+# If values are ~30-120      -> already mm/month total (do NOT multiply by days again)
+
+precip_dates_raw <- as.Date(time(precip))
+if (is.null(precip_dates_raw) || all(is.na(precip_dates_raw))) {
+  precip_dates_raw <- seq(as.Date("1950-01-01"), by = "month", length.out = nlyr(precip))
+}
+july_idx_p <- which(as.integer(format(precip_dates_raw, "%m")) == 7)[1]
+
+if (!is.na(july_idx_p)) {
+  precip_july      <- precip[[july_idx_p]]
+  precip_july_vals <- values(precip_july, mat = FALSE)
+  precip_july_vals <- precip_july_vals[is.finite(precip_july_vals)]
+  mean_p           <- mean(precip_july_vals, na.rm = TRUE)
+  
+  cat(sprintf("\n── PRECIPITATION UNIT CHECK (July layer %d) ────────────────\n", july_idx_p))
+  cat(sprintf("  Min  : %10.4f\n", min(precip_july_vals)))
+  cat(sprintf("  Mean : %10.4f\n", mean_p))
+  cat(sprintf("  Max  : %10.4f\n", max(precip_july_vals)))
+  cat("  Expected if mm/day   : ~0.5 to 5\n")
+  cat("  Expected if m/day    : ~0.0005 to 0.005  → multiply by 1000\n")
+  cat("  Expected if mm/month : ~15 to 150         → do NOT multiply by days again\n")
+  
+  if (mean_p < 0.01) {
+    cat("  ⚠ WARNING: Precip appears to be in m/day — add: precip <- precip * 1000\n")
+  } else if (mean_p > 20) {
+    cat("  ⚠ WARNING: Precip appears to be in mm/month — days_in_month multiplication will double-count\n")
+  } else {
+    cat("  ✓ Precip units look consistent with mm/day\n")
+  }
+  cat("────────────────────────────────────────────────────\n\n")
+} else {
+  cat("  ⚠ Could not find a July layer in Precip raster — check time axis\n")
+}
 # ---- Reproject to BC Albers ----
 target_crs <- "EPSG:3005"
 
@@ -101,8 +139,8 @@ days_in_month <- as.integer(first_next_month - first_of_month)
 precip <- precip * days_in_month
 cat("✓ Days-in-month scaling applied\n")
 
-# ---- Units: m → mm ----
-precip <- precip * 1000
+# ---- Units: mm → mm ----
+precip <- precip * 1
 cat(sprintf("Example mean (layer 1): %.2f mm/month\n", global(precip[[1]], "mean", na.rm = TRUE)$mean))
 
 # ---- Prepare matrix ----
