@@ -358,11 +358,7 @@ MONTH_NAMES_3 <- c("Jan","Feb","Mar","Apr","May","Jun",
 # computes an area-weighted basin mean from non-NA pixel values.
 # Returns data.frame(date, value) in chronological order, or NULL on failure.
 load_spei_seasonal_csvs <- function(scale, seas_dir) {
-  
-  if (!dir.exists(seas_dir)) {
-    cat(sprintf("    [load_spei_seasonal_csvs] Directory not found: %s\n", seas_dir))
-    return(NULL)
-  }
+  if (!dir.exists(seas_dir)) return(NULL)
   
   month_rows <- vector("list", 12L)
   
@@ -373,42 +369,34 @@ load_spei_seasonal_csvs <- function(scale, seas_dir) {
     )
     if (!file.exists(csv_file)) next
     
-    tryCatch({
-      df <- data.table::fread(csv_file, data.table = FALSE)
-      
-      # Columns: lon, lat, then one column per year (e.g. "1950", "1951", …)
-      year_cols <- setdiff(names(df), c("lon", "lat"))
-      year_cols <- year_cols[grepl("^[0-9]{4}$", year_cols)]
-      if (!length(year_cols)) next   # skip this month; don't abort the whole function
-      
-      years_int <- as.integer(year_cols)
-      
-      # Area-weighted basin mean.
-      # • Geographic coords (degrees, max|lon| ≤ 200): weight each pixel by
-      #   cos(lat) — exact for a regular lat/lon grid on a sphere.
-      # • Equal-area projected coords (metres, max|lon| > 200): all pixels
-      #   carry the same area, so a simple column mean is correct.
-      mat_yr <- as.matrix(df[, year_cols, drop = FALSE])
-      is_geo <- max(abs(df$lon), na.rm = TRUE) <= 200
-      if (is_geo) {
-        w <- cos(df$lat * pi / 180)
-        vals <- apply(mat_yr, 2, function(x) {
-          ok <- is.finite(x)
-          if (!any(ok)) return(NA_real_)
-          sum(x[ok] * w[ok]) / sum(w[ok])
-        })
-      } else {
-        vals <- colMeans(mat_yr, na.rm = TRUE)
-      }
-      vals[is.nan(vals)] <- NA_real_
-      
-      month_rows[[m]] <- data.frame(
-        date  = as.Date(paste(years_int, m, "01", sep = "-")),
-        value = as.numeric(vals),
-        stringsAsFactors = FALSE
-      )
-    }, error = function(e)
-      cat(sprintf("    ⚠ Could not read %s: %s\n", basename(csv_file), e$message)))
+    df <- tryCatch(data.table::fread(csv_file, data.table = FALSE), error = function(e) NULL)
+    if (is.null(df)) next
+    
+    yr_cols <- setdiff(names(df), c("lon", "lat"))
+    yr_cols <- yr_cols[grepl("^[0-9]{4}$", yr_cols)]
+    if (!length(yr_cols)) next
+    
+    mat_yr <- as.matrix(df[, yr_cols, drop = FALSE])
+    is_geo <- max(abs(df$lon), na.rm = TRUE) <= 200
+    
+    vals <- if (is_geo) {
+      w <- cos(df$lat * pi / 180)
+      apply(mat_yr, 2, function(x) {
+        ok <- is.finite(x)
+        if (!any(ok)) return(NA_real_)
+        sum(x[ok] * w[ok]) / sum(w[ok])
+      })
+    } else {
+      colMeans(mat_yr, na.rm = TRUE)
+    }
+    
+    vals[is.nan(vals)] <- NA_real_
+    
+    month_rows[[m]] <- data.frame(
+      date = as.Date(sprintf("%s-%02d-01", yr_cols, m)),
+      value = as.numeric(vals),
+      stringsAsFactors = FALSE
+    )
   }
   
   valid <- Filter(Negate(is.null), month_rows)
@@ -416,10 +404,11 @@ load_spei_seasonal_csvs <- function(scale, seas_dir) {
   
   out <- do.call(rbind, valid)
   out <- out[order(out$date), ]
-  out <- out[!is.na(out$value) & is.finite(out$value), ]
+  out <- out[is.finite(out$value) & !is.na(out$value), ]
   rownames(out) <- NULL
   out
 }
+
 
 # ── Shared panel constants ──────────────────────────────────────────────────────
 THR_EVENT       <- -0.5
@@ -830,309 +819,460 @@ detect_basin_sf <- function(coords_df, target_crs = "EPSG:3005") {
 ## Helper: build one Pearson r map panel ────────────────────────────────
 ## Transform coordinates to WGS84 (degrees) using terra::crds()
 transform_coords_to_degrees <- function(coords_df) {
-  # Check if coordinates appear to be projected (large values > 200)
-  is_proj <- max(abs(coords_df$lon), na.rm = TRUE) > 200
-  
-  if (is_proj && requireNamespace("terra", quietly = TRUE)) {
-    tryCatch({
-      src_crs <- terra::crs(basin_proj)
-      v      <- terra::vect(coords_df, geom = c("lon", "lat"), crs = src_crs)
-      v_4326 <- terra::project(v, "EPSG:4326")
-      crds   <- terra::crds(v_4326)
-      return(data.frame(lon = crds[, "x"], lat = crds[, "y"]))
-    }, error = function(e) {
-      cat(sprintf("  ⚠ Coordinate transformation failed: %s\n", e$message))
-      return(coords_df)
-    })
+  # If coordinates are already geographic (degrees), return as-is
+  if (max(abs(coords_df$lon), na.rm = TRUE) <= 200) {
+    return(data.frame(lon = coords_df$lon, lat = coords_df$lat))
   }
-  return(coords_df)
+  # Otherwise they are in BC Albers (EPSG:3005) — project to WGS84
+  v      <- terra::vect(coords_df, geom = c("lon", "lat"), crs = "EPSG:3005")
+  v_4326 <- terra::project(v, "EPSG:4326")
+  crds   <- terra::crds(v_4326)
+  data.frame(lon = crds[, 1], lat = crds[, 2])
 }
-
-make_map_panel <- function(r_v, coords, basin_sf, title_str, subtitle_str,
-                           palette = "Blues") {
-  ## 1. Transform pixel coordinates to degrees (WGS84)
-  lon_lat_df <- transform_coords_to_degrees(coords)
+#
+calc_r_fill_limits <- function(r_list, floor_to = 0.0, ceil_to = 1.0) {
+  vals <- unlist(r_list)
+  vals <- vals[is.finite(vals)]
   
-  ## 2. Create a terra raster from point data for reliable rendering
-  ##    This ensures a regular grid in WGS84
-  df_points <- data.frame(lon = lon_lat_df$lon, lat = lon_lat_df$lat, r = r_v)
-  df_points <- df_points[!is.na(df_points$r), ]
-  if (!nrow(df_points)) return(ggplot2::ggplot() + ggplot2::theme_void())
-  
-  ## Create SpatVector from points
-  v_points <- terra::vect(df_points, geom = c("lon", "lat"), crs = "EPSG:4326")
-  
-  ## Rasterize to a regular grid
-  ## Determine resolution from the point spacing
-  lon_u <- sort(unique(df_points$lon))
-  lat_u <- sort(unique(df_points$lat))
-  x_res <- if (length(lon_u) > 2) median(diff(lon_u)) else 0.1
-  y_res <- if (length(lat_u) > 2) median(diff(lat_u)) else 0.1
-  
-  ## Create raster template
-  r_template <- terra::rast(
-    xmin = min(df_points$lon) - x_res/2,
-    xmax = max(df_points$lon) + x_res/2,
-    ymin = min(df_points$lat) - y_res/2,
-    ymax = max(df_points$lat) + y_res/2,
-    resolution = c(x_res, y_res),
-    crs = "EPSG:4326"
-  )
-  
-  ## Rasterize points (nearest neighbor)
-  r_raster <- terra::rasterize(v_points, r_template, field = "r", method = "nearest")
-  
-  ## Convert raster to data frame for geom_raster
-  df_raster <- as.data.frame(r_raster, xy = TRUE, na.rm = TRUE)
-  names(df_raster) <- c("lon", "lat", "r")
-  
-  ## 3. Transform basin outline to WGS84 and create a proper group variable.
-  basin_df <- NULL
-  if (!is.null(basin_sf)) {
-    tryCatch({
-      basin_4326   <- sf::st_transform(basin_sf, "EPSG:4326")
-      basin_coords <- sf::st_coordinates(basin_4326)
-      basin_df     <- as.data.frame(basin_coords)
-      ## Build a unique group per ring × polygon combination
-      l2_col       <- if ("L2" %in% names(basin_df)) basin_df$L2 else rep(1L, nrow(basin_df))
-      basin_df$grp <- interaction(basin_df$L1, l2_col, drop = TRUE)
-    }, error = function(e) NULL)
+  if (!length(vals)) {
+    return(list(
+      limits = c(0.0, 1.0),
+      breaks = seq(0.0, 1.0, by = 0.1)
+    ))
   }
   
-  ## 4. Axis limits with small padding (3%)
-  x_lim <- range(df_raster$lon, na.rm = TRUE)
-  y_lim <- range(df_raster$lat, na.rm = TRUE)
-  x_pad <- diff(x_lim) * 0.03
-  y_pad <- diff(y_lim) * 0.03
+  r_min <- max(floor_to, floor(min(vals, na.rm = TRUE) * 10) / 10)
+  r_max <- min(ceil_to,  ceiling(max(vals, na.rm = TRUE) * 10) / 10)
   
-  ## 5. Correct aspect ratio for geographic (lon/lat) coordinates.
-  ##    FIXED: Account for both latitude distortion AND data range
-  mid_lat_rad <- mean(y_lim) * pi / 180
-  asp_ratio   <- diff(y_lim) / diff(x_lim) / cos(mid_lat_rad)
+  if (!is.finite(r_min) || !is.finite(r_max) || r_max <= r_min) {
+    r_min <- 0.0
+    r_max <- 1.0
+  }
   
-  ## 6. Colour scale
-  r_min <- max(0.40, floor(min(df_raster$r, na.rm = TRUE) * 10) / 10)
+  brks <- seq(r_min, r_max, by = 0.10)
+  if (length(brks) < 2L) brks <- c(r_min, r_max)
+  
+  list(limits = c(r_min, r_max), breaks = brks)
+}
+#
+make_map_panel <- function(r_v, coords, basin_sf, title_str, subtitle_str,
+                           palette = "Blues",
+                           snap_m = 1000,
+                           overfill = 1.01,
+                           show_legend = TRUE,
+                           legend_title = "Pearson r",
+                           fill_limits = NULL,
+                           fill_breaks = NULL) {
+  
+  df_points <- data.frame(
+    x = coords$lon,
+    y = coords$lat,
+    r = as.numeric(r_v)
+  )
+  df_points <- df_points[
+    is.finite(df_points$r) &
+      is.finite(df_points$x) &
+      is.finite(df_points$y), ]
+  
+  if (!nrow(df_points)) {
+    return(ggplot2::ggplot() + ggplot2::theme_void())
+  }
+  
+  df_points$x_r <- round(df_points$x / snap_m) * snap_m
+  df_points$y_r <- round(df_points$y / snap_m) * snap_m
+  
+  df_grid <- aggregate(r ~ x_r + y_r, data = df_points, FUN = mean)
+  
+  if (!nrow(df_grid)) {
+    return(ggplot2::ggplot() + ggplot2::theme_void())
+  }
+  
+  ux <- sort(unique(df_grid$x_r))
+  uy <- sort(unique(df_grid$y_r))
+  
+  dx <- if (length(ux) >= 2L) stats::median(diff(ux), na.rm = TRUE) else snap_m
+  dy <- if (length(uy) >= 2L) stats::median(diff(uy), na.rm = TRUE) else snap_m
+  
+  if (!is.finite(dx) || dx <= 0) dx <- snap_m
+  if (!is.finite(dy) || dy <= 0) dy <- snap_m
+  
+  x_lim <- range(df_grid$x_r, na.rm = TRUE)
+  y_lim <- range(df_grid$y_r, na.rm = TRUE)
+  
+  x_pad <- max(dx * 0.55, diff(x_lim) * 0.03)
+  y_pad <- max(dy * 0.55, diff(y_lim) * 0.03)
+  
+  # Shared limits/breaks across all comparable panels
+  if (is.null(fill_limits)) {
+    r_min <- max(0.0, floor(min(df_grid$r, na.rm = TRUE) * 10) / 10)
+    r_max <- min(1.0, ceiling(max(df_grid$r, na.rm = TRUE) * 10) / 10)
+    
+    if (!is.finite(r_min) || !is.finite(r_max) || r_max <= r_min) {
+      r_min <- 0.0
+      r_max <- 1.0
+    }
+    
+    fill_limits <- c(r_min, r_max)
+  }
+  
+  if (is.null(fill_breaks)) {
+    fill_breaks <- seq(fill_limits[1], fill_limits[2], by = 0.10)
+    if (length(fill_breaks) < 2L) fill_breaks <- fill_limits
+  }
+  
   if (palette == "Blues") {
-    col_low  <- "#c6dbef"  # Blues[2]
-    col_high <- "#08519c"  # Blues[9]
+    col_low  <- "#c6dbef"
+    col_high <- "#08519c"
   } else if (palette == "Greens") {
-    col_low  <- "#bae4bc"  # Greens[2]
-    col_high <- "#005824"  # Greens[9]
+    col_low  <- "#bae4bc"
+    col_high <- "#005824"
   } else {
     brewer_cols <- RColorBrewer::brewer.pal(9, palette)
     col_low  <- brewer_cols[2]
     col_high <- brewer_cols[9]
   }
   
-  ## 7. Build plot using geom_raster (not geom_tile)
-  p <- ggplot2::ggplot(df_raster, ggplot2::aes(x = lon, y = lat, fill = r)) +
-    ## Raster with guaranteed regular grid
-    ggplot2::geom_raster() +
-    ## Fill scale
+  ggplot2::ggplot(df_grid, ggplot2::aes(x = x_r, y = y_r, fill = r)) +
+    ggplot2::geom_raster(interpolate = FALSE) +
     ggplot2::scale_fill_gradient(
-      low    = col_low,
-      high   = col_high,
-      limits = c(r_min, 1),
-      name   = "Pearson r",
-      breaks = seq(r_min, 1, by = 0.10),
-      oob    = scales::squish,
-      guide  = "none") +
-    ## Basin outline
-    {if (!is.null(basin_df))
-      ggplot2::geom_path(data = basin_df,
-                         ggplot2::aes(x = X, y = Y, group = grp),
-                         colour = "black", linewidth = 0.6,
-                         inherit.aes = FALSE)} +
+      low = col_low,
+      high = col_high,
+      limits = fill_limits,
+      breaks = fill_breaks,
+      name = legend_title,
+      oob = scales::squish,
+      na.value = "transparent",
+      guide = if (show_legend) {
+        ggplot2::guide_colourbar(
+          title.position = "top",
+          barheight = grid::unit(2.8, "cm"),
+          barwidth  = grid::unit(0.35, "cm"),
+          frame.colour = "grey50",
+          ticks.colour = "grey40"
+        )
+      } else {
+        "none"
+      }
+    ) +
     ggplot2::coord_cartesian(
       xlim = c(x_lim[1] - x_pad, x_lim[2] + x_pad),
-      ylim = c(y_lim[1] - y_pad, y_lim[2] + y_pad)) +
-    ggplot2::scale_x_continuous(labels = function(x) sprintf("%.1f°", x)) +
-    ggplot2::scale_y_continuous(labels = function(x) sprintf("%.1f°", x)) +
+      ylim = c(y_lim[1] - y_pad, y_lim[2] + y_pad),
+      expand = FALSE
+    ) +
+    ggplot2::scale_x_continuous(expand = c(0, 0), breaks = NULL) +
+    ggplot2::scale_y_continuous(expand = c(0, 0), breaks = NULL) +
     ggplot2::labs(title = title_str, subtitle = subtitle_str) +
     theme_map4c +
-    ggplot2::theme(aspect.ratio = asp_ratio)
+    ggplot2::theme(
+      aspect.ratio = 1,
+      axis.text.x = ggplot2::element_blank(),
+      axis.text.y = ggplot2::element_blank(),
+      axis.ticks.x = ggplot2::element_blank(),
+      axis.ticks.y = ggplot2::element_blank()
+    )
+}
+## ── Part 4c / 4c-2 shared helpers (global scope) ─────────────────────────────
+## Defined here — OUTSIDE both tryCatch blocks — so that Part 4c-2 can always
+## find them even if Part 4c encountered an error before assigning them.
+
+## Helper: load 12 per-month CSVs for one scale x directory x prefix ──────────
+load_pixel_mat <- function(scale, seas_dir, prefix = "spei") {
+  month_list   <- vector("list", 12L)
+  coords_out   <- NULL
+  year_out     <- NULL
+  for (m in seq_len(12L)) {
+    csv_f   <- file.path(seas_dir,
+                         sprintf("%s_%02d_month%02d_%s.csv",
+                                 prefix, scale, m, MONTH_NAMES_3[m]))
+    if (!file.exists(csv_f)) next
+    df_m   <- tryCatch(data.table::fread(csv_f, data.table = FALSE),
+                       error = function(e) NULL)
+    if (is.null(df_m)) next
+    yr_c   <- setdiff(names(df_m), c("lon", "lat"))
+    yr_c   <- yr_c[grepl("^[0-9]{4}$", yr_c)]
+    if (!length(yr_c)) next
+    if (is.null(coords_out)) { coords_out <- df_m[, c("lon", "lat")]; year_out <- yr_c }
+    month_list[[m]] <- as.matrix(df_m[, yr_c, drop = FALSE])
+  }
+  valid <- which(!sapply(month_list, is.null))
+  if (!length(valid) || is.null(coords_out)) return(NULL)
+  list(mat          = do.call(cbind, month_list[valid]),
+       coords       = coords_out,
+       year_int     = as.integer(year_out),
+       yr_chr       = year_out,
+       valid_months = valid,
+       month_list   = month_list)
+}
+
+## Helper: per-pixel Pearson r with basin mean ─────────────────────────────────
+## cos(lat) area-weighting for geographic coordinates, plain mean for projected.
+compute_r <- function(obj) {
+  mat    <- obj$mat
+  coords <- obj$coords
+  is_geo <- max(abs(coords$lon), na.rm = TRUE) <= 200
+  if (is_geo) {
+    w    <- cos(coords$lat * pi / 180)
+    bavg <- apply(mat, 2, function(x) {
+      ok <- is.finite(x)
+      if (!any(ok)) return(NA_real_)
+      sum(x[ok] * w[ok]) / sum(w[ok])
+    })
+  } else {
+    bavg <- colMeans(mat, na.rm = TRUE)
+  }
+  vapply(seq_len(nrow(mat)), function(i) {
+    xi <- mat[i, ]; ok <- !is.na(xi) & !is.na(bavg)
+    if (sum(ok) < 10L) NA_real_ else cor(xi[ok], bavg[ok])
+  }, numeric(1L))
+}
+
+## Shared map theme ─────────────────────────────────────────────────────────────
+theme_map4c <- ggplot2::theme_bw(base_size = 10.5) +
+  ggplot2::theme(
+    axis.title        = ggplot2::element_blank(),
+    axis.text         = ggplot2::element_text(size = 7),
+    axis.text.x       = ggplot2::element_text(size = 7, angle = 45, hjust = 1, vjust = 1),
+    axis.text.y       = ggplot2::element_text(size = 7),
+    plot.title        = ggplot2::element_text(size = 7.5, face = "bold", hjust = 0.5,
+                                              lineheight = 1.1,
+                                              margin = ggplot2::margin(t = 2, b = 2)),
+    plot.subtitle     = ggplot2::element_text(size = 7, colour = "grey30",
+                                              hjust = 0.5,
+                                              lineheight = 0.9,
+                                              margin = ggplot2::margin(t = 0, b = 2)),
+    legend.key.height = ggplot2::unit(0.8, "cm"),
+    legend.key.width  = ggplot2::unit(0.25, "cm"),
+    legend.text       = ggplot2::element_text(size = 8),
+    legend.title      = ggplot2::element_text(size = 8.5),
+    legend.position   = "right",
+    panel.grid        = ggplot2::element_blank(),
+    plot.margin       = ggplot2::margin(5, 3, 1, 3))
+
+## Helper: build one r-density panel ──────────────────────────────────────────
+make_density_panel <- function(r_list, combo_names, col_pal,
+                               panel_lab, title_str) {
+  df  <- do.call(rbind, lapply(seq_along(r_list), function(k) {
+    rv  <- r_list[[k]]
+    if (is.null(rv)) return(NULL)
+    data.frame(r = rv, combo = combo_names[k], stringsAsFactors = FALSE)
+  }))
+  if (is.null(df) || !nrow(df))
+    return(ggplot2::ggplot() +
+             ggplot2::annotate("text", x = 0.5, y = 0.5,
+                               label = "No data", size = 4, colour = "grey50") +
+             ggplot2::theme_void())
+  df      <- df[!is.na(df$r), ]
+  df$combo   <- factor(df$combo, levels = combo_names)
+  med_df   <- do.call(rbind, lapply(combo_names, function(g) {
+    x   <- df$r[df$combo == g]
+    data.frame(combo = g, med_r = median(x, na.rm = TRUE),
+               stringsAsFactors = FALSE)
+  }))
+  med_df$combo   <- factor(med_df$combo, levels = combo_names)
   
-  return(p)
+  ## ── Stagger median labels vertically so they don't collide ────────────────
+  ## Rank by median r (ascending); assign vjust levels that stack labels
+  ## from the top down: smallest median gets highest vjust (lowest on page),
+  ## largest median gets smallest vjust (closest to top edge).
+  ## Levels: 1.1  (≈ 1 line below top)
+  ##         2.8  (≈ 2 lines below top)
+  ##         4.5  (≈ 3 lines below top)
+  rk <- rank(med_df$med_r, ties.method = "first")
+  vjust_levels <- c(1.1, 2.8, 4.5)
+  med_df$vjust_pos <- vjust_levels[rk]
+  
+  ## ── Nudge xintercepts slightly so overlapping lines stay visually distinct ──
+  ## When all 3 medians cluster within ~0.01 r units, solid/dashed/dotted lines
+  ## pile on top of each other.  A ±0.003 cosmetic offset (<0.5% of x range)
+  ## separates the lines without distorting the displayed label (which still
+  ## shows the true med_r value).
+  n_sc     <- length(combo_names)
+  offsets  <- seq(-0.003 * (n_sc - 1) / 2,
+                  0.003 * (n_sc - 1) / 2,
+                  length.out = n_sc)
+  med_df$xint_nudged <- med_df$med_r +
+    offsets[as.integer(med_df$combo)]
+  
+  ## Line types per scale: solid / dashed / dotted — visually separates
+  ## lines that may be very close in x position
+  lt_vals <- setNames(
+    c("solid", "dashed", "dotted")[seq_along(combo_names)],
+    combo_names)
+  
+  ## ── Per-scale density linewidths: thick→thin so overlapping curves stay ──────
+  ## distinguishable even when their x distributions are nearly identical.
+  ## Scale 1 = thickest (most prominent); scale 3 = thinnest.
+  lw_vals <- setNames(
+    c(1.6, 1.0, 0.45)[seq_along(combo_names)],
+    combo_names)
+  
+  ## ── Label x-offset: place text just to the RIGHT of its vertical line ────────
+  ## hjust = 0  → left edge of text anchored at x
+  ## x = xint_nudged + 0.008  → small gap between line and start of label
+  ## This prevents the line from bisecting the numeral.
+  LABEL_GAP <- 0.008
+  
+  ggplot2::ggplot(df, ggplot2::aes(x = r, colour = combo, fill = combo)) +
+    ## Map linewidth to combo so each density curve has a distinct stroke weight
+    ggplot2::geom_density(ggplot2::aes(linewidth = combo), alpha = 0.20) +
+    ggplot2::geom_vline(data = med_df,
+                        ggplot2::aes(xintercept = xint_nudged, colour = combo,
+                                     linetype = combo),
+                        linewidth = 0.75,
+                        show.legend = FALSE) +
+    ## Text: staggered vertically AND shifted right of the line
+    ggplot2::geom_text(data = med_df,
+                       ggplot2::aes(x     = xint_nudged + LABEL_GAP,
+                                    y     = Inf,
+                                    label = sprintf("%.2f", med_r),
+                                    colour = combo,
+                                    vjust  = vjust_pos),
+                       hjust = 0, size = 3.2,
+                       show.legend = FALSE) +
+    ggplot2::scale_colour_manual(values = col_pal, name = NULL) +
+    ggplot2::scale_fill_manual(values   = col_pal, name = NULL) +
+    ggplot2::scale_linewidth_manual(values = lw_vals, guide = "none") +
+    ggplot2::scale_linetype_manual(values = lt_vals) +
+    ggplot2::scale_x_continuous(limits = c(0.4, 1.01),
+                                breaks = seq(0.4, 1.0, by = 0.1)) +
+    ## RESERVE ~60% OF TOP PANEL FOR LABELS to guarantee no curve overlap
+    ggplot2::scale_y_continuous(expand = ggplot2::expansion(mult = c(0.05, 0.70))) +
+    ## NOTE: subtitle deliberately omitted here — a single shared note is added
+    ##       once via the patchwork caption in the fig_dens assembly below,
+    ##       preventing the identical text from appearing in both panels and
+    ##       overflowing into the adjacent panel's space.
+    ggplot2::labs(
+      title = sprintf("%s  %s", panel_lab, title_str),
+      x     = "Pearson r (pixel vs basin mean)",
+      y     = "Density") +
+    ggplot2::theme_classic(base_size = 11) +
+    ggplot2::theme(
+      plot.title      = ggplot2::element_text(size = 8.5, face = "bold", hjust = 0,
+                                              margin = ggplot2::margin(t = 3, b = 3)),
+      legend.text     = ggplot2::element_text(size = 9),
+      legend.position = "bottom",
+      legend.key.size = ggplot2::unit(0.4, "cm"),
+      axis.text       = ggplot2::element_text(size = 9),
+      plot.margin     = ggplot2::margin(5, 6, 2, 4))
 }
 
 tryCatch({
-  ## Helper: load 12 per-month CSVs for one scale x directory x prefix ──────
-  load_pixel_mat   <- function(scale, seas_dir, prefix = "spei") {
-    month_list   <- vector("list", 12L)
-    coords_out   <- NULL
-    year_out     <- NULL
-    for (m in seq_len(12L)) {
-      csv_f   <- file.path(seas_dir,
-                           sprintf("%s_%02d_month%02d_%s.csv",
-                                   prefix, scale, m, MONTH_NAMES_3[m]))
-      if (!file.exists(csv_f)) next
-      df_m   <- tryCatch(data.table::fread(csv_f, data.table = FALSE),
-                         error = function(e) NULL)
-      if (is.null(df_m)) next
-      yr_c   <- setdiff(names(df_m), c("lon", "lat"))
-      yr_c   <- yr_c[grepl("^[0-9]{4}$", yr_c)]
-      if (!length(yr_c)) next
-      if (is.null(coords_out)) { coords_out   <- df_m[, c("lon", "lat")]; year_out   <- yr_c }
-      month_list[[m]]   <- as.matrix(df_m[, yr_c, drop = FALSE])
-    }
-    valid   <- which(!sapply(month_list, is.null))
-    if (!length(valid) || is.null(coords_out)) return(NULL)
-    list(mat         = do.call(cbind, month_list[valid]),
-         coords      = coords_out,
-         year_int    = as.integer(year_out),
-         yr_chr      = year_out,
-         valid_months = valid,
-         month_list  = month_list)
-  }
-  
-  ## Helper: per-pixel Pearson r with basin mean ────────────────────────────
-  ## The reference basin mean must be area-weighted for the same reason as the
-  ## fallback loaders: cos(lat) weighting for geographic coords, plain mean
-  ## for equal-area projected coords.
-  compute_r <- function(obj) {
-    mat    <- obj$mat
-    coords <- obj$coords
-    is_geo <- max(abs(coords$lon), na.rm = TRUE) <= 200
-    if (is_geo) {
-      w    <- cos(coords$lat * pi / 180)
-      bavg <- apply(mat, 2, function(x) {
-        ok <- is.finite(x)
-        if (!any(ok)) return(NA_real_)
-        sum(x[ok] * w[ok]) / sum(w[ok])
-      })
-    } else {
-      bavg <- colMeans(mat, na.rm = TRUE)
-    }
-    vapply(seq_len(nrow(mat)), function(i) {
-      xi <- mat[i, ]; ok <- !is.na(xi) & !is.na(bavg)
-      if (sum(ok) < 10L) NA_real_ else cor(xi[ok], bavg[ok])
-    }, numeric(1L))
-  }
-  
-  ## Shared map theme ──────────────────────────────────────────────────────
-  theme_map4c <- ggplot2::theme_bw(base_size = 10.5) +
-    ggplot2::theme(
-      axis.title        = ggplot2::element_blank(),
-      axis.text         = ggplot2::element_text(size = 7),
-      axis.text.x       = ggplot2::element_text(size = 7, angle = 45, hjust = 1, vjust = 1),
-      axis.text.y       = ggplot2::element_text(size = 7),
-      plot.title        = ggplot2::element_text(size = 9, face = "bold", hjust = 0.5,
-                                                margin = ggplot2::margin(b = 2)),
-      plot.subtitle     = ggplot2::element_text(size = 7.5, colour = "grey30",
-                                                hjust = 0.5,
-                                                lineheight = 0.9,
-                                                margin = ggplot2::margin(t = 0, b = 2)),
-      legend.key.height = ggplot2::unit(0.8, "cm"),
-      legend.key.width  = ggplot2::unit(0.25, "cm"),
-      legend.text       = ggplot2::element_text(size = 8),
-      legend.title      = ggplot2::element_text(size = 8.5),
-      legend.position   = "right",
-      panel.grid        = ggplot2::element_blank(),
-      plot.margin       = ggplot2::margin(2, 3, 1, 3))
-  
-  ## Helper: build one r-density panel ─────────────────────────────────────
-  make_density_panel  <- function(r_list, combo_names, col_pal,
-                                  panel_lab, title_str) {
-    df  <- do.call(rbind, lapply(seq_along(r_list), function(k) {
-      rv  <- r_list[[k]]
-      if (is.null(rv)) return(NULL)
-      data.frame(r = rv, combo = combo_names[k], stringsAsFactors = FALSE)
-    }))
-    if (is.null(df) || !nrow(df))
-      return(ggplot2::ggplot() +
-               ggplot2::annotate("text", x = 0.5, y = 0.5,
-                                 label = "No data", size = 4, colour = "grey50") +
-               ggplot2::theme_void())
-    df      <- df[!is.na(df$r), ]
-    df$combo   <- factor(df$combo, levels = combo_names)
-    med_df   <- do.call(rbind, lapply(combo_names, function(g) {
-      x   <- df$r[df$combo == g]
-      data.frame(combo = g, med_r = median(x, na.rm = TRUE),
-                 stringsAsFactors = FALSE)
-    }))
-    med_df$combo   <- factor(med_df$combo, levels = combo_names)
-    ggplot2::ggplot(df, ggplot2::aes(x = r, colour = combo, fill = combo)) +
-      ggplot2::geom_density(alpha = 0.20, linewidth = 0.9) +
-      ggplot2::geom_vline(data = med_df,
-                          ggplot2::aes(xintercept = med_r, colour = combo),
-                          linetype = "solid", linewidth = 0.7,
-                          show.legend = FALSE) +
-      ## Text: Placed at the very top of the panel (y=Inf), anchored slightly below edge
-      ## This ensures they sit in empty space reserved by expand() below
-      ggplot2::geom_text(data = med_df,
-                         ggplot2::aes(x = med_r, y = Inf,
-                                      label = sprintf("%.2f", med_r),
-                                      colour = combo),
-                         vjust = 1.1, hjust = 0.5, size = 3.5,
-                         show.legend = FALSE) +
-      ggplot2::scale_colour_manual(values = col_pal, name = NULL) +
-      ggplot2::scale_fill_manual(values   = col_pal, name = NULL) +
-      ggplot2::scale_x_continuous(limits = c(0.4, 1.01),
-                                  breaks = seq(0.4, 1.0, by = 0.1)) +
-      ## RESERVE ~60% OF TOP PANEL FOR LABELS to guarantee no curve overlap
-      ggplot2::scale_y_continuous(expand = ggplot2::expansion(mult = c(0.05, 0.70))) +
-      ggplot2::labs(
-        title    = sprintf("%s  %s", panel_lab, title_str),
-        subtitle = "Solid vertical lines = median r per scale",
-        x        = "Pearson r (pixel vs basin mean)",
-        y        = "Density") +
-      ggplot2::theme_classic(base_size = 11) +
-      ggplot2::theme(
-        plot.title       = ggplot2::element_text(size = 9.5, face = "bold", hjust = 0,
-                                                 margin = ggplot2::margin(b = 3)),
-        plot.subtitle    = ggplot2::element_text(size = 8.5, colour = "grey40", hjust = 0),
-        legend.text      = ggplot2::element_text(size = 9),
-        legend.position  = "bottom",
-        legend.key.size  = ggplot2::unit(0.4, "cm"),
-        axis.text        = ggplot2::element_text(size = 9),
-        plot.margin      = ggplot2::margin(2, 6, 2, 4))
-  }
-  
   ## 1. Compute SPEI PM Pearson r for scales 1, 2, 3 ──────────────────────
-  spei_scales  <- c(1L, 2L, 3L)
-  spei_r_list  <- vector("list", 3L)
-  spei_plots   <- vector("list", 3L)
-  spei_labels  <- c("(a)", "(b)", "(c)")
+  ### 1. Compute SPEI PM Pearson r for scales 1, 2, 3 ──────────────────────
+  
+  spei_scales <- c(1L, 2L, 3L)
+  spei_r_list <- vector("list", 3L)
+  spei_obj_list <- vector("list", 3L)
+  spei_med_list <- rep(NA_real_, 3L)
+  spei_pct80_list <- rep(NA_real_, 3L)
+  spei_plots <- vector("list", 3L)
+  spei_labels <- c("(a)", "(b)", "(c)")
+  
   for (k in seq_along(spei_scales)) {
-    sc    <- spei_scales[k]
-    cat(sprintf("  Loading SPEI-PM-%d...\n", sc))
-    obj   <- tryCatch(load_pixel_mat(sc, SPEI_PM_DIR, prefix = "spei"),
-                      error = function(e) NULL)
-    if (is.null(obj)) { cat(sprintf("    No data\n")); next }
-    rv         <- compute_r(obj)
-    bsf        <- detect_basin_sf(obj$coords)
-    med_r      <- median(rv, na.rm = TRUE)
-    pct80      <- 100 * mean(rv >= 0.80, na.rm = TRUE)
-    spei_r_list[[k]]   <- rv
-    spei_plots[[k]]    <- make_map_panel(
-      rv, obj$coords, bsf,
-      title_str    = sprintf("%s  SPEI-%d  (Penman-Monteith)", spei_labels[k], sc),
-      subtitle_str = sprintf("median r = %.3f\n%.0f%% ≥ 0.80", med_r, pct80),
-      palette      = "Blues")
+    sc <- spei_scales[k]
+    cat(sprintf(" Loading SPEI-PM-%d...\n", sc))
+    
+    obj <- tryCatch(
+      load_pixel_mat(sc, SPEI_PM_DIR, prefix = "spei"),
+      error = function(e) NULL
+    )
+    
+    if (is.null(obj)) {
+      cat(" No data\n")
+      next
+    }
+    
+    rv <- compute_r(obj)
+    
+    spei_obj_list[[k]] <- obj
+    spei_r_list[[k]] <- rv
+    spei_med_list[k] <- median(rv, na.rm = TRUE)
+    spei_pct80_list[k] <- 100 * mean(rv >= 0.80, na.rm = TRUE)
   }
+  
+  # Shared colour scale for all 3 SPEI-PM maps
+  spei_fill_cfg <- calc_r_fill_limits(spei_r_list)
+  
+  # Build SPEI-PM map panels AFTER shared limits are known
+  for (k in seq_along(spei_scales)) {
+    obj <- spei_obj_list[[k]]
+    rv  <- spei_r_list[[k]]
+    
+    if (is.null(obj) || is.null(rv)) next
+    
+    bsf <- detect_basin_sf(obj$coords)
+    
+    spei_plots[[k]] <- make_map_panel(
+      rv, obj$coords, bsf,
+      title_str = sprintf("%s SPEI-%d (PM)", spei_labels[k], spei_scales[k]),
+      subtitle_str = sprintf("median r = %.3f\n%.0f%% \u2265 0.80",
+                             spei_med_list[k], spei_pct80_list[k]),
+      palette = "Blues",
+      show_legend = TRUE,
+      legend_title = "Pearson r (SPEI-PM)",
+      fill_limits = spei_fill_cfg$limits,
+      fill_breaks = spei_fill_cfg$breaks
+    )
+  }
+  
   
   ## 2. Compute SPI Pearson r for scales 1, 2, 3 ──────────────────────────
-  spi_scales  <- c(1L, 2L, 3L)
-  spi_r_list  <- vector("list", 3L)
-  spi_plots   <- vector("list", 3L)
-  spi_labels  <- c("(d)", "(e)", "(f)")
+  
+  spi_scales <- c(1L, 2L, 3L)
+  spi_r_list <- vector("list", 3L)
+  spi_obj_list <- vector("list", 3L)
+  spi_med_list <- rep(NA_real_, 3L)
+  spi_pct80_list <- rep(NA_real_, 3L)
+  spi_plots <- vector("list", 3L)
+  spi_labels <- c("(d)", "(e)", "(f)")
+  
   for (k in seq_along(spi_scales)) {
-    sc    <- spi_scales[k]
-    cat(sprintf("  Loading SPI-%d...\n", sc))
-    obj   <- tryCatch(load_pixel_mat(sc, SPI_SEAS_DIR, prefix = "spi"),
-                      error = function(e) NULL)
-    if (is.null(obj)) { cat(sprintf("    No data\n")); next }
-    rv         <- compute_r(obj)
-    bsf        <- detect_basin_sf(obj$coords)
-    med_r      <- median(rv, na.rm = TRUE)
-    pct80      <- 100 * mean(rv >= 0.80, na.rm = TRUE)
-    spi_r_list[[k]]   <- rv
-    spi_plots[[k]]    <- make_map_panel(
-      rv, obj$coords, bsf,
-      title_str    = sprintf("%s  SPI-%d", spi_labels[k], sc),
-      subtitle_str = sprintf("median r = %.3f\n%.0f%% ≥ 0.80", med_r, pct80),
-      palette      = "Greens")
+    sc <- spi_scales[k]
+    cat(sprintf(" Loading SPI-%d...\n", sc))
+    
+    obj <- tryCatch(
+      load_pixel_mat(sc, SPI_SEAS_DIR, prefix = "spi"),
+      error = function(e) NULL
+    )
+    
+    if (is.null(obj)) {
+      cat(" No data\n")
+      next
+    }
+    
+    rv <- compute_r(obj)
+    
+    spi_obj_list[[k]] <- obj
+    spi_r_list[[k]] <- rv
+    spi_med_list[k] <- median(rv, na.rm = TRUE)
+    spi_pct80_list[k] <- 100 * mean(rv >= 0.80, na.rm = TRUE)
   }
+  
+  # Shared colour scale for all 3 SPI maps
+  spi_fill_cfg <- calc_r_fill_limits(spi_r_list)
+  
+  # Build SPI map panels AFTER shared limits are known
+  for (k in seq_along(spi_scales)) {
+    obj <- spi_obj_list[[k]]
+    rv  <- spi_r_list[[k]]
+    
+    if (is.null(obj) || is.null(rv)) next
+    
+    bsf <- detect_basin_sf(obj$coords)
+    
+    spi_plots[[k]] <- make_map_panel(
+      rv, obj$coords, bsf,
+      title_str = sprintf("%s SPI-%d", spi_labels[k], spi_scales[k]),
+      subtitle_str = sprintf("median r = %.3f\n%.0f%% ≥ 0.80",
+                             spi_med_list[k], spi_pct80_list[k]),
+      palette = "Greens",
+      show_legend = TRUE,
+      legend_title = "Pearson r (SPI)",
+      fill_limits = spi_fill_cfg$limits,
+      fill_breaks = spi_fill_cfg$breaks
+    )
+  }
+  
   
   any_spei <- any(!sapply(spei_plots, is.null))
   any_spi  <- any(!sapply(spi_plots,  is.null))
@@ -1169,12 +1309,25 @@ tryCatch({
   })
   
   ## Ensure NO legends on map panels (override any defaults)
-  fig_maps <- patchwork::wrap_plots(top_plots, nrow = 2, ncol = 3) &
-    ggplot2::theme(legend.position = "none")
+  fig_maps <- patchwork::wrap_plots(top_plots, nrow = 2, ncol = 3, guides = "collect") &
+    ggplot2::theme(
+      legend.position = "right",
+      legend.box = "vertical"
+    )
   
-  ## Density panels keep their legends
+  ## Density panels keep their legends.
+  ## The shared subtitle note ("Vertical lines = median r …") is placed ONCE as
+  ## a patchwork caption below both panels — this prevents the identical text
+  ## from appearing in each individual panel and overflowing into its neighbour.
   fig_dens <- (pc_pm | pl_spi) +
-    patchwork::plot_layout(guides = "keep")
+    patchwork::plot_layout(guides = "keep") +
+    patchwork::plot_annotation(
+      caption = "Vertical lines = median r per scale  (solid / dashed / dotted)",
+      theme   = ggplot2::theme(
+        plot.caption = ggplot2::element_text(
+          size   = 7.5, colour = "grey40",
+          hjust  = 0.5,
+          margin = ggplot2::margin(t = 2, b = 2))))
   
   ## Combine: maps (no legends) + density plots (with their legends)
   fig4c  <- fig_maps / fig_dens +
@@ -1229,6 +1382,119 @@ tryCatch({
 })
 
 ################################################################################
+# PART 4c-2 – SPEI123 PM-ONLY SPATIAL REPRESENTATIVENESS FIGURE
+# Output:
+#   Fig4c_Pearson_r_SPEI123_PM_Thw.pdf/.png
+# Layout (Thornthwaite maps REMOVED — SPEI-PM panels only):
+#   Row 1 (a-c): SPEI-PM scales 1, 2, 3  (Blues palette)
+#   Bottom row : single density panel — Pixel Pearson r for SPEI-PM 1, 2, 3
+# NOTE: This is a modified version of the PM+Thw figure; the 3 SPEI-Thw
+#       maps have been intentionally omitted at the author's request.
+################################################################################
+cat("\n══════════════════════════════════════════════════════════════\n")
+cat("PART 4c-2: SPEI123 PM-only spatial representativeness figure\n")
+cat("          (Thornthwaite maps excluded)\n")
+cat("══════════════════════════════════════════════════════════════\n")
+
+tryCatch({
+  
+  ## 1. Compute SPEI-PM Pearson r for scales 1, 2, 3 ─────────────────────────
+  spei_scales_pm2  <- c(1L, 2L, 3L)
+  spei_r_list_pm2  <- vector("list", 3L)
+  spei_plots_pm2   <- vector("list", 3L)
+  spei_labels_pm2  <- c("(a)", "(b)", "(c)")
+  
+  for (k in seq_along(spei_scales_pm2)) {
+    sc  <- spei_scales_pm2[k]
+    cat(sprintf("  Loading SPEI-PM-%d...\n", sc))
+    obj <- tryCatch(load_pixel_mat(sc, SPEI_PM_DIR, prefix = "spei"),
+                    error = function(e) NULL)
+    if (is.null(obj)) { cat(sprintf("    No data for SPEI-PM-%d\n", sc)); next }
+    rv        <- compute_r(obj)
+    bsf       <- detect_basin_sf(obj$coords)
+    med_r     <- median(rv, na.rm = TRUE)
+    pct80     <- 100 * mean(rv >= 0.80, na.rm = TRUE)
+    spei_r_list_pm2[[k]] <- rv
+    spei_plots_pm2[[k]]  <- make_map_panel(
+      rv, obj$coords, bsf,
+      title_str    = sprintf("%s  SPEI-%d  (Penman-Monteith)", spei_labels_pm2[k], sc),
+      subtitle_str = sprintf("median r = %.3f\n%.0f%% \u2265 0.80", med_r, pct80),
+      palette      = "Blues")
+  }
+  
+  any_pm2 <- any(!sapply(spei_plots_pm2, is.null))
+  if (!any_pm2) { cat("  No SPEI-PM data available\n"); stop("no_data") }
+  
+  ## 2. Single density panel (d): SPEI-PM r values for scales 1, 2, 3 ────────
+  col_spei_pm2 <- c("SPEI-1 PM" = "#1f77b4",
+                    "SPEI-2 PM" = "#6baed6",
+                    "SPEI-3 PM" = "#2ca02c")
+  pc_pm2 <- make_density_panel(
+    r_list      = spei_r_list_pm2,
+    combo_names = names(col_spei_pm2),
+    col_pal     = col_spei_pm2,
+    panel_lab   = "(d)",
+    title_str   = "Pixel Pearson r \u2014 Penman-Monteith PET (scales 1, 2, 3)")
+  
+  ## 3. Assemble: 3 SPEI-PM maps (top) + density panel (bottom) ───────────────
+  top_plots_pm2 <- lapply(spei_plots_pm2, function(p) {
+    if (is.null(p)) ggplot2::ggplot() + ggplot2::theme_void() else p
+  })
+  
+  fig_maps_pm2 <- patchwork::wrap_plots(top_plots_pm2, nrow = 1, ncol = 3) &
+    ggplot2::theme(legend.position = "none")
+  
+  fig4c_pm2 <- fig_maps_pm2 / pc_pm2 +
+    patchwork::plot_layout(heights = c(1.6, 0.7)) +
+    patchwork::plot_annotation(
+      title = paste0("Pixel-to-basin-mean Pearson r \u2014 SPEI-PM 1, 2, 3 \u2014 ",
+                     "Nechako River Basin"),
+      theme = ggplot2::theme(
+        plot.title      = ggplot2::element_text(size = 12, face = "bold",
+                                                hjust = 0.5,
+                                                margin = ggplot2::margin(b = 4)),
+        plot.subtitle   = ggplot2::element_blank(),
+        legend.position = "bottom",
+        legend.text     = ggplot2::element_text(size = 10),
+        legend.key.size = ggplot2::unit(0.45, "cm")))
+  
+  ## 4. Save ───────────────────────────────────────────────────────────────────
+  for (ext in c("pdf", "png")) {
+    out_pm2 <- file.path(BASIN_PLOT_DIR,
+                         paste0("Fig4c_Pearson_r_SPEI123_PM_Thw.", ext))
+    tryCatch(
+      ggplot2::ggsave(out_pm2, fig4c_pm2,
+                      width     = 6.85,
+                      height    = 6.50,   # shorter: one map row instead of two
+                      units     = "in",
+                      dpi       = if (ext == "png") 600 else "print",
+                      device    = ext,
+                      limitsize = FALSE),
+      error = function(e) cat(sprintf("  \u26a0 %s: %s\n", ext, e$message)))
+    cat(sprintf("  \u2713 Saved: %s\n", basename(out_pm2)))
+  }
+  
+  ## 5. Console summary ────────────────────────────────────────────────────────
+  cat("\n  SPEI-PM representativeness summary (PM-only figure):\n")
+  cat(sprintf("  %-14s  median_r  pct_r\u226580\n", "Combination"))
+  cat("    ", paste(rep("-", 38), collapse = ""), "\n", sep = "")
+  for (k in seq_along(spei_scales_pm2)) {
+    rv <- spei_r_list_pm2[[k]]
+    if (is.null(rv)) next
+    cat(sprintf("  SPEI-PM-%d       %.3f    %.0f%%\n",
+                spei_scales_pm2[k],
+                median(rv, na.rm = TRUE),
+                100 * mean(rv >= 0.80, na.rm = TRUE)))
+  }
+  
+}, error = function(e) {
+  if (!identical(conditionMessage(e), "no_data"))
+    cat(sprintf("  \u26a0 Part 4c-2 failed: %s\n", e$message))
+})
+
+cat("\n\u2550\u2550 PART 4c-2 complete \u2550\u2550\n")
+
+################################################################################
 # PART 4d – SEASONALITY FIGURE  (P vs PET(PM) — 12 monthly means)
 #
 # Two-panel bar chart:
@@ -1264,15 +1530,13 @@ tryCatch({
     cat("    Run 2preq_PET_ERALand.R first, then re-run this script.\n")
     stop("pet_csv_missing_4d")
   }
-  
+  pet_raw_4d       <- data.table::fread(PET_SEAS_CSV, data.table = FALSE)
+  pet_raw_4d$date  <- as.Date(paste0(pet_raw_4d$year, "-", 
+                                     sprintf("%02d", pet_raw_4d$month), "-01"))
   COL_P_4d   <- "#4393c3"
   COL_PET_4d <- "#d7301f"
-  # Mean days per calendar month (non-leap average)
-  DAYS_PER_MON_4d <- c(31, 28.25, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
-  
   ## ── Precipitation from NetCDF (mm month⁻¹) ──────────────────────────────
   ## Mirrors the conversion in 1SPI_ERALand.R exactly:
-  ##   raw value = m/day mean rate → × actual days_in_month → m/month → × 1000 mm
   cat("  Loading precipitation from NetCDF...\n")
   pr_r  <- terra::rast(PRECIP_NC_4d)
   pr_dates <- tryCatch({
@@ -1397,7 +1661,7 @@ tryCatch({
     cat("────────────────────────────────────────────────────────────────────────\n\n")
     
   } else {
-    cat("  ⚠ w2 Part 4d: Could not find a July layer — defaulting to * dim_4d * 1000.\n")
+    cat("  ⚠⚠⚠ w2 Part 4d: Could not find a July layer — defaulting to * dim_4d * 1000.\n")
     precip_scale_4d <- dim_4d * 1000
   }
   
@@ -1422,12 +1686,10 @@ tryCatch({
       variable  = "Precipitation (P)")
   
   ## ── PET(PM) from CSV (mm month⁻¹) ────────────────────────────────────────
-  pet_raw_4d <- as.data.frame(data.table::fread(PET_SEAS_CSV))
-  if (!inherits(pet_raw_4d$date, "Date"))
-    pet_raw_4d$date <- as.Date(
-      paste0(substr(as.character(pet_raw_4d$date), 1, 7), "-01"))
-  pet_raw_4d$month  <- as.integer(format(pet_raw_4d$date, "%m"))
-  pet_raw_4d$pet_mm <- pet_raw_4d$mean_pet * DAYS_PER_MON_4d[pet_raw_4d$month]
+  pet_raw_4d$days_in_month <- as.integer(
+    as.Date(paste0(format(pet_raw_4d$date, "%Y-%m"), "-01")) %m+% months(1) -
+      as.Date(paste0(format(pet_raw_4d$date, "%Y-%m"), "-01")))
+  pet_raw_4d$pet_mm <- pet_raw_4d$mean_pet * pet_raw_4d$days_in_month
   
   cm_pet_4d <- pet_raw_4d |>
     dplyr::group_by(month) |>
@@ -2017,29 +2279,34 @@ export_basin_excel <- function(output_file) {
   ## Automatically correlate every available index pair on their common date range.
   corr_df <- tryCatch({
     series_list <- list(
-      SPI3  = load_any_ts("spi",   3),
-      SPEI3 = load_any_ts("spei",  3),
-      MSPI  = load_any_ts("mspi",  MSPI_MSPEI_SCALE),
+      SPI3  = load_any_ts("spi", 3),
+      SPEI3 = load_any_ts("spei", 3),
+      MSPI  = load_any_ts("mspi", MSPI_MSPEI_SCALE),
       MSPEI = load_any_ts("mspei", MSPI_MSPEI_SCALE)
     )
     series_list <- Filter(Negate(is.null), series_list)
     nms <- names(series_list)
     
-    ## Merge all on date (inner join to common period)
+    if (!length(nms)) {
+      return(data.frame(Comparison = character(), Correlation = numeric(), 
+                        N_months = integer(), stringsAsFactors = FALSE))
+    }
+    
+    # Merge all on date (inner join to common period)
     mrg <- Reduce(
       function(a, b_idx) {
-        b  <- series_list[[b_idx]][, c("date", "value")]
+        b <- series_list[[b_idx]][, c("date", "value")]
         names(b)[2] <- nms[b_idx]
         merge(a, b, by = "date")
       },
       seq_along(nms)[-1],
       init = {
-        tmp        <- series_list[[nms[1]]][, c("date", "value")]
+        tmp <- series_list[[nms[1]]][, c("date", "value")]
         names(tmp)[2] <- nms[1]
         tmp
       })
     
-    ## All pairwise Pearson correlations
+    # All pairwise Pearson correlations
     pairs <- combn(nms, 2, simplify = FALSE)
     do.call(rbind, lapply(pairs, function(p) {
       cx <- mrg[[p[1]]]; cy <- mrg[[p[2]]]
@@ -2051,13 +2318,10 @@ export_basin_excel <- function(output_file) {
         stringsAsFactors = FALSE)
     }))
   }, error = function(e) {
-    cat("  ⚠ Correlation sheet skipped:", e$message, "\n")
-    data.frame(Comparison  = character(),
-               Correlation = numeric(),
-               N_months    = integer(),
-               stringsAsFactors = FALSE)
+    cat(" ⚠ Correlation sheet skipped:", e$message, "\n")
+    data.frame(Comparison = character(), Correlation = numeric(), 
+               N_months = integer(), stringsAsFactors = FALSE)
   })
-  
   openxlsx::addWorksheet(wb, "Correlations")
   openxlsx::writeData(wb, "Correlations", corr_df)
   openxlsx::addStyle(wb, "Correlations", hdr_style,
@@ -2104,6 +2368,12 @@ cat("  Spatial representativeness (PDF): ",
 cat("  Spatial representativeness (PNG): ",
     normalizePath(file.path(BASIN_PLOT_DIR,
                             "Fig4c_Pearson_r_SPEI_PM_SPI.png")), "\n")
+cat("  SPEI-PM only fig (PDF)          : ",
+    normalizePath(file.path(BASIN_PLOT_DIR,
+                            "Fig4c_Pearson_r_SPEI123_PM_Thw.pdf")), "\n")
+cat("  SPEI-PM only fig (PNG)          : ",
+    normalizePath(file.path(BASIN_PLOT_DIR,
+                            "Fig4c_Pearson_r_SPEI123_PM_Thw.png")), "\n")
 cat("  Excel summary         : ", normalizePath(excel_out),       "\n")
 cat("  Seasonality P/PET(PM) : ",
     normalizePath(file.path(BASIN_PLOT_DIR,

@@ -891,102 +891,290 @@ create_pet_comparison_plots <- function() {
 }
 ################################################################################
 ################################################################################
-# FUNCTION 15: PET-PM SEASONAL TRENDS PLOT
+# FUNCTION 15: PET SEASONAL TRENDS PLOTS (PET-PM, PET-Thw, and combined panel)
+#
+# Outputs
+#   FigS_PET_Seasonal_Trends.png/.pdf        — PET-PM only  (unchanged)
+#   FigS_PET_Thw_Seasonal_Trends.png/.pdf    — PET-Thw only (new)
+#   FigS_PET_Both_Seasonal_Trends.png/.pdf   — PM + Thw side-by-side (new)
 ################################################################################
-create_pet_seasonal_trends <- function(
-    df = basin_avg_monthly,
-    out_dir_loc = out_dir,  # Renamed to avoid recursive promise error
-    basin_label = "Nechako River Basin",
-    year_start  = 1950L,
-    year_end    = 2025L
-) {
-  cat("\n── Function 15: PET-PM seasonal trends plot ──\n")
-  if (is.null(df) || !"date" %in% names(df)) {
-    cat("  ⚠ Basin monthly data not available — skipping PET seasonal trends.\n")
-    return(invisible(NULL))
-  }
-  
-  pet_raw <- data.table::as.data.table(df) 
-  pet_raw <- pet_raw[, .(date, pet_mm_month)]
-  setnames(pet_raw, c("date", "pet"))
-  pet_raw <- pet_raw[!is.na(pet)]
-  
-  pet_raw[, .date := as.Date(date)]
-  pet_raw[, year  := as.integer(format(.date, "%Y"))]
-  pet_raw[, month := as.integer(format(.date, "%m"))]
-  pet_raw <- pet_raw[year >= year_start & year <= year_end]
-  
-  pet_raw[, season := data.table::fcase(
-    month %in% c(12, 1, 2), "DJF (Dec\u2013Feb)",
-    month %in% c(3, 4, 5),  "MAM (Mar\u2013May)",
-    month %in% c(6, 7, 8),  "JJA (Jun\u2013Aug)",
-    month %in% c(9, 10, 11),"SON (Sep\u2013Nov)"
+
+# ── internal helper: build seasonal-means table from a monthly numeric vector ──
+.pet_seas_means <- function(df_dt, value_col, year_start, year_end) {
+  SEASON_LEVELS <- c(
+    "DJF (Dec\u2013Feb)", "MAM (Mar\u2013May)",
+    "JJA (Jun\u2013Aug)", "SON (Sep\u2013Nov)"
+  )
+  raw <- df_dt[, .(date = as.Date(date), pet = as.numeric(get(value_col)))]
+  raw <- raw[!is.na(pet)]
+  raw[, year  := as.integer(format(date, "%Y"))]
+  raw[, month := as.integer(format(date, "%m"))]
+  raw <- raw[year >= year_start & year <= year_end]
+  raw[, season := data.table::fcase(
+    month %in% c(12L, 1L, 2L), "DJF (Dec\u2013Feb)",
+    month %in% c(3L, 4L, 5L),  "MAM (Mar\u2013May)",
+    month %in% c(6L, 7L, 8L),  "JJA (Jun\u2013Aug)",
+    month %in% c(9L, 10L, 11L),"SON (Sep\u2013Nov)"
   )]
-  pet_raw[, season_year := data.table::fifelse(month == 12L, year + 1L, year)]
-  
-  SEASON_LEVELS <- c("DJF (Dec\u2013Feb)", "MAM (Mar\u2013May)",
-                     "JJA (Jun\u2013Aug)", "SON (Sep\u2013Nov)")
-  
-  seas_means <- pet_raw[, .(pet_mean = mean(pet, na.rm = TRUE)), by = .(season_year, season)]
-  seas_means <- seas_means[season_year >= year_start & season_year <= year_end]
-  seas_means[, season := factor(season, levels = SEASON_LEVELS)]
-  
+  raw[, season_year := data.table::fifelse(month == 12L, year + 1L, year)]
+  sm <- raw[, .(pet_mean = mean(pet, na.rm = TRUE) * 3), by = .(season_year, season)]
+  sm <- sm[season_year >= year_start & season_year <= year_end]
+  sm[, season := factor(season, levels = SEASON_LEVELS)]
+  list(seas_means = sm, SEASON_LEVELS = SEASON_LEVELS)
+}
+
+# ── internal helper: OLS trend label string ──
+.pet_trend_label <- function(seas_means, SEASON_LEVELS) {
   trend_stats <- seas_means[, {
-    fit   <- lm(pet_mean ~ season_year)
-    slope <- coef(fit)[["season_year"]]
-    pval  <- summary(fit)$coefficients["season_year", "Pr(>|t|)"]
-    list(slope = slope, p_value = pval)
+    fit  <- lm(pet_mean ~ season_year)
+    list(
+      slope   = coef(fit)[["season_year"]],
+      p_value = summary(fit)$coefficients["season_year", "Pr(>|t|)"]
+    )
   }, by = season]
-  
-  trend_label <- paste(
+  paste(
     sapply(SEASON_LEVELS, function(s) {
-      row   <- trend_stats[season == s]
-      sig   <- if (!is.na(row$p_value) && row$p_value < 0.05) " *" else ""
+      row <- trend_stats[season == s]
+      sig <- if (!is.na(row$p_value) && row$p_value < 0.05) " *" else ""
       sprintf("%s: %+.4f mm/yr%s", sub(" \\(.*", "", s), row$slope, sig)
     }),
     collapse = "   |   "
   )
-  
+}
+
+# ── internal helper: build one seasonal-trend ggplot panel ──
+.pet_seas_ggplot <- function(seas_means, SEASON_LEVELS,
+                             title_str, subtitle_str, ylab_str,
+                             year_start, year_end,
+                             base_size = 16) {
   season_colours <- c(
     "DJF (Dec\u2013Feb)" = "#4472C4",
     "MAM (Mar\u2013May)" = "#70AD47",
     "JJA (Jun\u2013Aug)" = "#C00000",
     "SON (Sep\u2013Nov)" = "#ED7D31"
   )
-  
-  p_pet <- ggplot(seas_means, aes(x = season_year, y = pet_mean, colour = season, group = season)) +
-    geom_line(linewidth = 0.6, alpha = 0.85) +
-    geom_point(size = 1.2, alpha = 0.75) +
-    geom_smooth(method = "lm", formula = y ~ x, se = FALSE, linetype = "dashed", linewidth = 1.6) +
-    geom_hline(yintercept = 0, linetype = "dotted", colour = "grey50", linewidth = 0.4) +
-    scale_colour_manual(values = season_colours, name = NULL,
-                        guide = guide_legend(direction = "horizontal", nrow = 1,
-                                             override.aes = list(linewidth = 1.4, size = 2))) +
-    scale_x_continuous(breaks = seq(1950, 2025, by = 10), expand = expansion(mult = 0.01)) +
-    labs(
-      title = sprintf("Seasonal PET-PM Trends \u2014 %s (%d\u2013%d)", basin_label, year_start, year_end),
-      subtitle = paste0("Annual seasonal means with OLS trend lines (dashed).  * p < 0.05\n", trend_label),
-      x = "Year", y = "Seasonal mean PET-PM (mm/month)"
+  ggplot2::ggplot(
+    seas_means,
+    ggplot2::aes(x = season_year, y = pet_mean,
+                 colour = season, group = season)
+  ) +
+    ggplot2::geom_line(linewidth = 0.6, alpha = 0.85) +
+    ggplot2::geom_point(size = 1.2, alpha = 0.75) +
+    ggplot2::geom_smooth(method = "lm", formula = y ~ x,
+                         se = FALSE, linetype = "dashed", linewidth = 1.6) +
+    ggplot2::geom_hline(yintercept = 0, linetype = "dotted",
+                        colour = "grey50", linewidth = 0.4) +
+    ggplot2::scale_colour_manual(
+      values = season_colours, name = NULL,
+      guide  = ggplot2::guide_legend(
+        direction = "horizontal", nrow = 1,
+        override.aes = list(linewidth = 1.4, size = 2)
+      )
     ) +
-    theme_bw(base_size = 12) +
-    theme(
-      plot.title = element_text(face = "bold", size = 13, margin = margin(b = 2)),
-      plot.subtitle = element_text(size = 9.5, colour = "grey30", margin = margin(b = 8)),
-      legend.position = "top", legend.text = element_text(size = 10),
-      legend.key.width = unit(1.6, "cm"), panel.grid.minor = element_blank(),
-      panel.grid.major = element_line(colour = "grey90", linewidth = 0.3),
-      axis.title = element_text(size = 11), axis.text = element_text(size = 10)
+    ggplot2::scale_x_continuous(
+      breaks = seq(year_start, year_end, by = 10),
+      expand = ggplot2::expansion(mult = 0.01)
+    ) +
+    ggplot2::labs(title    = title_str,
+                  subtitle = subtitle_str,
+                  x = "Year", y = ylab_str) +
+    ggplot2::theme_bw(base_size = base_size) +
+    ggplot2::theme(
+      plot.title    = ggplot2::element_text(face = "bold", size = base_size + 1,
+                                            margin = ggplot2::margin(b = 2)),
+      plot.subtitle = ggplot2::element_text(size = base_size - 2.5,
+                                            colour = "grey30",
+                                            margin = ggplot2::margin(b = 8)),
+      legend.position   = "top",
+      legend.text       = ggplot2::element_text(size = base_size - 2),
+      legend.key.width  = ggplot2::unit(1.6, "cm"),
+      panel.grid.minor  = ggplot2::element_blank(),
+      panel.grid.major  = ggplot2::element_line(colour = "grey90", linewidth = 0.3),
+      axis.title        = ggplot2::element_text(size = base_size - 1),
+      axis.text         = ggplot2::element_text(size = base_size - 2)
     )
+}
+
+# ── main function ──
+create_pet_seasonal_trends <- function(
+    df          = basin_avg_monthly,
+    out_dir_loc = out_dir,
+    basin_label = "Nechako River Basin",
+    year_start  = 1950L,
+    year_end    = 2025L
+) {
+  cat("\n── Function 15: PET seasonal trends plots (PM, Thw, combined) ──\n")
   
+  if (is.null(df) || !"date" %in% names(df)) {
+    cat("  \u26a0 Basin monthly data not available \u2014 skipping PET seasonal trends.\n")
+    return(invisible(NULL))
+  }
+  
+  df_dt      <- data.table::as.data.table(df)
+  has_pm     <- "pet_mm_month"     %in% names(df_dt)
+  has_thw_15 <- "pet_thw_mm_month" %in% names(df_dt)
+  
+  if (!has_pm) {
+    cat("  \u26a0 pet_mm_month not found \u2014 skipping Function 15.\n")
+    return(invisible(NULL))
+  }
+  
+  # ── 15a: PET-PM (original plot, unchanged filenames) ────────────────────────
+  cat("  15a: PET-PM seasonal trends...\n")
+  res_pm       <- .pet_seas_means(df_dt, "pet_mm_month", year_start, year_end)
+  label_pm     <- .pet_trend_label(res_pm$seas_means, res_pm$SEASON_LEVELS)
+  p_pm <- .pet_seas_ggplot(
+    seas_means    = res_pm$seas_means,
+    SEASON_LEVELS = res_pm$SEASON_LEVELS,
+    title_str     = sprintf("Seasonal PET-PM Trends \u2014 %s (%d\u2013%d)",
+                            basin_label, year_start, year_end),
+    subtitle_str  = paste0("Annual seasonal means with OLS trend lines (dashed).  * p < 0.05\n",
+                           label_pm),
+    ylab_str      = "Seasonal mean PET-PM (mm/season)",
+    year_start    = year_start, year_end = year_end
+  )
   out_png <- file.path(out_dir_loc, "FigS_PET_Seasonal_Trends.png")
   out_pdf <- file.path(out_dir_loc, "FigS_PET_Seasonal_Trends.pdf")
-  tryCatch({ ggsave(out_png, p_pet, width = 14, height = 7, units = "in", dpi = 300)
-    cat(sprintf("  \u2713 PET seasonal trends saved: %s\n", basename(out_png))) },
-    error = function(e) cat(sprintf("  \u26a0 PET PNG: %s\n", e$message)))
-  tryCatch({ ggsave(out_pdf, p_pet, width = 14, height = 7, units = "in", device = "pdf")
-    cat(sprintf("  \u2713 PET seasonal trends saved: %s\n", basename(out_pdf))) },
-    error = function(e) cat(sprintf("  \u26a0 PET PDF: %s\n", e$message)))
-  invisible(p_pet)
+  tryCatch({ ggplot2::ggsave(out_png, p_pm, width = 14, height = 7, units = "in", dpi = 300)
+    cat(sprintf("  \u2713 15a PNG saved: %s\n", basename(out_png))) },
+    error = function(e) cat(sprintf("  \u26a0 15a PNG: %s\n", e$message)))
+  tryCatch({ ggplot2::ggsave(out_pdf, p_pm, width = 14, height = 7, units = "in", device = "pdf")
+    cat(sprintf("  \u2713 15a PDF saved: %s\n", basename(out_pdf))) },
+    error = function(e) cat(sprintf("  \u26a0 15a PDF: %s\n", e$message)))
+  
+  # ── 15b: PET-Thw (new standalone plot) ──────────────────────────────────────
+  p_thw <- NULL
+  if (!has_thw_15) {
+    cat("  \u26a0 pet_thw_mm_month not found \u2014 skipping 15b (PET-Thw seasonal trends).\n")
+  } else {
+    cat("  15b: PET-Thw seasonal trends...\n")
+    res_thw   <- .pet_seas_means(df_dt, "pet_thw_mm_month", year_start, year_end)
+    label_thw <- .pet_trend_label(res_thw$seas_means, res_thw$SEASON_LEVELS)
+    p_thw <- .pet_seas_ggplot(
+      seas_means    = res_thw$seas_means,
+      SEASON_LEVELS = res_thw$SEASON_LEVELS,
+      title_str     = sprintf("Seasonal PET-Thw Trends \u2014 %s (%d\u2013%d)",
+                              basin_label, year_start, year_end),
+      subtitle_str  = paste0("Annual seasonal means with OLS trend lines (dashed).  * p < 0.05\n",
+                             label_thw),
+      ylab_str      = "Seasonal mean PET-Thw (mm/season)",
+      year_start    = year_start, year_end = year_end
+    )
+    out_thw_png <- file.path(out_dir_loc, "FigS_PET_Thw_Seasonal_Trends.png")
+    out_thw_pdf <- file.path(out_dir_loc, "FigS_PET_Thw_Seasonal_Trends.pdf")
+    tryCatch({ ggplot2::ggsave(out_thw_png, p_thw, width = 14, height = 7, units = "in", dpi = 300)
+      cat(sprintf("  \u2713 15b PNG saved: %s\n", basename(out_thw_png))) },
+      error = function(e) cat(sprintf("  \u26a0 15b PNG: %s\n", e$message)))
+    tryCatch({ ggplot2::ggsave(out_thw_pdf, p_thw, width = 14, height = 7, units = "in", device = "pdf")
+      cat(sprintf("  \u2713 15b PDF saved: %s\n", basename(out_thw_pdf))) },
+      error = function(e) cat(sprintf("  \u26a0 15b PDF: %s\n", e$message)))
+  }
+  
+  # ── 15c: single-panel difference figure (PET_Thw − PET_PM) ─────────────────
+  if (!is.null(p_thw)) {
+    cat("  15c: PET difference (Thw \u2212 PM) single-panel figure...\n")
+    
+    # Merge the two seasonal-means tables on (season_year, season)
+    sm_pm  <- data.table::copy(res_pm$seas_means)
+    sm_thw <- data.table::copy(res_thw$seas_means)
+    data.table::setnames(sm_pm,  "pet_mean", "pet_pm")
+    data.table::setnames(sm_thw, "pet_mean", "pet_thw")
+    sm_diff <- merge(sm_pm, sm_thw, by = c("season_year", "season"))
+    sm_diff[, diff_mean := pet_thw - pet_pm]
+    
+    # Drop winter (DJF) — keep only MAM, JJA, SON
+    sm_diff <- sm_diff[season != "DJF (Dec\u2013Feb)"]
+    
+    # OLS trend label for the difference series (3 non-winter seasons)
+    SEASON_LEVELS <- c("MAM (Mar\u2013May)", "JJA (Jun\u2013Aug)", "SON (Sep\u2013Nov)")
+    sm_diff[, season := factor(season, levels = SEASON_LEVELS)]
+    trend_diff <- sm_diff[, {
+      fit <- lm(diff_mean ~ season_year)
+      list(
+        slope   = coef(fit)[["season_year"]],
+        p_value = summary(fit)$coefficients["season_year", "Pr(>|t|)"]
+      )
+    }, by = season]
+    label_diff <- paste(
+      sapply(SEASON_LEVELS, function(s) {
+        row <- trend_diff[season == s]
+        sig <- if (!is.na(row$p_value) && row$p_value < 0.05) " *" else ""
+        sprintf("%s: %+.4f mm/yr%s", sub(" \\(.*", "", s), row$slope, sig)
+      }),
+      collapse = "   |   "
+    )
+    
+    season_colours <- c(
+      "MAM (Mar\u2013May)" = "#70AD47",
+      "JJA (Jun\u2013Aug)" = "#C00000",
+      "SON (Sep\u2013Nov)" = "#ED7D31"
+    )
+    
+    p_both <- ggplot2::ggplot(
+      sm_diff,
+      ggplot2::aes(x = season_year, y = diff_mean,
+                   colour = season, group = season)
+    ) +
+      ggplot2::geom_line(linewidth = 0.6, alpha = 0.85) +
+      ggplot2::geom_point(size = 1.2, alpha = 0.75) +
+      ggplot2::geom_smooth(method = "lm", formula = y ~ x,
+                           se = FALSE, linetype = "dashed", linewidth = 1.6) +
+      ggplot2::geom_hline(yintercept = 0, linetype = "solid",
+                          colour = "grey60", linewidth = 0.3) +
+      ggplot2::scale_colour_manual(
+        values = season_colours, name = NULL,
+        guide  = ggplot2::guide_legend(
+          direction = "horizontal", nrow = 1,
+          override.aes = list(linewidth = 1.4, size = 2)
+        )
+      ) +
+      ggplot2::scale_x_continuous(
+        breaks = seq(year_start, year_end, by = 10),
+        expand = ggplot2::expansion(mult = 0.01)
+      ) +
+      ggplot2::scale_y_continuous(
+        minor_breaks = scales::breaks_width(2)
+      ) +
+      ggplot2::labs(
+        title    = sprintf(
+          "Seasonal PET Difference (Thornthwaite \u2212 Penman\u2013Monteith) \u2014 %s (%d\u2013%d)",
+          basin_label, year_start, year_end),
+        subtitle = paste0(
+          "Seasonal annual means of PET\u2009Thw \u2212 PET\u2009PM with OLS trend lines (dashed).  * p < 0.05\n",
+          label_diff),
+        x = "Year",
+        y = "PET\u2009Thw \u2212 PET\u2009PM (mm\u2009season\u207b\u00b9)"
+      ) +
+      ggplot2::theme_bw(base_size = 16) +
+      ggplot2::theme(
+        plot.title    = ggplot2::element_text(face = "bold", size = 17, hjust = 0.5,
+                                              margin = ggplot2::margin(b = 2)),
+        plot.subtitle = ggplot2::element_text(size = 13, colour = "grey30",
+                                              margin = ggplot2::margin(b = 8)),
+        legend.position  = "top",
+        legend.text      = ggplot2::element_text(size = 14),
+        legend.key.width = ggplot2::unit(1.6, "cm"),
+        panel.grid.minor   = ggplot2::element_blank(),
+        panel.grid.major.x = ggplot2::element_line(colour = "grey82", linewidth = 0.35),
+        panel.grid.major.y = ggplot2::element_line(colour = "grey82", linewidth = 0.45),
+        panel.grid.minor.y = ggplot2::element_line(colour = "grey92", linewidth = 0.25),
+        panel.grid.minor.x = ggplot2::element_blank(),
+        axis.title       = ggplot2::element_text(size = 15),
+        axis.text        = ggplot2::element_text(size = 14)
+      )
+    
+    out_both_png <- file.path(out_dir_loc, "FigS_PET_Both_Seasonal_Trends.png")
+    out_both_pdf <- file.path(out_dir_loc, "FigS_PET_Both_Seasonal_Trends.pdf")
+    tryCatch({ ggplot2::ggsave(out_both_png, p_both, width = 14, height = 7, units = "in", dpi = 300)
+      cat(sprintf("  \u2713 15c PNG saved: %s\n", basename(out_both_png))) },
+      error = function(e) cat(sprintf("  \u26a0 15c PNG: %s\n", e$message)))
+    tryCatch({ ggplot2::ggsave(out_both_pdf, p_both, width = 14, height = 7, units = "in", device = "pdf")
+      cat(sprintf("  \u2713 15c PDF saved: %s\n", basename(out_both_pdf))) },
+      error = function(e) cat(sprintf("  \u26a0 15c PDF: %s\n", e$message)))
+  }
+  
+  cat("\u2500\u2500 Function 15 complete.\n")
+  invisible(list(p_pm = p_pm, p_thw = p_thw))
 }
 ####################################################################################
 # FUNCTION: Seasonal Climatology P vs PET (Bar Chart Style - Fig3.png)
@@ -1306,7 +1494,7 @@ create_temperature_dedicated_plots <- function() {
     ggplot2::theme(legend.position="top")
   p12b <- p12b 
   # + ggplot2::annotate("text", x=min(df_anom$year)+2, y=max(df_anom$anomaly)*0.85,
-                                   # label="10-yr rolling mean", colour="#1f78b4", hjust=0, size=3, fontface="italic")
+  # label="10-yr rolling mean", colour="#1f78b4", hjust=0, size=3, fontface="italic")
   tryCatch(ggplot2::ggsave(file.path(out_dir, "temperature_annual_anomaly.pdf"),
                            p12b, width=10, height=5, units="in", device="pdf"),
            error=function(e) cat(" \u26a0 12b PDF: ", e$message, "\n"))
@@ -1360,5 +1548,9 @@ cat(" pet_comparison_14d_monthly_bias.pdf/.png — monthly bias (PM − Thw)\n")
 cat(" pet_comparison_14e_scatter.pdf/.png — per-month PM vs Thw scatter\n")
 cat("\n[NEW] SEASONALITY OUTPUT:\n")
 cat(" FigS_Seasonality_P_PET.png — seasonal cycle P vs PET (two-panel bar chart)\n")
+cat("\nPET SEASONAL TRENDS (Function 15):\n")
+cat(" FigS_PET_Seasonal_Trends.png/.pdf      — 15a: PET-PM seasonal trends (original)\n")
+cat(" FigS_PET_Thw_Seasonal_Trends.png/.pdf  — 15b: PET-Thw seasonal trends (new)\n")
+cat(" FigS_PET_Both_Seasonal_Trends.png/.pdf — 15c: single-panel seasonal difference (PET_Thw − PET_PM)\n")
 cat("\nSPATIAL MAPS: all 4 variables (Pr, PET_PM, PET_Thw, Temperature)\n")
 cat("SPECIFIC-POINT: 4-panel TS + 4-panel slope bars at each point\n")

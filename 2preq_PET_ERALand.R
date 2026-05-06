@@ -501,28 +501,30 @@ tryCatch(
 # A. PM time series
 log_event("... A: PM time series")
 save_plot("A_PM_timeseries", function() {
-  par(mfrow = c(1, 1), mar = c(4, 4, 3, 1))
+  par(mfrow = c(1, 1), mar = c(5, 5, 4, 2))
   plot(dates, pet_summary$mean_pet, type = "l", col = "blue", lwd = 2,
        xlab = "Date", ylab = "PET (mm/day)",
-       main = "Basin-Average PET Time Series (Penman-Monteith)")
-  grid()
+       main = "Basin-Average PET Time Series (Penman-Monteith)",
+       cex.main = 1.5, cex.lab = 1.3, cex.axis = 1.2, font.main = 2)
+  grid(lty = "dotted", col = "grey88")
   if (nrow(pet_summary) >= 12) {
     ma_12 <- stats::filter(pet_summary$mean_pet, rep(1/12, 12), sides = 2)
     lines(dates, ma_12, col = "red", lwd = 2)
     legend("topleft", legend = c("Monthly PET", "12-month MA"),
-           col = c("blue", "red"), lwd = 2, bty = "n")
+           col = c("blue", "red"), lwd = 2, bty = "n", cex = 1.2)
   }
 })
 
 # B. Seasonal cycle
 log_event("... B: Seasonal cycle boxplot")
 save_plot("B_seasonal_boxplot", function() {
-  par(mfrow = c(1, 1), mar = c(4, 4, 3, 1))
+  par(mfrow = c(1, 1), mar = c(5, 5, 4, 2))
   boxplot(mean_pet ~ month, data = pet_summary,
           xlab = "Month", ylab = "PET (mm/day)",
           main = "Seasonal Distribution of PET (PM)",
-          names = month.abb, col = "lightblue", border = "darkblue")
-  grid()
+          names = month.abb, col = "lightblue", border = "darkblue",
+          cex.main = 1.5, cex.lab = 1.3, cex.axis = 1.2, font.main = 2)
+  grid(lty = "dotted", col = "grey88")
 })
 
 # C. Range validation
@@ -538,18 +540,19 @@ if (nrow(anomalies) > 0) {
 # D. Monthly climatology (PM only, mm/day)
 log_event("... D: Monthly climatology (PM)")
 save_plot("D_monthly_climatology_PM", function() {
-  par(mfrow = c(1, 1), mar = c(4, 4, 3, 1))
+  par(mfrow = c(1, 1), mar = c(5, 5, 4, 2))
   plot(monthly_stats$month, monthly_stats$mean_pet, type = "b", pch = 19, col = "darkblue",
        xlab = "Month", ylab = "Mean PET (mm/day)",
        main = "Mean PM PET Climatology by Calendar Month",
-       xaxt = "n", ylim = c(0, max(monthly_stats$mean_pet, na.rm = TRUE) * 1.1))
-  axis(1, at = 1:12, labels = month.abb)
+       xaxt = "n", ylim = c(0, max(monthly_stats$mean_pet, na.rm = TRUE) * 1.1),
+       cex.main = 1.5, cex.lab = 1.3, cex.axis = 1.2, font.main = 2)
+  axis(1, at = 1:12, labels = month.abb, cex.axis = 1.2)
   arrows(monthly_stats$month,
          monthly_stats$mean_pet - monthly_stats$std_dev,
          monthly_stats$month,
          monthly_stats$mean_pet + monthly_stats$std_dev,
          angle = 90, code = 3, length = 0.05, col = "gray50")
-  grid()
+  grid(lty = "dotted", col = "grey88")
 })
 
 # E. Inter-annual variability with Sen's slope
@@ -604,16 +607,17 @@ log_event("... F2: PM vs. Thornthwaite comparison")
 
 # F2a. Time series overlay
 save_plot("F2a_timeseries_PM_vs_Thw", function() {
-  par(mfrow = c(1, 1), mar = c(4, 4, 3, 1))
+  par(mfrow = c(1, 1), mar = c(5, 5, 4, 2))
   y_lim <- range(c(pet_summary$mean_pet, pet_thw_summary$mean_pet), na.rm = TRUE)
-  plot(dates, pet_summary$mean_pet, type = "l", col = "blue", lwd = 1.5,
+  plot(dates, pet_summary$mean_pet, type = "l", col = "blue", lwd = 2,
        ylim = y_lim, xlab = "Date", ylab = "PET (mm/day)",
-       main = "Basin-Average PET: Penman-Monteith vs. Thornthwaite")
-  lines(dates, pet_thw_summary$mean_pet, col = "darkorange", lwd = 1.5, lty = 2)
+       main = "Basin-Average PET: Penman-Monteith vs. Thornthwaite",
+       cex.main = 1.5, cex.lab = 1.3, cex.axis = 1.2, font.main = 2)
+  lines(dates, pet_thw_summary$mean_pet, col = "darkorange", lwd = 2, lty = 2)
   legend("topright",
-         legend = c("Penman-Monteith (ERA5)", "Thornthwaite (T-only)"),
-         col = c("blue", "darkorange"), lwd = 2, lty = c(1, 2), bty = "n")
-  grid()
+         legend = c("Penman-Monteith", "Thornthwaite (T-only)"),
+         col = c("blue", "darkorange"), lwd = 2, lty = c(1, 2), bty = "n", cex = 1.2)
+  grid(lty = "dotted", col = "grey88")
 })
 
 # F2b. Seasonal climatology with error bars — UNIT FIX: convert mm/day -> mm/month
@@ -624,24 +628,50 @@ sd_pm        <- monthly_stats$std_dev      * days_per_month
 sd_thw       <- monthly_stats_thw$std_dev  * days_per_month
 
 save_plot("F2b_seasonal_climatology_PM_vs_Thw", function() {
-  par(mfrow = c(1, 1), mar = c(4, 5, 3, 1))
+  # ── Increased font sizes for readability ──────────────────────────────────
+  CEX_MAIN <- 1.65   # plot title
+  CEX_LAB  <- 1.60   # axis labels (x / y)
+  CEX_AXIS <- 1.50   # tick labels (both x month names and y numeric values)
+  CEX_LEG  <- 1.25   # legend text
+  LWD_LINE <- 2.5    # line width
+  
+  par(mfrow = c(1, 1), mar = c(5, 6, 4, 2))
   y_max <- max(c(pet_clim_pm, pet_clim_thw), na.rm = TRUE) * 1.15
-  plot(1:12, pet_clim_pm, type = "b", pch = 19, col = "blue", lwd = 2,
+  
+  # ── Base plot: Penman-Monteith (blue solid, filled circles) ───────────────
+  # cex.axis here controls the y-axis tick numbers; x-axis is redrawn below.
+  plot(1:12, pet_clim_pm,
+       type = "b", pch = 19, col = "blue", lwd = LWD_LINE,
        xlab = "Month", ylab = "Mean PET (mm/month)",
        main = "Seasonal PET Climatology: PM vs. Thornthwaite",
-       xaxt = "n", ylim = c(0, y_max))
-  axis(1, at = 1:12, labels = month.abb)
-  lines(1:12, pet_clim_thw, type = "b", pch = 17, col = "darkorange", lwd = 2, lty = 2)
+       xaxt = "n", ylim = c(0, y_max),
+       cex.main = CEX_MAIN, cex.lab = CEX_LAB, cex.axis = CEX_AXIS, font.main = 2)
+  axis(1, at = 1:12, labels = month.abb, cex.axis = CEX_AXIS)
+  
+  # ── Overlay: Thornthwaite (orange dashed, filled triangles) ──────────────
+  lines(1:12, pet_clim_thw,
+        type = "b", pch = 17, col = "darkorange", lwd = LWD_LINE, lty = 2)
+  
+  # ── Error bars (±1 SD) ────────────────────────────────────────────────────
   suppressWarnings({
     arrows(1:12, pet_clim_pm  - sd_pm,  1:12, pet_clim_pm  + sd_pm,
-           angle = 90, code = 3, length = 0.04, col = "blue")
+           angle = 90, code = 3, length = 0.05, col = "blue",       lwd = 1.5)
     arrows(1:12, pet_clim_thw - sd_thw, 1:12, pet_clim_thw + sd_thw,
-           angle = 90, code = 3, length = 0.04, col = "darkorange")
+           angle = 90, code = 3, length = 0.05, col = "darkorange", lwd = 1.5)
   })
+  
+  # ── Legend (label fixed: "Penman-Monteith" not "Penman-Monteith (ERA5)") ─
   legend("topleft",
-         legend = c("Penman-Monteith (ERA5)", "Thornthwaite (T-only)"),
-         col = c("blue", "darkorange"), lwd = 2, pch = c(19, 17), lty = c(1, 2), bty = "n")
-  grid()
+         legend = c("Penman-Monteith", "Thornthwaite (T-only)"),
+         col    = c("blue", "darkorange"),
+         lwd    = LWD_LINE,
+         pch    = c(19L, 17L),
+         lty    = c(1L, 2L),
+         bty    = "n",
+         cex    = CEX_LEG)
+  
+  # ── Light dotted reference grid ───────────────────────────────────────────
+  grid(lty = "dotted", col = "grey88", lwd = 0.8)
 })
 
 # F2c. Bias bar chart — UNIT FIX: convert mm/day -> mm/month

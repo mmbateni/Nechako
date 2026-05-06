@@ -13,6 +13,7 @@ library(lubridate)
 library(dplyr)
 library(tidyr)
 library(ggplot2)
+library(ggtext)
 setwd("D:/Nechako_Drought/Nechako/")
 out_dir <- "decomp_results"
 if (!dir.exists(out_dir)) dir.create(out_dir)
@@ -1257,21 +1258,22 @@ fig6_123  <- patchwork::wrap_plots(panels, ncol = 1) +
     title    = paste0("Thermodynamic fraction of drought severity — ",
                       "SPEI-1, 2, 3  —  Nechako River Basin (1950–2025)"),
     subtitle = paste0(
-      expression(italic(F)[thm]),
-      " = annual mean |SPEI₀| / (|SPEIₚₘ| + ε)  using all 12 calendar months.   ",
-      "Solid red = full-record OLS ± 95% CI ribbon.   ",
-      "Dashed red = post-1990 OLS ± 90% CI ribbon.   ",
-      "Coloured points = decade.  Grey band = 2022–2025 focus period."),
+      "*F*<sub>thm</sub> = annual mean |SPEI<sub>0</sub>| / (|SPEI<sub>pm</sub>| + \u03b5)",
+      "  using all 12 calendar months.   ",
+      "Solid red = full-record OLS \u00b1 95% CI ribbon.   ",
+      "Dashed red = post-1990 OLS \u00b1 90% CI ribbon.   ",
+      "Coloured points = decade.  Grey band = 2022\u20132025 focus period."),
     caption  = paste0(
-      "ε = 10⁻⁶ prevents division by zero.   ",
+      "\u03b5 = 10\u207b\u2076 prevents division by zero.   ",
       "OLS fitted by ordinary least squares; CI from classical normal theory.   ",
       "All months included (SPEI-1/2/3 respond throughout the year)."),
     theme = ggplot2::theme(
       plot.title    = ggplot2::element_text(size = 11, face = "bold", hjust = 0.5),
-      plot.subtitle = ggplot2::element_text(size = 8,  colour = "grey35", hjust = 0,
-                                            margin = ggplot2::margin(b = 4)),
+      plot.subtitle = ggtext::element_markdown(size = 8, colour = "grey35", hjust = 0,
+                                               margin = ggplot2::margin(b = 4)),
       plot.caption  = ggplot2::element_text(size = 6.5, colour = "grey50", hjust = 0,
                                             margin = ggplot2::margin(t = 4)),
+      plot.margin   = ggplot2::margin(t = 14, r = 8, b = 6, l = 8),
       legend.position = "right",
       legend.text     = ggplot2::element_text(size = 8),
       legend.title    = ggplot2::element_text(size = 8.5, face = "bold")))
@@ -1289,13 +1291,14 @@ fig6_123_patched  <- patchwork::wrap_plots(panels_patched, ncol = 1) +
     title    = paste0("Thermodynamic fraction of drought severity — ",
                       "SPEI-1, 2, 3  —  Nechako River Basin (1950–2025)"),
     subtitle = paste0(
-      expression(italic(F)[thm]),
-      " = annual mean |SPEI₀| / (|SPEIₚₘ| + ε)  using all 12 calendar months.   ",
-      "Coloured points = decade.  Grey band = 2022–2025 focus period."),
+      "*F*<sub>thm</sub> = annual mean |SPEI<sub>0</sub>| / (|SPEI<sub>pm</sub>| + \u03b5)",
+      "  using all 12 calendar months.   ",
+      "Coloured points = decade.  Grey band = 2022\u20132025 focus period."),
     theme = ggplot2::theme(
       plot.title    = ggplot2::element_text(size = 11, face = "bold", hjust = 0.5),
-      plot.subtitle = ggplot2::element_text(size = 8,  colour = "grey35", hjust = 0,
-                                            margin = ggplot2::margin(b = 4)),
+      plot.subtitle = ggtext::element_markdown(size = 8, colour = "grey35", hjust = 0,
+                                               margin = ggplot2::margin(b = 4)),
+      plot.margin   = ggplot2::margin(t = 14, r = 8, b = 6, l = 8),
       legend.position = "right",
       legend.text     = ggplot2::element_text(size = 8),
       legend.title    = ggplot2::element_text(size = 8.5, face = "bold")))
@@ -1304,12 +1307,12 @@ f6_123_pdf  <- file.path(out_dir, "Fig6_thermodynamic_trend_SPEI123.pdf")
 f6_123_png  <- file.path(out_dir, "Fig6_thermodynamic_trend_SPEI123.png")
 tryCatch({
   ggplot2::ggsave(f6_123_pdf, fig6_123,
-                  width  = 7.0, height = 11.0, units = "in", device = "pdf")
+                  width  = 7.5, height = 11.0, units = "in", device = "pdf")
   cat(sprintf("  ✓ Fig6 SPEI-1/2/3 (PDF): %s\n", basename(f6_123_pdf)))
 }, error = function(e) cat(sprintf("  ⚠ PDF failed: %s\n", e$message)))
 tryCatch({
   ggplot2::ggsave(f6_123_png, fig6_123,
-                  width  = 7.0, height = 11.0, units = "in", dpi = 300, device = "png")
+                  width  = 7.5, height = 11.0, units = "in", dpi = 300, device = "png")
   cat(sprintf("  ✓ Fig6 SPEI-1/2/3 (PNG): %s\n", basename(f6_123_png)))
 }, error = function(e) cat(sprintf("  ⚠ PNG failed: %s\n", e$message)))
 # ── Save PATCHED ────────────────────────────────────────────────────────────
@@ -1317,12 +1320,12 @@ f6_123_pdf_patched  <- file.path(out_dir, "Fig6_thermodynamic_trend_SPEI123_PATC
 f6_123_png_patched  <- file.path(out_dir, "Fig6_thermodynamic_trend_SPEI123_PATCHED.png")
 tryCatch({
   ggplot2::ggsave(f6_123_pdf_patched, fig6_123_patched,
-                  width  = 7.0, height = 11.0, units = "in", device = "pdf")
+                  width  = 7.5, height = 11.0, units = "in", device = "pdf")
   cat(sprintf("  ✓ Fig6 SPEI-1/2/3 PATCHED (PDF): %s\n", basename(f6_123_pdf_patched)))
 }, error = function(e) cat(sprintf("  ⚠ PATCHED PDF failed: %s\n", e$message)))
 tryCatch({
   ggplot2::ggsave(f6_123_png_patched, fig6_123_patched,
-                  width  = 7.0, height = 11.0, units = "in", dpi = 300, device = "png")
+                  width  = 7.5, height = 11.0, units = "in", dpi = 300, device = "png")
   cat(sprintf("  ✓ Fig6 SPEI-1/2/3 PATCHED (PNG): %s\n", basename(f6_123_png_patched)))
 }, error = function(e) cat(sprintf("  ⚠ PATCHED PNG failed: %s\n", e$message)))
 # ── Console summary ───────────────────────────────────────────────────────────
