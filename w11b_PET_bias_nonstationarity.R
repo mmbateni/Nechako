@@ -72,6 +72,8 @@ P1_START <- 1950L; P1_END <- 1990L
 P3_START <- 2022L; P3_END <- 2025L
 SCALES   <- c(1L, 2L, 3L)
 EPS      <- 1e-6
+SPEI_PM_THR <- -0.5   # drought severity gate: Fthm is only meaningful when SPEI_PM <= this.
+# Prevents unstable fractions from near-zero denominators in wet months.
 
 season_of <- function(m) dplyr::case_when(
   m %in% c(12L,1L,2L)  ~ "DJF",
@@ -151,8 +153,8 @@ cat(sprintf("  bias (mm/month): %.3f to %.3f\n",
             max(base$bias_mm_month,   na.rm = TRUE)))
 
 write.csv(base %>% select(date, year, month, season, days_in_month,
-                           wb_pm_mm_month, pet_pm_mm_day, pet_thw_mm_day,
-                           bias_mm_day, bias_mm_month, in_P1, in_P3),
+                          wb_pm_mm_month, pet_pm_mm_day, pet_thw_mm_day,
+                          bias_mm_day, bias_mm_month, in_P1, in_P3),
           file.path(OUT_DIR, "bias_monthly_timeseries.csv"), row.names = FALSE)
 cat("  Saved: bias_monthly_timeseries.csv\n")
 
@@ -177,15 +179,15 @@ correction_all <- list()
 
 for (k in SCALES) {
   cat(sprintf("\n  Scale k=%d:\n", k))
-
+  
   # k-month rolling sums (align="right": window ENDS at position i)
   wb_k    <- rollsum(base$wb_pm_mm_month, k, align = "right", fill = NA)
   bias_k  <- rollsum(base$bias_mm_month,  k, align = "right", fill = NA)
-
+  
   tmp <- base %>%
     mutate(wb_k   = wb_k,
            bias_k = bias_k)
-
+  
   # P1 statistics per ending calendar month
   p1_stats <- tmp %>%
     filter(in_P1, !is.na(wb_k), !is.na(bias_k)) %>%
@@ -197,7 +199,7 @@ for (k in SCALES) {
       mean_wb_k_P1      = mean(wb_k,   na.rm = TRUE),
       .groups = "drop"
     )
-
+  
   # P3 statistics per ending calendar month
   p3_stats <- tmp %>%
     filter(in_P3, !is.na(bias_k)) %>%
@@ -207,7 +209,7 @@ for (k in SCALES) {
       mean_bias_k_P3    = mean(bias_k, na.rm = TRUE),
       .groups = "drop"
     )
-
+  
   corr_k <- inner_join(p1_stats, p3_stats, by = "month") %>%
     mutate(
       scale            = k,
@@ -224,9 +226,9 @@ for (k in SCALES) {
            mean_bias_k_P1, mean_bias_k_P3, delta_bias_k,
            sd_wb_k_P1, mean_wb_k_P1,
            delta_SPEI_k)
-
+  
   correction_all[[as.character(k)]] <- corr_k
-
+  
   cat(sprintf("  %-5s %-6s %-14s %-14s %-14s %-14s %-12s\n",
               "Month","Season","bias_k_P1","bias_k_P3",
               "delta_bias_k","SD_WB_k_P1","delta_SPEI_k"))
@@ -347,23 +349,29 @@ corrected_list <- list()
 for (k in SCALES) {
   corr_k  <- correction_all[[as.character(k)]]
   delta_lk <- setNames(corr_k$delta_SPEI_k, as.character(corr_k$month))
-
+  
   d_sc <- decomp %>%
     filter(scale == k, year >= P3_START, year <= P3_END) %>%
     mutate(
       delta_SPEI_k   = delta_lk[as.character(month)],
       SPEI_Thw_corr  = SPEI_Thw + delta_SPEI_k,
-      f_thm_orig     = abs(SPEI_Thw)      / (abs(SPEI_PM) + EPS),
-      f_thm_corr     = abs(SPEI_Thw_corr) / (abs(SPEI_PM) + EPS),
+      # Fthm is only computed where SPEI_PM <= SPEI_PM_THR (-0.5).
+      # Outside that range the denominator is near zero and the fraction is unstable.
+      f_thm_orig     = dplyr::if_else(SPEI_PM <= SPEI_PM_THR,
+                                      abs(SPEI_Thw)      / (abs(SPEI_PM) + EPS),
+                                      NA_real_),
+      f_thm_corr     = dplyr::if_else(SPEI_PM <= SPEI_PM_THR,
+                                      abs(SPEI_Thw_corr) / (abs(SPEI_PM) + EPS),
+                                      NA_real_),
       delta_f_pp     = 100 * (f_thm_corr - f_thm_orig),
       season         = season_of(month)
     ) %>%
     select(date, year, month, season, scale,
            SPEI_PM, SPEI_Thw, delta_SPEI_k,
            SPEI_Thw_corr, f_thm_orig, f_thm_corr, delta_f_pp)
-
+  
   corrected_list[[as.character(k)]] <- d_sc
-
+  
   seas_sc <- d_sc %>%
     group_by(season) %>%
     summarise(
@@ -372,15 +380,15 @@ for (k in SCALES) {
       delta_f_pp  = round(mean(delta_f_pp, na.rm = TRUE), 2),
       .groups = "drop"
     )
-
+  
   ann_sc <- d_sc %>%
     summarise(
       f_orig_pct = round(100 * mean(f_thm_orig, na.rm = TRUE), 2),
       f_corr_pct = round(100 * mean(f_thm_corr, na.rm = TRUE), 2),
       delta_f_pp = round(mean(delta_f_pp, na.rm = TRUE), 2)
     )
-
-  cat(sprintf("\n  SPEI-%d (48-month mean): f_thm %.2f%% → %.2f%% (Δ = %+.2f pp)\n",
+  
+  cat(sprintf("\n  SPEI-%d (months with SPEI_PM <= -0.5): f_thm %.2f%% → %.2f%% (Δ = %+.2f pp)\n",
               k, ann_sc$f_orig_pct, ann_sc$f_corr_pct, ann_sc$delta_f_pp))
   cat("    Seasonal breakdown:\n")
   print(seas_sc)
@@ -451,7 +459,7 @@ sd_plot <- correction_df %>%
          scale_lbl  = paste0("SPEI-", scale, " (k=", scale, " month SD_WB)"))
 
 f3 <- ggplot(sd_plot, aes(x=month_name, y=sd_wb_k_P1,
-                            colour=scale_lbl, group=scale_lbl)) +
+                          colour=scale_lbl, group=scale_lbl)) +
   geom_line(linewidth=1.1) +
   geom_point(size=2.2) +
   labs(title="SD of k-month accumulated WB_PM per calendar month (P1: 1950-1990)",
@@ -523,13 +531,14 @@ cat(sprintf("
     P3 annual mean (2022-2025):  %+.3f mm/month
     Annual delta bias:           %+.3f mm/month
     Welch t-test (annual agg.):  t=%.3f, p=%.4f (n_P3=%d — indicative)\n\n",
-  mean(p1_ann, na.rm=TRUE), mean(p3_ann, na.rm=TRUE),
-  mean(p3_ann, na.rm=TRUE) - mean(p1_ann, na.rm=TRUE),
-  tt_ann$statistic, tt_ann$p.value, length(p3_ann)
+            mean(p1_ann, na.rm=TRUE), mean(p3_ann, na.rm=TRUE),
+            mean(p3_ann, na.rm=TRUE) - mean(p1_ann, na.rm=TRUE),
+            tt_ann$statistic, tt_ann$p.value, length(p3_ann)
 ))
 
 for (k in SCALES) {
   d <- corrected_list[[as.character(k)]]
+  # Summaries already use na.rm = TRUE; NA values (SPEI_PM > -0.5) are excluded automatically.
   fo <- round(100 * mean(d$f_thm_orig, na.rm=TRUE), 2)
   fc <- round(100 * mean(d$f_thm_corr, na.rm=TRUE), 2)
   df <- round(fc - fo, 2)

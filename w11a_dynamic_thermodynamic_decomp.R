@@ -18,6 +18,13 @@ setwd("D:/Nechako_Drought/Nechako/")
 out_dir <- "decomp_results"
 if (!dir.exists(out_dir)) dir.create(out_dir)
 
+# ------------------------------------------------------------------------------
+# GLOBAL THRESHOLDS (used throughout all steps)
+# ------------------------------------------------------------------------------
+THR_EVENT <- -0.5   # event-identification threshold (Section 3.2 of manuscript)
+THR_FTHM  <- -0.5  # SPEI-PM gate for Fthm: only compute where SPEI_PM <= this value
+# prevents unstable fractions when the drought signal is weak (near-zero denominator)
+
 # ==============================================================================
 #   STEP 1: LOAD PRE-COMPUTED SPEI RESULTS
 # ==============================================================================
@@ -123,9 +130,15 @@ compute_decomposition <- function(spei_pm, spei_thw, dates, month_nums, year_num
     SPEI_PM       = spei_pm_mean,
     SPEI_Thw      = spei_thw_mean,
     SPEI_Dynamic  = spei_dyn_mean,
-    # Fraction of total drought severity from each component
-    thm_frac      = abs(spei_thw_mean) / (abs(spei_pm_mean) + 1e-6),
-    dyn_frac      = abs(spei_dyn_mean) / (abs(spei_pm_mean) + 1e-6)
+    # Fraction of total drought severity from each component.
+    # Only computed where SPEI_PM <= THR_FTHM (-0.5) to avoid unstable values
+    # when the drought signal is weak (near-zero denominator).
+    thm_frac      = dplyr::if_else(spei_pm_mean <= THR_FTHM,
+                                   abs(spei_thw_mean) / (abs(spei_pm_mean) + 1e-6),
+                                   NA_real_),
+    dyn_frac      = dplyr::if_else(spei_pm_mean <= THR_FTHM,
+                                   abs(spei_dyn_mean) / (abs(spei_pm_mean) + 1e-6),
+                                   NA_real_)
   )
 }
 decomp_all  <- bind_rows(lapply(decomp_scales, function(sc) {
@@ -151,7 +164,7 @@ cat("✓ Decomposition timeseries saved\n")
 # ==============================================================================
 cat("\n===== STEP 4: 2022-2025 DROUGHT DECOMPOSITION =====\n")
 drought_decomp <- decomp_all %>%
-  filter(year >= 2022, year <= 2025) %>%
+  filter(year >= 2022, year <= 2025, SPEI_PM <= THR_FTHM) %>%   # gate on SPEI_PM <= -0.5
   group_by(scale) %>%
   summarise(
     SPEI_PM_mean        = mean(SPEI_PM,      na.rm = TRUE),
@@ -181,8 +194,10 @@ write.csv(drought_decomp, file.path(out_dir, "decomp_2022_2025_summary.csv"), ro
 # ==============================================================================
 cat("\n===== STEP 5: TREND IN THERMODYNAMIC FRACTION (1950-2025) =====\n")
 # Focus on SPEI-3 JJA (summer drought most relevant for Nechako)
+# Filter to SPEI_PM <= THR_FTHM before aggregating so that only drought-active months
+# contribute to the annual Fthm mean (avoids unstable fractions near zero denominator).
 trend_df <- decomp_all %>%
-  dplyr::filter(scale == 3, month %in% c(6, 7, 8)) %>%
+  dplyr::filter(scale == 3, month %in% c(6, 7, 8), SPEI_PM <= THR_FTHM) %>%
   dplyr::group_by(year) %>%
   dplyr::summarise(
     SPEI_PM       = mean(SPEI_PM,      na.rm = TRUE),
@@ -265,7 +280,7 @@ COL_THW <- "#e31a1c"    # red         — SPEI₀  (thermodynamic)
 COL_DYN <- "#1f78b4"    # blue        — SPEIᵟ  (dynamic)
 HIGHLIGHT_START <- as.Date("2022-01-01")
 HIGHLIGHT_END   <- as.Date("2025-12-31")
-THR_EVENT <- -0.5   # event-identification threshold (Section 3.2 of manuscript)
+# THR_EVENT and THR_FTHM are defined at the top of the script
 
 # ==============================================================================
 #   SUPPLEMENTARY FIGURES (original code, lightly tidied)
@@ -333,9 +348,10 @@ seasons <- list(
 for (s_name in names(seasons)) {
   s_months <- seasons[[s_name]]
   
-  # Calculate subset for the specific season
+  # Filter to drought-active months only (SPEI_PM <= THR_FTHM) before aggregating
+  # to prevent unstable Fthm values from inflating seasonal trend estimates.
   s_trend_df <- decomp_all %>%
-    dplyr::filter(scale == 3, month %in% s_months) %>%
+    dplyr::filter(scale == 3, month %in% s_months, SPEI_PM <= THR_FTHM) %>%
     # Shift December forward by 1 year so DJF forms a continuous winter
     dplyr::mutate(met_year = dplyr::if_else(month == 12, year + 1, year)) %>%
     dplyr::group_by(met_year) %>%
@@ -879,46 +895,45 @@ tryCatch({
 }, error = function(e) cat(sprintf("  ⚠ Fig6 patched PNG: %s\n", e$message)))
 
 # ==============================================================================
-#   Fig6_SPEI123_thermodynamic_trend.R
-# ------------------------------------------------------------------------------
-#   Generates Fig6_thermodynamic_trend_SPEI123.pdf/.png
-# This is a DROP-IN ADDITION for w11a_dynamic_thermodynamic_decomp.R.
-# Paste this block immediately AFTER the existing "STEP 6: GENERATE FIGURES"
-# section (after the existing Fig6 is saved), or source it standalone once
-# decomp_all exists in the environment.
-# WHAT IT DOES
-# For each of SPEI-1, SPEI-2, SPEI-3:
-#   1. Computes annual F_thm = mean(|SPEI_Thw| / (|SPEI_PM| + ε))
-# using ALL 12 calendar months (short scales respond throughout the year).
-# 2. Fits two OLS models:
-#   (a) Full record 1950–2025 — slope, 95% CI, p-value
-# (b) Post-1990 sub-period  — slope, 90% CI, p-value
-# 3. Builds one panel per scale (same visual language as the existing Fig6
-#                                for SPEI-3 JJA: decade-coloured scatter, ribbon CIs, vertical
-#                                references at 1990 & 2022, slope annotations).
-# The three panels are assembled into a single 7.0 × 11.0 in publication
-# figure (PDF + 300 DPI PNG).
-# REQUIRES (already in environment after STEP 3 of w11a):
-#   decomp_all  — data.frame(date, year, month, scale,
-#                            SPEI_PM, SPEI_Thw, SPEI_Dynamic, ...)
-# out_dir     — character, output directory
-# COL_THW     — "#e31a1c"  (red, thermodynamic)
-# theme_ms    — shared ggplot2 theme
-# OUTPUT files written to out_dir:
-#   Fig6_thermodynamic_trend_SPEI123.pdf/.png (ORIGINAL with ribbons/lines/p-values)
-# Fig6_thermodynamic_trend_SPEI123_PATCHED.pdf/.png (PATCHED slope-only)
+#  Fig6_thermodynamic_trend_SPEI123_PATCHED_v2.R
+#
+#  DROP-IN REPLACEMENT for the PATCHED Fig6 block in
+#  w11a_dynamic_thermodynamic_decomp.R.
+#
+#  Changes relative to the original PATCHED block
+#  ------------------------------------------------
+#  1. OLS annotation boxes REMOVED:
+#       • "Full record OLS …"  annotate("label") — removed
+#       • "Post-1990 OLS …"    annotate("label") — removed
+#     All other annotations are kept unchanged:
+#       • "Post-1990 acceleration"  (italic grey text)
+#       • "2022–2025 drought"       (italic grey text)
+#       • Panel/scale label         (bold, top-right corner)
+#  2. Legend enlarged   : key.size 0.32 → 0.55 cm
+#                         text size 7.5 → 12 pt
+#                         title size 8.0 → 13 pt
+#  3. Axis tick labels  : x-tick text 8  → 12 pt  (bottom panel)
+#                         y-tick text     → 12 pt  (all panels, was implicit)
+#  4. Axis titles       : 9 → 13 pt  (both axes)
+#
+#  REQUIRES (already in environment after running w11a Steps 1–5):
+#    decomp_all   — data.frame produced in STEP 3
+#    out_dir      — output directory (default: "decomp_results")
+#    COL_THW      — "#e31a1c"
+#    theme_ms     — shared ggplot2 theme
 # ==============================================================================
+
 # ── Guard: ensure required objects exist ──────────────────────────────────────
 if (!exists("decomp_all"))
-  stop("Run w11a Steps 1-5 first so decomp_all, out_dir, COL_THW, theme_ms exist.")
-if (!exists("out_dir"))   out_dir  <- "decomp_results"
-if (!exists("COL_THW"))   COL_THW  <- "#e31a1c"
+  stop("Run w11a Steps 1–5 first so decomp_all, out_dir, COL_THW, theme_ms exist.")
+if (!exists("out_dir"))  out_dir  <- "decomp_results"
+if (!exists("COL_THW"))  COL_THW  <- "#e31a1c"
 if (!exists("theme_ms")) {
-  theme_ms  <- ggplot2::theme_classic(base_size = 10) +
+  theme_ms <- ggplot2::theme_classic(base_size = 10) +
     ggplot2::theme(
-      plot.title    = ggplot2::element_text(size = 10, face = "bold", hjust = 0),
-      plot.subtitle = ggplot2::element_text(size = 8.5, colour = "grey40", hjust = 0,
-                                            margin = ggplot2::margin(b = 4)),
+      plot.title       = ggplot2::element_text(size = 10, face = "bold", hjust = 0),
+      plot.subtitle    = ggplot2::element_text(size = 8.5, colour = "grey40", hjust = 0,
+                                               margin = ggplot2::margin(b = 4)),
       legend.position  = "bottom",
       legend.key.size  = ggplot2::unit(0.4, "cm"),
       legend.text      = ggplot2::element_text(size = 8.5),
@@ -927,38 +942,37 @@ if (!exists("theme_ms")) {
       panel.grid.minor = ggplot2::element_blank(),
       plot.margin      = ggplot2::margin(4, 8, 4, 4))
 }
+
 suppressPackageStartupMessages({
-  library(dplyr); library(ggplot2); library(patchwork)
+  library(dplyr); library(ggplot2); library(patchwork); library(ggtext)
 })
-cat("\n  Building Fig6: thermodynamic fraction trend — SPEI-1/2/3...\n")
-# ── Helper: format p-value ────────────────────────────────────────────────────
-.fmt_p <- function(p) {
-  if      (p < 0.001) "p < 0.001"
-  else if (p < 0.05)  sprintf("p = %.3f", p)
-  else if (p < 0.10)  sprintf("p = %.3f†", p)   # dagger = marginal
-  else                sprintf("p = %.2f",  p)
-}
-# ── Scales to plot ────────────────────────────────────────────────────────────
-MS_SCALES <- c(1L, 2L, 3L)
-# Panel labels
+
+MS_SCALES    <- c(1L, 2L, 3L)
 PANEL_LABELS <- c("(a)", "(b)", "(c)")
-# ── Build one panel ───────────────────────────────────────────────────────────
-# sc       : integer scale (1, 2, or 3)
-# pan_lab  : panel label string, e.g. "(a)"
-# show_x   : TRUE = show x-axis text (bottom panel only)
-# show_leg : TRUE = show decade legend (bottom panel only)
-make_f6_panel <- function(sc, pan_lab, show_x = FALSE, show_leg = FALSE) {
-  #   ── 1. Annual F_thm — ALL calendar months ──────────────────────────────────
+
+cat("\n  Building Fig6 PATCHED v2 (no OLS boxes, larger text)...\n")
+
+# ==============================================================================
+#  Panel builder — PATCHED v2
+# ==============================================================================
+make_f6_panel_patched_v2 <- function(sc, pan_lab,
+                                     show_x   = FALSE,
+                                     show_leg = FALSE) {
+  
+  # ── 1. Annual F_thm — restricted to months where SPEI_PM <= THR_FTHM ────────
+  # Filtering before group_by ensures only drought-active months (SPEI_PM <= -0.5)
+  # contribute to each year's mean Fthm, preventing unstable near-zero denominators.
   td <- decomp_all %>%
-    dplyr::filter(scale == sc) %>%
+    dplyr::filter(scale == sc, SPEI_PM <= THR_FTHM) %>%
     dplyr::group_by(year) %>%
     dplyr::summarise(
-      SPEI_PM       = mean(SPEI_PM,  na.rm = TRUE),
-      SPEI_Thw      = mean(SPEI_Thw, na.rm = TRUE),
-      thm_frac_abs  = mean(abs(SPEI_Thw) / (abs(SPEI_PM) + 1e-6), na.rm = TRUE),
+      SPEI_PM      = mean(SPEI_PM,  na.rm = TRUE),
+      SPEI_Thw     = mean(SPEI_Thw, na.rm = TRUE),
+      thm_frac_abs = mean(abs(SPEI_Thw) / (abs(SPEI_PM) + 1e-6), na.rm = TRUE),
       .groups = "drop"
     ) %>%
     dplyr::filter(!is.na(thm_frac_abs), is.finite(thm_frac_abs))
+  
   n_yrs <- nrow(td)
   if (n_yrs < 10) {
     return(ggplot2::ggplot() +
@@ -967,393 +981,201 @@ make_f6_panel <- function(sc, pan_lab, show_x = FALSE, show_leg = FALSE) {
                                size = 4, colour = "grey50") +
              ggplot2::theme_void())
   }
-  #   ── 2. Full-record OLS (1950-2025) ─────────────────────────────────────────
-  fit_full  <- lm(thm_frac_abs ~ year, data = td)
-  sl_full   <- coef(fit_full)["year"]
-  pv_full   <- summary(fit_full)$coefficients["year", 4]
-  ci95      <- confint(fit_full, "year", level = 0.95)
-  pred_full <- predict(fit_full,
-                       newdata   = data.frame(year = td$year),
-                       interval  = "confidence", level = 0.95)
-  td$fit_full <- pred_full[, "fit"]
-  td$lwr95    <- pred_full[, "lwr"]
-  td$upr95    <- pred_full[, "upr"]
-  #   ── 3. Post-1990 OLS ───────────────────────────────────────────────────────
-  td90 <- dplyr::filter(td, year >= 1990)
-  fit90 <- NULL; sl90 <- NA_real_; pv90 <- NA_real_
-  if (nrow(td90) >= 10) {
-    fit90 <- lm(thm_frac_abs ~ year, data = td90)
-    sl90  <- coef(fit90)["year"]
-    pv90  <- summary(fit90)$coefficients["year", 4]
-    pred90 <- predict(fit90,
-                      newdata  = data.frame(year = td90$year),
-                      interval = "confidence", level = 0.90)
-    td90$fit_p90 <- pred90[, "fit"]
-    td90$lwr90   <- pred90[, "lwr"]
-    td90$upr90   <- pred90[, "upr"]
-  }
-  #   ── 4. Decade colouring ────────────────────────────────────────────────────
+  
+  # ── 2. Decade colouring ───────────────────────────────────────────────────
   all_decades <- seq(1950, 2020, by = 10)
   td$decade <- factor(
     paste0(floor(td$year / 10) * 10, "s"),
     levels = paste0(all_decades, "s"))
-  #   ── 5. y-axis range ────────────────────────────────────────────────────────
+  
+  # ── 3. y-axis range ────────────────────────────────────────────────────────
   ylo <- max(0.0,  min(td$thm_frac_abs, na.rm = TRUE) - 0.06)
-  yhi <- min(3, quantile(td$thm_frac_abs, 0.99, na.rm = TRUE)  + 0.16)
-  #   ── 6. Annotation strings ──────────────────────────────────────────────────
-  ann_full <- sprintf(
-    "Full record OLS\n%+.4f yr⁻¹  (%s)\n(1950–2025)",
-    sl_full, .fmt_p(pv_full))
-  ann_p90 <- if (!is.null(fit90))
-    sprintf("Post-1990 OLS\n%+.4f yr⁻¹  (%s)\n(1990–2025)",
-            sl90, .fmt_p(pv90))
-  else NULL
-  #   ── 7. Build plot (ORIGINAL with ribbons and lines) ────────────────────────
+  yhi <- min(3,   quantile(td$thm_frac_abs, 0.99, na.rm = TRUE) + 0.16)
+  
+  # ── 4. Build plot ──────────────────────────────────────────────────────────
   p <- ggplot2::ggplot() +
-    # 2022-2025 highlight band
+    
+    # 2022–2025 highlight band
     ggplot2::annotate("rect",
                       xmin = 2022, xmax = 2026,
-                      ymin = -Inf, ymax = Inf,
+                      ymin = -Inf, ymax =  Inf,
                       fill = "grey82", alpha = 0.55) +
-    # 95% CI ribbon — full-record OLS
-    ggplot2::geom_ribbon(
-      data        = td,
-      ggplot2::aes(x = year, ymin = lwr95, ymax = upr95),
-      fill        = COL_THW,
-      alpha       = 0.15,
-      inherit.aes = FALSE) +
-    # Full-record OLS line
-    ggplot2::geom_line(
-      data        = td,
-      ggplot2::aes(x = year, y = fit_full),
-      colour      = COL_THW,
-      linewidth   = 0.9,
-      linetype    = "solid",
-      inherit.aes = FALSE)
-  #   Post-1990 ribbons and line (only if fit succeeded)
-  if (!is.null(fit90)) {
-    p <- p +
-      ggplot2::geom_ribbon(
-        data        = td90,
-        ggplot2::aes(x = year, ymin = lwr90, ymax = upr90),
-        fill        = COL_THW,
-        alpha       = 0.10,
-        inherit.aes = FALSE) +
-      ggplot2::geom_line(
-        data        = td90,
-        ggplot2::aes(x = year, y = fit_p90),
-        colour      = COL_THW,
-        linewidth   = 0.75,
-        linetype    = "dashed",
-        alpha       = 0.80,
-        inherit.aes = FALSE)
-  }
-  p <- p +
-    # Annual data points (decade colour)
-    ggplot2::geom_point(
-      data        = td,
-      ggplot2::aes(x = year, y = thm_frac_abs, fill = decade),
-      shape       = 21,
-      size        = 2.0,
-      colour      = "white",
-      stroke      = 0.35,
-      inherit.aes = FALSE) +
-    ggplot2::scale_fill_brewer(
-      palette   = "RdYlBu",
-      direction = -1,
-      name      = "Decade",
-      drop      = FALSE) +
-    # 1990 reference line
-    ggplot2::geom_vline(xintercept = 1990, linetype = "dotted",
-                        colour = "grey30", linewidth = 0.55) +
-    ggplot2::annotate("text", x = 1991, y = ylo + 0.025,
-                      label = "Post-1990\nacceleration",
-                      hjust = 0, vjust = 0, size = 2.5,
-                      colour = "grey30", fontface = "italic") +
-    # 2022 drought onset line
-    ggplot2::geom_vline(xintercept = 2022, linetype = "dashed",
-                        colour = "grey50", linewidth = 0.45) +
-    ggplot2::annotate("text", x = 2021.5, y = ylo + 0.025,
-                      label = "2022–2025\ndrought",
-                      hjust = 1, vjust = 0, size = 2.4,
-                      colour = "grey40", fontface = "italic") +
-    # Slope annotation — full record
-    ggplot2::annotate("label",
-                      x = 1952, y = yhi - 0.03,
-                      label = ann_full,
-                      hjust = 0, vjust = 1, size = 2.6,
-                      colour = COL_THW, fill = "white",
-                      label.size = 0.20,
-                      label.padding = ggplot2::unit(0.14, "lines"),
-                      label.r = ggplot2::unit(0.08, "lines")) +
-    # Scale label in top-right corner
-    ggplot2::annotate("text", x = 2024, y = yhi - 0.02,
-                      label = sprintf("%s  SPEI-%d\n(all months)", pan_lab, sc),
-                      hjust = 1, vjust = 1, size = 3.0,
-                      colour = "grey10", fontface = "bold") +
-    ggplot2::scale_x_continuous(
-      breaks = seq(1950, 2025, by = 10),
-      expand = ggplot2::expansion(add = c(1, 2))) +
-    ggplot2::scale_y_continuous(
-      limits = c(ylo, yhi),
-      breaks = seq(0, 1, by = 0.1),
-      labels = scales::percent_format(accuracy = 1),
-      expand = ggplot2::expansion(mult = c(0, 0))) +
-    ggplot2::labs(
-      x = if (show_x) "Year" else NULL,
-      y = expression(italic(F)[thm])) +
-    theme_ms +
-    ggplot2::theme(
-      legend.position = if (show_leg) "right" else "none",
-      legend.key.size = ggplot2::unit(0.32, "cm"),
-      legend.text     = ggplot2::element_text(size = 7.5),
-      legend.title    = ggplot2::element_text(size = 8, face = "bold"),
-      axis.text.x  = if (show_x) ggplot2::element_text(size = 8) else ggplot2::element_blank(),
-      axis.ticks.x = if (show_x) ggplot2::element_line() else ggplot2::element_blank(),
-      axis.title.y = ggplot2::element_text(size = 9),
-      axis.title.x = ggplot2::element_text(size = 9))
-  #   Optional post-1990 annotation (only on panels b and c)
-  if (!is.null(ann_p90) && sc >= 1) {
-    p <- p + ggplot2::annotate("label",
-                               x = 1991, y = yhi - 0.03,
-                               label = ann_p90,
-                               hjust = 0, vjust = 1, size = 2.4,
-                               colour = COL_THW, fill = "white",
-                               label.size = 0.18,
-                               label.padding = ggplot2::unit(0.12, "lines"),
-                               label.r = ggplot2::unit(0.07, "lines"))
-  }
-  p
-}
-# ── Build PATCHED panel function (slope-only, NO ribbons, NO lines) ────────
-make_f6_panel_patched <- function(sc, pan_lab, show_x = FALSE, show_leg = FALSE) {
-  #   ── 1. Annual F_thm — ALL calendar months ──────────────────────────────────
-  td <- decomp_all %>%
-    dplyr::filter(scale == sc) %>%
-    dplyr::group_by(year) %>%
-    dplyr::summarise(
-      SPEI_PM       = mean(SPEI_PM,  na.rm = TRUE),
-      SPEI_Thw      = mean(SPEI_Thw, na.rm = TRUE),
-      thm_frac_abs  = mean(abs(SPEI_Thw) / (abs(SPEI_PM) + 1e-6), na.rm = TRUE),
-      .groups = "drop"
-    ) %>%
-    dplyr::filter(!is.na(thm_frac_abs), is.finite(thm_frac_abs))
-  n_yrs <- nrow(td)
-  if (n_yrs < 10) {
-    return(ggplot2::ggplot() +
-             ggplot2::annotate("text", x = 0.5, y = 0.5,
-                               label = sprintf("Insufficient data\nSPEI-%d", sc),
-                               size = 4, colour = "grey50") +
-             ggplot2::theme_void())
-  }
-  #   ── 2. OLS fits (for slope annotation only — NOT plotted) ─────────────────
-  fit_full <- lm(thm_frac_abs ~ year, data = td)
-  sl_full  <- coef(fit_full)["year"]
-  pv_full  <- summary(fit_full)$coefficients["year", 4]
-  td90 <- dplyr::filter(td, year >= 1990)
-  sl90 <- NA_real_
-  if (nrow(td90) >= 10) {
-    fit90 <- lm(thm_frac_abs ~ year, data = td90)
-    sl90  <- coef(fit90)["year"]
-  }
-  #   ── 3. Decade colouring ────────────────────────────────────────────────────
-  all_decades <- seq(1950, 2020, by = 10)
-  td$decade <- factor(
-    paste0(floor(td$year / 10) * 10, "s"),
-    levels = paste0(all_decades, "s"))
-  #   ── 4. y-axis range ────────────────────────────────────────────────────────
-  ylo <- max(0.0,  min(td$thm_frac_abs, na.rm = TRUE) - 0.06)
-  yhi <- min(3, quantile(td$thm_frac_abs, 0.99, na.rm = TRUE)  + 0.16)
-  #   ── 5. Annotation strings — SLOPE ONLY, no p-value ────────────────────────
-  ann_full <- sprintf("Full record OLS\n%+.4f yr⁻¹\n(1950–2025)", sl_full)
-  ann_p90  <- if (!is.na(sl90))
-    sprintf("Post-1990 OLS\n%+.4f yr⁻¹\n(1990–2025)", sl90)
-  else NULL
-  #   ── 6. Build plot (PATCHED: NO ribbons, NO OLS lines) ─────────────────────
-  p <- ggplot2::ggplot() +
-    # 2022-2025 highlight band
-    ggplot2::annotate("rect",
-                      xmin = 2022, xmax = 2026,
-                      ymin = -Inf, ymax = Inf,
-                      fill = "grey82", alpha = 0.55) +
-    # Annual data points (NO ribbons, NO OLS lines)
+    
+    # Annual data points — coloured by decade; NO ribbons, NO OLS lines
     ggplot2::geom_point(
       data = td,
       ggplot2::aes(x = year, y = thm_frac_abs, fill = decade),
-      shape = 21, size  = 2.0, colour = "white", stroke = 0.35,
+      shape = 21, size = 2.0, colour = "white", stroke = 0.35,
       inherit.aes = FALSE) +
-    ggplot2::scale_fill_brewer(
-      palette = "RdYlBu", direction = -1, name = "Decade", drop = FALSE) +
-    # 1990 reference line
-    ggplot2::geom_vline(xintercept = 1990, linetype = "dotted",
+    
+    # Custom gradient: blue → purple → red — avoids the near-invisible yellow
+    # that RdYlBu places on the 1980s (its midpoint) when printed on white paper.
+    ggplot2::scale_fill_manual(
+      values = setNames(
+        grDevices::colorRampPalette(
+          c("#2166ac", "#6a3d9a", "#c51b7d", "#b2182b"))(8),
+        paste0(seq(1950, 2020, by = 10), "s")),
+      name = "Decade", drop = FALSE) +
+    
+    # 1990 reference line — placed at 1990.5 so it falls between the 1990 and 1991 data points
+    ggplot2::geom_vline(xintercept = 1990.5, linetype = "dotted",
                         colour = "grey30", linewidth = 0.55) +
-    ggplot2::annotate("text", x = 1991, y = ylo + 0.025,
+    # "Post-1990 acceleration" label  ← KEPT
+    ggplot2::annotate("text",
+                      x = 1991, y = ylo + 0.025,
                       label = "Post-1990\nacceleration",
                       hjust = 0, vjust = 0, size = 2.5,
                       colour = "grey30", fontface = "italic") +
-    # 2022 drought onset line
-    ggplot2::geom_vline(xintercept = 2022, linetype = "dashed",
+    
+    # 2022 drought onset line — placed at 2021.5 so it falls between the 2021 and 2022 data points
+    ggplot2::geom_vline(xintercept = 2021.5, linetype = "dashed",
                         colour = "grey50", linewidth = 0.45) +
-    ggplot2::annotate("text", x = 2021.5, y = ylo + 0.025,
-                      label = "2022–2025\ndrought",
+    # "2022–2025 drought" label  ← KEPT (colour changed to red)
+    ggplot2::annotate("text",
+                      x = 2021.3, y = ylo + 0.025,
+                      label = "2022\u20132025\ndrought",
                       hjust = 1, vjust = 0, size = 2.4,
-                      colour = "grey40", fontface = "italic") +
-    # Slope annotation — full record (slope only)
-    ggplot2::annotate("label",
-                      x = 1952, y = yhi - 0.03,
-                      label = ann_full,
-                      hjust = 0, vjust = 1, size = 2.6,
-                      colour = COL_THW, fill = "white",
-                      label.size = 0.20,
-                      label.padding = ggplot2::unit(0.14, "lines"),
-                      label.r = ggplot2::unit(0.08, "lines")) +
-    # Scale label
-    ggplot2::annotate("text", x = 2024, y = yhi - 0.02,
-                      label = sprintf("%s  SPEI-%d\n(all months)", pan_lab, sc),
+                      colour = "red", fontface = "italic") +
+    
+    # ── "Full record OLS …" annotation box  ← REMOVED ──
+    # ── "Post-1990 OLS …"  annotation box  ← REMOVED ──
+    
+    # Panel / scale label — top-right corner  ← KEPT
+    ggplot2::annotate("text",
+                      x = 2024, y = yhi - 0.02,
+                      label = sprintf("%s  SPEI-%d\n(SPEI\u2009\u2264\u2009\u22120.5 months)", pan_lab, sc),
                       hjust = 1, vjust = 1, size = 3.0,
                       colour = "grey10", fontface = "bold") +
+    
     ggplot2::scale_x_continuous(
       breaks = seq(1950, 2025, by = 10),
       expand = ggplot2::expansion(add = c(1, 2))) +
+    
     ggplot2::scale_y_continuous(
       limits = c(ylo, yhi),
       breaks = seq(0, 1, by = 0.1),
       labels = scales::percent_format(accuracy = 1),
       expand = ggplot2::expansion(mult = c(0, 0))) +
+    
     ggplot2::labs(
       x = if (show_x) "Year" else NULL,
       y = expression(italic(F)[thm])) +
+    
     theme_ms +
+    
     ggplot2::theme(
-      legend.position = if (show_leg) "right" else "none",
-      legend.key.size = ggplot2::unit(0.32, "cm"),
-      axis.text.x  = if (show_x) ggplot2::element_text(size = 8) else ggplot2::element_blank(),
-      axis.ticks.x = if (show_x) ggplot2::element_line() else ggplot2::element_blank(),
-      axis.title.y = ggplot2::element_text(size = 9),
-      axis.title.x = ggplot2::element_text(size = 9))
-  # Post-1990 slope annotation on panels b and c only
-  if (!is.null(ann_p90) && sc >= 1) {
-    p <- p + ggplot2::annotate("label",
-                               x = 1991, y = yhi - 0.03,
-                               label = ann_p90,
-                               hjust = 0, vjust = 1, size = 2.4,
-                               colour = COL_THW, fill = "white",
-                               label.size = 0.18,
-                               label.padding = ggplot2::unit(0.12, "lines"),
-                               label.r = ggplot2::unit(0.07, "lines"))
-  }
+      # ── Legend (enlarged) ───────────────────────────────────────────────
+      legend.position  = if (show_leg) "right" else "none",
+      legend.key.size  = ggplot2::unit(0.55, "cm"),          # was 0.32
+      legend.text      = ggplot2::element_text(size = 12),   # was 7.5
+      legend.title     = ggplot2::element_text(size = 13,    # was 8.0
+                                               face = "bold"),
+      # ── Axis tick labels (enlarged) ─────────────────────────────────────
+      axis.text.x  = if (show_x)
+        ggplot2::element_text(size = 12)                     # was 8
+      else
+        ggplot2::element_blank(),
+      axis.ticks.x = if (show_x)
+        ggplot2::element_line()
+      else
+        ggplot2::element_blank(),
+      axis.text.y  = ggplot2::element_text(size = 10),       # reduced from 12 to prevent overlap
+      # ── Axis titles (enlarged) ───────────────────────────────────────────
+      axis.title.y = ggplot2::element_text(size = 13),       # was 9
+      axis.title.x = ggplot2::element_text(size = 13))       # was 9
+  
   p
 }
-# ── Build all three panels (ORIGINAL) ─────────────────────────────────────────
-panels <- mapply(
-  FUN      = make_f6_panel,
+
+# ==============================================================================
+#  Assemble three-panel figure
+# ==============================================================================
+panels_patched_v2 <- mapply(
+  FUN      = make_f6_panel_patched_v2,
   sc       = MS_SCALES,
   pan_lab  = PANEL_LABELS,
   show_x   = c(FALSE, FALSE, TRUE),
   show_leg = c(FALSE, FALSE, TRUE),
   SIMPLIFY = FALSE)
-fig6_123  <- patchwork::wrap_plots(panels, ncol = 1) +
+
+fig6_123_patched_v2 <- patchwork::wrap_plots(panels_patched_v2, ncol = 1) +
   patchwork::plot_layout(guides = "collect") +
   patchwork::plot_annotation(
-    title    = paste0("Thermodynamic fraction of drought severity — ",
-                      "SPEI-1, 2, 3  —  Nechako River Basin (1950–2025)"),
+    title    = paste0(
+      "Thermodynamic fraction of drought severity \u2014 ",
+      "SPEI-1, 2, 3  \u2014  Nechako River Basin (1950\u20132025)"),
     subtitle = paste0(
       "*F*<sub>thm</sub> = annual mean |SPEI<sub>0</sub>| / (|SPEI<sub>pm</sub>| + \u03b5)",
-      "  using all 12 calendar months.   ",
-      "Solid red = full-record OLS \u00b1 95% CI ribbon.   ",
-      "Dashed red = post-1990 OLS \u00b1 90% CI ribbon.   ",
-      "Coloured points = decade.  Grey band = 2022\u20132025 focus period."),
-    caption  = paste0(
-      "\u03b5 = 10\u207b\u2076 prevents division by zero.   ",
-      "OLS fitted by ordinary least squares; CI from classical normal theory.   ",
-      "All months included (SPEI-1/2/3 respond throughout the year)."),
-    theme = ggplot2::theme(
-      plot.title    = ggplot2::element_text(size = 11, face = "bold", hjust = 0.5),
-      plot.subtitle = ggtext::element_markdown(size = 8, colour = "grey35", hjust = 0,
-                                               margin = ggplot2::margin(b = 4)),
-      plot.caption  = ggplot2::element_text(size = 6.5, colour = "grey50", hjust = 0,
-                                            margin = ggplot2::margin(t = 4)),
-      plot.margin   = ggplot2::margin(t = 14, r = 8, b = 6, l = 8),
-      legend.position = "right",
-      legend.text     = ggplot2::element_text(size = 8),
-      legend.title    = ggplot2::element_text(size = 8.5, face = "bold")))
-# ── Build all three panels (PATCHED) ──────────────────────────────────────────
-panels_patched <- mapply(
-  FUN      = make_f6_panel_patched,
-  sc       = MS_SCALES,
-  pan_lab  = PANEL_LABELS,
-  show_x   = c(FALSE, FALSE, TRUE),
-  show_leg = c(FALSE, FALSE, TRUE),
-  SIMPLIFY = FALSE)
-fig6_123_patched  <- patchwork::wrap_plots(panels_patched, ncol = 1) +
-  patchwork::plot_layout(guides = "collect") +
-  patchwork::plot_annotation(
-    title    = paste0("Thermodynamic fraction of drought severity — ",
-                      "SPEI-1, 2, 3  —  Nechako River Basin (1950–2025)"),
-    subtitle = paste0(
-      "*F*<sub>thm</sub> = annual mean |SPEI<sub>0</sub>| / (|SPEI<sub>pm</sub>| + \u03b5)",
-      "  using all 12 calendar months.   ",
+      "  restricted to months where SPEI<sub>pm</sub> \u2264 \u22120.5.   ",
       "Coloured points = decade.  Grey band = 2022\u20132025 focus period."),
     theme = ggplot2::theme(
-      plot.title    = ggplot2::element_text(size = 11, face = "bold", hjust = 0.5),
-      plot.subtitle = ggtext::element_markdown(size = 8, colour = "grey35", hjust = 0,
+      plot.title    = ggplot2::element_text(size = 12, face = "bold", hjust = 0.5),
+      plot.subtitle = ggtext::element_markdown(size = 9, colour = "grey35", hjust = 0,
                                                margin = ggplot2::margin(b = 4)),
       plot.margin   = ggplot2::margin(t = 14, r = 8, b = 6, l = 8),
+      # ── Legend collected at figure level (enlarged) ──────────────────────
       legend.position = "right",
-      legend.text     = ggplot2::element_text(size = 8),
-      legend.title    = ggplot2::element_text(size = 8.5, face = "bold")))
-# ── Save ORIGINAL ────────────────────────────────────────────────────────────
-f6_123_pdf  <- file.path(out_dir, "Fig6_thermodynamic_trend_SPEI123.pdf")
-f6_123_png  <- file.path(out_dir, "Fig6_thermodynamic_trend_SPEI123.png")
+      legend.text     = ggplot2::element_text(size = 12),    # was 8
+      legend.title    = ggplot2::element_text(size = 13,     # was 8.5
+                                              face = "bold"),
+      legend.key.size = ggplot2::unit(0.55, "cm")))          # was implicit
+
+# ==============================================================================
+#  Save
+# ==============================================================================
+f6_v2_pdf <- file.path(out_dir, "Fig6_thermodynamic_trend_SPEI123_PATCHED_v2.pdf")
+f6_v2_png <- file.path(out_dir, "Fig6_thermodynamic_trend_SPEI123_PATCHED_v2.png")
+
 tryCatch({
-  ggplot2::ggsave(f6_123_pdf, fig6_123,
-                  width  = 7.5, height = 11.0, units = "in", device = "pdf")
-  cat(sprintf("  ✓ Fig6 SPEI-1/2/3 (PDF): %s\n", basename(f6_123_pdf)))
-}, error = function(e) cat(sprintf("  ⚠ PDF failed: %s\n", e$message)))
+  ggplot2::ggsave(f6_v2_pdf, fig6_123_patched_v2,
+                  width = 7.5, height = 11.0, units = "in", device = "pdf")
+  cat(sprintf("  \u2713 Saved (PDF): %s\n", basename(f6_v2_pdf)))
+}, error = function(e) cat(sprintf("  \u26a0 PDF failed: %s\n", e$message)))
+
 tryCatch({
-  ggplot2::ggsave(f6_123_png, fig6_123,
-                  width  = 7.5, height = 11.0, units = "in", dpi = 300, device = "png")
-  cat(sprintf("  ✓ Fig6 SPEI-1/2/3 (PNG): %s\n", basename(f6_123_png)))
-}, error = function(e) cat(sprintf("  ⚠ PNG failed: %s\n", e$message)))
-# ── Save PATCHED ────────────────────────────────────────────────────────────
-f6_123_pdf_patched  <- file.path(out_dir, "Fig6_thermodynamic_trend_SPEI123_PATCHED.pdf")
-f6_123_png_patched  <- file.path(out_dir, "Fig6_thermodynamic_trend_SPEI123_PATCHED.png")
-tryCatch({
-  ggplot2::ggsave(f6_123_pdf_patched, fig6_123_patched,
-                  width  = 7.5, height = 11.0, units = "in", device = "pdf")
-  cat(sprintf("  ✓ Fig6 SPEI-1/2/3 PATCHED (PDF): %s\n", basename(f6_123_pdf_patched)))
-}, error = function(e) cat(sprintf("  ⚠ PATCHED PDF failed: %s\n", e$message)))
-tryCatch({
-  ggplot2::ggsave(f6_123_png_patched, fig6_123_patched,
-                  width  = 7.5, height = 11.0, units = "in", dpi = 300, device = "png")
-  cat(sprintf("  ✓ Fig6 SPEI-1/2/3 PATCHED (PNG): %s\n", basename(f6_123_png_patched)))
-}, error = function(e) cat(sprintf("  ⚠ PATCHED PNG failed: %s\n", e$message)))
-# ── Console summary ───────────────────────────────────────────────────────────
+  ggplot2::ggsave(f6_v2_png, fig6_123_patched_v2,
+                  width = 7.5, height = 11.0, units = "in",
+                  dpi = 300, device = "png")
+  cat(sprintf("  \u2713 Saved (PNG): %s\n", basename(f6_v2_png)))
+}, error = function(e) cat(sprintf("  \u26a0 PNG failed: %s\n", e$message)))
+
+# ==============================================================================
+#  Console summary — OLS slopes and p-values for all three scales
+# ==============================================================================
 cat("\n  Thermodynamic fraction trend summary (all months):\n")
 cat(sprintf("  %-8s  %-12s  %-10s  %-12s  %-10s\n",
             "Scale", "Slope full", "p full", "Slope post90", "p post90"))
 cat("   ", paste(rep("-", 58), collapse = ""), "\n", sep = "")
+
 for (sc in MS_SCALES) {
-  td_sc  <- decomp_all %>%
-    dplyr::filter(scale == sc) %>%
+  td_sc <- decomp_all %>%
+    dplyr::filter(scale == sc, SPEI_PM <= THR_FTHM) %>%   # only drought-active months
     dplyr::group_by(year) %>%
     dplyr::summarise(
       thm_frac_abs = mean(abs(SPEI_Thw) / (abs(SPEI_PM) + 1e-6), na.rm = TRUE),
       .groups = "drop") %>%
     dplyr::filter(!is.na(thm_frac_abs), is.finite(thm_frac_abs))
-  if (nrow(td_sc) < 10) { cat(sprintf("  SPEI-%d: insufficient data\n", sc)); next }
+  
+  if (nrow(td_sc) < 10) {
+    cat(sprintf("  SPEI-%d: insufficient data\n", sc))
+    next
+  }
+  
   f_all  <- lm(thm_frac_abs ~ year, data = td_sc)
   f_p90  <- lm(thm_frac_abs ~ year, data = dplyr::filter(td_sc, year >= 1990))
-  sl_a   <- coef(f_all)["year"];   pv_a <- summary(f_all)$coefficients["year", 4]
-  sl_p90 <- coef(f_p90)["year"];   pv_p <- summary(f_p90)$coefficients["year", 4]
-  sig_a   <- if (pv_a   < 0.05)  "*" else if (pv_a   < 0.10)  "†" else "  "
-  sig_p   <- if (pv_p   < 0.05)  "*" else if (pv_p   < 0.10)  "†" else "  "
+  sl_a   <- coef(f_all)["year"];  pv_a <- summary(f_all)$coefficients["year", 4]
+  sl_p90 <- coef(f_p90)["year"];  pv_p <- summary(f_p90)$coefficients["year", 4]
+  sig_a  <- if (pv_a < 0.05) "*" else if (pv_a < 0.10) "\u2020" else "  "
+  sig_p  <- if (pv_p < 0.05) "*" else if (pv_p < 0.10) "\u2020" else "  "
+  
   cat(sprintf("  SPEI-%-3d  %+.5f/yr   %.4f%s   %+.5f/yr   %.4f%s\n",
               sc, sl_a, pv_a, sig_a, sl_p90, pv_p, sig_p))
 }
-cat("  (* p < 0.05  † p < 0.10)\n")
+
+cat("  (* p < 0.05  \u2020 p < 0.10)\n")
 cat("  Output: ", normalizePath(out_dir), "\n")
 
+cat("\n  Fig6 PATCHED v2 complete.\n")
 # ==============================================================================
 #   STEP 7: SEASONAL DECOMPOSITION  2022-2025  (SPEI-1 / 2 / 3)
 # ------------------------------------------------------------------------------
@@ -1392,9 +1214,12 @@ MONTH_ABBR  <- c("Jan", "Feb", "Mar", "Apr", "May", "Jun",
                  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 SEAS_SCALES  <- c(1L, 2L, 3L)
 PANEL_LAB_7  <- c("(a) SPEI-1",  "(b) SPEI-2",  "(c) SPEI-3")
-# ── Aggregate: mean ± SD per scale × month across 2022-2025 ─────────────────
+# ── Aggregate: mean ± SD per scale × month across 2022-2025
+# Restricted to SPEI_PM <= THR_FTHM (-0.5) so that only drought-active months
+# contribute — preventing unstable Fthm fractions from inflating seasonal statistics.
 seas_stats <- decomp_all %>%
-  dplyr::filter(year >= 2022, year <= 2025, scale %in% SEAS_SCALES) %>%
+  dplyr::filter(year >= 2022, year <= 2025, scale %in% SEAS_SCALES,
+                SPEI_PM <= THR_FTHM) %>%                   # gate on drought severity
   dplyr::mutate(month_abb = factor(MONTH_ABBR[month], levels = MONTH_ABBR)) %>%
   dplyr::group_by(scale, month, month_abb) %>%
   dplyr::summarise(
@@ -1419,7 +1244,7 @@ seas_stats <- decomp_all %>%
     thw_lo = thw_mean - thw_sd, thw_hi = thw_mean + thw_sd,
     dyn_lo = dyn_mean - dyn_sd, dyn_hi = dyn_mean + dyn_sd
   )
-cat(sprintf("  Seasonal stats: %d rows (%d scales × 12 months)\n",
+cat(sprintf("  Seasonal stats: %d rows (SPEI_PM <= -0.5 months, %d scales)\n",
             nrow(seas_stats), length(SEAS_SCALES)))
 # ── Shared theme ──────────────────────────────────────────────────────────────
 theme_seas <- ggplot2::theme_classic(base_size = 9) +

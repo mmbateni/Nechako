@@ -38,6 +38,8 @@ lag_sec_vec__ <- numeric(0L)
 
 all_mm_results <- list(); all_gam_fits <- list()
 mm_lag_profile <- list(); gam_lag_prof  <- list(); convergence_rows <- list()
+cd_lag_results <- list()   # causal decomposition per lag
+bf_result_best <- NULL     # Bayes factor table (computed at optimal lag)
 
 cat(sprintf("\n%s\n  INDEX: %s | Lags 0-%d | script elapsed %s\n%s\n\n",
             strrep("=",62), index_label, max(LAGS_TO_TEST),
@@ -143,6 +145,25 @@ for (lag in LAGS_TO_TEST) {
     }
   }
   
+  # ── TRACK 2b: CAUSAL PATH DECOMPOSITION (Kretschmer et al. 2021) ──────────────
+  # Three-equation decomposition: a-path (ENSO->PNA|PDO,Fthm),
+  # b-path (PNA->SPEI|ENSO,Fthm), total effect (ENSO->SPEI|Fthm only).
+  # PNA is NOT in the total-effect regression — avoids mediator-blocking bias.
+  cat(sprintf("\n  --- TRACK 2b: Causal Path Decomposition (lag=%d) ---\n", lag))
+  cd_res <- tryCatch(
+    fit_causal_decomposition(df_lag, fthm_df=FTHM_SERIES, lag=lag,
+                             n_boot=n_boot_this, seed=BOOTSTRAP_SEED,
+                             block_length=BLOCK_LENGTH),
+    error=function(e) { cat("  XX Causal decomp:", e$message, "\n"); NULL })
+  cd_lag_results[[sprintf("lag_%02d", lag)]] <- cd_res
+  
+  if (!is.null(cd_res)) {
+    write.csv(cd_res$table,
+              file.path(IDX_DIR, sprintf("causal_decomp_lag%02d.csv", lag)),
+              row.names=FALSE)
+    cat(sprintf("  OK Saved: causal_decomp_lag%02d.csv\n", lag))
+  }
+  
   # ── TRACK 3: CONVERGENCE CHECK  (reuses gam_s — PERF-3) ───────────────────────
   gam_ti_p<-NA_real_; mm_imm_p<-NA_real_; gam_dev<-NA_real_; mm_imm_e<-NA_real_
   if (!is.null(gam_s)) {
@@ -154,12 +175,24 @@ for (lag in LAGS_TO_TEST) {
     imm_row <- mm_res$params[mm_res$params$label=="IMM",]
     if (nrow(imm_row)) { mm_imm_p<-round(imm_row$pvalue[1],4); mm_imm_e<-round(.get_est(imm_row),4) }
   }
+  # Extend convergence table with causal decomposition columns
+  cd_te <- cd_ie <- cd_de <- cd_pm <- cd_ie_p <- NA_real_
+  if (!is.null(cd_res)) {
+    cd_te   <- round(cd_res$te,       4)
+    cd_ie   <- round(cd_res$indirect, 4)
+    cd_de   <- round(cd_res$direct,   4)
+    cd_pm   <- round(cd_res$pm * 100, 1)
+    cd_ie_p <- round(cd_res$ie_p,     4)
+  }
   convergence_rows[[length(convergence_rows)+1]] <- data.frame(
     Lag=lag, GAM_Dev_Expl_pct=gam_dev, GAM_ti_ONI_PDO_p=gam_ti_p,
     GAM_ti_sig=!is.na(gam_ti_p)&&gam_ti_p<0.05,
     MM_IMM_est=mm_imm_e, MM_IMM_p=mm_imm_p,
     MM_IMM_sig=!is.na(mm_imm_p)&&mm_imm_p<0.05,
     Both_agree=(!is.na(gam_ti_p)&&gam_ti_p<0.05)&&(!is.na(mm_imm_p)&&mm_imm_p<0.05),
+    CD_TotalEffect=cd_te, CD_IndirectIE=cd_ie, CD_DirectDE=cd_de,
+    CD_PropMediated_pct=cd_pm, CD_IE_p=cd_ie_p,
+    PathTrace_OK=if(!is.na(cd_ie)&&!is.na(cd_te)) abs((cd_ie+cd_de)-cd_te)<0.001 else NA,
     Boot_reps=n_boot_this, Block_length=BLOCK_LENGTH, stringsAsFactors=FALSE)
   
   # ── Lag timing & progress bar ──────────────────────────────────────────────────
@@ -282,6 +315,42 @@ if (length(gam_lag_prof) > 0) {
 } else optimal_lag <- 2L
 cat(sprintf("  Optimal lag (max GAM dev.expl): %d months\n", optimal_lag))
 
+####################################################################################
+# BAYES FACTOR TABLE at optimal lag  (Kretschmer et al. 2021, Part IV)
+####################################################################################
+cat("\n-- Bayes factor table at optimal lag --\n")
+
+df_opt <- tryCatch(
+  build_analysis_dataframe(idx_spec$index, idx_spec$scale,
+                           lag_months=optimal_lag, start_year=1950L, end_year=2024L,
+                           tele_df=TELE_MASTER),
+  error=function(e) { cat("  XX BF data:", e$message, "\n"); NULL })
+
+bf_result_best <- if (!is.null(df_opt))
+  tryCatch(compute_bayes_factors(df_opt),
+           error=function(e) { cat("  XX BF:", e$message, "\n"); NULL })
+else NULL
+
+bf_rows <- NULL   # scoped here so Excel section can find it
+if (!is.null(bf_result_best)) {
+  cat("  P(drought | ENSO, PDO):\n"); print(round(bf_result_best$prob_table, 3))
+  cat("  Bayes factors (PDO amplification given ENSO phase):\n")
+  print(round(bf_result_best$bayes_factors, 3))
+  cat(sprintf("  delta_P La Nina vs neutral: %.4f\n", bf_result_best$delta_p_lanina))
+  bf_rows <- do.call(rbind, lapply(rownames(bf_result_best$bayes_factors), function(enso) {
+    data.frame(ENSO_cat=enso,
+               PDO_phase   = colnames(bf_result_best$bayes_factors),
+               ProbDrought = as.numeric(bf_result_best$prob_table[enso, ]),
+               BayesFactor = as.numeric(bf_result_best$bayes_factors[enso, ]),
+               stringsAsFactors=FALSE) }))
+  bf_rows$OptimalLag <- optimal_lag; bf_rows$Index <- index_label
+  # Save for w8_4_bayes_factor_table.R collation
+  write.csv(bf_rows,
+            file.path(IDX_DIR, sprintf("bf_optimal_lag_%s.csv", index_label)),
+            row.names=FALSE)
+  cat(sprintf("  Saved: bf_optimal_lag_%s.csv\n", index_label))
+}
+
 sens_mm <- list(); sens_gam <- list()
 for (si in SENSITIVITY_INDICES) {
   lbl <- sprintf("%s-%d", toupper(si$index), si$scale)
@@ -342,6 +411,16 @@ if (length(gam_lag_prof))    add_sheet(wb,"GAM_Lag_Profile", do.call(rbind,gam_l
 if (length(sens_gam))        add_sheet(wb,"GAM_Sensitivity", do.call(rbind,sens_gam))
 if (length(convergence_rows))
   add_sheet(wb,"Convergence_GAM_vs_MM", do.call(rbind,convergence_rows))
+
+# Causal decomposition (all lags) — path-tracing a/b/total/IE/DE per lag
+if (length(cd_lag_results)) {
+  cd_all_df <- do.call(rbind, lapply(names(cd_lag_results), function(nm) {
+    r <- cd_lag_results[[nm]]; if (is.null(r)) return(NULL)
+    d <- r$table; d$Lag <- r$lag; d }))
+  if (!is.null(cd_all_df)) add_sheet(wb, "CD_Causal_Decomp_Lags", cd_all_df)
+}
+# Bayes factor table at optimal lag
+if (!is.null(bf_rows)) add_sheet(wb, "BF_Optimal_Lag", bf_rows)
 
 boot_meta <- data.frame(
   Parameter=c("Bootstrap_type","Block_length_months","Full_R","Screened_R",

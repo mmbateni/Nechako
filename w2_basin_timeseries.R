@@ -932,6 +932,58 @@ make_map_panel <- function(r_v, coords, basin_sf, title_str, subtitle_str,
     col_high <- brewer_cols[9]
   }
   
+  ## ── Axis ticks in native plot coordinates ────────────────────────────────────
+  ## Target geographic graticule values (no CRS transformation of the plot):
+  ##   Longitude: 128°W to 123°W (6 ticks, step 1°), labelled as e.g. "128°W"
+  ##   Latitude : 53°N  to 56°N  (4 ticks, step 1°), labelled as e.g. "53°N"
+  ##
+  ## Strategy: detect coordinate system from value range.
+  ##   • Geographic (lon in −200..200): tick positions are the degree values.
+  ##   • Projected (BC Albers EPSG:3005): reproject a reference grid of
+  ##     lon/lat points to Albers and interpolate the native x/y for each
+  ##     desired graticule line, using a linear mapping fitted to the data.
+  
+  lon_targets <- seq(-128, -123, by = 1)   # 6 ticks
+  lat_targets <- seq(53, 56, by = 1)       # 4 ticks
+  lon_labels  <- paste0(abs(lon_targets), "\u00b0W")
+  lat_labels  <- paste0(lat_targets, "\u00b0N")
+  
+  is_geo <- max(abs(df_grid$x_r), na.rm = TRUE) <= 200
+  
+  if (is_geo) {
+    ## Geographic coords — tick positions are the degree values directly
+    x_breaks <- lon_targets
+    y_breaks <- lat_targets
+  } else {
+    ## Projected coords (BC Albers) — map graticule degrees → native units
+    ## Build a small reference grid covering the basin and project it
+    ref_lon <- seq(-130, -120, by = 0.5)
+    ref_lat <- seq(52,   58,   by = 0.5)
+    ref_grid <- expand.grid(lon = ref_lon, lat = ref_lat)
+    ref_vect <- terra::vect(ref_grid, geom = c("lon", "lat"), crs = "EPSG:4326")
+    ref_alb  <- terra::project(ref_vect, "EPSG:3005")
+    ref_crds <- terra::crds(ref_alb)
+    ref_df   <- data.frame(
+      lon    = ref_grid$lon,
+      lat    = ref_grid$lat,
+      x_alb  = ref_crds[, 1],
+      y_alb  = ref_crds[, 2]
+    )
+    ## Linear model: native_x ~ lon,  native_y ~ lat
+    ## (adequate for a ~5°×5° domain; avoids full reprojection of plot axes)
+    lm_x     <- stats::lm(x_alb ~ lon, data = ref_df)
+    lm_y     <- stats::lm(y_alb ~ lat, data = ref_df)
+    x_breaks <- stats::predict(lm_x, newdata = data.frame(lon = lon_targets))
+    y_breaks <- stats::predict(lm_y, newdata = data.frame(lat = lat_targets))
+    ## Keep only ticks that fall within the plot extent (with a small margin)
+    x_margin <- diff(x_lim) * 0.05
+    y_margin <- diff(y_lim) * 0.05
+    keep_x   <- x_breaks >= (x_lim[1] - x_margin) & x_breaks <= (x_lim[2] + x_margin)
+    keep_y   <- y_breaks >= (y_lim[1] - y_margin) & y_breaks <= (y_lim[2] + y_margin)
+    x_breaks  <- x_breaks[keep_x];  lon_labels <- lon_labels[keep_x]
+    y_breaks  <- y_breaks[keep_y];  lat_labels <- lat_labels[keep_y]
+  }
+  
   ggplot2::ggplot(df_grid, ggplot2::aes(x = x_r, y = y_r, fill = r)) +
     ggplot2::geom_raster(interpolate = FALSE) +
     ggplot2::scale_fill_gradient(
@@ -959,16 +1011,31 @@ make_map_panel <- function(r_v, coords, basin_sf, title_str, subtitle_str,
       ylim = c(y_lim[1] - y_pad, y_lim[2] + y_pad),
       expand = FALSE
     ) +
-    ggplot2::scale_x_continuous(expand = c(0, 0), breaks = NULL) +
-    ggplot2::scale_y_continuous(expand = c(0, 0), breaks = NULL) +
-    ggplot2::labs(title = title_str, subtitle = subtitle_str) +
+    ggplot2::scale_x_continuous(
+      expand = c(0, 0),
+      breaks = x_breaks,
+      labels = lon_labels
+    ) +
+    ggplot2::scale_y_continuous(
+      expand = c(0, 0),
+      breaks = y_breaks,
+      labels = lat_labels
+    ) +
+    ggplot2::labs(
+      title    = title_str,
+      subtitle = subtitle_str,
+      x        = "Longitude (\u00b0W)",
+      y        = "Latitude (\u00b0N)"
+    ) +
     theme_map4c +
     ggplot2::theme(
-      aspect.ratio = 1,
-      axis.text.x = ggplot2::element_blank(),
-      axis.text.y = ggplot2::element_blank(),
-      axis.ticks.x = ggplot2::element_blank(),
-      axis.ticks.y = ggplot2::element_blank()
+      aspect.ratio  = 1,
+      axis.title.x  = ggplot2::element_text(size = 6.5, margin = ggplot2::margin(t = 2)),
+      axis.title.y  = ggplot2::element_text(size = 6.5, margin = ggplot2::margin(r = 2)),
+      axis.text.x   = ggplot2::element_text(size = 6, angle = 45, hjust = 1, vjust = 1),
+      axis.text.y   = ggplot2::element_text(size = 6),
+      axis.ticks     = ggplot2::element_line(linewidth = 0.3, colour = "grey40"),
+      axis.ticks.length = ggplot2::unit(2, "pt")
     )
 }
 ## ── Part 4c / 4c-2 shared helpers (global scope) ─────────────────────────────

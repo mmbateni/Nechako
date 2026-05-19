@@ -53,6 +53,10 @@ basin_shp <- "D:/Nechako_Drought/Nechako/Spatial/nechakoBound_dissolve.shp"
 out_dir   <- "D:/Nechako_Drought/Nechako/elevation"
 if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 
+# DEM cache — saved after first successful download so the script never needs
+# to re-download from AWS on subsequent runs (also works offline).
+dem_cache <- file.path(out_dir, "nechako_dem_z8.tif")
+
 # ── 2. BASIN BOUNDARY ────────────────────────────────────────────────────────────
 cat("── Loading basin boundary ──\n")
 basin_sf   <- st_read(basin_shp, quiet = TRUE) |> st_transform(4326)
@@ -67,9 +71,12 @@ cat(sprintf("  Basin extent: %.3f to %.3f W, %.3f to %.3f N\n",
             -basin_bbox["xmax"], -basin_bbox["xmin"],
             basin_bbox["ymin"],  basin_bbox["ymax"]))
 
-# Fixed map extent — wide enough for Kitimat (W), Mackenzie (NE), Quesnel (S)
-map_xlim <- c(-130.0, -121.0)
-map_ylim <- c(  52.3,   56.3)
+# Fixed map extent — trimmed to focus on Nechako basin:
+#   • West: -129.5 (was -130.0) — removes ~0.5° of empty space on the left
+#   • South: 52.9 (was 52.7) — further trims empty grey below the basin
+#   • North/East unchanged — Takla Lake reaches ~56°N; right margin holds the legend
+map_xlim <- c(-128.5, -122.0)
+map_ylim <- c(  52.9,   56.2)
 
 # Expanded query bbox in BC Albers for road + Fraser watershed queries
 query_bbox_3005 <- st_as_sfc(
@@ -79,12 +86,53 @@ query_bbox_3005 <- st_as_sfc(
 ) |> st_transform(3005)
 
 # ── 3. DEM ───────────────────────────────────────────────────────────────────────
-cat("── Downloading DEM via elevatr (z = 8) ──\n")
-dir.create(tempdir(), showWarnings = FALSE, recursive = TRUE)
 options(timeout = 300)
-dem_raw <- get_elev_raster(locations = basin_sf, z = 8, clip = "bbox",
-                           src = "aws", neg_to_na = FALSE, verbose = FALSE)
-dem <- rast(dem_raw)
+
+if (file.exists(dem_cache)) {
+  # ── Fast path: load cached raster (subsequent runs / offline) ──────────────
+  cat("── Loading cached DEM ──\n")
+  cat(sprintf("  Cache: %s\n", dem_cache))
+  dem <- rast(dem_cache)
+  
+} else {
+  # ── Slow path: download from AWS Terrain Tiles, then cache ─────────────────
+  cat("── Downloading DEM via elevatr (z = 8) ──\n")
+  cat("  (result will be cached to avoid re-downloading)\n")
+  dir.create(tempdir(), showWarnings = FALSE, recursive = TRUE)
+  
+  dem_raw <- tryCatch(
+    get_elev_raster(locations = basin_sf, z = 8, clip = "bbox",
+                    src = "aws", neg_to_na = FALSE, verbose = FALSE),
+    error = function(e) {
+      stop(paste0(
+        "elevatr download failed: ", conditionMessage(e), "\n",
+        "  Possible causes:\n",
+        "    1. No internet connection — check network access.\n",
+        "    2. Firewall / proxy blocking AWS (s3.amazonaws.com).\n",
+        "       Try: options(httr_config = httr::use_proxy('<host>', <port>))\n",
+        "       before re-running.\n",
+        "    3. Transient AWS outage — wait a few minutes and retry.\n",
+        "  Once a successful download completes, it is cached at:\n",
+        "    ", dem_cache, "\n",
+        "  and the network call will never be needed again."
+      ))
+    }
+  )
+  
+  if (is.null(dem_raw)) {
+    stop(paste0(
+      "get_elev_raster() returned NULL (no error thrown).\n",
+      "This usually means there is no internet access or the AWS endpoint\n",
+      "is unreachable. See proxy note above.\n",
+      "Cache path (once download succeeds): ", dem_cache
+    ))
+  }
+  
+  dem <- rast(dem_raw)
+  writeRaster(dem, dem_cache, overwrite = TRUE)
+  cat(sprintf("  DEM cached to: %s\n", dem_cache))
+}
+
 dem <- mask(dem, basin_v, touches = TRUE)
 names(dem) <- "elevation"
 elev_range <- as.numeric(global(dem, c("min","max"), na.rm = TRUE))
@@ -208,8 +256,10 @@ if (has_bcdata) {
         filter(WATERSHED_GROUP_CODE %in% c(
           "BRID", "CANA", "CHIL", "CROL", "DEAD", "ENCL", "FRAN",
           "GREE", "HARR", "HORS", "ILEC", "LCHL", "LILL", "LNIC",
-          "MAST", "NAZO", "NECH", "NICL", "QUES", "SALA", "SALM",
+          "MAST", "NAZO", "NECH", "NICL", "SALA", "SALM",
           "SARA", "SHUA", "STUL", "THOM", "WIDG"
+          # "QUES" removed: Quesnel watershed was rendering as a distinct dark-grey
+          # polygon in the map extent, which was visually confusing.
         )) |>
         collect() |> st_transform(4326) |> st_union()
     }, error = function(e2) {
@@ -437,18 +487,14 @@ hill_df <- as.data.frame(hill, xy = TRUE, na.rm = FALSE) |>
 # ── 10. LEGEND INSET ─────────────────────────────────────────────────────────────
 cat("── Building legend inset ──\n")
 
-# Abstract y-axis: 10 categorical rows (spacing 0.95) above a separator,
-# then "Elevation (m)" title and colour swatch below.
-# Row centres (top → bottom):
-#   City(13.1) Municipality(12.15) Nechako WS(11.2) Fraser WS(10.25)
-#   Waterbodies(9.3) Lake label(8.35) Paved road(7.4)
-#   Kenney Dam(6.45) Skins Spillway(5.5) Kemano Powerhouse(4.55)
-#   separator(4.0) Elevation title(3.75) swatch(0.30–3.40)
-
-leg_ymin <- 0.30
-leg_ymax <- 3.40
-swatch_xctr  <- 0.375
-swatch_width <- 0.55
+# Compact SINGLE-COLUMN layout — narrow enough to fit in upper-right void
+# (panel-relative lon ≈ -123.2 to -121, lat ≈ 54.5 to 56.2).
+# Row spacing = 0.80 units; items stack top-down from y=10.0.
+# Elevation swatch sits at the bottom (y=0.25–3.25) with title above.
+leg_ymin <- 0.25
+leg_ymax <- 3.25
+swatch_xctr  <- 0.32
+swatch_width <- 0.52
 n_tiles      <- 60
 tile_h       <- (leg_ymax - leg_ymin) / n_tiles
 
@@ -460,99 +506,95 @@ elev_grad_df <- data.frame(
 
 legend_plot <- ggplot() +
   
-  # ── City / Municipality — two dot sizes on one row ───────────────────────
-  # Large dot (city) at x=0.22, small dot (municipality) at x=0.52,
-  # single label to the right.
-  annotate("point", x=0.22, y=12.60,
-           shape=21, fill=muni_col, color="grey20", size=3.8, stroke=0.9) +
-  annotate("point", x=0.52, y=12.60,
-           shape=21, fill=muni_col, color="grey20", size=2.5, stroke=0.7) +
-  annotate("text",  x=0.78, y=12.60, hjust=0, size=2.45, color="grey10",
-           label="City / Municipality") +
-  
-  # ── Nechako Watershed ────────────────────────────────────────────────────
-  annotate("rect",  xmin=0.10, xmax=0.65, ymin=11.32, ymax=12.08,
-           fill=NA, color=basin_col, linewidth=0.85) +
-  annotate("text",  x=0.78, y=11.70, hjust=0, size=2.45, color="grey10",
-           label="Nechako Watershed") +
-  
-  # ── Fraser Watershed ─────────────────────────────────────────────────────
-  annotate("rect",  xmin=0.10, xmax=0.65, ymin=10.37, ymax=11.13,
-           fill=fraser_fill, color=fraser_line, linewidth=0.4) +
-  annotate("text",  x=0.78, y=10.75, hjust=0, size=2.45, color="grey10",
-           label="Fraser Watershed") +
-  
-  # ── Waterbodies ──────────────────────────────────────────────────────────
-  annotate("rect",  xmin=0.10, xmax=0.65, ymin=9.42, ymax=10.18,
-           fill=water_fill, color=water_line, linewidth=0.4) +
-  annotate("text",  x=0.78, y=9.80, hjust=0, size=2.45, color="grey10",
-           label="Waterbodies") +
-  
-  # ── Lake name label (italic blue box) ────────────────────────────────────
-  annotate("label", x=0.375, y=8.85,
-           label="Lake", fontface="italic",
-           fill=alpha(water_fill, 0.70), color="grey10",
-           size=2.0, label.size=0.12, label.r=unit(0.10,"lines"),
-           label.padding=unit(0.15,"lines")) +
-  annotate("text",  x=0.78, y=8.85, hjust=0, size=2.45, color="grey10",
-           label="Lake name") +
-  
-  # ── Paved road ───────────────────────────────────────────────────────────
-  annotate("segment", x=0.10, xend=0.65, y=7.90, yend=7.90,
-           color=road_col, linewidth=0.75) +
-  annotate("text",  x=0.78, y=7.90, hjust=0, size=2.45, color="grey10",
-           label="Paved road") +
-  
-  # ── Kenney Dam (orange filled square) ────────────────────────────────────
-  annotate("point", x=0.375, y=6.95,
-           shape=22, fill=dam_fill, color="black", size=3.0, stroke=0.8) +
-  annotate("text",  x=0.78, y=6.95, hjust=0, size=2.45, color="grey10",
-           label="Kenney Dam") +
-  
-  # ── Skins Lake Spillway (purple upward triangle) ──────────────────────────
-  annotate("point", x=0.375, y=6.00,
-           shape=24, fill=spillway_fill, color="black", size=2.8, stroke=0.8) +
-  annotate("text",  x=0.78, y=6.00, hjust=0, size=2.45, color="grey10",
-           label="Skins Lake Spillway") +
-  
-  # ── Kemano Powerhouse (yellow diamond) ───────────────────────────────────
-  annotate("point", x=0.375, y=5.05,
-           shape=23, fill=power_fill, color="black", size=3.0, stroke=0.8) +
-  annotate("text",  x=0.78, y=5.05, hjust=0, size=2.45, color="grey10",
-           label="Kemano Powerhouse") +
-  
-  # ── Separator ────────────────────────────────────────────────────────────
-  annotate("segment", x=0.05, xend=2.60, y=4.50, yend=4.50,
-           color="grey65", linewidth=0.28) +
-  
-  # ── Elevation swatch ─────────────────────────────────────────────────────
-  annotate("text",  x=0.375, y=4.28, hjust=0.5, vjust=1, size=2.45,
+  # ── Elevation swatch (vertical, compact, bottom of panel) ─────────────────
+  annotate("text",  x=1.02, y=3.62, hjust=0.5, vjust=0, size=6.00,
            fontface="bold", color="grey10", label="Elevation (m)") +
   geom_tile(data=elev_grad_df, aes(x=x, y=y, fill=fill),
             width=swatch_width, height=tile_h) +
   scale_fill_gradientn(colours=elev_pal, guide="none") +
   annotate("rect",
-           xmin = swatch_xctr - swatch_width / 2,
-           xmax = swatch_xctr + swatch_width / 2,
-           ymin = leg_ymin, ymax = leg_ymax,
+           xmin=swatch_xctr - swatch_width/2,
+           xmax=swatch_xctr + swatch_width/2,
+           ymin=leg_ymin, ymax=leg_ymax,
            fill=NA, color="black", linewidth=0.4) +
-  annotate("text",  x=0.70, y=leg_ymax,
+  annotate("text", x=swatch_xctr + swatch_width/2 + 0.05, y=leg_ymax,
            label=paste0(round(elev_range[2]), " m"),
-           hjust=0, vjust=1.0, size=2.1, color="grey15") +
-  annotate("text",  x=0.70, y=leg_ymin,
+           hjust=0, vjust=1.0, size=4.84, color="grey15") +
+  annotate("text", x=swatch_xctr + swatch_width/2 + 0.05, y=leg_ymin,
            label=paste0(round(elev_range[1]), " m"),
-           hjust=0, vjust=0.0, size=2.1, color="grey15") +
+           hjust=0, vjust=0.0, size=4.84, color="grey15") +
   
-  # ── Axes ─────────────────────────────────────────────────────────────────
-  xlim(0.05, 2.65) +
-  ylim(0.05, 13.20) +
+  # ── Separator between swatch and symbol items ─────────────────────────────
+  annotate("segment", x=0.05, xend=2.05, y=3.90, yend=3.90,
+           color="grey65", linewidth=0.25) +
+  
+  # ── Single column: infrastructure items ──────────────────────────────────
+  # Kenney Dam     (y = 4.50)
+  annotate("point", x=0.28, y=4.50,
+           shape=22, fill=dam_fill, color="black", size=2.6, stroke=0.7) +
+  annotate("text",  x=0.50, y=4.50, hjust=0, size=5.88, color="grey10",
+           label="Kenney Dam") +
+  
+  # Skins Lake Spillway  (y = 5.30)
+  annotate("point", x=0.28, y=5.30,
+           shape=24, fill=spillway_fill, color="black", size=2.4, stroke=0.7) +
+  annotate("text",  x=0.50, y=5.30, hjust=0, size=5.88, color="grey10",
+           label="Skins Lake Spillway") +
+  
+  # Kemano Powerhouse  (y = 6.10)
+  annotate("point", x=0.28, y=6.10,
+           shape=23, fill=power_fill, color="black", size=2.6, stroke=0.7) +
+  annotate("text",  x=0.50, y=6.10, hjust=0, size=5.88, color="grey10",
+           label="Kemano Powerhouse") +
+  
+  # ── Separator ─────────────────────────────────────────────────────────────
+  annotate("segment", x=0.05, xend=2.05, y=6.58, yend=6.58,
+           color="grey65", linewidth=0.25) +
+  
+  # ── Single column: map feature items ─────────────────────────────────────
+  # Paved road  (y = 7.10)
+  annotate("segment", x=0.10, xend=0.52, y=7.10, yend=7.10,
+           color=road_col, linewidth=0.70) +
+  annotate("text",  x=0.65, y=7.10, hjust=0, size=5.88, color="grey10",
+           label="Paved road") +
+  
+  # Waterbodies  (y = 7.90)
+  annotate("rect",  xmin=0.10, xmax=0.52, ymin=7.52, ymax=8.28,
+           fill=water_fill, color=water_line, linewidth=0.4) +
+  annotate("text",  x=0.65, y=7.90, hjust=0, size=5.88, color="grey10",
+           label="Waterbodies") +
+  
+  # Fraser Watershed  (y = 8.70)
+  annotate("rect",  xmin=0.10, xmax=0.52, ymin=8.32, ymax=9.08,
+           fill=fraser_fill, color=fraser_line, linewidth=0.4) +
+  annotate("text",  x=0.65, y=8.70, hjust=0, size=5.88, color="grey10",
+           label="Fraser Watershed") +
+  
+  # Nechako Watershed  (y = 9.50)
+  annotate("rect",  xmin=0.10, xmax=0.52, ymin=9.12, ymax=9.88,
+           fill=NA, color=basin_col, linewidth=0.85) +
+  annotate("text",  x=0.65, y=9.50, hjust=0, size=5.88, color="grey10",
+           label="Nechako Watershed") +
+  
+  # City / Municipality  (y = 10.30, two circles to show size difference)
+  annotate("point", x=0.20, y=10.30,
+           shape=21, fill=muni_col, color="grey20", size=3.2, stroke=0.8) +
+  annotate("point", x=0.40, y=10.30,
+           shape=21, fill=muni_col, color="grey20", size=2.0, stroke=0.6) +
+  annotate("text",  x=0.58, y=10.30, hjust=0, size=5.88, color="grey10",
+           label="City / Municipality") +
+  
+  # ── Axes ──────────────────────────────────────────────────────────────────
+  # xlim extended from 2.05 → 2.22 to accommodate labels at +15% size
+  # ("Skins Lake Spillway" is the longest: starts at x=0.50, needs ~1.55 width)
+  xlim(0.05, 3.70) +
+  ylim(0.05, 10.72) +
   theme_void() +
   theme(
     plot.background = element_rect(fill=alpha("white", 0.92),
-                                   color="grey35", linewidth=0.45),
+                                   color="grey35", linewidth=0.40),
     plot.margin     = margin(4, 5, 4, 5)
   )
-
 # ── 11. INSET LOCATOR MAP ────────────────────────────────────────────────────────
 cat("── Building inset locator map ──\n")
 
@@ -585,8 +627,6 @@ inset <- ggplot() +
   geom_sf(data=bc_sf_inset,  fill="gray75", color="gray45", linewidth=0.35) +
   geom_sf(data=basin_sf_inset, fill=NA, color="#c0392b",
           linewidth=0.85, alpha=0.9) +
-  annotate("text", x=-135.5, y=54.0, label="British\nColumbia",
-           size=1.9, color="grey20", fontface="italic", lineheight=0.85) +
   coord_sf(xlim=c(-140,-113), ylim=c(47,61), expand=FALSE) +
   theme_void(base_size=7) +
   theme(
@@ -619,13 +659,14 @@ main_map <- ggplot() +
     name     = "Elevation (m)",
     na.value = NA,
     guide    = guide_colorbar(
-      barwidth       = unit(0.5, "cm"),
-      barheight      = unit(6.5, "cm"),
+      barwidth       = unit(10, "cm"),
+      barheight      = unit(0.4, "cm"),
       title.position = "top",
       title.hjust    = 0.5,
       ticks.colour   = "black",
       frame.colour   = "black",
-      frame.linewidth = 0.4
+      frame.linewidth = 0.4,
+      label.position = "bottom"
     )
   ) +
   
@@ -697,7 +738,7 @@ main_map <- ggplot() +
     data=manual_labels_df,
     aes(x=lon, y=lat, label=label, angle=angle),
     fontface="italic", colour="#1a6699",
-    size=2.7, lineheight=0.85, inherit.aes=FALSE
+    size=3.56, lineheight=0.85, inherit.aes=FALSE
   ) +
   
   # Municipality + infrastructure labels
@@ -706,7 +747,7 @@ main_map <- ggplot() +
     aes(x = lon, y = lat, label = name),
     fontface      = ifelse(poi_labels_df$name == "Prince George", "bold", "plain"),
     fill          = alpha("white", 0.85),
-    size          = 2.8,
+    size          = 3.70,
     label.size    = 0.15,
     label.r       = unit(0.10, "lines"),
     color         = "grey10",
@@ -754,7 +795,7 @@ main_map <- ggplot() +
       aes(x=lon, y=lat, label=name),
       fontface      = "italic",
       fill          = alpha(water_fill, 0.70),
-      size          = 2.5,
+      size          = 3.30,
       label.size    = 0.12,
       label.r       = unit(0.10, "lines"),
       color         = "grey10",
@@ -776,7 +817,7 @@ main_map <- ggplot() +
   
   # Scale bar
   annotation_scale(
-    location="br", width_hint=0.18,
+    location="bl", width_hint=0.18,
     style="bar", text_cex=0.70,
     pad_x=unit(0.35,"cm"), pad_y=unit(0.35,"cm")
   ) +
@@ -798,36 +839,52 @@ main_map <- ggplot() +
   ) +
   
   # Theme
-  theme_minimal(base_size=11, base_family="sans") +
+  theme_minimal(base_size=12, base_family="sans") +
   theme(
     plot.background  = element_rect(fill="white",   color=NA),
     panel.background = element_rect(fill=bg_land,   color=NA),
     panel.grid.major = element_line(color=alpha("white", 0.40),
                                     linetype="dashed", linewidth=0.20),
     panel.border     = element_rect(fill=NA, color="grey20", linewidth=0.7),
-    plot.title       = element_text(face="bold", size=18, hjust=0.5,
+    plot.title       = element_text(face="bold", size=19, hjust=0.5,
                                     margin=margin(b=8)),
     plot.caption     = element_text(size=7.0, color="grey50", hjust=0,
                                     margin=margin(t=6)),
-    axis.title       = element_text(size=9.0, color="grey30"),
-    axis.text        = element_text(size=8.0, color="grey30"),
+    axis.title       = element_text(size=15.6, color="grey30"),
+    axis.text        = element_text(size=14.4, color="grey30"),
     legend.position  = "none"   # all legend items in legend_plot inset
   )
 
 # ── 13. COMBINE MAIN MAP + INSETS ────────────────────────────────────────────────
 cat("── Assembling final layout ──\n")
 
+# Both insets use align_to="panel" so coordinates are relative to the DATA
+# area only (i.e. the map extent), not the full plot including axis labels.
+#
+# Map panel spans: lon -129.5 → -121.0 (Δ = 8.5°), lat 52.9 → 56.2 (Δ = 3.3°)
+#
+# Legend  — upper-right void (east of basin, lon ≈ -123.2 to -121, lat ≈ 54.5–56.2)
+#   left  = (-123.2 − -129.5) / 8.5 = 0.741
+#   bottom= ( 54.5  −  52.9)  / 3.3 = 0.485
+#
+# BC inset — middle-left void (west of basin, lon ≈ -129.5 to -128, lat ≈ 53.8–55.2)
+#   right = (-128.0 − -129.5) / 8.5 = 0.176
+#   bottom= ( 53.8  −  52.9)  / 3.3 = 0.273
+#   top   = ( 55.2  −  52.9)  / 3.3 = 0.697
+
 final_map <- main_map +
-  # Locator inset — top-left (inside panel)
-  inset_element(
-    inset,
-    left=0.00, bottom=0.68, right=0.19, top=0.985,
-    align_to="plot"
-  ) +
-  # Legend inset — top-right (lon ≈ -122.5 to -121, outside Nechako basin)
+  # Legend inset — upper-right void inside the map panel
   inset_element(
     legend_plot,
-    left=0.835, bottom=0.28, right=0.995, top=0.985,
+    left=0.74, bottom=0.48, right=0.995, top=0.995,
+    align_to="panel"
+  ) +
+  # Locator inset — middle-left void inside the map panel
+  # 8% bigger than previous: width 0.195→0.211, height 0.43→0.464,
+  # vertical centre held at 0.485 → bottom=0.253, top=0.717
+  inset_element(
+    inset,
+    left=0.00, bottom=0.235, right=0.228, top=0.736,
     align_to="panel"
   )
 

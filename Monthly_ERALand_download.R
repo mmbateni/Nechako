@@ -3,7 +3,14 @@
 # Due to a bug in ERA5-Land Data accumulated monthly variables, for
 # total_precipitation, potential_evaporation, and surface_solar_radiation_downwards 
 # product_type will be changed from "monthly_averaged_reanalysis" to 
-# "monthly_averaged_reanalysis_by_hour_of_day"  
+# "monthly_averaged_reanalysis_by_hour_of_day"
+#
+# Basin Memory variables (instantaneous state fields — no product_type change needed):
+#   snow_depth_water_equivalent  : SWE proxy (m water equivalent)
+#   volumetric_soil_water_layer_1: near-surface soil moisture 0–7 cm   (m³/m³)
+#   volumetric_soil_water_layer_2: shallow soil moisture    7–28 cm    (m³/m³)
+#   volumetric_soil_water_layer_3: medium soil moisture     28–100 cm  (m³/m³)  [optional]
+#   volumetric_soil_water_layer_4: deep soil moisture       100–289 cm (m³/m³)  [optional]
 # ============================================================================
 # Load required libraries
 library(ecmwfr)  # For CDS API access
@@ -14,8 +21,8 @@ library(dotenv)
 dotenv::load_dot_env(".env")
 
 # Set working directory (ensure this path exists)
-setwd(WD_PATH)
-
+load_dot_env(".env")
+setwd(Sys.getenv("WD_PATH"))
 # ===================== CONFIGURATION =====================
 # Set credentials 
 
@@ -34,8 +41,8 @@ end_date <- "2025-12-31"
 # Variables needed for SPI and SPEI
 variables <- c(
   #"snow_cover",
-  #"snow_depth_water_equivalent",
-   # "surface_solar_radiation_downwards",
+  "snow_depth_water_equivalent",      # SWE proxy (m water equiv.) — Basin Memory
+  # "surface_solar_radiation_downwards",
   "10m_u_component_of_wind",
   "10m_v_component_of_wind",
   # "geopotential",
@@ -43,12 +50,12 @@ variables <- c(
   # "total_precipitation",
   # "potential_evaporation"
   "2m_temperature",
-  "2m_dewpoint_temperature"
+  "2m_dewpoint_temperature",
   # "skin_reservoir_content",
-  # "volumetric_soil_water_layer_1",
-  # "volumetric_soil_water_layer_2",
-  # "volumetric_soil_water_layer_3",
-  # "volumetric_soil_water_layer_4"
+  "volumetric_soil_water_layer_1",    # 0–7 cm   — near-surface, responds to AR events
+  "volumetric_soil_water_layer_2"     # 7–28 cm  — shallow memory, most drought-relevant
+  # "volumetric_soil_water_layer_3",  # 28–100 cm  — medium-term memory  [add if needed]
+  # "volumetric_soil_water_layer_4"   # 100–289 cm — deep storage         [add if needed]
 )
 
 # Create output directories
@@ -151,6 +158,19 @@ tryCatch({
       # Convert from Kelvin to Celsius if desired
       # result <- result - 273.15
       # cat("  Converted temperature from K to °C.\n")
+    }
+    
+    if (var == "snow_depth_water_equivalent") {
+      # ERA5-Land SWE is already in metres water equivalent (m).
+      # No conversion required for downstream w9 analysis.
+      # Multiply by 1000 here only if mm w.e. is preferred.
+      cat("  SWE: units are metres water equivalent (no conversion applied).\n")
+    }
+    
+    if (grepl("volumetric_soil_water", var)) {
+      # ERA5-Land soil moisture is in m³/m³ (dimensionless volume fraction).
+      # No conversion required; values range 0–1 (wilting ~0.05, saturation ~0.50).
+      cat("  Soil moisture: units are m\u00b3/m\u00b3 (no conversion applied).\n")
     }
     
     # Save to file
