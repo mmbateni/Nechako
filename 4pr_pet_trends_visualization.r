@@ -1529,6 +1529,233 @@ create_temperature_dedicated_plots()
 create_point_timeseries_plots()
 create_point_monthly_trend_plots()
 create_point_summary_table()
+####################################################################################
+# 4pr_precip_seasonal_trends_Fig16.r
+# ─────────────────────────────────────────────────────────────────────────────────
+# FUNCTION 16: Precipitation Seasonal Trends Plot
+#   Mirrors Function 15 (FigS_PET_Seasonal_Trends) but for Precipitation.
+#
+# OUTPUTS
+#   FigS_Precip_Seasonal_Trends.png   — main figure (300 dpi, 14 × 7 in)
+#   FigS_Precip_Seasonal_Trends.pdf   — vector version
+#
+# HOW TO USE
+#   Option A – append to 4pr_pet_trends_visualization.r
+#     Just paste this file after all existing code (the helper functions
+#     .pet_seas_means / .pet_trend_label / .pet_seas_ggplot from Function 15
+#     will already be in the environment).
+#
+#   Option B – run as a standalone script
+#     The script self-contains all helpers and will load the metadata .rds
+#     produced by 4pr_pet_trends.r from `out_dir`.
+#     Adjust `setwd()` and `out_dir` at the top if needed.
+#
+# NOTES
+#   • The seasonal mean is computed as: mean(monthly value over the 3 months in
+#     the season) × 3 — identical to how PET seasonal means are built — giving
+#     an approximate seasonal total in mm/season.
+#   • DJF season-year is assigned to the *following* calendar year (December
+#     of year Y counts towards the DJF season of year Y+1), matching the PET
+#     treatment.
+####################################################################################
+
+# ── 0. STANDALONE PREAMBLE (skip if appending to the visualisation script) ──────
+
+if (!exists("basin_avg_monthly")) {            # only run when standalone
+  library(data.table)
+  library(ggplot2)
+  
+  setwd("D:/Nechako_Drought/Nechako/")         # ← adjust if needed
+  out_dir <- "trend_analysis_pr_pet"
+  
+  metadata         <- readRDS(file.path(out_dir, "analysis_metadata.rds"))
+  basin_avg_monthly <- metadata$basin_avg_monthly
+  names(basin_avg_monthly) <- trimws(names(basin_avg_monthly))
+}
+
+# ── 1. HELPER FUNCTIONS (self-contained copies; already present in vis. script) ──
+
+# Build seasonal-means data.table from a named monthly column
+.seas_means_generic <- function(df_dt, value_col, year_start, year_end) {
+  SEASON_LEVELS <- c(
+    "DJF (Dec\u2013Feb)", "MAM (Mar\u2013May)",
+    "JJA (Jun\u2013Aug)", "SON (Sep\u2013Nov)"
+  )
+  raw <- df_dt[, .(date = as.Date(date), val = as.numeric(get(value_col)))]
+  raw <- raw[!is.na(val)]
+  raw[, year  := as.integer(format(date, "%Y"))]
+  raw[, month := as.integer(format(date, "%m"))]
+  raw <- raw[year >= year_start & year <= year_end]
+  raw[, season := data.table::fcase(
+    month %in% c(12L, 1L, 2L), "DJF (Dec\u2013Feb)",
+    month %in% c(3L, 4L, 5L),  "MAM (Mar\u2013May)",
+    month %in% c(6L, 7L, 8L),  "JJA (Jun\u2013Aug)",
+    month %in% c(9L, 10L, 11L), "SON (Sep\u2013Nov)"
+  )]
+  # December of year Y rolls into DJF of year Y+1
+  raw[, season_year := data.table::fifelse(month == 12L, year + 1L, year)]
+  # mean of the 3 monthly values × 3 ≈ seasonal total (mm/season)
+  sm <- raw[, .(seas_mean = mean(val, na.rm = TRUE) * 3L),
+            by = .(season_year, season)]
+  sm <- sm[season_year >= year_start & season_year <= year_end]
+  sm[, season := factor(season, levels = SEASON_LEVELS)]
+  list(seas_means = sm, SEASON_LEVELS = SEASON_LEVELS)
+}
+
+# OLS trend label: "DJF: +0.0060 mm/yr  |  MAM: +0.xxxx mm/yr *  | …"
+.seas_trend_label <- function(seas_means, SEASON_LEVELS) {
+  trend_stats <- seas_means[, {
+    fit <- lm(seas_mean ~ season_year)
+    list(
+      slope   = coef(fit)[["season_year"]],
+      p_value = summary(fit)$coefficients["season_year", "Pr(>|t|)"]
+    )
+  }, by = season]
+  paste(
+    sapply(SEASON_LEVELS, function(s) {
+      row <- trend_stats[season == s]
+      sig <- if (!is.na(row$p_value) && row$p_value < 0.05) " *" else ""
+      sprintf("%s: %+.4f mm/yr%s", sub(" \\(.*", "", s), row$slope, sig)
+    }),
+    collapse = "   |   "
+  )
+}
+
+# Build ggplot panel for seasonal trends
+.seas_ggplot <- function(seas_means, SEASON_LEVELS,
+                         title_str, subtitle_str, ylab_str,
+                         year_start, year_end,
+                         base_size = 22) {
+  season_colours <- c(
+    "DJF (Dec\u2013Feb)" = "#4472C4",
+    "MAM (Mar\u2013May)" = "#70AD47",
+    "JJA (Jun\u2013Aug)" = "#C00000",
+    "SON (Sep\u2013Nov)" = "#ED7D31"
+  )
+  ggplot2::ggplot(
+    seas_means,
+    ggplot2::aes(x = season_year, y = seas_mean,
+                 colour = season, group = season)
+  ) +
+    ggplot2::geom_line(linewidth = 0.6, alpha = 0.85) +
+    ggplot2::geom_point(size = 1.2, alpha = 0.75) +
+    ggplot2::geom_smooth(method = "lm", formula = y ~ x,
+                         se = FALSE, linetype = "dashed", linewidth = 1.6) +
+    ggplot2::geom_hline(yintercept = 0, linetype = "dotted",
+                        colour = "grey50", linewidth = 0.4) +
+    ggplot2::scale_colour_manual(
+      values = season_colours, name = NULL,
+      guide  = ggplot2::guide_legend(
+        direction = "horizontal", nrow = 1,
+        override.aes = list(linewidth = 1.4, size = 2)
+      )
+    ) +
+    ggplot2::scale_x_continuous(
+      breaks = seq(year_start, year_end, by = 10),
+      expand = ggplot2::expansion(mult = 0.01)
+    ) +
+    ggplot2::labs(title    = title_str,
+                  subtitle = subtitle_str,
+                  x = "Year", y = ylab_str) +
+    ggplot2::theme_bw(base_size = base_size) +
+    ggplot2::theme(
+      plot.title    = ggplot2::element_text(face = "bold", size = base_size + 4,
+                                            margin = ggplot2::margin(b = 4)),
+      plot.subtitle = ggplot2::element_text(size  = base_size - 1,
+                                            colour = "grey30",
+                                            margin = ggplot2::margin(b = 10)),
+      legend.position  = "top",
+      legend.text      = ggplot2::element_text(size = base_size),
+      legend.key.width = ggplot2::unit(1.6, "cm"),
+      panel.grid.minor = ggplot2::element_blank(),
+      panel.grid.major = ggplot2::element_line(colour = "grey90", linewidth = 0.3),
+      axis.title       = ggplot2::element_text(size = base_size + 2),
+      axis.text        = ggplot2::element_text(size = base_size)
+    )
+}
+
+# ── 2. MAIN FUNCTION ─────────────────────────────────────────────────────────────
+
+create_precip_seasonal_trends <- function(
+    df          = basin_avg_monthly,    # data.frame/data.table with columns:
+    #   date (Date or character), precip_mm_month
+    out_dir_loc = out_dir,
+    basin_label = "Nechako River Basin",
+    year_start  = 1950L,
+    year_end    = 2025L
+) {
+  cat("\n\u2500\u2500 Function 16: Precipitation seasonal trends plot \u2500\u2500\n")
+  
+  # ── guards ───────────────────────────────────────────────────────────────────
+  if (is.null(df) || !"date" %in% names(df)) {
+    cat("  \u26a0 Basin monthly data not available \u2014 skipping Function 16.\n")
+    return(invisible(NULL))
+  }
+  df_dt <- data.table::as.data.table(df)
+  if (!"precip_mm_month" %in% names(df_dt)) {
+    cat("  \u26a0 Column 'precip_mm_month' not found in basin_avg_monthly",
+        "\u2014 skipping Function 16.\n")
+    cat("    Available columns:", paste(names(df_dt), collapse = ", "), "\n")
+    return(invisible(NULL))
+  }
+  
+  # ── build seasonal means ─────────────────────────────────────────────────────
+  cat("  Computing seasonal means for Precipitation...\n")
+  res_pr <- .seas_means_generic(df_dt, "precip_mm_month", year_start, year_end)
+  
+  if (nrow(res_pr$seas_means) == 0) {
+    cat("  \u26a0 No seasonal data within", year_start, "\u2013", year_end,
+        "\u2014 skipping.\n")
+    return(invisible(NULL))
+  }
+  
+  # quick sanity check: print per-season N and mean
+  check <- res_pr$seas_means[, .(n = .N, mean_mm = round(mean(seas_mean, na.rm = TRUE), 1)),
+                             by = season]
+  cat("  Seasonal check (n obs, mean mm/season):\n")
+  print(as.data.frame(check))
+  
+  # ── OLS trend labels for subtitle ───────────────────────────────────────────
+  label_pr <- .seas_trend_label(res_pr$seas_means, res_pr$SEASON_LEVELS)
+  
+  # ── build ggplot ─────────────────────────────────────────────────────────────
+  p_pr <- .seas_ggplot(
+    seas_means    = res_pr$seas_means,
+    SEASON_LEVELS = res_pr$SEASON_LEVELS,
+    title_str     = sprintf(
+      "Seasonal Precipitation Trends \u2014 %s (%d\u2013%d)",
+      basin_label, year_start, year_end
+    ),
+    subtitle_str  = paste0(
+      "Annual seasonal means with OLS trend lines (dashed).  * p < 0.05\n",
+      label_pr
+    ),
+    ylab_str      = "Seasonal mean Precipitation (mm/season)",
+    year_start    = year_start,
+    year_end      = year_end
+  )
+  
+  # ── save PNG ─────────────────────────────────────────────────────────────────
+  out_png <- file.path(out_dir_loc, "FigS_Precip_Seasonal_Trends.png")
+  tryCatch({
+    ggplot2::ggsave(out_png, p_pr, width = 14, height = 7,
+                    units = "in", dpi = 300)
+    cat(sprintf("  \u2713 PNG saved: %s\n", basename(out_png)))
+  }, error = function(e) cat(sprintf("  \u26a0 PNG error: %s\n", e$message)))
+  
+  # ── save PDF ─────────────────────────────────────────────────────────────────
+  out_pdf <- file.path(out_dir_loc, "FigS_Precip_Seasonal_Trends.pdf")
+  tryCatch({
+    ggplot2::ggsave(out_pdf, p_pr, width = 14, height = 7,
+                    units = "in", device = "pdf")
+    cat(sprintf("  \u2713 PDF saved: %s\n", basename(out_pdf)))
+  }, error = function(e) cat(sprintf("  \u26a0 PDF error: %s\n", e$message)))
+  
+  invisible(p_pr)
+}
+
+# ── 3. CALL ───────────────────────────────────────────────────────────────────
+create_precip_seasonal_trends()
 cat("\n========================================\n")
 cat("\u2705 ALL VISUALIZATIONS CREATED\n")
 cat("========================================\n")
@@ -1554,3 +1781,211 @@ cat(" FigS_PET_Thw_Seasonal_Trends.png/.pdf  — 15b: PET-Thw seasonal trends (n
 cat(" FigS_PET_Both_Seasonal_Trends.png/.pdf — 15c: single-panel seasonal difference (PET_Thw − PET_PM)\n")
 cat("\nSPATIAL MAPS: all 4 variables (Pr, PET_PM, PET_Thw, Temperature)\n")
 cat("SPECIFIC-POINT: 4-panel TS + 4-panel slope bars at each point\n")
+####################################################################################
+# FUNCTION 17: Temperature Seasonal Trends Plot
+# ─────────────────────────────────────────────────────────────────────────────────
+# Mirrors Function 16 (Precipitation) and Function 15 (PET) but for Temperature.
+# Produces a single-panel figure showing the inter-annual time series of seasonal
+# mean temperature (DJF, MAM, JJA, SON) with OLS trend lines and significance
+# annotations — matching the style of temperature_seasonal_trends.png.
+#
+# OUTPUTS
+#   FigS_Temp_Seasonal_Trends.png   — main figure (300 dpi, 14 × 7 in)
+#   FigS_Temp_Seasonal_Trends.pdf   — vector version
+#
+# KEY DIFFERENCES FROM FUNCTION 16 (Precipitation)
+#   • Source column : tair_degC_month  (°C, not mm)
+#   • Seasonal mean : mean(val) over 3 months — NOT multiplied by 3
+#     (temperature is an average quantity, not a total)
+#   • y-axis label  : "Seasonal mean temperature (°C)"
+#   • Slope label   : "°C/yr" instead of "mm/yr"
+####################################################################################
+
+# ── 0. STANDALONE PREAMBLE (skip if appending to the visualisation script) ──────
+
+if (!exists("basin_avg_monthly")) {
+  library(data.table)
+  library(ggplot2)
+  
+  setwd("D:/Nechako_Drought/Nechako/")          # ← adjust if needed
+  out_dir <- "trend_analysis_pr_pet"
+  
+  metadata          <- readRDS(file.path(out_dir, "analysis_metadata.rds"))
+  basin_avg_monthly <- metadata$basin_avg_monthly
+  names(basin_avg_monthly) <- trimws(names(basin_avg_monthly))
+}
+
+# ── 1. TEMPERATURE-SPECIFIC HELPER ───────────────────────────────────────────────
+# Builds seasonal-means data.table for a temperature-like column (mean, not total).
+# Reuses the SEASON_LEVELS / DJF roll-forward logic from .seas_means_generic but
+# skips the ×3 multiplication that is appropriate only for accumulation variables.
+
+.temp_seas_means <- function(df_dt, value_col, year_start, year_end) {
+  SEASON_LEVELS <- c(
+    "DJF (Dec\u2013Feb)", "MAM (Mar\u2013May)",
+    "JJA (Jun\u2013Aug)", "SON (Sep\u2013Nov)"
+  )
+  raw <- df_dt[, .(date = as.Date(date), val = as.numeric(get(value_col)))]
+  raw <- raw[!is.na(val)]
+  raw[, year  := as.integer(format(date, "%Y"))]
+  raw[, month := as.integer(format(date, "%m"))]
+  raw <- raw[year >= year_start & year <= year_end]
+  raw[, season := data.table::fcase(
+    month %in% c(12L, 1L, 2L),  "DJF (Dec\u2013Feb)",
+    month %in% c(3L, 4L, 5L),  "MAM (Mar\u2013May)",
+    month %in% c(6L, 7L, 8L),  "JJA (Jun\u2013Aug)",
+    month %in% c(9L, 10L, 11L), "SON (Sep\u2013Nov)"
+  )]
+  # December of year Y rolls into DJF of year Y+1 (consistent with other functions)
+  raw[, season_year := data.table::fifelse(month == 12L, year + 1L, year)]
+  # seasonal MEAN (not total) — appropriate for temperature
+  sm <- raw[, .(seas_mean = mean(val, na.rm = TRUE)),
+            by = .(season_year, season)]
+  sm <- sm[season_year >= year_start & season_year <= year_end]
+  sm[, season := factor(season, levels = SEASON_LEVELS)]
+  list(seas_means = sm, SEASON_LEVELS = SEASON_LEVELS)
+}
+
+# OLS trend label in °C/yr
+.temp_trend_label <- function(seas_means, SEASON_LEVELS) {
+  trend_stats <- seas_means[, {
+    fit <- lm(seas_mean ~ season_year)
+    list(
+      slope   = coef(fit)[["season_year"]],
+      p_value = summary(fit)$coefficients["season_year", "Pr(>|t|)"]
+    )
+  }, by = season]
+  paste(
+    sapply(SEASON_LEVELS, function(s) {
+      row <- trend_stats[season == s]
+      sig <- if (!is.na(row$p_value) && row$p_value < 0.05) " *" else ""
+      sprintf("%s: %+.4f \u00b0C/yr%s", sub(" \\(.*", "", s), row$slope, sig)
+    }),
+    collapse = "   |   "
+  )
+}
+
+# ── 2. MAIN FUNCTION ─────────────────────────────────────────────────────────────
+
+create_temp_seasonal_trends <- function(
+    df          = basin_avg_monthly,
+    out_dir_loc = out_dir,
+    basin_label = "Nechako River Basin",
+    year_start  = 1950L,
+    year_end    = 2025L,
+    base_size   = 22
+) {
+  cat("\n\u2500\u2500 Function 17: Temperature seasonal trends plot \u2500\u2500\n")
+  
+  # ── guards ───────────────────────────────────────────────────────────────────
+  if (is.null(df) || !"date" %in% names(df)) {
+    cat("  \u26a0 Basin monthly data not available \u2014 skipping Function 17.\n")
+    return(invisible(NULL))
+  }
+  df_dt <- data.table::as.data.table(df)
+  if (!"tair_degC_month" %in% names(df_dt)) {
+    cat("  \u26a0 Column 'tair_degC_month' not found in basin_avg_monthly",
+        "\u2014 skipping Function 17.\n")
+    cat("    Available columns:", paste(names(df_dt), collapse = ", "), "\n")
+    return(invisible(NULL))
+  }
+  
+  # ── build seasonal means ─────────────────────────────────────────────────────
+  cat("  Computing seasonal means for Temperature...\n")
+  res_t <- .temp_seas_means(df_dt, "tair_degC_month", year_start, year_end)
+  
+  if (nrow(res_t$seas_means) == 0) {
+    cat("  \u26a0 No seasonal data within", year_start, "\u2013", year_end,
+        "\u2014 skipping.\n")
+    return(invisible(NULL))
+  }
+  
+  check <- res_t$seas_means[, .(n = .N,
+                                mean_degC = round(mean(seas_mean, na.rm = TRUE), 2)),
+                            by = season]
+  cat("  Seasonal check (n obs, mean \u00b0C/season):\n")
+  print(as.data.frame(check))
+  
+  # ── OLS trend labels for subtitle ───────────────────────────────────────────
+  label_t <- .temp_trend_label(res_t$seas_means, res_t$SEASON_LEVELS)
+  
+  # ── colour palette (matches the reference figure) ────────────────────────────
+  season_colours <- c(
+    "DJF (Dec\u2013Feb)" = "#4472C4",   # blue
+    "MAM (Mar\u2013May)" = "#70AD47",   # green
+    "JJA (Jun\u2013Aug)" = "#C00000",   # dark red
+    "SON (Sep\u2013Nov)" = "#ED7D31"    # orange
+  )
+  
+  # ── build ggplot ─────────────────────────────────────────────────────────────
+  p_t <- ggplot2::ggplot(
+    res_t$seas_means,
+    ggplot2::aes(x = season_year, y = seas_mean,
+                 colour = season, group = season)
+  ) +
+    ggplot2::geom_line(linewidth = 0.6, alpha = 0.85) +
+    ggplot2::geom_point(size = 1.2, alpha = 0.75) +
+    ggplot2::geom_smooth(method = "lm", formula = y ~ x,
+                         se = FALSE, linetype = "dashed", linewidth = 1.6) +
+    ggplot2::geom_hline(yintercept = 0, linetype = "dotted",
+                        colour = "grey50", linewidth = 0.4) +
+    ggplot2::scale_colour_manual(
+      values = season_colours, name = NULL,
+      guide  = ggplot2::guide_legend(
+        direction = "horizontal", nrow = 1,
+        override.aes = list(linewidth = 1.4, size = 2)
+      )
+    ) +
+    ggplot2::scale_x_continuous(
+      breaks = seq(year_start, year_end, by = 10),
+      expand = ggplot2::expansion(mult = 0.01)
+    ) +
+    ggplot2::labs(
+      title    = sprintf(
+        "Seasonal Temperature Trends \u2014 %s (%d\u2013%d)",
+        basin_label, year_start, year_end
+      ),
+      subtitle = paste0(
+        "Annual seasonal means with OLS trend lines (dashed).  * p < 0.05\n",
+        label_t
+      ),
+      x = "Year",
+      y = "Seasonal mean temperature (\u00b0C)"
+    ) +
+    ggplot2::theme_bw(base_size = base_size) +
+    ggplot2::theme(
+      plot.title    = ggplot2::element_text(face = "bold", size = base_size + 4,
+                                            margin = ggplot2::margin(b = 4)),
+      plot.subtitle = ggplot2::element_text(size   = base_size - 1,
+                                            colour = "grey30",
+                                            margin = ggplot2::margin(b = 10)),
+      legend.position  = "top",
+      legend.text      = ggplot2::element_text(size = base_size),
+      legend.key.width = ggplot2::unit(1.6, "cm"),
+      panel.grid.minor = ggplot2::element_blank(),
+      panel.grid.major = ggplot2::element_line(colour = "grey90", linewidth = 0.3),
+      axis.title       = ggplot2::element_text(size = base_size + 2),
+      axis.text        = ggplot2::element_text(size = base_size)
+    )
+  
+  # ── save PNG ─────────────────────────────────────────────────────────────────
+  out_png <- file.path(out_dir_loc, "FigS_Temp_Seasonal_Trends.png")
+  tryCatch({
+    ggplot2::ggsave(out_png, p_t, width = 14, height = 7,
+                    units = "in", dpi = 300)
+    cat(sprintf("  \u2713 PNG saved: %s\n", basename(out_png)))
+  }, error = function(e) cat(sprintf("  \u26a0 PNG error: %s\n", e$message)))
+  
+  # ── save PDF ─────────────────────────────────────────────────────────────────
+  out_pdf <- file.path(out_dir_loc, "FigS_Temp_Seasonal_Trends.pdf")
+  tryCatch({
+    ggplot2::ggsave(out_pdf, p_t, width = 14, height = 7,
+                    units = "in", device = "pdf")
+    cat(sprintf("  \u2713 PDF saved: %s\n", basename(out_pdf)))
+  }, error = function(e) cat(sprintf("  \u26a0 PDF error: %s\n", e$message)))
+  
+  invisible(p_t)
+}
+
+# ── 3. CALL ───────────────────────────────────────────────────────────────────
+create_temp_seasonal_trends()
