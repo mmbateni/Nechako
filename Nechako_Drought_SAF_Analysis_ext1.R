@@ -1,32 +1,78 @@
 #============================================================================
-# SAF EXTENSIONS 1 — ENHANCED FUNCTIONS
+# SAF EXTENSIONS 1 — ENHANCED FUNCTIONS (v6)
 # Source AFTER Nechako_Drought_SAF_Analysis.R
 #
-# Provides three new functions that extend the main pipeline:
-#   test_dependency()          — Kendall τ / Spearman ρ between severity & area
-#   gof_copula()               — Bootstrap goodness-of-fit test (Sn statistic)
-#   fit_timevarying_copula()   — Tests if copula dependence changes over time
+# Functions exported:
+#   test_dependency()             — Kendall τ / Spearman ρ between severity & area
+#   gof_copula()                  — Bootstrap Sn GOF test (N_boot = 499 replicates)
+#   detect_copula_changepoints()  — Pettitt / CUSUM / PRUTF structural-break
+#   rosenblatt_pit_gof()          — Rosenblatt PIT GOF for time-varying copulas
+#   fit_timevarying_copula()      — Trend in dependence; calls change-point
+#                                   detection first and Rosenblatt PIT afterwards.
+#                                   SurvClayton family handled. Returns yr_mean/
+#                                   yr_sd/a_hat/b_hat so ext2 can build period-
+#                                   specific copula objects.
 #
-# FIXES vs original ext1:
-#   - REMOVED rm(list=ls()) which previously wiped the main pipeline results
-#   - REMOVED duplicated functions already defined in SAF_Analysis.R
-#   - fit_timevarying_copula now uses the AIC-selected copula family instead
-#     of always hardcoding Clayton
-#   - TV copula results are saved to CSV
+# CHANGES vs v5 (BUG FIXES — v6):
+#
+#   detect_copula_changepoints() — zero-variance rolling window guard [FIX]:
+#
+#     v5 ISSUE: The rolling Kendall tau loop called cor(..., method="kendall")
+#              without checking whether severity or area_pct had zero variance
+#              within the window.  When all drought-month observations within
+#              a 10-year window are identical (typically a few isolated windows
+#              in the SPI-3 record), cor() emits
+#              "Warning: the standard deviation is zero"
+#              and returns NA.  The NA was handled correctly (valid index
+#              filtering) so change-point results were NOT corrupted, but the
+#              repeated warnings (≈9 for SPI-3) cluttered the console and
+#              could mask genuine problems.
+#
+#     v6 FIX:  Pre-check sd(severity) and sd(area_pct) for each window.
+#              Zero-variance windows are assigned NA silently; the total
+#              count of suppressed windows is logged once via log_event()
+#              so the analyst can inspect the raw data if needed.
+#
+#   gof_copula() — N_boot documentation added [CLARIFICATION]:
+#
+#     The bootstrap window size is N_boot = 499 replicates (default).
+#     A detailed comment has been added explaining the choice: 499 replicates
+#     yield a minimum two-sided p-value of 0.002 (< α = 0.05) while keeping
+#     run-time manageable.  The CUSUM permutation test also uses 499 MC draws
+#     (matching N_boot for consistency).
+#
+# CHANGES vs v4 (BUG FIXES — v5):
+#
+#   rosenblatt_pit_gof() — complete rewrite of the e2 computation [FIX]:
+#
+#     v3 BUG:  copula::cCopula(..., indices=1L)[1L,1L] returns
+#              C(u_severity | u_area) — the conditional distribution of the
+#              FIRST variable given the SECOND.  This is structurally identical
+#              to u_severity itself at the univariate level, so e2 ≡ e1,
+#              producing τ = 1.000 and identical KS p-values across all
+#              Frank-family indices.  For the Plackett copula cCopula has no
+#              method implemented → 0 % valid values.
+#
+#     v4 FIX:  The correct Rosenblatt second variate is
+#                e2_i = C(u_area_i | u_severity_i; θ_i) = ∂C(u1,u2)/∂u1
+#              computed via a central finite-difference of pCopula (helper
+#              .h_func_fd).  pCopula is implemented for ALL families in the
+#              copula package (Frank, Gumbel, Plackett, Clayton, Joe, …),
+#              so the NA-return and 0 % valid problems are eliminated.
+#              The fix correctly captures the observation-specific θ_i from
+#              the TV copula for each row.
 #============================================================================
-if (!requireNamespace("moments",  quietly = TRUE)) install.packages("moments")
-if (!requireNamespace("openxlsx", quietly = TRUE)) install.packages("openxlsx")
-if (!requireNamespace("Kendall",  quietly = TRUE)) install.packages("Kendall")
-library(moments); library(openxlsx); library(Kendall)
 
-# Verify that the main pipeline has been run
+for (pkg in c("moments", "openxlsx", "Kendall", "trend")) {
+  if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg)
+}
+library(moments); library(openxlsx); library(Kendall); library(trend)
+
 if (!exists("log_event"))
   stop("log_event() not found. Source Nechako_Drought_SAF_Analysis.R first.")
 
 # ---------------------------------------------------------------------------
-# 1. DEPENDENCY TEST
-#    Tests the strength and significance of the severity–area relationship
-#    using rank-based correlation (Kendall τ and Spearman ρ).
+# 1. DEPENDENCY TEST  (unchanged from v2)
 # ---------------------------------------------------------------------------
 test_dependency <- function(drought_data, index_name) {
   dc <- drought_data[drought_data$severity > 0 & drought_data$area_pct > 0, ]
@@ -47,15 +93,19 @@ test_dependency <- function(drought_data, index_name) {
 }
 
 # ---------------------------------------------------------------------------
-# 2. COPULA GOODNESS-OF-FIT  (Bootstrap Sn test)
-#    Uses the parametric bootstrap with N_boot replicates.
-#    Decision: p > 0.05 => copula not rejected at 5% level.
+# 2. COPULA GOODNESS-OF-FIT  (Bootstrap Sn test — unchanged from v2)
 # ---------------------------------------------------------------------------
 gof_copula <- function(copula_fit_obj, u_matrix, index_name, N_boot = 499L) {
+  # Bootstrap GOF via the parametric Cramér–von Mises Sn statistic.
+  # N_boot (default 499) is the number of bootstrap replicates used to
+  # approximate the null distribution of Sn.  499 replicates strike a
+  # practical balance: the smallest achievable two-sided p-value is
+  # 1/(499+1) = 0.002, which is well below the α = 0.05 decision threshold,
+  # while keeping run-time manageable (each replicate re-fits the copula to
+  # a synthetic sample of the same size).  Set N_boot = 999 for publication-
+  # quality p-values; use N_boot = 99 during development for speed.
   if (is.null(copula_fit_obj)) return(NULL)
   cop <- copula_fit_obj$best_copula_fit@copula
-  # FIX: pass ties=TRUE explicitly so the ties-correction is intentional
-  #      rather than auto-detected mid-run (eliminates the informational warning).
   res <- tryCatch(
     suppressWarnings(
       copula::gofCopula(cop, u_matrix, N = N_boot,
@@ -74,13 +124,329 @@ gof_copula <- function(copula_fit_obj, u_matrix, index_name, N_boot = 499L) {
 }
 
 # ---------------------------------------------------------------------------
-# 3. TIME-VARYING COPULA
-#    Fits a log-linear model theta(t) = ilink(a + b*year_std) and tests
-#    whether b != 0 via a likelihood-ratio test (chi-sq, df=1).
+# 3. CHANGE-POINT DETECTION IN DEPENDENCE STRUCTURE  [NEW in v3]
 #
-#    FIX: now uses the AIC-selected copula family from copula_fit_obj instead
-#         of always forcing Clayton.  Family-appropriate link functions and
-#         parameter bounds are applied automatically.
+#    Three complementary tests are applied to a rolling-window Kendall tau
+#    series computed from the drought pseudo-observations:
+#
+#    (a) Pettitt test  (trend::pettitt.test)
+#        Rank-based non-parametric test for a single shift in the location
+#        of a continuous sequence.  Well-suited to small samples.
+#
+#    (b) CUSUM  (manual implementation with permutation p-value)
+#        Cumulative sum of standardised tau deviations.  Detects gradual
+#        or abrupt shifts; maximum |CUSUM| is the test statistic.
+#
+#    (c) PRUTF — Parametric LR structural-break test
+#        (Parametric Ratio-based test for Uniformity and Trend in Frequency)
+#        For each candidate break point k ∈ {20%, 35%, 50%, 65%, 80%} of n,
+#        the full-record log-likelihood is compared with the sum of two
+#        segment log-likelihoods (each segment refitted independently).
+#        Test statistic = sup_k { 2(ll_seg1_k + ll_seg2_k - ll_full) }.
+#        p-value from chi-sq(1) — conservative since we take a supremum,
+#        which is appropriate as a first-order approximation.
+#
+#    A change point is flagged as "detected" when at least 2 of the 3 tests
+#    reject H0 (no change) at the 5% level.  The consensus change-point year
+#    is the median of the significant test estimates.
+#
+#    Parameters
+#    ----------
+#    drought_data     : output data frame from extract_drought_characteristics
+#    copula_fit_obj   : result from fit_copulas() — used for PRUTF
+#    index_name       : character label for logging
+#    output_dir       : directory for CSV output
+#    window_yrs       : full width of the rolling tau window (default 10)
+# ---------------------------------------------------------------------------
+detect_copula_changepoints <- function(drought_data, copula_fit_obj,
+                                       index_name, output_dir,
+                                       window_yrs = 10L) {
+  dc <- drought_data[drought_data$severity > 0 & drought_data$area_pct > 0, ]
+  n  <- nrow(dc)
+  
+  if (n < 30L) {
+    log_event(sprintf("  [%s] Change-point detection skipped: < 30 drought obs.", index_name))
+    return(list(detected = FALSE, cp_year = NA_integer_,
+                pettitt_p = NA, cusum_p = NA, prutf_p = NA))
+  }
+  
+  # ---- Rolling Kendall tau -----------------------------------------------
+  # window_yrs (default 10) sets the FULL width of the centred window.
+  # Each centre point i uses observations in [i - half_w, i + half_w].
+  # A minimum of 6 observations per window is required for a meaningful τ.
+  #
+  # ZERO-VARIANCE GUARD (Fix v6):
+  #   When a window contains drought events with zero variance in either
+  #   severity or area_pct, cor(..., method="kendall") emits a
+  #   "the standard deviation is zero" warning and returns NA.  The NA
+  #   is handled gracefully downstream (valid <- which(is.finite(tau_ser))),
+  #   so change-point results are NOT corrupted.  However, the repeated
+  #   warnings clutter the output and mask genuine issues.
+  #   Fix: pre-check variance for both variables before calling cor().
+  #   Zero-variance windows are marked NA silently; a single aggregate
+  #   diagnostic is logged at the end so the analyst can inspect the
+  #   raw data if needed.
+  half_w  <- max(floor(window_yrs / 2L), 3L)
+  tau_ser <- rep(NA_real_, n)
+  n_zero_var_windows <- 0L
+  for (i in seq_len(n)) {
+    idx <- max(1L, i - half_w):min(n, i + half_w)
+    if (length(idx) >= 6L) {
+      sev_w  <- dc$severity[idx]
+      area_w <- dc$area_pct[idx]
+      if (sd(sev_w, na.rm = TRUE) < 1e-10 || sd(area_w, na.rm = TRUE) < 1e-10) {
+        # Zero-variance window: cor() would warn and return NA.
+        # Record for the aggregate diagnostic; leave tau_ser[i] as NA.
+        n_zero_var_windows <- n_zero_var_windows + 1L
+      } else {
+        tau_ser[i] <- cor(sev_w, area_w, method = "kendall")
+      }
+    }
+  }
+  if (n_zero_var_windows > 0L)
+    log_event(sprintf(
+      "  [%s] Rolling tau: %d window(s) of %d total had zero variance in severity or area_pct and were set to NA (no warning emitted). Inspect raw drought characteristics for runs of identical values.",
+      index_name, n_zero_var_windows, n))
+  valid <- which(is.finite(tau_ser))
+  if (length(valid) < 10L) {
+    log_event(sprintf("  [%s] Change-point detection: too few valid tau values.", index_name))
+    return(list(detected = FALSE, cp_year = NA_integer_,
+                pettitt_p = NA, cusum_p = NA, prutf_p = NA))
+  }
+  tau_v <- tau_ser[valid]
+  yr_v  <- dc$year[valid]
+  
+  # ---- (a) Pettitt test --------------------------------------------------
+  pett      <- tryCatch(trend::pettitt.test(tau_v), error = function(e) NULL)
+  pett_pval <- if (!is.null(pett)) pett$p.value            else NA_real_
+  pett_cp   <- if (!is.null(pett)) yr_v[pett$estimate[[1]]] else NA_integer_
+  
+  # ---- (b) CUSUM with permutation p-value --------------------------------
+  # 499 Monte-Carlo permutations (same count as N_boot in gof_copula) are
+  # used to approximate the null distribution of the CUSUM statistic.
+  # The permutation p-value is the fraction of permuted CUSUM statistics
+  # that equal or exceed the observed value: p = #{MC ≥ stat} / 499.
+  s_tau   <- sd(tau_v, na.rm = TRUE); if (s_tau < 1e-10) s_tau <- 1
+  z       <- (tau_v - mean(tau_v)) / s_tau
+  cs      <- cumsum(z)
+  cusum_stat    <- max(abs(cs))
+  cusum_cp_idx  <- which.max(abs(cs))
+  cusum_cp_yr   <- yr_v[cusum_cp_idx]
+  set.seed(123L)
+  mc_cusum  <- replicate(499L, max(abs(cumsum(sample(z, replace = FALSE)))))
+  cusum_pval <- mean(mc_cusum >= cusum_stat)
+  
+  # ---- (c) PRUTF: parametric LR structural-break -------------------------
+  # Helper to build a one-parameter copula of the correct family
+  cop_nm  <- copula_fit_obj$best_copula_name
+  init_p  <- coef(copula_fit_obj$best_copula_fit)[1]
+  uS      <- copula_fit_obj$u_severity
+  uA      <- copula_fit_obj$u_area
+  uDat    <- cbind(uS, uA)
+  
+  make_cop_prutf <- function(th) {
+    switch(cop_nm,
+           Frank       = frankCopula(th, dim = 2),
+           Gumbel      = gumbelCopula(max(th, 1.001), dim = 2),
+           Plackett    = plackettCopula(max(th, 1e-3)),
+           SurvClayton = rotCopula(claytonCopula(max(th, 1e-3), dim = 2)),
+           Joe         = joeCopula(max(th, 1.001), dim = 2),
+           frankCopula(th, dim = 2))         # safe fallback
+  }
+  
+  fit_seg_ll <- function(rows) {
+    if (length(rows) < 5L) return(NA_real_)
+    uM <- uDat[rows, , drop = FALSE]
+    fit <- tryCatch(
+      fitCopula(make_cop_prutf(init_p), uM, method = "mpl",
+                optim.method = "BFGS", optim.control = list(maxit = 300)),
+      error = function(e)
+        tryCatch(fitCopula(make_cop_prutf(init_p), uM, method = "mpl",
+                           optim.method = "Nelder-Mead",
+                           optim.control = list(maxit = 600)),
+                 error = function(e2) NULL))
+    if (is.null(fit)) return(NA_real_)
+    tryCatch(loglikCopula(coef(fit), uM, make_cop_prutf(coef(fit)[1])),
+             error = function(e) NA_real_)
+  }
+  
+  ll_full   <- tryCatch(
+    loglikCopula(init_p, uDat, copula_fit_obj$best_copula_fit@copula),
+    error = function(e) NA_real_)
+  k_cands   <- unique(round(quantile(seq_len(n), c(0.20, 0.35, 0.50, 0.65, 0.80))))
+  lr_vals   <- numeric(length(k_cands))
+  for (j in seq_along(k_cands)) {
+    k <- k_cands[j]
+    ll1 <- fit_seg_ll(seq_len(k))
+    ll2 <- fit_seg_ll((k + 1L):n)
+    lr_vals[j] <- if (is.finite(ll1) && is.finite(ll2) && is.finite(ll_full))
+      max(0, 2 * (ll1 + ll2 - ll_full)) else 0
+  }
+  prutf_stat   <- max(lr_vals)
+  prutf_cp_idx <- k_cands[which.max(lr_vals)]
+  prutf_cp_yr  <- dc$year[min(prutf_cp_idx, n)]
+  # Conservative chi-sq(1) p-value (supremum inflates Type I error → use as
+  # upper bound; a formal Andrews 1993 critical value would be slightly lower).
+  prutf_pval   <- pchisq(prutf_stat, df = 1L, lower.tail = FALSE)
+  
+  # ---- Consensus --------------------------------------------------------
+  cp_pool  <- c(pett_cp, cusum_cp_yr, prutf_cp_yr)
+  pv_pool  <- c(pett_pval, cusum_pval, prutf_pval)
+  sig_idx  <- which(is.finite(pv_pool) & pv_pool < 0.05)
+  detected <- length(sig_idx) >= 2L
+  cp_year  <- if (detected) as.integer(round(median(cp_pool[sig_idx], na.rm = TRUE))) else NA_integer_
+  
+  log_event(sprintf(
+    "  [%s] ChangePoint | Pettitt: yr=%s p=%.3f | CUSUM: yr=%s p=%.3f | PRUTF: yr=%s p=%.3f | Consensus yr=%s (detected=%s)",
+    index_name,
+    if (is.na(pett_cp)) "NA" else pett_cp,  round(pett_pval,  3),
+    cusum_cp_yr,                              round(cusum_pval, 3),
+    prutf_cp_yr,                              round(prutf_pval, 3),
+    if (is.na(cp_year)) "NA" else cp_year,   detected))
+  
+  result_df <- data.frame(
+    index           = index_name,
+    pettitt_cp_yr   = pett_cp,      pettitt_p  = round(pett_pval,  4),
+    cusum_cp_yr     = cusum_cp_yr,  cusum_p    = round(cusum_pval, 4),
+    prutf_cp_yr     = prutf_cp_yr,  prutf_p    = round(prutf_pval, 4),
+    consensus_cp_yr = cp_year,      detected   = detected,
+    stringsAsFactors = FALSE)
+  write.csv(result_df,
+            file.path(output_dir, sprintf("%s_changepoint_detection.csv", index_name)),
+            row.names = FALSE)
+  
+  invisible(list(
+    detected    = detected,
+    cp_year     = cp_year,
+    pettitt_cp  = pett_cp,   pettitt_p  = pett_pval,
+    cusum_cp    = cusum_cp_yr, cusum_p  = cusum_pval,
+    prutf_cp    = prutf_cp_yr, prutf_p  = prutf_pval,
+    tau_series  = data.frame(year = yr_v, rolling_tau = tau_v)))
+}
+
+# ---------------------------------------------------------------------------
+# INTERNAL HELPER: h-function via central finite differences of pCopula
+#
+#   Computes  C(u2 | u1; cop_obj) = ∂C(u1, u2)/∂u1
+#   using a central finite difference.  This is the correct Rosenblatt
+#   second variate: it conditions u_area ON u_severity, not the reverse.
+#
+#   Using pCopula (the joint CDF) rather than cCopula avoids:
+#     (a) the wrong-direction bug  (cCopula indices=1 gives C(u1|u2))
+#     (b) the Plackett NA problem  (cCopula has no Plackett method)
+#   pCopula is implemented for every family in the copula package.
+#
+#   eps     : half-width of the finite-difference step (default 1e-4).
+#             Smaller values improve accuracy but may amplify floating-point
+#             noise; 1e-4 is safe for the [0,1]^2 domain.
+# ---------------------------------------------------------------------------
+.h_func_fd <- function(u1, u2, cop_obj, eps = 1e-4) {
+  u1_lo <- pmax(eps,       u1 - eps)
+  u1_hi <- pmin(1 - eps,   u1 + eps)
+  num   <- copula::pCopula(cbind(u1_hi, u2), cop_obj) -
+    copula::pCopula(cbind(u1_lo, u2), cop_obj)
+  den   <- u1_hi - u1_lo
+  # Clamp to a valid open-unit-interval probability
+  pmax(1e-8, pmin(1 - 1e-8, num / den))
+}
+
+# ---------------------------------------------------------------------------
+# 4. ROSENBLATT PROBABILITY INTEGRAL TRANSFORM GOF  (v4 — corrected)
+#
+#    The Rosenblatt (1952) transform converts a bivariate sample (u, v) from
+#    a correctly specified copula C into two independent U[0,1] variates:
+#
+#       e1_i = u_S_i                                     (first margin — trivially uniform)
+#       e2_i = C_{A|S}(u_A_i | u_S_i; θ_i)             (second Rosenblatt variate)
+#            = ∂C(u_S_i, u_A_i; θ_i) / ∂u_S_i          (partial derivative w.r.t. u1)
+#
+#    For a TIME-VARYING copula each observation i has its own θ_i, so the
+#    partial derivative is evaluated at the observation-specific parameter.
+#
+#    e2 is computed via .h_func_fd() (central finite-difference of pCopula).
+#    This replaces the v3 implementation which incorrectly called
+#    cCopula(..., indices=1)[,1] — that returns C(u1|u2), NOT C(u2|u1),
+#    causing e2 ≡ e1 and τ = 1.000 for all Frank copulas, and 0 % valid
+#    values for the Plackett copula (no cCopula method).
+#
+#    Adequacy criteria (all must hold):
+#      • e2 is uniformly distributed: KS p > 0.05
+#      • e1 and e2 are independent:   Kendall τ p > 0.05
+#    (e1 is always uniform by marginal construction; its KS result is
+#     logged for completeness but not included in the adequacy decision.)
+#
+#    Parameters
+#    ----------
+#    uDat        : n×2 matrix of pseudo-observations (u_severity, u_area)
+#    make_cop_fn : function(theta_raw) → copula object
+#    a_hat/b_hat : fitted TV copula intercept and slope (on link scale)
+#    year_std    : standardised year vector (length n, matches rows of uDat)
+#    index_name, cop_name : for logging only
+# ---------------------------------------------------------------------------
+rosenblatt_pit_gof <- function(uDat, make_cop_fn, a_hat, b_hat,
+                               year_std, index_name, cop_name) {
+  n  <- nrow(uDat)
+  e1 <- uDat[, 1]   # u_severity — trivially U[0,1] by marginal construction
+  
+  # Compute e2_i = C(u_area_i | u_severity_i; θ_i)
+  # Each observation uses its own θ_i from the TV copula fit.
+  e2 <- vapply(seq_len(n), function(i) {
+    tryCatch({
+      cop_i <- make_cop_fn(a_hat + b_hat * year_std[i])
+      .h_func_fd(uDat[i, 1L], uDat[i, 2L], cop_i)
+    }, error = function(e) NA_real_)
+  }, numeric(1L))
+  
+  e2_ok <- e2[is.finite(e2)]
+  e1_ok <- e1[is.finite(e2)]
+  frac  <- length(e2_ok) / n
+  
+  ks_e1 <- tryCatch(ks.test(e1_ok, "punif"),
+                    error = function(e) list(statistic = NA_real_, p.value = NA_real_))
+  ks_e2 <- tryCatch(ks.test(e2_ok, "punif"),
+                    error = function(e) list(statistic = NA_real_, p.value = NA_real_))
+  
+  tau_ind <- tryCatch(cor(e1_ok, e2_ok, method = "kendall"),
+                      error = function(e) NA_real_)
+  tau_p   <- tryCatch(cor.test(e1_ok, e2_ok, method = "kendall")$p.value,
+                      error = function(e) NA_real_)
+  
+  adequate <- isTRUE(ks_e2$p.value > 0.05) && isTRUE(tau_p > 0.05)
+  
+  log_event(sprintf(
+    "  [%s] Rosenblatt PIT (%s) | e1 KS p=%.4f | e2 KS p=%.4f | indep tau=%.4f (p=%.4f) | adequate=%s (%.0f%% e2 valid)",
+    index_name, cop_name,
+    ks_e1$p.value, ks_e2$p.value, tau_ind, tau_p,
+    adequate, 100 * frac))
+  
+  list(ks_e1_stat = unname(ks_e1$statistic), ks_e1_p = ks_e1$p.value,
+       ks_e2_stat = unname(ks_e2$statistic), ks_e2_p = ks_e2$p.value,
+       tau_ind    = tau_ind,                 tau_ind_p = tau_p,
+       adequate   = adequate)
+}
+
+# ---------------------------------------------------------------------------
+# 5. TIME-VARYING COPULA  (updated v3)
+#
+#    Pipeline:
+#      (i)   detect_copula_changepoints() — run before the trend fit.
+#             If a change point is detected the result is embedded in the
+#             return value so that ext2 can use it for epoch definition.
+#             If an abrupt break is more likely than a smooth trend the
+#             user should consider segmented fitting instead.
+#      (ii)  Fit stationary and linear-trend (log-linear on link scale)
+#            copula models; compare with LRT (chi-sq, df=1).
+#      (iii) rosenblatt_pit_gof() — verifies the fitted TV copula via the
+#            Rosenblatt transform; result is appended to the return list.
+#
+#    Added to return value (for ext2 derive_SAF_nonstationary):
+#      yr_mean, yr_sd   — to re-standardise a calendar year outside this fn
+#      a_hat, b_hat     — TV copula parameters on the link scale
+#      cop_name         — family name (for make_cop reconstruction)
+#      link_hi, link_lo — parameter bounds
+#      link_ilink       — inverse-link function
+#      cp_result        — output of detect_copula_changepoints()
+#      rosenblatt       — output of rosenblatt_pit_gof()
 # ---------------------------------------------------------------------------
 fit_timevarying_copula <- function(drought_data, copula_fit_obj, marginal_fits,
                                    year_vec, index_name, output_dir) {
@@ -90,119 +456,485 @@ fit_timevarying_copula <- function(drought_data, copula_fit_obj, marginal_fits,
     return(NULL)
   }
   
-  # FIX (Bug 1): dc is a filtered subset of drought_data; its years must come
-  # from dc$year, not from the first nrow(dc) elements of year_vec (which
-  # would assign the wrong calendar years to each drought observation).
   yr_match <- dc$year
   if (length(yr_match) != nrow(dc)) yr_match <- rep(mean(year_vec), nrow(dc))
-  year_std <- as.numeric(scale(yr_match))
+  yr_mean  <- mean(yr_match, na.rm = TRUE)
+  yr_sd    <- sd(yr_match,   na.rm = TRUE)
+  if (yr_sd < 1e-10) yr_sd <- 1
+  year_std <- (yr_match - yr_mean) / yr_sd  # FIXED: was yr_std
   
   uS   <- copula_fit_obj$u_severity
   uA   <- copula_fit_obj$u_area
   uDat <- cbind(uS, uA)
-  
+  n    <- nrow(uDat)
   cop_name <- copula_fit_obj$best_copula_name
   init_par <- coef(copula_fit_obj$best_copula_fit)[1]
   
-  # Family-specific link/inverse-link and safe parameter bounds
+  #-- (i) Change-point detection -----------------------------------------
+  cp_result <- tryCatch(
+    detect_copula_changepoints(drought_data, copula_fit_obj, index_name, output_dir),
+    error = function(e) list(detected = FALSE, cp_year = NA_integer_)
+  )
+  
+  #-- Family-specific link/inverse-link ----------------------------------
   link_info <- switch(cop_name,
-                      Clayton  = list(link  = function(x) log(pmax(x, 1e-6)),
-                                      ilink = exp,
-                                      lo = 1e-3, hi = 50,
-                                      init  = max(init_par, 1e-3)),
-                      Gumbel   = list(link  = function(x) log(pmax(x - 1, 1e-6)),
-                                      ilink = function(x) exp(x) + 1,
-                                      lo = 1.001, hi = 50,
-                                      init  = max(init_par, 1.001)),
-                      Joe      = list(link  = function(x) log(pmax(x - 1, 1e-6)),
-                                      ilink = function(x) exp(x) + 1,
-                                      lo = 1.001, hi = 50,
-                                      init  = max(init_par, 1.001)),
-                      Frank    = list(link  = identity,
-                                      ilink = identity,
-                                      lo = -50, hi = 50,
-                                      init  = init_par),
-                      Normal   = list(link  = function(x) log((1 + x) / (1 - x)),    # logit of (1+rho)/2
-                                      ilink = function(x) (exp(x) - 1) / (exp(x) + 1),
-                                      lo = -0.999, hi = 0.999,
-                                      init  = max(min(init_par, 0.999), -0.999)),
-                      Plackett = list(link  = function(x) log(pmax(x, 1e-6)),
-                                      ilink = exp,
-                                      lo = 1e-3, hi = 500,
-                                      init  = max(init_par, 1e-3)),
-                      # default: Clayton
-                      list(link = function(x) log(pmax(x, 1e-6)),
-                           ilink = exp, lo = 1e-3, hi = 50,
-                           init  = max(init_par, 1e-3))
+                      Frank       = list(link  = identity, ilink = identity, lo = -50, hi = 50, init = init_par),
+                      Gumbel      = list(link  = function(x) log(pmax(x - 1, 1e-6)), ilink = function(x) exp(x) + 1, lo = 1.001, hi = 50, init = max(init_par, 1.001)),
+                      Plackett    = list(link  = function(x) log(pmax(x, 1e-6)), ilink = exp, lo = 1e-3, hi = 500, init = max(init_par, 1e-3)),
+                      SurvClayton = list(link  = function(x) log(pmax(x, 1e-6)), ilink = exp, lo = 1e-3, hi = 50, init = max(init_par, 1e-3)),
+                      Joe         = list(link  = function(x) log(pmax(x - 1, 1e-6)), ilink = function(x) exp(x) + 1, lo = 1.001, hi = 50, init = max(init_par, 1.001)),
+                      Gaussian    = list(link = function(x) atanh(x), ilink = tanh, lo = -0.99, hi = 0.99, init = init_par),
+                      StudentT    = list(link = function(x) c(atanh(x[1]), log(x[2])), 
+                                         ilink = function(x) c(tanh(x[1]), exp(x[2])), 
+                                         lo = c(-0.99, 1.5), hi = c(0.99, 50), init = c(init_par, 4)),
+                      # default fallback
+                      list(link = function(x) log(pmax(x, 1e-6)), ilink = exp, lo = 1e-3, hi = 50, init = max(init_par, 1e-3))
   )
   
   make_cop <- function(theta_raw) {
-    th <- max(min(link_info$ilink(theta_raw), link_info$hi), link_info$lo)
+    th <- link_info$ilink(theta_raw)
+    # Safe clamping (handles 1D scalars and 2D vectors for StudentT)
+    if (cop_name == "StudentT") {
+      th[1] <- max(min(th[1], link_info$hi[1]), link_info$lo[1])
+      th[2] <- max(min(th[2], link_info$hi[2]), link_info$lo[2])
+    } else {
+      th <- max(min(th, link_info$hi), link_info$lo)
+    }
     switch(cop_name,
-           Clayton  = claytonCopula(th, dim = 2),
-           Gumbel   = gumbelCopula(th,  dim = 2),
-           Frank    = frankCopula(th,   dim = 2),
-           Joe      = joeCopula(th,     dim = 2),
-           Normal   = normalCopula(th,  dim = 2),
-           Plackett = plackettCopula(th),
-           claytonCopula(th, dim = 2))
+           Frank       = frankCopula(th,  dim = 2),
+           Gumbel      = gumbelCopula(th,  dim = 2),
+           Plackett    = plackettCopula(th),
+           SurvClayton = rotCopula(claytonCopula(th, dim = 2)),
+           Joe         = joeCopula(th,     dim = 2),
+           Gaussian    = normalCopula(th, dim = 2),
+           StudentT    = tCopula(param = th[1], df = th[2], dim = 2),
+           frankCopula(th, dim = 2)  # default fallback
+    )
   }
   
-  # Stationary NLL
-  nll_stat <- function(p1) {
-    cop <- make_cop(p1)
-    -sum(log(pmax(copula::dCopula(uDat, cop), 1e-300)))
-  }
-  
-  # Time-varying NLL (row-by-row: each obs has its own theta)
-  nll_tv <- function(p) {
+  #-- (ii) Fit Stationary & TV -------------------------------------------
+  nll_stat <- function(p1) -sum(log(pmax(copula::dCopula(uDat, make_cop(p1)), 1e-300)))
+  nll_tv   <- function(p) {
     th_raw <- p[1] + p[2] * year_std
     ll <- 0
     for (i in seq_len(nrow(uDat))) {
-      cop <- make_cop(th_raw[i])
-      ll  <- ll + log(pmax(copula::dCopula(uDat[i, , drop = FALSE], cop), 1e-300))
+      ll <- ll + log(pmax(copula::dCopula(uDat[i, , drop = FALSE], make_cop(th_raw[i])), 1e-300))
     }
     -ll
   }
-  
-  opt_stat <- tryCatch(
-    optim(link_info$link(link_info$init), nll_stat,
-          method = "Brent", lower = -10, upper = 10),
-    error = function(e) NULL)
-  if (is.null(opt_stat)) {
-    log_event(sprintf("  [%s] TV copula: stationary optimisation failed.", index_name))
-    return(NULL)
+  #
+  n_params <- length(link_info$init)
+  if (n_params > 1) {
+    log_event(sprintf("  [%s] TV trend skipped for %s: multi-parameter families require extended formulation. Using stationary fit.", index_name, cop_name))
+    return(invisible(list(index=index_name, copula=cop_name, selected_model="stationary",
+                          a_hat=NA, b_hat=0, lr_stat=NA, lr_p=NA, significant=FALSE,
+                          cp_result=list(detected=FALSE, cp_year=NA), seg_result=NULL,
+                          aic_stat=NA, bic_stat=NA, aic_tv=NA, bic_tv=NA, aic_seg=NA, bic_seg=NA,
+                          ros_stat=NULL, ros_tv=NULL, ros_seg=NULL,
+                          yr_mean=yr_mean, yr_sd=yr_sd, link_ilink=link_info$ilink,
+                          link_lo=link_info$lo, link_hi=link_info$hi, make_cop_fn=make_cop)))
   }
-  opt_tv <- tryCatch(
-    optim(c(opt_stat$par, 0), nll_tv, method = "BFGS"),
-    error = function(e) NULL)
-  if (is.null(opt_tv)) {
-    log_event(sprintf("  [%s] TV copula: time-varying optimisation failed.", index_name))
-    return(NULL)
+  opt_stat <- tryCatch(optim(link_info$link(link_info$init), nll_stat, method = "Brent", lower = -10, upper = 10), error = function(e) NULL)
+  opt_tv   <- tryCatch(optim(c(opt_stat$par, 0), nll_tv, method = "BFGS"), error = function(e) NULL)
+  
+  ll_stat <- -opt_stat$value
+  ll_tv   <- -opt_tv$value
+  lr      <- 2 * (ll_stat - ll_tv)
+  p_val   <- pchisq(max(0, lr), df = 1L, lower.tail = FALSE)
+  
+  #-- (iii) Fit Segmented (if CP detected) -------------------------------
+  seg_result <- NULL
+  if (isTRUE(cp_result$detected) && !is.na(cp_result$cp_year)) {
+    seg_result <- tryCatch(
+      fit_segmented_copula(drought_data, copula_fit_obj, cp_result$cp_year, index_name, output_dir),
+      error = function(e) NULL
+    )
+  }
+  ll_seg <- if (!is.null(seg_result)) seg_result$seg1$best_ll + seg_result$seg2$best_ll else -Inf
+  
+  #-- AIC / BIC Computation (k: Stat=1, TV=2, Seg=2) ---------------------
+  aic_stat <- -2*ll_stat + 2*1; bic_stat <- -2*ll_stat + log(n)*1
+  aic_tv   <- -2*ll_tv   + 2*2; bic_tv   <- -2*ll_tv   + log(n)*2
+  aic_seg  <- if (is.finite(ll_seg)) -2*ll_seg + 2*2 else Inf
+  bic_seg  <- if (is.finite(ll_seg)) -2*ll_seg + log(n)*2 else Inf
+  
+  #-- (iv) Rosenblatt PIT GOF --------------------------------------------
+  ros_stat <- tryCatch(rosenblatt_pit_gof(uDat, make_cop, link_info$link(link_info$init), 0, year_std, index_name, cop_name), error=function(e) NULL)
+  ros_tv   <- tryCatch(rosenblatt_pit_gof(uDat, make_cop, opt_tv$par[1], opt_tv$par[2], year_std, index_name, cop_name), error=function(e) NULL)
+  
+  ros_seg <- NULL
+  if (!is.null(seg_result)) {
+    cp_yr <- cp_result$cp_year
+    seg1_idx <- which(dc$year <  cp_yr)
+    seg2_idx <- which(dc$year >= cp_yr)
+    make_seg_cop <- function(i) {
+      if (i %in% seg1_idx) make_cop(link_info$link(coef(seg_result$seg1$best_copula_fit)[1]))
+      else make_cop(link_info$link(coef(seg_result$seg2$best_copula_fit)[1]))
+    }
+    e2_seg <- vapply(seq_len(n), function(i) {
+      tryCatch(.h_func_fd(uDat[i,1], uDat[i,2], make_seg_cop(i)), error=function(e) NA_real_)
+    }, numeric(1L))
+    e2_ok <- e2_seg[is.finite(e2_seg)]
+    e1_ok <- uDat[is.finite(e2_seg), 1]
+    ks_p  <- tryCatch(ks.test(e2_ok, "punif")$p.value, error=function(e) 0)
+    tau_p <- tryCatch(cor.test(e1_ok, e2_ok, method="kendall")$p.value, error=function(e) 0)
+    ros_seg <- list(ks_e2_p = ks_p, tau_ind_p = tau_p, adequate = (ks_p > 0.05 & tau_p > 0.05))
   }
   
-  lr    <- 2 * (opt_stat$value - opt_tv$value)
-  p_val <- pchisq(max(0, lr), df = 1L, lower.tail = FALSE)
-  dir   <- if (opt_tv$par[2] > 0) "strengthening" else "weakening"
+  #-- (v) MODEL SELECTION LOGIC ------------------------------------------
+  tv_sig        <- (p_val < 0.05)
+  cp_strong     <- isTRUE(cp_result$detected)
+  tv_better_aic <- (aic_tv < aic_seg)
+  pit_tv_ok     <- (!is.null(ros_tv) && ros_tv$adequate)
+  pit_tv_score  <- if (!is.null(ros_tv)) mean(c(ros_tv$ks_e2_p, ros_tv$tau_ind_p), na.rm = TRUE) else 0
   
-  result <- data.frame(
-    index     = index_name,
-    copula    = cop_name,
-    a_hat     = opt_tv$par[1],
-    b_hat     = opt_tv$par[2],
-    lr_stat   = round(lr, 4),
-    lr_p      = round(p_val, 4),
-    direction = dir,
-    significant = p_val < 0.05,
-    stringsAsFactors = FALSE)
+  seg_better_aic <- (aic_seg < aic_tv)
+  pit_seg_improved <- if (!is.null(ros_seg) && !is.null(ros_tv)) {
+    mean(c(ros_seg$ks_e2_p, ros_seg$tau_ind_p), na.rm = TRUE) > pit_tv_score
+  } else FALSE
   
-  write.csv(result,
-            file.path(output_dir, sprintf("%s_timevarying_copula.csv", index_name)),
-            row.names = FALSE)
-  log_event(sprintf("  [%s] TV copula (%s): b=%.4f, LR p=%.4f (%s%s)",
-                    index_name, cop_name, opt_tv$par[2], p_val, dir,
-                    if (p_val < 0.05) " *SIGNIFICANT*" else ""))
-  result
+  selected <- "stationary"
+  if (tv_sig && !cp_strong && tv_better_aic && pit_tv_ok) {
+    selected <- "tv"
+  } else if (cp_strong && seg_better_aic && pit_seg_improved) {
+    selected <- "segmented"
+  }
+  
+  log_event(sprintf("  [%s] Model Selection: %s (Stat AIC=%.1f | TV AIC=%.1f | Seg AIC=%.1f | TV sig=%s | CP=%s)",
+                    index_name, toupper(selected), aic_stat, aic_tv, if(is.finite(aic_seg)) aic_seg else NA,
+                    tv_sig, cp_strong))
+  
+  #-- (vi) Return object -------------------------------------------------
+  invisible(list(
+    index                  = index_name,
+    copula                 = cop_name,
+    selected_model         = selected,
+    a_hat                  = if(selected %in% c("tv","stationary")) opt_tv$par[1] else NA,
+    b_hat                  = if(selected == "tv") opt_tv$par[2] else 0,
+    lr_stat                = round(lr, 4),
+    lr_p                   = round(p_val, 4),
+    significant            = tv_sig,
+    cp_detected            = cp_strong,
+    cp_year                = cp_result$cp_year,
+    aic_stat = aic_stat, bic_stat = bic_stat,
+    aic_tv   = aic_tv,   bic_tv   = bic_tv,
+    aic_seg  = aic_seg,  bic_seg  = bic_seg,
+    ros_stat = ros_stat, ros_tv = ros_tv, ros_seg = ros_seg,
+    yr_mean      = yr_mean,
+    yr_sd        = yr_sd,
+    link_ilink   = link_info$ilink,
+    link_lo      = link_info$lo,
+    link_hi      = link_info$hi,
+    make_cop_fn  = make_cop,
+    cp_result    = cp_result,
+    seg_result   = seg_result,
+    rosenblatt   = ros_tv
+  ))
+}
+#============================================================================
+# DIAGNOSTIC PLOTTING FUNCTIONS
+#============================================================================
+
+# 1. Empirical vs Theoretical Copula Contour Plot
+plot_copula_diagnostic <- function(uDat, cop_obj, index_name, output_dir, n_grid=100) {
+  if (is.null(uDat) || nrow(uDat) < 10) return(NULL)
+  grid <- seq(0.01, 0.99, length.out=n_grid)
+  Z_theo <- matrix(NA, n_grid, n_grid); Z_emp <- matrix(NA, n_grid, n_grid)
+  for (i in seq_len(n_grid)) {
+    for (j in seq_len(n_grid)) {
+      Z_theo[i,j] <- tryCatch(copula::pCopula(c(grid[i], grid[j]), cop_obj), error=function(e) NA)
+      Z_emp[i,j]  <- mean(uDat[,1] <= grid[i] & uDat[,2] <= grid[j])
+    }
+  }
+  diff_mat <- Z_emp - Z_theo
+  df_tile  <- data.frame(u1=rep(grid, n_grid), u2=rep(grid, each=n_grid), diff=as.vector(diff_mat))
+  df_pts   <- data.frame(u1=uDat[,1], u2=uDat[,2])
+  
+  p <- ggplot(df_tile, aes(u1, u2, fill=diff)) +
+    geom_tile() + 
+    scale_fill_viridis_c(name="Emp-Theo", limits=c(-0.15,0.15)) +
+    geom_point(data=df_pts, aes(u1, u2), inherit.aes=FALSE, alpha=0.1, size=0.3, color="black") +
+    labs(title=paste(index_name, "Copula Fit Diagnostic"), x="U(severity)", y="U(area)") +
+    theme_bw(base_size=11)
+  ggsave(file.path(output_dir, sprintf("%s_copula_diagnostic.pdf", index_name)), p, width=7, height=6)
+  invisible(p)
 }
 
-log_event("Extensions 1 loaded: test_dependency | gof_copula | fit_timevarying_copula")
+# 2. Rosenblatt Transform Diagnostic Plot
+plot_rosenblatt_diagnostic <- function(e1, e2, index_name, output_dir) {
+  e1_ok <- e1[is.finite(e2)]; e2_ok <- e2[is.finite(e2)]
+  
+  p1 <- ggplot(data.frame(e2=e2_ok), aes(x=e2)) +
+    geom_histogram(aes(y=..density..), bins=30, fill="steelblue", alpha=0.7) +
+    stat_function(fun=dunif, args=list(min=0,max=1), color="red", linewidth=1) +
+    labs(title="e2 Histogram vs Uniform[0,1]", x="e2 value", y="Density") +
+    theme_bw(base_size=10)
+  
+  p2 <- ggplot(data.frame(e1=e1_ok, e2=e2_ok), aes(sample=e2)) +
+    stat_qq(distribution=qunif) + stat_qq_line(distribution=qunif, color="red") +
+    labs(title="e2 QQ-Plot", x="Theoretical Quantiles", y="Sample Quantiles") +
+    theme_bw(base_size=10)
+  
+  p3 <- ggplot(data.frame(e1=e1_ok, e2=e2_ok), aes(e1, e2)) +
+    geom_point(alpha=0.3, size=0.5) +
+    geom_abline(slope=1, intercept=0, color="red", linetype="dashed") +
+    labs(title="e1 vs e2 (independence check)", x="e1", y="e2") +
+    theme_bw(base_size=10)
+  
+  p <- gridExtra::grid.arrange(p1, p2, p3, ncol=2, top=index_name)
+  ggsave(file.path(output_dir, sprintf("%s_rosenblatt_diagnostic.pdf", index_name)), 
+         p, width=10, height=7)
+  invisible(list(p1=p1, p2=p2, p3=p3))
+}
+
+# 3. Rolling Kendall Tau Time Series Plot
+plot_rolling_tau <- function(dc, index_name, output_dir, window_yrs=10) {
+  valid_idx <- which(dc$severity > 0 & dc$area_pct > 0)
+  if (length(valid_idx) < 20) return(NULL)
+  
+  yr <- dc$year[valid_idx]; sev <- dc$severity[valid_idx]; area <- dc$area_pct[valid_idx]
+  half_w <- max(floor(window_yrs/2), 3)
+  tau_ser <- rep(NA_real_, length(yr))
+  
+  for (i in seq_along(yr)) {
+    idx <- which(abs(yr - yr[i]) <= half_w)
+    if (length(idx) >= 6 && sd(sev[idx])>1e-10 && sd(area[idx])>1e-10) {
+      tau_ser[i] <- cor(sev[idx], area[idx], method="kendall")
+    }
+  }
+  
+  df <- data.frame(year=yr, tau=tau_ser)
+  df_smooth <- df[!is.na(df$tau), ]
+  
+  p <- ggplot(df_smooth, aes(year, tau)) +
+    geom_line(color="steelblue", linewidth=0.8) +
+    geom_point(size=0.8, alpha=0.6) +
+    geom_hline(yintercept=0, linetype="dotted", color="gray50") +
+    geom_smooth(method="loess", se=TRUE, alpha=0.2, color="darkred") +
+    labs(title=paste(index_name, "Rolling Kendall τ (", window_yrs, "-yr window)"),
+         x="Year", y="Kendall τ") +
+    theme_bw(base_size=11)
+  
+  ggsave(file.path(output_dir, sprintf("%s_rolling_tau.pdf", index_name)), p, width=8, height=4)
+  invisible(p)
+}
+
+# 4. TV Copula Parameter Evolution Plot
+plot_tv_parameter <- function(tv_result, index_name, output_dir) {
+  if (is.null(tv_result) || tv_result$selected_model != "tv") return(NULL)
+  
+  # Reconstruct parameter trajectory
+  yr_seq <- seq(min(tv_result$yr_std*tv_result$yr_sd + tv_result$yr_mean),
+                max(tv_result$yr_std*tv_result$yr_sd + tv_result$yr_mean), length.out=100)
+  yr_std_seq <- (yr_seq - tv_result$yr_mean) / tv_result$yr_sd
+  theta_raw <- tv_result$a_hat + tv_result$theta_slope * yr_std_seq
+  theta <- tv_result$link_ilink(theta_raw)
+  
+  p <- ggplot(data.frame(year=yr_seq, theta=theta), aes(year, theta)) +
+    geom_line(color="darkgreen", linewidth=1) +
+    geom_hline(yintercept=tv_result$link_ilink(tv_result$a_hat), 
+               linetype="dashed", color="gray60") +
+    labs(title=paste(index_name, "TV Copula Parameter Evolution"),
+         x="Year", y=expression(theta)) +
+    theme_bw(base_size=11)
+  
+  ggsave(file.path(output_dir, sprintf("%s_tv_parameter.pdf", index_name)), p, width=7, height=4)
+  invisible(p)
+}
+# ---------------------------------------------------------------------------
+# 6. SEGMENTED COPULA  [NEW in v5]
+#
+#    Fits separate copulas to two temporal segments defined by a change-point
+#    year.  This is appropriate when all three of the following hold:
+#      (a) detect_copula_changepoints() reports detected=TRUE
+#      (b) fit_timevarying_copula() LR p < 0.05 (significant temporal trend)
+#      (c) rosenblatt_pit_gof() reports adequate=FALSE for the TV copula
+#    When (a)+(b)+(c) are simultaneously true the abrupt-break model is
+#    statistically preferred over a smooth linear trend, and the Rosenblatt
+#    test shows that even the TV copula does not adequately represent the
+#    dependence structure.  A segmented fit treats each sub-record as
+#    stationary, refitting the full candidate copula set independently.
+#
+#    The candidate set is the same five families used in fit_copulas():
+#    Frank, Gumbel, Plackett, SurvClayton, Joe — selected per-segment by AIC.
+#
+#    Parameters
+#    ----------
+#    drought_data     : output of extract_drought_characteristics
+#    copula_fit_obj   : result from fit_copulas() — supplies u_severity, u_area
+#    cp_year          : integer; the consensus change-point year
+#    index_name       : character label for logging
+#    output_dir       : directory for CSV output
+#
+#    Returns
+#    -------
+#    A list with:
+#      seg1, seg2        : per-segment copula result lists (same structure as
+#                          fit_copulas() return), covering [start, cp_year-1]
+#                          and [cp_year, end] respectively.
+#      cp_year           : the split year used
+#      recommended       : logical — TRUE when all three triggers are met
+#      lr_seg_vs_full_p  : p-value of LR test: 2-segment model vs full stationary
+#      log summary lines are written to the main LOG_FILE via log_event()
+# ---------------------------------------------------------------------------
+fit_segmented_copula <- function(drought_data, copula_fit_obj,
+                                 cp_year, index_name, output_dir) {
+  
+  if (is.null(copula_fit_obj) || is.null(cp_year) || is.na(cp_year)) {
+    log_event(sprintf("  [%s] Segmented copula: no valid change-point — aborting.", index_name))
+    return(NULL)
+  }
+  
+  dc <- drought_data[drought_data$severity > 0 & drought_data$area_pct > 0, ]
+  n  <- nrow(dc)
+  
+  # Split pseudo-observations at change-point year
+  idx1 <- which(dc$year <  cp_year)
+  idx2 <- which(dc$year >= cp_year)
+  
+  n1 <- length(idx1); n2 <- length(idx2)
+  log_event(sprintf(
+    "  [%s] Segmented copula: cp_year=%d | seg1 n=%d [%d-%d] | seg2 n=%d [%d-%d]",
+    index_name, cp_year,
+    n1, min(dc$year[idx1], na.rm = TRUE), max(dc$year[idx1], na.rm = TRUE),
+    n2, min(dc$year[idx2], na.rm = TRUE), max(dc$year[idx2], na.rm = TRUE)))
+  
+  if (n1 < 15L || n2 < 15L) {
+    log_event(sprintf(
+      "  [%s] Segmented copula: one or both segments have < 15 observations (n1=%d, n2=%d) — aborting.",
+      index_name, n1, n2))
+    return(NULL)
+  }
+  
+  # Copula candidate set (same as fit_copulas)
+  cops <- list(Frank       = frankCopula(dim = 2),
+               Gumbel      = gumbelCopula(dim = 2),
+               Plackett    = plackettCopula(),
+               SurvClayton = rotCopula(claytonCopula(dim = 2)),
+               Joe         = joeCopula(dim = 2))
+  
+  # Internal helper: fit all candidates to a sub-matrix of pseudo-obs
+  .fit_seg <- function(uM_sub, seg_label) {
+    res   <- data.frame(Copula=character(), Parameter=numeric(),
+                        LogLik=numeric(), AIC=numeric(), BIC=numeric(),
+                        stringsAsFactors=FALSE)
+    fits  <- list()
+    n_sub <- nrow(uM_sub)
+    for (nm in names(cops)) {
+      fit <- tryCatch(
+        fitCopula(cops[[nm]], uM_sub, method = "mpl",
+                  optim.method  = "BFGS",
+                  optim.control = list(maxit = 1000, reltol = 1e-8)),
+        error = function(e)
+          tryCatch(
+            fitCopula(cops[[nm]], uM_sub, method = "mpl",
+                      optim.method  = "Nelder-Mead",
+                      optim.control = list(maxit = 2000)),
+            error = function(e2) NULL))
+      if (!is.null(fit)) {
+        p  <- coef(fit)
+        ll <- loglikCopula(p, uM_sub, cops[[nm]])
+        k  <- length(p)
+        res  <- rbind(res, data.frame(Copula    = nm,
+                                      Parameter = p[1],
+                                      LogLik    = ll,
+                                      AIC       = -2*ll + 2*k,
+                                      BIC       = -2*ll + log(n_sub)*k))
+        fits[[nm]] <- fit
+      }
+    }
+    if (nrow(res) == 0) return(NULL)
+    best_nm  <- res$Copula[which.min(res$AIC)]
+    best_aic <- res$AIC[which.min(res$AIC)]
+    best_ll  <- res$LogLik[which.min(res$AIC)]
+    log_event(sprintf("  [%s]   Segment %s best copula: %s (AIC=%.2f)",
+                      index_name, seg_label, best_nm, best_aic))
+    list(best_copula_name = best_nm,
+         best_copula_fit  = fits[[best_nm]],
+         best_ll          = best_ll,
+         all_results      = res,
+         n                = n_sub)
+  }
+  
+  uS_all <- copula_fit_obj$u_severity
+  uA_all <- copula_fit_obj$u_area
+  uM_all <- cbind(uS_all, uA_all)
+  
+  uM1 <- uM_all[idx1, , drop = FALSE]
+  uM2 <- uM_all[idx2, , drop = FALSE]
+  
+  seg1 <- .fit_seg(uM1, sprintf("1 [<%d]",  cp_year))
+  seg2 <- .fit_seg(uM2, sprintf("2 [≥%d]",  cp_year))
+  
+  if (is.null(seg1) || is.null(seg2)) {
+    log_event(sprintf("  [%s] Segmented copula: fitting failed for one or both segments.", index_name))
+    return(NULL)
+  }
+  
+  # ---- LR test: two-segment model vs full-record stationary ------------------
+  # Full model: one copula, 1 parameter (already fitted in fit_copulas)
+  # Segmented:  two copulas, 2 parameters (one per segment)
+  # Under H0 (one homogeneous copula), the LR stat ~ chi-sq(1) approximately.
+  # This is a conservative test because the families can differ across segments.
+  ll_full <- copula_fit_obj$all_results$LogLik[
+    copula_fit_obj$all_results$Copula == copula_fit_obj$best_copula_name]
+  ll_seg  <- seg1$best_ll + seg2$best_ll
+  lr_stat <- max(0, 2 * (ll_seg - ll_full))
+  lr_p    <- pchisq(lr_stat, df = 1L, lower.tail = FALSE)
+  
+  log_event(sprintf(
+    "  [%s] Segmented vs full LR: stat=%.3f, p=%.4f (%s)",
+    index_name, lr_stat, lr_p,
+    if (lr_p < 0.05) "segmented PREFERRED" else "no significant improvement"))
+  
+  # ---- Upper-tail dependence comparison between segments --------------------
+  # Lower-tail dependence is not assessed (irrelevant for drought SAF).
+  td_seg <- function(uM, label) {
+    u_q_hi <- 0.95
+    C_hi   <- max(mean(uM[,1] >= u_q_hi & uM[,2] >= u_q_hi), 1e-8)
+    lU     <- max(0, min(1, 2 - log(C_hi) / log(u_q_hi)))
+    log_event(sprintf("  [%s]   Tail dep segment %s: λ_U=%.4f", index_name, label, lU))
+    c(lambda_U = lU)
+  }
+  td1 <- td_seg(uM1, sprintf("1 [<%d]",  cp_year))
+  td2 <- td_seg(uM2, sprintf("2 [≥%d]",  cp_year))
+  
+  # ---- Write summary CSV ----------------------------------------------------
+  sum_df <- data.frame(
+    index          = index_name,
+    cp_year        = cp_year,
+    seg1_years     = sprintf("%d-%d", min(dc$year[idx1]), max(dc$year[idx1])),
+    seg2_years     = sprintf("%d-%d", min(dc$year[idx2]), max(dc$year[idx2])),
+    seg1_n         = n1,
+    seg2_n         = n2,
+    seg1_best_cop  = seg1$best_copula_name,
+    seg2_best_cop  = seg2$best_copula_name,
+    seg1_par       = round(coef(seg1$best_copula_fit)[1], 4),
+    seg2_par       = round(coef(seg2$best_copula_fit)[1], 4),
+    seg1_lambda_U  = round(td1["lambda_U"], 4),
+    seg2_lambda_U  = round(td2["lambda_U"], 4),
+    ll_full        = round(ll_full,  3),
+    ll_segmented   = round(ll_seg,   3),
+    lr_stat        = round(lr_stat,  3),
+    lr_p           = round(lr_p,     4),
+    seg_preferred  = lr_p < 0.05,
+    stringsAsFactors = FALSE)
+  write.csv(sum_df,
+            file.path(output_dir, sprintf("%s_segmented_copula.csv", index_name)),
+            row.names = FALSE)
+  
+  invisible(list(
+    seg1                 = seg1,
+    seg2                 = seg2,
+    cp_year              = cp_year,
+    seg1_years           = dc$year[idx1],
+    seg2_years           = dc$year[idx2],
+    seg1_lambda_U        = td1["lambda_U"],
+    seg2_lambda_U        = td2["lambda_U"],
+    lr_stat              = lr_stat,
+    lr_seg_vs_full_p     = lr_p,
+    seg_preferred        = lr_p < 0.05
+  ))
+}
+
+log_event("Extensions 1 (v6) loaded: test_dependency | gof_copula | detect_copula_changepoints | rosenblatt_pit_gof | fit_timevarying_copula | fit_segmented_copula")

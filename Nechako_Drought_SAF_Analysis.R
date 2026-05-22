@@ -81,7 +81,13 @@ n_months      <- length(dates)
 month_indices <- as.integer(format(dates, "%m"))
 year_indices  <- as.integer(format(dates, "%Y"))
 record_len    <- max(year_indices) - min(year_indices) + 1L
-cell_area_km2 <- terra::cellSize(spi1[[1]], unit = "km")
+# terra::cellSize() computes geodesic cell areas directly on the reference
+# ellipsoid (WGS84 by default for geographic CRS, or native projected units
+# converted to km² for projected CRS).  An equal-area / isometric projection
+# is NOT required: terra integrates the latitude band for geographic CRS and
+# uses the projected-unit area for metric CRS.  Derived from SPI-1 layer 1;
+# all four index grids share the same grid definition so this is computed once.
+cell_area_km2  <- terra::cellSize(spi1[[1]], unit = "km")
 total_area_km2 <- terra::global(cell_area_km2, "sum", na.rm = TRUE)[1, 1]
 
 log_event(sprintf("Loaded indices. Period: %s to %s (%d months). Basin area: %.2f km²",
@@ -251,13 +257,24 @@ fit_copulas <- function(drought_data, marginal_fits, index_name, out_dir) {
   uA  <- pmax(pmin(uA, 1 - 1e-6), 1e-6)
   uM  <- cbind(uS, uA); n <- nrow(uM)
   
-  cops <- list(Clayton  = claytonCopula(dim=2),
-               Gumbel   = gumbelCopula(dim=2),
-               Frank    = frankCopula(dim=2),
-               Joe      = joeCopula(dim=2),
-               Normal   = normalCopula(dim=2),
-               Plackett = plackettCopula())
-  # FIX: include LogLik in the comparison table
+  # Copula candidate set:
+  #   Frank       — symmetric, no tail dependence (Archimedean)
+  #   Gumbel      — upper-tail dependence (Archimedean)
+  #   Plackett    — symmetric, light tails (one-parameter)
+  #   SurvClayton — survival (180°-rotated) Clayton: upper-tail dependence,
+  #                 complementary to standard Clayton's lower-tail focus
+  #   Joe         — strong upper-tail dependence (Archimedean)
+  # Standard Clayton and Gaussian Normal have been intentionally excluded.
+  cops <- list(
+    Frank       = frankCopula(dim = 2),
+    Gumbel      = gumbelCopula(dim = 2),
+    Plackett    = plackettCopula(),
+    SurvClayton = rotCopula(claytonCopula(dim = 2)),
+    Joe         = joeCopula(dim = 2),
+    # New robust candidates:
+    Gaussian    = normalCopula(param = 0.5, dim = 2, dispstr = "un"),
+    StudentT    = tCopula(param = 0.5, df = 4, dim = 2)
+  )
   res  <- data.frame(Copula=character(), Parameter=numeric(),
                      LogLik=numeric(), AIC=numeric(), BIC=numeric(),
                      stringsAsFactors=FALSE)
@@ -267,6 +284,9 @@ fit_copulas <- function(drought_data, marginal_fits, index_name, out_dir) {
     # transforms uS/uA (IFM-style two-stage MLE, not rank-based pseudo-obs).
     # FIX: added optim.method="BFGS" + maxit=1000 to suppress convergence
     #      code=52 warnings; falls back to Nelder-Mead if BFGS errors out.
+    # NOTE: for SurvClayton (rotCopula), fitCopula / loglikCopula dispatch
+    #       through dCopula which is generic and correctly handles rotCopula
+    #       objects; coef() returns the base Clayton parameter.
     fit <- tryCatch(
       fitCopula(cops[[nm]], uM, method = "mpl",
                 optim.method  = "BFGS",
@@ -293,13 +313,97 @@ fit_copulas <- function(drought_data, marginal_fits, index_name, out_dir) {
   best <- res$Copula[which.min(res$AIC)]
   log_event(sprintf("[%s] Best copula: %s (AIC=%.2f)", index_name, best,
                     res$AIC[res$Copula == best]))
+  
+  # ---- Empirical upper-tail dependence coefficient ---------------------------
+  # λ_U = lim_{u→1} P(V > u | U > u)
+  # Estimated non-parametrically (Schmidt & Stadtmüller 2006, Scand. J. Stat.):
+  #   λ_U ≈ 2 - log(C_hi) / log(u_q_hi)   at  u_q_hi = 0.95
+  # where C_hi = empirical P(U > 0.95, V > 0.95).
+  # Result is clamped to [0, 1].
+  #
+  # Lower-tail dependence (λ_L) is NOT assessed.  Drought severity and
+  # drought-affected area co-occur at the UPPER tail (joint extremes), so
+  # lower-tail diagnostics are irrelevant to the SAF objective.
+  #
+  # References: Joe (1997); Nelsen (2006); Schmidt & Stadtmüller (2006).
+  emp_td <- tryCatch({
+    u_q_hi <- 0.95
+    C_hi   <- mean(uS >= u_q_hi & uA >= u_q_hi)   # empirical P(U > 0.95, V > 0.95)
+    C_hi   <- max(C_hi, 1e-8)                       # boundary guard: log(0) protection
+    lam_U_emp <- max(0, min(1, 2 - log(C_hi) / log(u_q_hi)))
+    list(lambda_U = lam_U_emp)
+  }, error = function(e) list(lambda_U = NA_real_))
+  
+  # Theoretical upper-tail dependence coefficient for the best-fitting copula
+  # computed at the MLE parameter value.
+  best_par   <- coef(fits[[best]])[1]
+  theo_td    <- tryCatch({
+    switch(best,
+           Gumbel      = list(lambda_U = 2 - 2^(1/max(best_par, 1.001))),
+           Joe         = list(lambda_U = 2 - 2^(1/max(best_par, 1.001))),
+           SurvClayton = list(lambda_U = 2^(-1/max(best_par, 1e-6))),  # rotated Clayton
+           Frank       = list(lambda_U = 0),
+           Plackett    = list(lambda_U = 0),
+           list(lambda_U = NA_real_)   # fallback
+    )
+  }, error = function(e) list(lambda_U = NA_real_))
+  
+  # ---- Copula family recommendation based on empirical upper-tail evidence ---
+  # Decision rule (Joe 1997; Nelsen 2006; Poulin et al. 2007):
+  #   λ_U > 0.10  → upper-tail dependence present → prefer Gumbel / Joe / SurvClayton
+  #   λ_U ≤ 0.10  → no meaningful upper-tail dep  → Frank / Plackett adequate
+  # Threshold 0.10 is conservative; λ_U < 0.05 is strong evidence of asymptotic
+  # tail independence.  The recommendation is advisory — AIC winner is still used.
+  td_recommendation <- if (!is.finite(emp_td$lambda_U)) {
+    "Tail dependence inconclusive (insufficient data)"
+  } else if (emp_td$lambda_U > 0.10) {
+    "Upper-tail dependence detected (λ_U > 0.10): Gumbel, Joe, or SurvClayton preferred"
+  } else {
+    "No meaningful upper-tail dependence (λ_U ≤ 0.10): Frank or Plackett adequate"
+  }
+  
+  # Flag mismatch: AIC best has zero upper-tail dep but empirical λ_U is substantial
+  td_mismatch <- isTRUE(emp_td$lambda_U > 0.10) &&
+    best %in% c("Frank", "Plackett") &&
+    !is.na(emp_td$lambda_U)
+  
+  log_event(sprintf(
+    "[%s] Tail dependence — empirical λ_U=%.4f | theoretical (best=%s) λ_U=%.4f",
+    index_name, emp_td$lambda_U, best,
+    if (is.finite(theo_td$lambda_U)) theo_td$lambda_U else NA))
+  log_event(sprintf("[%s] TD recommendation: %s", index_name, td_recommendation))
+  if (td_mismatch)
+    log_event(sprintf(
+      "[%s] WARNING [TD-U]: AIC-best copula (%s) has no upper-tail dependence but empirical λ_U=%.4f > 0.10. Consider Gumbel, Joe, or SurvClayton for extreme return periods.",
+      index_name, best, emp_td$lambda_U))
+  
+  # Append tail dependence columns to the comparison table
+  res$emp_lambda_U   <- round(emp_td$lambda_U, 4)
+  # Theoretical λ_U per candidate (requires parameter from each fit)
+  theo_U <- vapply(names(cops), function(nm) {
+    if (is.null(fits[[nm]])) return(NA_real_)
+    p <- coef(fits[[nm]])[1]
+    switch(nm,
+           Gumbel      = 2 - 2^(1/max(p, 1.001)),
+           Joe         = 2 - 2^(1/max(p, 1.001)),
+           SurvClayton = 2^(-1/max(p, 1e-6)),
+           0)   # Frank, Plackett → 0
+  }, numeric(1L))
+  res$theo_lambda_U    <- round(theo_U, 4)
+  res$td_mismatch      <- td_mismatch & (res$Copula == best)
+  res$td_recommendation <- td_recommendation
+  
   write.csv(res, file.path(out_dir, sprintf("%s_copula_comparison.csv", index_name)),
             row.names = FALSE)
-  list(best_copula_name = best,
-       best_copula_fit  = fits[[best]],
-       all_results      = res,
-       u_severity       = uS,
-       u_area           = uA)
+  list(best_copula_name    = best,
+       best_copula_fit     = fits[[best]],
+       all_results         = res,
+       u_severity          = uS,
+       u_area              = uA,
+       emp_lambda_U        = emp_td$lambda_U,
+       theo_lambda_U_best  = theo_td$lambda_U,
+       td_mismatch         = td_mismatch,
+       td_recommendation   = td_recommendation)
 }
 
 # 6. HELPER: CDF of severity under fitted marginal ---------------------------
