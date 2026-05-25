@@ -22,14 +22,6 @@
 #          are silently set to NA and counted in a single aggregate log message
 #          instead of emitting ≈9 "standard deviation is zero" warnings for SPI-3.
 #
-#   [ext1/main] Lower-tail dependence estimator corrected: previous formula
-#          log(C_lo)/log(u_q_lo) is the tail INDEX (exponent), not the tail
-#          dependence COEFFICIENT λ_L ∈ [0,1].  Fixed to the symmetric
-#          Schmidt & Stadtmüller form: 2 – log(C_lo)/log(u_q_lo), clamped to
-#          [0,1].  td_mismatch now separately flags λ_U and λ_L mismatches;
-#          a dedicated WARNING [TD-L] is logged when any index shows λ_L > 0.10
-#          (structural limitation of the candidate copula set).
-#
 #   [QuickStart] total_events now sourced from nrow(ev_file) when the raw event
 #          CSV exists (authoritative); sum(rp$n_events) retained as fallback and
 #          cross-check target.  MISMATCH flag compares the two counts.
@@ -142,8 +134,13 @@ for (nm in names(INDEX_RESULTS)) {
     plot_copula_diagnostic(u_mat, res$copulas$best_copula_fit@copula, nm, out_dir)
     # Guard against NA parameters when the segmented model is selected
     if (!is.null(tv) && !is.null(tv$rosenblatt) && !is.na(tv$a_hat)) {
+      # FIX (3.3): u_mat has n_drought rows (severity>0 & area_pct>0 only).
+      # res$dc contains ALL months, so res$dc$year[i] mis-maps to the wrong
+      # calendar year for every row after the first non-drought month.
+      # Filter to drought months first so index i aligns with u_mat row i.
+      dc_drought <- res$dc[res$dc$severity > 0 & res$dc$area_pct > 0, ]
       e2_vals <- vapply(seq_len(nrow(u_mat)), function(i) {
-        yr_std_i <- (res$dc$year[i] - tv$yr_mean) / tv$yr_sd
+        yr_std_i <- (dc_drought$year[i] - tv$yr_mean) / tv$yr_sd
         cop_i <- tv$make_cop_fn(tv$a_hat + tv$b_hat * yr_std_i)
         .h_func_fd(u_mat[i,1], u_mat[i,2], cop_i)
       }, numeric(1))

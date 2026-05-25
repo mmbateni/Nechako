@@ -239,19 +239,28 @@ detect_copula_changepoints <- function(drought_data, copula_fit_obj,
   # ---- (c) PRUTF: parametric LR structural-break -------------------------
   # Helper to build a one-parameter copula of the correct family
   cop_nm  <- copula_fit_obj$best_copula_name
-  init_p  <- coef(copula_fit_obj$best_copula_fit)[1]
+  init_p  <- coef(copula_fit_obj$best_copula_fit)   # full vector: length-1 for 1-param families, length-2 for StudentT
   uS      <- copula_fit_obj$u_severity
   uA      <- copula_fit_obj$u_area
   uDat    <- cbind(uS, uA)
   
   make_cop_prutf <- function(th) {
+    # th is a full coefficient vector (length 1 for single-param families,
+    # length 2 for StudentT).  Always index th[1] for scalar families so that
+    # passing coef(fit) — which may be a named numeric — works safely.
+    if (cop_nm == "StudentT") {
+      rho <- max(min(th[1], 0.99), -0.99)
+      df  <- max(if (length(th) >= 2L) th[2] else 4, 1.5)
+      return(tCopula(param = rho, df = df, dim = 2))
+    }
     switch(cop_nm,
-           Frank       = frankCopula(th, dim = 2),
-           Gumbel      = gumbelCopula(max(th, 1.001), dim = 2),
-           Plackett    = plackettCopula(max(th, 1e-3)),
-           SurvClayton = rotCopula(claytonCopula(max(th, 1e-3), dim = 2)),
-           Joe         = joeCopula(max(th, 1.001), dim = 2),
-           frankCopula(th, dim = 2))         # safe fallback
+           Frank       = frankCopula(th[1], dim = 2),
+           Gumbel      = gumbelCopula(max(th[1], 1.001), dim = 2),
+           Plackett    = plackettCopula(max(th[1], 1e-3)),
+           SurvClayton = rotCopula(claytonCopula(max(th[1], 1e-3), dim = 2)),
+           Joe         = joeCopula(max(th[1], 1.001), dim = 2),
+           Gaussian    = normalCopula(max(min(th[1], 0.99), -0.99), dim = 2, dispstr = "un"),
+           frankCopula(th[1], dim = 2))      # safe fallback
   }
   
   fit_seg_ll <- function(rows) {
@@ -266,7 +275,7 @@ detect_copula_changepoints <- function(drought_data, copula_fit_obj,
                            optim.control = list(maxit = 600)),
                  error = function(e2) NULL))
     if (is.null(fit)) return(NA_real_)
-    tryCatch(loglikCopula(coef(fit), uM, make_cop_prutf(coef(fit)[1])),
+    tryCatch(loglikCopula(coef(fit), uM, make_cop_prutf(coef(fit))),
              error = function(e) NA_real_)
   }
   
@@ -539,7 +548,7 @@ fit_timevarying_copula <- function(drought_data, copula_fit_obj, marginal_fits,
   
   ll_stat <- -opt_stat$value
   ll_tv   <- -opt_tv$value
-  lr      <- 2 * (ll_stat - ll_tv)
+  lr      <- 2 * (ll_tv - ll_stat )
   p_val   <- pchisq(max(0, lr), df = 1L, lower.tail = FALSE)
   
   #-- (iii) Fit Segmented (if CP detected) -------------------------------
@@ -559,7 +568,12 @@ fit_timevarying_copula <- function(drought_data, copula_fit_obj, marginal_fits,
   bic_seg  <- if (is.finite(ll_seg)) -2*ll_seg + log(n)*2 else Inf
   
   #-- (iv) Rosenblatt PIT GOF --------------------------------------------
-  ros_stat <- tryCatch(rosenblatt_pit_gof(uDat, make_cop, link_info$link(link_info$init), 0, year_std, index_name, cop_name), error=function(e) NULL)
+  ros_stat <- tryCatch(
+    rosenblatt_pit_gof(uDat, make_cop,
+                       if (!is.null(opt_stat)) opt_stat$par[1]   # ← MLE from stationary fit
+                       else link_info$link(link_info$init),
+                       0, year_std, index_name, cop_name),
+    error = function(e) NULL)
   ros_tv   <- tryCatch(rosenblatt_pit_gof(uDat, make_cop, opt_tv$par[1], opt_tv$par[2], year_std, index_name, cop_name), error=function(e) NULL)
   
   ros_seg <- NULL
@@ -609,7 +623,12 @@ fit_timevarying_copula <- function(drought_data, copula_fit_obj, marginal_fits,
     index                  = index_name,
     copula                 = cop_name,
     selected_model         = selected,
-    a_hat                  = if(selected %in% c("tv","stationary")) opt_tv$par[1] else NA,
+    a_hat = if      (selected == "tv")         opt_tv$par[1]
+    else if (selected == "stationary") {
+      if (!is.null(opt_stat)) opt_stat$par[1]
+      else                    opt_tv$par[1]    # safe fallback if stat opt failed
+    }
+    else NA,
     b_hat                  = if(selected == "tv") opt_tv$par[2] else 0,
     lr_stat                = round(lr, 4),
     lr_p                   = round(p_val, 4),
@@ -727,6 +746,8 @@ plot_tv_parameter <- function(tv_result, index_name, output_dir) {
   yr_seq <- seq(min(tv_result$yr_std*tv_result$yr_sd + tv_result$yr_mean),
                 max(tv_result$yr_std*tv_result$yr_sd + tv_result$yr_mean), length.out=100)
   yr_std_seq <- (yr_seq - tv_result$yr_mean) / tv_result$yr_sd
+  tv_result$yr_std <- (yr_seq - (tv_result$yr_mean)) / tv_result$yr_sd
+  tv_result$theta_slope <- tv_result$b_hat
   theta_raw <- tv_result$a_hat + tv_result$theta_slope * yr_std_seq
   theta <- tv_result$link_ilink(theta_raw)
   
@@ -755,8 +776,9 @@ plot_tv_parameter <- function(tv_result, index_name, output_dir) {
 #    dependence structure.  A segmented fit treats each sub-record as
 #    stationary, refitting the full candidate copula set independently.
 #
-#    The candidate set is the same five families used in fit_copulas():
-#    Frank, Gumbel, Plackett, SurvClayton, Joe — selected per-segment by AIC.
+#    The candidate set is the same seven families used in fit_copulas():
+#    Frank, Gumbel, Plackett, SurvClayton, Joe, Gaussian, StudentT —
+#    selected per-segment by AIC.
 #
 #    Parameters
 #    ----------
@@ -806,12 +828,14 @@ fit_segmented_copula <- function(drought_data, copula_fit_obj,
     return(NULL)
   }
   
-  # Copula candidate set (same as fit_copulas)
+  # Copula candidate set (same seven families used in fit_copulas)
   cops <- list(Frank       = frankCopula(dim = 2),
                Gumbel      = gumbelCopula(dim = 2),
                Plackett    = plackettCopula(),
                SurvClayton = rotCopula(claytonCopula(dim = 2)),
-               Joe         = joeCopula(dim = 2))
+               Joe         = joeCopula(dim = 2),
+               Gaussian    = normalCopula(param = 0.5, dim = 2, dispstr = "un"),
+               StudentT    = tCopula(param = 0.5, df = 4, dim = 2))
   
   # Internal helper: fit all candidates to a sub-matrix of pseudo-obs
   .fit_seg <- function(uM_sub, seg_label) {

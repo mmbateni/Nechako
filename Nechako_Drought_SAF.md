@@ -15,7 +15,7 @@ The analysis follows a multivariate frequency analysis framework: drought severi
 | `Nechako_Drought_RUN_ALL.R` | **Master orchestrator** — single entry point that runs all steps in order | Yes |
 | `Nechako_Drought_QuickStart.R` | Input verification and pre-flight checks | Yes |
 | `Nechako_Drought_SAF_Analysis.R` | Core analysis pipeline (data loading → SAF curves) | Yes |
-| `Nechako_Drought_SAF_Analysis_ext1.R` | Extension: dependency tests, copula GOF, time-varying copula | Yes |
+| `Nechako_Drought_SAF_Analysis_ext1.R` | Extension: dependency tests, copula GOF, time-varying and segmented copula | Yes |
 | `Nechako_Drought_SAF_Analysis_ext2.R` | Extension: non-stationary marginals, Kendall-corrected NS SAF, event placement | Yes |
 | `Nechako_Drought_Methodology_Guide.R` | Optional utility functions (threshold sensitivity, seasonal plots, spatial maps) | **Optional** |
 
@@ -71,6 +71,7 @@ The scripts auto-install missing packages. The full list is:
 | `Kendall` | Rank correlation tests (ext1) |
 | `gamlss` | Non-stationary GAMLSS models (ext2) |
 | `gamlss.dist` | GAMLSS distribution families (ext2) |
+| `trend` | Pettitt test (ext1) |
 
 ---
 
@@ -91,7 +92,7 @@ This runs all six steps (see below) in the correct order. Do **not** source the 
 
 ### Step 1 — Input Verification (`QuickStart.R`)
 
-- Checks that all 48 required NetCDF files exist (4 indices × 12 months × 1 file each).
+- Spot-checks **4 representative NetCDF files** (one per index, January only) as proxies for all 48 required files (4 indices × 12 months). A missing file stops execution; the remaining 44 files are verified implicitly when the pipeline loads them in Step 3.
 - Loads `SPI-1` for January and validates that pixel values fall within the physically plausible range of −5 to +5.
 - Runs a mathematical sanity check on the Kendall distribution formula using the known analytical result for the independence copula at `t = 0.5`.
 - Prints the recommended run order to the console.
@@ -154,17 +155,23 @@ Using only months with active drought (`severity > 0`, `area_pct > 0`):
 
 Output: `<INDEX>_severity_dist_comparison.csv`.
 
-####  3e. Copula Fitting
-The parametric marginal CDFs are used to transform severity and area into uniform pseudo-observations `(u_S, u_A)`. Five copula families are then fitted to these pseudo-observations using the IFM (Inference Functions for Margins) maximum pseudo-likelihood method:
-| Copula        | Tail dependence |
-| -------------- | --------------- |
-| Survival Clayton | Upper tail      |
-| Gumbel         | Upper tail      |
-| Frank          | Symmetric       |
-| Joe            | Upper tail      |
-| Plackett       | Symmetric       |
+#### 3e. Copula Fitting
 
-Best copula is selected by minimum AIC. Both AIC and log-likelihood are saved.
+The parametric marginal CDFs are used to transform severity and area into uniform pseudo-observations `(u_S, u_A)`. **Seven** copula families are then fitted to these pseudo-observations using the IFM (Inference Functions for Margins) maximum pseudo-likelihood method:
+
+| Copula | Tail dependence |
+|---|---|
+| Survival Clayton | Upper tail |
+| Gumbel | Upper tail |
+| Frank | Symmetric (no tail) |
+| Joe | Upper tail |
+| Plackett | Symmetric (no tail) |
+| Gaussian (Normal) | No tail (asymptotic independence for all \|ρ\| < 1) |
+| Student-t | Both tails (symmetric) |
+
+The best copula is selected by minimum AIC. AIC, BIC, and log-likelihood are all saved. An empirical upper-tail dependence coefficient λ_U is computed non-parametrically (Schmidt & Stadtmüller 2006) and compared to the theoretical λ_U of the winning family. A `WARNING [TD-U]` is logged if the AIC-best family has zero upper-tail dependence (Frank, Plackett, or Gaussian) but empirical λ_U > 0.10.
+
+> **Note:** The same seven-family candidate set is used in `fit_copulas()` (Step 3), `detect_copula_changepoints()` / `fit_segmented_copula()` (Step 5c), and the PRUTF structural-break test in ext1. The Student-t family has two parameters (ρ, df); because the log-linear TV formulation is scalar, the TV copula trend model is skipped for Student-t and the stationary fit is used instead (a warning is logged).
 
 Output: `<INDEX>_copula_comparison.csv`.
 
@@ -206,7 +213,13 @@ The four result objects `res_spi1`, `res_spei1`, `res_spi3`, `res_spei3` remain 
 
 ### Step 4 — Load Extensions (`ext1.R` + `ext2.R`)
 
-The extension scripts are sourced here. They only define functions — no computation occurs yet. Both scripts verify that `log_event()` from `SAF_Analysis.R` is present before loading; an error stops execution if the main pipeline was skipped.
+The extension scripts are sourced here. They only define functions — no heavy computation occurs at load time (each script emits a single `log_event()` message confirming successful loading). Both scripts verify that `log_event()` from `SAF_Analysis.R` is present before loading; an error stops execution if the main pipeline was skipped.
+
+**Functions exported by `ext1.R` (v6):**
+`test_dependency`, `gof_copula`, `detect_copula_changepoints`, `rosenblatt_pit_gof`, `fit_timevarying_copula`, `fit_segmented_copula`
+
+**Functions exported by `ext2.R` (v4):**
+`fit_nonstationary_marginals`, `derive_SAF_nonstationary`, `derive_SAF_nonstationary_kendall`, `place_event_on_saf`
 
 ### Step 5 — Run Enhancements
 
@@ -222,33 +235,63 @@ Performs a parametric bootstrap GOF test using the Cramér–von Mises `Sn` stat
 
 Output: logged to console and saved indirectly via `log_event`.
 
-#### 5c. Time-Varying Copula
+#### 5c. Time-Varying & Segmented Copula
 
-5c. Time-Varying Copula & Diagnostics
-Tests whether the dependence structure between severity and area has changed over time. It fits a log-linear model for the copula parameter:
-θ(t) = ilink(a + b × year_std)
-and compares it to the stationary model via a likelihood-ratio test (χ² with 1 df). The sign of `b` indicates whether dependence is strengthening or weakening. The copula family used is the AIC-selected family from Step 3.
+Tests whether the dependence structure between severity and area has changed over time. The analysis proceeds in three stages:
 
-Prior to fitting, change-point detection (Pettitt, CUSUM, PRUTF) identifies abrupt structural breaks. Post-fitting, a Rosenblatt Probability Integral Transform (PIT) Goodness-of-Fit test validates the TV copula by checking the uniformity (KS test) and independence (Kendall τ test) of the transformed pseudo-observations.
-Output: `<INDEX>_timevarying_copula.csv`.
+**Change-point detection** (Pettitt, CUSUM, PRUTF) is run first on a rolling Kendall-τ series to identify abrupt structural breaks. A break is flagged when at least 2 of the 3 tests reject H₀ at the 5% level; the consensus change-point year is the median of the significant test estimates.
+
+**Three copula models** are then fitted and compared by AIC and BIC:
+
+| Model | Description | Free parameters |
+|---|---|---|
+| Stationary | Single fixed copula parameter | 1 |
+| Time-varying (TV) | Log-linear trend: `θ(t) = ilink(a + b × year_std)` | 2 |
+| Segmented | Two independent stationary copulas, one per epoch defined by the change-point year | 2 |
+
+Model selection logic: TV is preferred when the LRT is significant (p < 0.05), no strong abrupt break is detected, TV has lower AIC than the segmented model, and the Rosenblatt PIT GOF passes. Segmented is preferred when a change point is detected, the segmented model has lower AIC, and the Rosenblatt diagnostic is better. Otherwise the stationary model is retained.
+
+**Post-fitting**, a **Rosenblatt Probability Integral Transform (PIT)** Goodness-of-Fit test validates both the TV and segmented copulas by checking uniformity (KS test on `e2`) and independence (Kendall τ test between `e1` and `e2`) of the transformed pseudo-observations.
+
+Diagnostic PDFs produced conditionally:
+
+| File | Condition |
+|---|---|
+| `<INDEX>_rolling_tau.pdf` | Always written |
+| `<INDEX>_copula_diagnostic.pdf` | GOF bootstrap rejected (p < 0.05) |
+| `<INDEX>_rosenblatt_diagnostic.pdf` | GOF rejected AND TV copula was fitted with a valid `a_hat` |
+| `<INDEX>_tv_parameter.pdf` | TV model selected |
+
+Outputs: `<INDEX>_timevarying_copula.csv`, `<INDEX>_segmented_copula.csv` (written only when a change point is detected and both segments have ≥ 15 observations).
 
 #### 5d. Non-Stationary Marginals (GAMLSS)
 
-Fits a **GAMLSS Gamma regression** to drought severity with a linear year trend on the mean parameter (log link). Compares AIC with the stationary Gamma model (ΔAIC < −2 favours the non-stationary model).
+Fits **three GAMLSS Gamma models** to drought severity and selects among them by AIC:
 
-Period-specific mean severity `mu_ref` and `mu_rec` are computed for two epochs:
-- **Reference period**: first 40% of the record
-- **Recent period**: last 30% of the record
+| Model | mu formula | sigma formula |
+|---|---|---|
+| M0 (stationary) | `~ 1` | `~ 1` |
+| M1 (mu-trend) | `~ year_std` | `~ 1` |
+| M2 (mu+sigma-trend) | `~ year_std` | `~ year_std` |
 
-(Override by passing explicit `ref_years` and `recent_years` vectors.)
+Period-specific mean severity `mu` and coefficient of variation `sigma` are computed for two epochs:
+- **Reference period**: first 40% of the record — or from record start to `cp_year − 1` if a change point is detected and falls between 20%–80% of the record.
+- **Recent period**: last 30% of the record — or from `cp_year` to record end when a change point is used.
+
+(Override by passing explicit `ref_years` and `recent_years` vectors to `fit_nonstationary_marginals()`.)
+
+Period-specific `mu` and `sigma` are extracted directly from model coefficients (not via `predict()`) by applying the GA log-link manually: `mu(t) = exp(b0 + b1 × year_std(t))`. Values are averaged over the epoch years. Both `mu` and `sigma` are passed to Step 5e.
 
 Output: `<INDEX>_nonstationary_summary.csv`.
 
 #### 5e. Non-Stationary SAF Curves
 
-Uses the period-specific Gamma marginal (from 5d) while keeping the stationary copula and Beta area marginal unchanged. Produces separate SAF curves for the reference and recent periods using both:
-- **Method A (Conditional_NS)** — same conditional copula approach but with period-specific severity marginal.
+Uses the period-specific Gamma parameters `mu` and `sigma` (from 5d) while keeping the Beta area marginal unchanged. Produces separate SAF curves for the reference and recent periods using both:
+
+- **Method A (Conditional_NS)** — conditional copula approach with period-specific severity marginal.
 - **Method B (Kendall_NS)** — Kendall-corrected approach with period-specific severity marginal (consistent with De Michele et al. 2026, Eq. 11).
+
+**Copula selection in NS SAF:** When the time-varying copula analysis (5c) found a statistically significant trend in dependence (`lr_p < 0.05`), the copula used in each SAF curve is replaced with a **period-specific instance** evaluated at the epoch midpoint year using the fitted TV copula (via the internal helper `.build_period_copula()`). This propagates non-stationarity in both the severity marginal and the dependence structure into the SAF curve. When the TV trend is not significant, the stationary copula from Step 3 is used unchanged for both periods.
 
 This allows detection of **shifts in drought severity for the same return period** between historical and recent climates.
 
@@ -272,7 +315,7 @@ These lines are commented out but ready to activate:
 
 ```
 drought_analysis/
-├── SAF_analysis_log.txt                     # Timestamped log of all steps
+├── SAF_analysis_log.txt                               # Timestamped log of all steps
 ├── SPI1_analysis/
 │   ├── SPI1_drought_characteristics.csv
 │   ├── SPI1_duration_classified_events.csv
@@ -283,11 +326,16 @@ drought_analysis/
 │   ├── SPI1_SAF_kendall_all.csv
 │   ├── SPI1_SAF_overlay.pdf
 │   ├── SPI1_timevarying_copula.csv
+│   ├── SPI1_segmented_copula.csv                      # written if change-point detected
 │   ├── SPI1_nonstationary_summary.csv
 │   ├── SPI1_SAF_nonstationary_reference_<yr>_<yr>.csv
 │   ├── SPI1_SAF_nonstationary_recent_<yr>_<yr>.csv
 │   ├── SPI1_SAF_nonstationary_kendall_reference_<yr>_<yr>.csv
 │   ├── SPI1_SAF_nonstationary_kendall_recent_<yr>_<yr>.csv
+│   ├── SPI1_rolling_tau.pdf                           # always written in Step 5c
+│   ├── SPI1_copula_diagnostic.pdf                     # written if bootstrap GOF rejected
+│   ├── SPI1_rosenblatt_diagnostic.pdf                 # written if GOF rejected & TV fitted
+│   ├── SPI1_tv_parameter.pdf                          # written if TV model selected
 │   └── (per-class SAF CSVs when ≥15 events per class)
 ├── SPEI1_analysis/   (same structure)
 ├── SPI3_analysis/    (same structure, no D1-2 class)
@@ -309,7 +357,7 @@ If optional Step 6 maps are enabled, a separate `drought_maps/` folder is create
 | Running `SAF_Analysis.R` standalone | No |
 | Running ext1 or ext2 | No |
 
-**Verdict:** The Methodology Guide is a collection of supplementary diagnostic and visualisation tools. The SAF curves, copula fits, return period tables, non-stationary analyses, and all CSV/PDF outputs produced in Steps 3–5 are entirely independent of it. You can safely omit it if you do not need the Step 6 utilities. If you want threshold sensitivity charts, seasonal breakdowns, spatial frequency maps, or cross-index scatter plots, keep it.
+**Verdict:** The Methodology Guide is a collection of supplementary diagnostic and visualisation tools. The SAF curves, copula fits, return period tables, non-stationary analyses, and all CSV/PDF outputs produced in Steps 3–5 are entirely independent of it.
 
 ---
 
@@ -317,32 +365,25 @@ If optional Step 6 maps are enabled, a separate `drought_maps/` folder is create
 
 The comments in the scripts document several important corrections relative to earlier versions:
 
-1. **Kendall distribution formula** (`QuickStart.R`, `SAF_Analysis.R`): The correct empirical `K_C(t) = P(C(U,V) ≤ t)` replaces the incorrect analytical shortcut `t − (1 − C(t,t))/t`.
-2. **`rm(list=ls())` removed** (`SAF_Analysis.R`, `ext1.R`, `ext2.R`): Earlier versions wiped the workspace mid-pipeline. This is now the caller's responsibility.
-3. **Copula log-likelihood in comparison table** (`SAF_Analysis.R`): Previously missing; now saved alongside AIC/BIC.
+1. **Kendall distribution formula** (`QuickStart.R`, `SAF_Analysis.R`): The pipeline uses `kc_fn(t) = mean(C(U,V) <= t)` (empirical K_C), verified at startup against the known analytical result for the independence copula `K_C(t) = t - t*log(t)`.
+2. **`rm(list=ls())` removed** (`SAF_Analysis.R`, `ext1.R`, `ext2.R`): Earlier versions wiped the workspace mid-pipeline. Cleanup is now the caller's responsibility.
+3. **Copula log-likelihood in comparison table** (`SAF_Analysis.R`): Saved alongside AIC/BIC.
 4. **Minimum events threshold raised to 15** (`SAF_Analysis.R`): Per-class SAF fitting is skipped for classes with fewer than 15 events to avoid unreliable tail fits.
-5. **Time-varying copula family** (`ext1.R`): Previously hardcoded to Clayton; now uses whichever family was selected by AIC.
-6. **GAMLSS `predict()` workaround** (`ext2.R`): Some `gamlss` package versions return a closure instead of a numeric from `predict(..., type="response")`. The fix extracts coefficients directly and applies `exp()` manually.
-7. **Non-stationary year window** (`ext2.R`): Reference and recent periods are now derived from the actual record length (40% / 30% split) instead of hardcoded calendar years.
+5. **Time-varying copula family** (`ext1.R`): Uses whichever family was selected by AIC in Step 3. Multi-parameter families (Student-t) fall back to the stationary model with a logged warning.
+6. **GAMLSS `predict()` workaround** (`ext2.R`): Some `gamlss` package versions return a closure instead of a numeric from `predict(..., type="response")`. The fix extracts coefficients directly and applies `exp()` manually to implement the log-link.
+7. **Non-stationary year window** (`ext2.R`): Reference and recent periods are derived from the actual record length (40%/30% split) instead of hardcoded calendar years. The detected change-point year takes precedence when it falls between 20%–80% of the record.
 8. **Rosenblatt PIT** (`ext1.R` — `rosenblatt_pit_gof()`):
 
-  e₂ is now computed as the central finite-difference derivative of
-   `pCopula` with respect to u₁ (internal helper `.h_func_fd`). `pCopula`
-   is implemented for every copula family in the package (Frank, Gumbel,
-   Plackett, Clayton, Joe, SurvClayton), eliminating the NA-return failure
-   and producing correctly independent Uniform(0,1) variates when the copula
-   is well-specified.
+   `e2` is computed as the central finite-difference derivative of `pCopula` with respect to `u1` (helper `.h_func_fd`). `pCopula` is implemented for every copula family in the package (Frank, Gumbel, Plackett, Clayton, Joe, SurvClayton, Gaussian, StudentT), eliminating the NA-return failure and producing correctly independent Uniform(0,1) variates when the copula is well-specified.
 
 9. **Epoch boundary truncation** (`ext2.R` — `fit_nonstationary_marginals()`):
 
- `yr_match <- dc$year` uses the actual calendar year stored in each
-   row of the filtered drought dataframe. `yr_range` now correctly spans
-   1950–2025 and `recent_years` extends to the record end.
+   `yr_match <- dc$year` uses the actual calendar year stored in each drought-month row. `yr_range` now correctly spans 1950–2025 and `recent_years` extends to the record end.
 
    *Impact on epoch labels after fix:*
 
-   | Index | CP year | Reference period | Recent period|
-   |-------|---------|-----------------|-------------------|
+   | Index | CP year | Reference period | Recent period |
+   |-------|---------|-----------------|----------------|
    | SPI-1  | 1965 | 1950–1964 | 1965–2025 (+27 yr) |
    | SPEI-1 | 1996 | 1950–1995 | 1996–2025 (CP used correctly) |
    | SPI-3  | 1973 | 1950–1972 | 1973–2025 (+27 yr) |
@@ -350,17 +391,15 @@ The comments in the scripts document several important corrections relative to e
 
 10. **`total_events` authoritative source** (`QuickStart.R` — `quick_diagnostic()`):
 
-    Previously, `total_events <- sum(rp$n_events, na.rm = TRUE)` used the per-class aggregation as the primary source. This can diverge from the actual event count when sub-threshold events are not assigned to a class. Fixed: `total_events` is now read directly from `nrow(<INDEX>_duration_classified_events.csv)` when the file exists — the same object serialised by `identify_duration_classified_events()`. `sum(rp$n_events)` is retained as a fallback (when the event file is absent) and as a cross-check target. A `MISMATCH` flag is printed when the two counts differ.
+    `total_events` is now read directly from `nrow(<INDEX>_duration_classified_events.csv)` when the file exists. `sum(rp$n_events)` is retained as a fallback and cross-check target. A `MISMATCH` flag is printed when the two counts differ.
 
 11. **SPI-3 zero-variance rolling-window warnings** (`ext1.R` — `detect_copula_changepoints()`):
 
-    The rolling Kendall tau loop in `detect_copula_changepoints()` called `cor(..., method="kendall")` without checking whether severity or area_pct had zero variance within the 10-year window. A few isolated windows in the SPI-3 record contain drought observations with identical values, causing R to emit `"Warning: the standard deviation is zero"` (≈9 occurrences) and return NA. The NAs were handled correctly by `valid <- which(is.finite(tau_ser))`, so **change-point results were never corrupted**. However, the repeated warnings obscured the console output.
-
-    Fixed: both `sd(severity_window)` and `sd(area_pct_window)` are checked before calling `cor()`. Zero-variance windows are assigned NA silently; the total count is reported once via `log_event()` for diagnostic purposes.
+    Both `sd(severity_window)` and `sd(area_pct_window)` are checked before calling `cor()`. Zero-variance windows are assigned NA silently; the total count is reported once via `log_event()`. Change-point results are not affected.
 
     **Bootstrap and permutation window sizes:**
-    - `gof_copula()`: **N_boot = 499 replicates** (parametric Cramér–von Mises Sn bootstrap). The minimum achievable two-sided p-value is 1/(499+1) = 0.002, well below the α = 0.05 threshold. Use `N_boot = 999` for publication; `N_boot = 99` for fast development runs.
-    - `detect_copula_changepoints()` CUSUM test: **499 Monte-Carlo permutations** (matching N_boot for consistency). The CUSUM p-value is the fraction of permuted statistics ≥ the observed value.
+    - `gof_copula()`: **N_boot = 499 replicates** (parametric Cramér–von Mises Sn bootstrap). Minimum achievable two-sided p-value: 1/500 = 0.002. Use `N_boot = 999` for publication; `N_boot = 99` for fast development.
+    - `detect_copula_changepoints()` CUSUM test: **499 Monte-Carlo permutations** (matching N_boot for consistency).
 
 ---
 
@@ -368,10 +407,10 @@ The comments in the scripts document several important corrections relative to e
 
 | Warning / Log message | Source | Severity | Cause | Action |
 |---|---|---|---|---|
-| `WARNING [TD-L]: Empirical λ_L=X > 0.10 but ALL five candidate copulas have λ_L = 0` | `fit_copulas()` | Advisory | Lower-tail association detected but no candidate family can model it; Clayton excluded by design | Acceptable; note caveat in reporting. Expand candidate set if lower-tail fit is critical. |
-| `WARNING [TD-U]: AIC-best copula has no upper-tail dependence but empirical λ_U > 0.10` | `fit_copulas()` | Advisory | AIC prefers Frank/Plackett despite upper-tail signal | Consider Gumbel or Joe; compare SAF curves at high return periods |
-| `[INDEX] Rolling tau: N window(s) had zero variance … set to NA` | `detect_copula_changepoints()` | Informational | Isolated drought-month windows with identical severity or area values in the SPI-3 record | Inspect `<INDEX>_drought_characteristics.csv` for constant runs; no change-point results affected |
-| `MISMATCH — investigate aggregation!` in `quick_diagnostic()` | `QuickStart.R` | Warning | `nrow(ev_file) ≠ sum(rp$n_events)`; sub-threshold events may not be mapped to a class | Check duration classification logic and `D0 (Sub-threshold)` rows in the rp table |
+| `WARNING [TD-U]: AIC-best copula has no upper-tail dependence but empirical λ_U > 0.10` | `fit_copulas()` | Advisory | AIC prefers Frank, Plackett, or Gaussian despite upper-tail signal | Consider Gumbel, Joe, SurvClayton, or StudentT; compare SAF curves at high return periods |
+| `[INDEX] Rolling tau: N window(s) had zero variance … set to NA` | `detect_copula_changepoints()` | Informational | Isolated drought-month windows with identical severity or area values (typical in SPI-3 record) | Inspect `<INDEX>_drought_characteristics.csv` for constant runs; change-point results unaffected |
+| `MISMATCH — investigate aggregation!` in `quick_diagnostic()` | `QuickStart.R` | Warning | `nrow(ev_file) ≠ sum(rp$n_events)`; sub-threshold events may not map to a named class | Check duration classification logic and `D0 (Sub-threshold)` rows in the rp table |
+| `TV trend skipped for StudentT: multi-parameter families require extended formulation` | `fit_timevarying_copula()` | Informational | StudentT has 2 parameters (ρ, df); the scalar log-linear TV model is not applicable | Stationary StudentT fit is used; segmented model is still evaluated if a change point is detected |
 
 ---
 
@@ -388,3 +427,7 @@ The comments in the scripts document several important corrections relative to e
 | GAMLSS | Generalised Additive Models for Location, Scale and Shape — used here for non-stationary distributional regression |
 | Return period | Expected average time between events of at least a given magnitude |
 | Duration class | Grouping of drought events by length in months (D1-2, D3-6, D7-12, D13+) |
+| TV copula | Time-varying copula: a copula whose dependence parameter θ is modelled as a log-linear function of standardised year |
+| Segmented copula | Two independent stationary copulas fitted to temporal sub-records defined by a consensus change-point year |
+| Rosenblatt PIT | Probability Integral Transform (Rosenblatt 1952): converts a bivariate sample from a correctly specified copula into two independent U[0,1] variates for GOF testing |
+| λ_U | Upper-tail dependence coefficient: limiting probability of joint exceedances as the threshold approaches 1; measures the tendency for simultaneous extremes |

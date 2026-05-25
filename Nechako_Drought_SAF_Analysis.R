@@ -240,30 +240,53 @@ fit_copulas <- function(drought_data, marginal_fits, index_name, out_dir) {
   dc <- drought_data[drought_data$severity > 0 & drought_data$area_pct > 0, ]
   if (nrow(dc) < 10 || is.null(marginal_fits)) return(NULL)
   
-  # =======================================================================
-  # CML APPROACH: Transform to empirical rank-based pseudo-observations
-  # =======================================================================
-  uM <- copula::pobs(cbind(dc$severity, dc$area_pct))
-  uS <- uM[, 1]
-  uA <- uM[, 2]
-  n  <- nrow(uM)
+  A    <- dc$area_pct / 100
+  uA   <- pbeta(A, shape1 = marginal_fits$area_fit$estimate["shape1"],
+                shape2 = marginal_fits$area_fit$estimate["shape2"])
+  dist <- marginal_fits$severity_dist_name
+  pars <- marginal_fits$severity_fit$estimate
+  uS   <- switch(dist,
+                 Exponential = pexp(dc$severity, rate   = pars["rate"]),
+                 Gamma       = pgamma(dc$severity, shape = pars["shape"], rate  = pars["rate"]),
+                 Weibull     = pweibull(dc$severity, shape= pars["shape"], scale = pars["scale"]),
+                 `Log-Normal`= plnorm(dc$severity, meanlog=pars["meanlog"], sdlog=pars["sdlog"]),
+                 Normal      = pnorm(dc$severity, mean  = pars["mean"],  sd    = pars["sd"]),
+                 Logistic    = plogis(dc$severity, location=pars["location"], scale=pars["scale"]),
+                 pgamma(dc$severity, shape = 1, rate = 1))
+  uS  <- pmax(pmin(uS, 1 - 1e-6), 1e-6)
+  uA  <- pmax(pmin(uA, 1 - 1e-6), 1e-6)
+  uM  <- cbind(uS, uA); n <- nrow(uM)
   
+  # Copula candidate set:
+  #   Frank       — symmetric, no tail dependence (Archimedean)
+  #   Gumbel      — upper-tail dependence (Archimedean)
+  #   Plackett    — symmetric, light tails (one-parameter)
+  #   SurvClayton — survival (180°-rotated) Clayton: upper-tail dependence,
+  #                 complementary to standard Clayton's lower-tail focus
+  #   Joe         — strong upper-tail dependence (Archimedean)
+  # Standard Clayton and Gaussian Normal have been intentionally excluded.
   cops <- list(
     Frank       = frankCopula(dim = 2),
     Gumbel      = gumbelCopula(dim = 2),
     Plackett    = plackettCopula(),
     SurvClayton = rotCopula(claytonCopula(dim = 2)),
     Joe         = joeCopula(dim = 2),
+    # New robust candidates:
     Gaussian    = normalCopula(param = 0.5, dim = 2, dispstr = "un"),
     StudentT    = tCopula(param = 0.5, df = 4, dim = 2)
   )
-  
   res  <- data.frame(Copula=character(), Parameter=numeric(),
                      LogLik=numeric(), AIC=numeric(), BIC=numeric(),
                      stringsAsFactors=FALSE)
   fits <- list()
-  
   for (nm in names(cops)) {
+    # "mpl" here maximises the copula log-likelihood given the parametric CDF
+    # transforms uS/uA (IFM-style two-stage MLE, not rank-based pseudo-obs).
+    # FIX: added optim.method="BFGS" + maxit=1000 to suppress convergence
+    #      code=52 warnings; falls back to Nelder-Mead if BFGS errors out.
+    # NOTE: for SurvClayton (rotCopula), fitCopula / loglikCopula dispatch
+    #       through dCopula which is generic and correctly handles rotCopula
+    #       objects; coef() returns the base Clayton parameter.
     fit <- tryCatch(
       fitCopula(cops[[nm]], uM, method = "mpl",
                 optim.method  = "BFGS",
@@ -291,21 +314,121 @@ fit_copulas <- function(drought_data, marginal_fits, index_name, out_dir) {
   log_event(sprintf("[%s] Best copula: %s (AIC=%.2f)", index_name, best,
                     res$AIC[res$Copula == best]))
   
-  # ... [Keep existing Tail Dependence computation blocks here] ...
+  # ---- Empirical upper-tail dependence coefficient ---------------------------
+  # λ_U = lim_{u→1} P(V > u | U > u)
+  # Estimated non-parametrically (Schmidt & Stadtmüller 2006, Scand. J. Stat.):
+  #   λ_U ≈ 2 - log(C_hi) / log(u_q_hi)   at  u_q_hi = 0.95
+  # where C_hi = empirical P(U > 0.95, V > 0.95).
+  # Result is clamped to [0, 1].
+  #
+  # Lower-tail dependence (λ_L) is NOT assessed.  Drought severity and
+  # drought-affected area co-occur at the UPPER tail (joint extremes), so
+  # lower-tail diagnostics are irrelevant to the SAF objective.
+  #
+  # References: Joe (1997); Nelsen (2006); Schmidt & Stadtmüller (2006).
+  emp_td <- tryCatch({
+    u_q_hi <- 0.95
+    C_hi   <- mean(uS >= u_q_hi & uA >= u_q_hi)   # empirical P(U > 0.95, V > 0.95)
+    C_hi   <- max(C_hi, 1e-8)                       # boundary guard: log(0) protection
+    lam_U_emp <- max(0, min(1, 2 - log(C_hi) / log(u_q_hi)))
+    list(lambda_U = lam_U_emp)
+  }, error = function(e) list(lambda_U = NA_real_))
+  
+  # Theoretical upper-tail dependence coefficient for the best-fitting copula
+  # computed at the MLE parameter value.
+  best_par   <- coef(fits[[best]])[1]   # rho for StudentT, scalar param otherwise
+  theo_td    <- tryCatch({
+    switch(best,
+           Gumbel      = list(lambda_U = 2 - 2^(1/max(best_par, 1.001))),
+           Joe         = list(lambda_U = 2 - 2^(1/max(best_par, 1.001))),
+           SurvClayton = list(lambda_U = 2^(-1/max(best_par, 1e-6))),
+           Frank       = list(lambda_U = 0),
+           Plackett    = list(lambda_U = 0),
+           Gaussian    = list(lambda_U = 0),   # Gaussian: asymptotic tail independence
+           StudentT    = {                      # λ_U = 2*t_{df+1}(-sqrt((df+1)(1-ρ)/(1+ρ)))
+             rho    <- max(min(best_par, 0.9999), -0.9999)
+             df_par <- coef(fits[[best]])[2]   # degrees-of-freedom parameter
+             df_par <- max(df_par, 1.5)
+             list(lambda_U = 2 * pt(-sqrt((df_par + 1) * (1 - rho) / (1 + rho)),
+                                    df = df_par + 1))
+           },
+           list(lambda_U = NA_real_)            # unknown family fallback
+    )
+  }, error = function(e) list(lambda_U = NA_real_))
+  
+  # ---- Copula family recommendation based on empirical upper-tail evidence ---
+  # Decision rule (Joe 1997; Nelsen 2006; Poulin et al. 2007):
+  #   λ_U > 0.10  → upper-tail dependence present → prefer Gumbel / Joe / SurvClayton
+  #   λ_U ≤ 0.10  → no meaningful upper-tail dep  → Frank / Plackett adequate
+  # Threshold 0.10 is conservative; λ_U < 0.05 is strong evidence of asymptotic
+  # tail independence.  The recommendation is advisory — AIC winner is still used.
+  td_recommendation <- if (!is.finite(emp_td$lambda_U)) {
+    "Tail dependence inconclusive (insufficient data)"
+  } else if (emp_td$lambda_U > 0.10) {
+    "Upper-tail dependence detected (λ_U > 0.10): Gumbel, Joe, or SurvClayton preferred"
+  } else {
+    "No meaningful upper-tail dependence (λ_U ≤ 0.10): Frank or Plackett adequate"
+  }
+  
+  # Families with zero theoretical upper-tail dependence.
+  # Frank, Plackett, and Gaussian all have λ_U = 0; if any of these wins
+  # AIC but empirical λ_U > 0.10, the selected model cannot represent
+  # joint tail extremes and should be flagged.
+  zero_tail_families <- c("Frank", "Plackett", "Gaussian")
+  td_mismatch <- isTRUE(emp_td$lambda_U > 0.10) &&
+    best %in% zero_tail_families &&
+    !is.na(emp_td$lambda_U)
+  
+  log_event(sprintf(
+    "[%s] Tail dependence — empirical λ_U=%.4f | theoretical (best=%s) λ_U=%.4f",
+    index_name, emp_td$lambda_U, best,
+    if (is.finite(theo_td$lambda_U)) theo_td$lambda_U else NA))
+  log_event(sprintf("[%s] TD recommendation: %s", index_name, td_recommendation))
+  if (td_mismatch)
+    log_event(sprintf(
+      "[%s] WARNING [TD-U]: AIC-best copula (%s) has no upper-tail dependence (λ_U = 0) but empirical λ_U=%.4f > 0.10. Consider Gumbel, Joe, SurvClayton, or StudentT for extreme return periods.",
+      index_name, best, emp_td$lambda_U))
+  
+  # Append tail dependence columns to the comparison table
+  res$emp_lambda_U   <- round(emp_td$lambda_U, 4)
+  # Theoretical λ_U per candidate (requires parameter from each fit)
+  # StudentT: λ_U = 2·t_{df+1}(−√((df+1)(1−ρ)/(1+ρ)))   (Joe 1997 §2.3)
+  # Gaussian: λ_U = 0 (asymptotic tail independence for all |ρ| < 1)
+  # Frank/Plackett: λ_U = 0
+  theo_U <- vapply(names(cops), function(nm) {
+    if (is.null(fits[[nm]])) return(NA_real_)
+    p <- coef(fits[[nm]])
+    switch(nm,
+           Gumbel      = 2 - 2^(1/max(p[1], 1.001)),
+           Joe         = 2 - 2^(1/max(p[1], 1.001)),
+           SurvClayton = 2^(-1/max(p[1], 1e-6)),
+           Frank       = 0,
+           Plackett    = 0,
+           Gaussian    = 0,
+           StudentT    = {
+             rho    <- max(min(p[1], 0.9999), -0.9999)
+             df_par <- max(if (length(p) >= 2L) p[2] else 4, 1.5)
+             2 * pt(-sqrt((df_par + 1) * (1 - rho) / (1 + rho)), df = df_par + 1)
+           },
+           NA_real_)    # unknown family fallback
+  }, numeric(1L))
+  res$theo_lambda_U    <- round(theo_U, 4)
+  res$td_mismatch      <- td_mismatch & (res$Copula == best)
+  res$td_recommendation <- td_recommendation
   
   write.csv(res, file.path(out_dir, sprintf("%s_copula_comparison.csv", index_name)),
             row.names = FALSE)
-  
   list(best_copula_name    = best,
        best_copula_fit     = fits[[best]],
        all_results         = res,
-       u_severity          = uS,  # Now strictly empirical
-       u_area              = uA,  # Now strictly empirical
+       u_severity          = uS,
+       u_area              = uA,
        emp_lambda_U        = emp_td$lambda_U,
        theo_lambda_U_best  = theo_td$lambda_U,
        td_mismatch         = td_mismatch,
        td_recommendation   = td_recommendation)
 }
+
 # 6. HELPER: CDF of severity under fitted marginal ---------------------------
 compute_u_severity <- function(s_val, marginal_fits) {
   dist <- marginal_fits$severity_dist_name
@@ -472,7 +595,6 @@ subset_drought_chars_by_class <- function(drought_chars, events_df, class_label)
 }
 
 # 8. MASTER PIPELINE ---------------------------------------------------------
-# 8. MASTER PIPELINE ---------------------------------------------------------
 run_saf_pipeline <- function(index_name, index_rast, out_dir, scale = 1) {
   log_event(paste(rep("=", 70), collapse = ""))
   log_event(sprintf("RUNNING SAF PIPELINE: %s", index_name))
@@ -481,33 +603,38 @@ run_saf_pipeline <- function(index_name, index_rast, out_dir, scale = 1) {
   # a) Drought characteristics
   dc <- extract_drought_characteristics_spi(index_rast, cell_area_km2,
                                             DROUGHT_THRESHOLD, index_name)
-  write.csv(dc, file.path(out_dir, sprintf("%s_drought_characteristics.csv", index_name)), row.names = FALSE)
+  write.csv(dc,
+            file.path(out_dir, sprintf("%s_drought_characteristics.csv", index_name)),
+            row.names = FALSE)
   
   # b) Events & empirical return periods
   events <- identify_duration_classified_events(dc, index_name, scale)
   if (nrow(events) > 0)
-    write.csv(events, file.path(out_dir, sprintf("%s_duration_classified_events.csv", index_name)), row.names = FALSE)
-  
+    write.csv(events,
+              file.path(out_dir, sprintf("%s_duration_classified_events.csv", index_name)),
+              row.names = FALSE)
   rp <- compute_return_periods_by_class(events, index_name, record_len, scale)
-  write.csv(rp, file.path(out_dir, sprintf("%s_return_periods_by_class.csv", index_name)), row.names = FALSE)
+  write.csv(rp,
+            file.path(out_dir, sprintf("%s_return_periods_by_class.csv", index_name)),
+            row.names = FALSE)
   
   # c) Marginals & copula
   m <- fit_marginal_distributions(dc, index_name, out_dir)
-  if (is.null(m)) { log_event(sprintf("[%s] Marginal fitting failed.", index_name)); return(invisible(NULL)) }
+  if (is.null(m)) { log_event(sprintf("[%s] Marginal fitting failed. Skipping.", index_name)); return(invisible(NULL)) }
   cop <- fit_copulas(dc, m, index_name, out_dir)
-  if (is.null(cop)) { log_event(sprintf("[%s] Copula fitting failed.", index_name)); return(invisible(NULL)) }
+  if (is.null(cop)) { log_event(sprintf("[%s] Copula fitting failed. Skipping.", index_name)); return(invisible(NULL)) }
   
-  # d) Full-record SAF curves (Kendall Only)
+  # d) Full-record SAF curves (both methods)
+  saf_cond <- derive_SAF_curves_conditional(dc, m, cop, index_name, out_dir, "all")
   saf_kend <- derive_SAF_curves_kendall(dc, m, cop, index_name, out_dir, "all")
+  create_comparative_SAF_plots(saf_cond, saf_kend, index_name, out_dir)
   
-  # e) Per-class SAF 
-  dc_labels <- if (scale == 1) {
+  # e) Per-class SAF (FIX: threshold raised to 15 events for reliable fitting)
+  dc_labels       <- if (scale == 1)
     c("D1-2 (Very-short)", "D3-6 (Short-term)", "D7-12 (Medium-term)", "D13+ (Long-term)")
-  } else {
+  else
     c("D3-6 (Short-term)", "D7-12 (Medium-term)", "D13+ (Long-term)")
-  }
-  
-  saf_kend_cls <- list()
+  saf_cond_cls <- list(); saf_kend_cls <- list()
   
   for (cl in dc_labels) {
     n_ev <- sum(events$duration_class == cl, na.rm = TRUE)
@@ -521,20 +648,23 @@ run_saf_pipeline <- function(index_name, index_rast, out_dir, scale = 1) {
     m_sub  <- fit_marginal_distributions(dc_sub, lbl, out_dir)
     c_sub  <- if (!is.null(m_sub)) fit_copulas(dc_sub, m_sub, lbl, out_dir) else NULL
     if (!is.null(m_sub) && !is.null(c_sub)) {
+      saf_cond_cls[[cl]] <- derive_SAF_curves_conditional(dc_sub, m_sub, c_sub, index_name, out_dir, cl)
       saf_kend_cls[[cl]] <- derive_SAF_curves_kendall(dc_sub, m_sub, c_sub, index_name, out_dir, cl)
     }
   }
   
   log_event(sprintf("[%s] Pipeline complete.", index_name))
-  invisible(list(dc = dc, events = events, rp = rp, marginals = m, copulas = cop,
-                 saf_kendall = saf_kend, saf_kend_by_class = saf_kend_cls))
+  invisible(list(dc               = dc,
+                 events           = events,
+                 rp               = rp,
+                 marginals        = m,
+                 copulas          = cop,
+                 saf_conditional  = saf_cond,
+                 saf_kendall      = saf_kend,
+                 saf_cond_by_class= saf_cond_cls,
+                 saf_kend_by_class= saf_kend_cls))
 }
 
-# 9. EXECUTE -----------------------------------------------------------------
-res_spi1  <- run_saf_pipeline("SPI1",  spi1,  file.path(OUT_ROOT, "SPI1_analysis"),  scale = 1)
-res_spi3  <- run_saf_pipeline("SPI3",  spi3,  file.path(OUT_ROOT, "SPI3_analysis"),  scale = 3)
-
-log_event("=== MAIN PIPELINE COMPLETE. Check drought_analysis/ for results. ===")
 # 9. EXECUTE -----------------------------------------------------------------
 res_spi1  <- run_saf_pipeline("SPI1",  spi1,  file.path(OUT_ROOT, "SPI1_analysis"),  scale = 1)
 res_spei1 <- run_saf_pipeline("SPEI1", spei1, file.path(OUT_ROOT, "SPEI1_analysis"), scale = 1)

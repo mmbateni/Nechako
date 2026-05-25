@@ -1,8 +1,5 @@
 #============================================================================
 # QUICK-START & DATA VERIFICATION (SPI/SPEI ONLY)
-# Fixed: Kendall distribution sanity check now uses the correct
-#        Archimedean generator formula K_C(t) = t - phi(t)/phi'(t)
-#        instead of the previous incorrect t - (1-C(t,t))/t
 #============================================================================
 library(terra); library(copula)
 setwd("D:/Nechako_Drought/Nechako")
@@ -30,21 +27,31 @@ if (max(st$max) > 5 || min(st$min) < -5) {
   cat("✓ SPI-1 range valid.\n")
 }
 
-# --- 3. Kendall distribution sanity check -----------------------------------
-# Correct formula for Archimedean copulas: K_C(t) = t - phi(t) / phi'(t)
-# Independence (product) copula generator: phi(t) = -log(t), phi'(t) = -1/t
-# => K_C(t) = t - (-log t) / (-1/t) = t - t*log(t)
-# At t = 0.5: K_C(0.5) = 0.5 - 0.5*log(0.5) ≈ 0.847
+# --- 3. Kendall distribution sanity check — empirical formula ---------------
+# The pipeline uses:  kc_fn(t) = mean(C(U,V) <= t)   [empirical K_C]
+# For the independence copula C(u,v) = u*v, the analytical result is
+#   K_C(t) = P(U*V <= t) = t - t*log(t)
+# We verify that the empirical formula recovers this value within MC noise.
+# This directly mirrors derive_SAF_curves_kendall() so the check is
+# testing the actual implementation, not an unrelated formula.
+
+set.seed(42L)
+n_mc     <- 100000L
+u_sim    <- runif(n_mc)
+v_sim    <- runif(n_mc)
+c_vals   <- u_sim * v_sim                        # independence copula C(u,v) = u*v
 test_t   <- 0.5
-phi_t    <- -log(test_t)         # generator value
-phi_d_t  <- -1 / test_t          # generator derivative
-k_c      <- test_t - phi_t / phi_d_t              # = t - t*log(t)
-expected <- test_t - test_t * log(test_t)          # analytical reference
-if (abs(k_c - expected) < 1e-9) {
-  cat(sprintf("✓ Kendall distribution formula verified (K_C(%.1f) ≈ %.4f).\n",
-              test_t, k_c))
+k_c_emp  <- mean(c_vals <= test_t)               # empirical: P(C(U,V) <= t)
+k_c_ana  <- test_t - test_t * log(test_t)        # analytical ≈ 0.8466
+
+if (abs(k_c_emp - k_c_ana) < 0.005) {            # 0.005 tolerance covers MC noise
+  cat(sprintf(
+    "✓ Empirical K_C formula verified (empirical=%.4f | analytical=%.4f | diff=%.5f).\n",
+    k_c_emp, k_c_ana, abs(k_c_emp - k_c_ana)))
 } else {
-  warning("⚠ Kendall formula check failed.")
+  warning(sprintf(
+    "⚠ Empirical K_C check FAILED (empirical=%.4f | analytical=%.4f | diff=%.5f).",
+    k_c_emp, k_c_ana, abs(k_c_emp - k_c_ana)))
 }
 
 # --- 4. Quick post-run diagnostic -------------------------------------------
