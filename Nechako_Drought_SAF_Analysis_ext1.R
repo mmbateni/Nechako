@@ -1,5 +1,5 @@
 #============================================================================
-# SAF EXTENSIONS 1 — ENHANCED FUNCTIONS (v6)
+# SAF EXTENSIONS 1 — ENHANCED FUNCTIONS 
 # Source AFTER Nechako_Drought_SAF_Analysis.R
 #
 # Functions exported:
@@ -13,22 +13,12 @@
 #                                   yr_sd/a_hat/b_hat so ext2 can build period-
 #                                   specific copula objects.
 #
-# CHANGES vs v5 (BUG FIXES — v6):
+# CHANGES :
 #
 #   detect_copula_changepoints() — zero-variance rolling window guard [FIX]:
 #
-#     v5 ISSUE: The rolling Kendall tau loop called cor(..., method="kendall")
-#              without checking whether severity or area_pct had zero variance
-#              within the window.  When all drought-month observations within
-#              a 10-year window are identical (typically a few isolated windows
-#              in the SPI-3 record), cor() emits
-#              "Warning: the standard deviation is zero"
-#              and returns NA.  The NA was handled correctly (valid index
-#              filtering) so change-point results were NOT corrupted, but the
-#              repeated warnings (≈9 for SPI-3) cluttered the console and
-#              could mask genuine problems.
 #
-#     v6 FIX:  Pre-check sd(severity) and sd(area_pct) for each window.
+#      Pre-check sd(severity) and sd(area_pct) for each window.
 #              Zero-variance windows are assigned NA silently; the total
 #              count of suppressed windows is logged once via log_event()
 #              so the analyst can inspect the raw data if needed.
@@ -41,26 +31,6 @@
 #     run-time manageable.  The CUSUM permutation test also uses 499 MC draws
 #     (matching N_boot for consistency).
 #
-# CHANGES vs v4 (BUG FIXES — v5):
-#
-#   rosenblatt_pit_gof() — complete rewrite of the e2 computation [FIX]:
-#
-#     v3 BUG:  copula::cCopula(..., indices=1L)[1L,1L] returns
-#              C(u_severity | u_area) — the conditional distribution of the
-#              FIRST variable given the SECOND.  This is structurally identical
-#              to u_severity itself at the univariate level, so e2 ≡ e1,
-#              producing τ = 1.000 and identical KS p-values across all
-#              Frank-family indices.  For the Plackett copula cCopula has no
-#              method implemented → 0 % valid values.
-#
-#     v4 FIX:  The correct Rosenblatt second variate is
-#                e2_i = C(u_area_i | u_severity_i; θ_i) = ∂C(u1,u2)/∂u1
-#              computed via a central finite-difference of pCopula (helper
-#              .h_func_fd).  pCopula is implemented for ALL families in the
-#              copula package (Frank, Gumbel, Plackett, Clayton, Joe, …),
-#              so the NA-return and 0 % valid problems are eliminated.
-#              The fix correctly captures the observation-specific θ_i from
-#              the TV copula for each row.
 #============================================================================
 
 for (pkg in c("moments", "openxlsx", "Kendall", "trend")) {
@@ -349,13 +319,31 @@ detect_copula_changepoints <- function(drought_data, copula_fit_obj,
 #             Smaller values improve accuracy but may amplify floating-point
 #             noise; 1e-4 is safe for the [0,1]^2 domain.
 # ---------------------------------------------------------------------------
+# REPLACE the existing .h_func_fd with this version:
 .h_func_fd <- function(u1, u2, cop_obj, eps = 1e-4) {
-  u1_lo <- pmax(eps,       u1 - eps)
-  u1_hi <- pmin(1 - eps,   u1 + eps)
-  num   <- copula::pCopula(cbind(u1_hi, u2), cop_obj) -
+  # ADAPTIVE step-size: shrink near boundaries to avoid overflow
+  # eps_base is the nominal step, but we scale it by distance to boundary
+  eps_base <- eps
+  
+  # Compute adaptive step for each observation
+  # Minimum distance to either boundary (0 or 1)
+  dist_to_boundary <- pmin(u1, 1 - u1)
+  
+  # Scale eps by distance to boundary, but keep minimum step of 1e-8
+  eps_adj <- pmax(eps_base * dist_to_boundary, 1e-8)
+  
+  # Apply adaptive step
+  u1_lo <- pmax(1e-10, u1 - eps_adj)
+  u1_hi <- pmin(1 - 1e-10, u1 + eps_adj)
+  
+  num <- copula::pCopula(cbind(u1_hi, u2), cop_obj) -
     copula::pCopula(cbind(u1_lo, u2), cop_obj)
-  den   <- u1_hi - u1_lo
-  # Clamp to a valid open-unit-interval probability
+  den <- u1_hi - u1_lo
+  
+  # Avoid division by zero
+  den <- ifelse(den < 1e-12, 1e-12, den)
+  
+  # Clamp to valid probability range
   pmax(1e-8, pmin(1 - 1e-8, num / den))
 }
 
@@ -763,7 +751,7 @@ plot_tv_parameter <- function(tv_result, index_name, output_dir) {
   invisible(p)
 }
 # ---------------------------------------------------------------------------
-# 6. SEGMENTED COPULA  [NEW in v5]
+# 6. SEGMENTED COPULA  
 #
 #    Fits separate copulas to two temporal segments defined by a change-point
 #    year.  This is appropriate when all three of the following hold:
@@ -895,21 +883,51 @@ fit_segmented_copula <- function(drought_data, copula_fit_obj,
     return(NULL)
   }
   
-  # ---- LR test: two-segment model vs full-record stationary ------------------
-  # Full model: one copula, 1 parameter (already fitted in fit_copulas)
-  # Segmented:  two copulas, 2 parameters (one per segment)
-  # Under H0 (one homogeneous copula), the LR stat ~ chi-sq(1) approximately.
-  # This is a conservative test because the families can differ across segments.
+  # ---- Model comparison: segmented vs full-record stationary -----------------
+  #
+  # NOTE ON VALIDITY:
+  #   If seg1 and seg2 select the same copula family as the full model, the
+  #   LR statistic 2*(ll_seg - ll_full) is asymptotically chi-sq(1) under H0
+  #   (one extra parameter: 2 segment params vs 1 full param).
+  #
+  #   If the families DIFFER across segments (common when AIC selects
+  #   independently per segment), the models are NON-NESTED. The chi-sq(1)
+  #   reference distribution is then INVALID and the test can be
+  #   anti-conservative (inflated Type I error), not conservative.
+  #
+  #   For non-nested comparison, delta-AIC is the appropriate criterion:
+  #     delta_AIC < 0  => segmented model preferred (lower AIC)
+  #     |delta_AIC| > 2 is a commonly used threshold for meaningful difference
+  #   A Vuong (1989) z-test would be the formal alternative for non-nested
+  #   models but is not implemented here.
+  #
+  #   PRIMARY DECISION: delta_AIC
+  #   SUPPLEMENTARY:    LR p-value (valid only when families match)
   ll_full <- copula_fit_obj$all_results$LogLik[
     copula_fit_obj$all_results$Copula == copula_fit_obj$best_copula_name]
   ll_seg  <- seg1$best_ll + seg2$best_ll
   lr_stat <- max(0, 2 * (ll_seg - ll_full))
   lr_p    <- pchisq(lr_stat, df = 1L, lower.tail = FALSE)
   
+  # AIC: full model has k=1 param; segmented model has k=2 params (one per segment)
+  n_full <- nrow(uM_all)
+  aic_full_here <- -2 * ll_full + 2 * 1
+  aic_seg_here  <- -2 * ll_seg  + 2 * 2
+  delta_aic     <- aic_seg_here - aic_full_here   # negative = segmented preferred
+  
+  families_match <- (seg1$best_copula_name == copula_fit_obj$best_copula_name &&
+                       seg2$best_copula_name == copula_fit_obj$best_copula_name)
+  lr_valid <- families_match   # LR test is only chi-sq valid when families are nested
+  
+  # Primary criterion for preferring segmented model
+  seg_preferred_aic <- delta_aic < -2   # threshold: meaningful AIC improvement
+  
   log_event(sprintf(
-    "  [%s] Segmented vs full LR: stat=%.3f, p=%.4f (%s)",
-    index_name, lr_stat, lr_p,
-    if (lr_p < 0.05) "segmented PREFERRED" else "no significant improvement"))
+    "  [%s] Segmented vs full | LR: stat=%.3f p=%.4f (valid=%s, families: full=%s seg1=%s seg2=%s) | delta_AIC=%.2f => %s",
+    index_name, lr_stat, lr_p, lr_valid,
+    copula_fit_obj$best_copula_name, seg1$best_copula_name, seg2$best_copula_name,
+    delta_aic,
+    if (seg_preferred_aic) "segmented PREFERRED (AIC)" else "no meaningful AIC improvement"))
   
   # ---- Upper-tail dependence comparison between segments --------------------
   # Lower-tail dependence is not assessed (irrelevant for drought SAF).
@@ -941,7 +959,11 @@ fit_segmented_copula <- function(drought_data, copula_fit_obj,
     ll_segmented   = round(ll_seg,   3),
     lr_stat        = round(lr_stat,  3),
     lr_p           = round(lr_p,     4),
-    seg_preferred  = lr_p < 0.05,
+    lr_valid         = lr_valid,           # FALSE flags the non-nested case
+    aic_full         = round(aic_full_here, 2),
+    aic_seg          = round(aic_seg_here,  2),
+    delta_aic        = round(delta_aic,     2),
+    seg_preferred  = seg_preferred_aic,
     stringsAsFactors = FALSE)
   write.csv(sum_df,
             file.path(output_dir, sprintf("%s_segmented_copula.csv", index_name)),

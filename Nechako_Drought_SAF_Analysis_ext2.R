@@ -1,44 +1,83 @@
 #============================================================================
-# SAF EXTENSIONS 2 — ADDITIONAL SAF METHODS (v4)
+# SAF EXTENSIONS 2 — ADDITIONAL SAF METHODS 
 # Source AFTER Nechako_Drought_SAF_Analysis.R and ext1.R
 #
 # Functions exported:
 #   fit_nonstationary_marginals()      — Three-model GAMLSS comparison:
 #                                        stationary, mu-trend, mu+sigma-trend.
 #                                        Epoch definition from change-point or
-#                                        automatic data split. [UPDATED]
+#                                        automatic data split. 
 #   derive_SAF_nonstationary()         — SAF curves with period-specific marginals
-#                                        AND optional period-specific copula
-#                                        when TV dependence is significant. [UPDATED]
-#   derive_SAF_nonstationary_kendall() — Kendall-corrected version of above. [UPDATED]
+#                                        AND period-specific copula. 
+#   derive_SAF_nonstationary_kendall() — Kendall-corrected version of above.
 #   place_event_on_saf()               — Joint return period of a named event.
+#                                        
 #
-# CHANGES vs v3 (BUG FIX):
+# CHANGES:
 #
-#   fit_nonstationary_marginals() — epoch boundary truncation [FIX]:
+#   Addresses the hybrid non-stationary framework inconsistency:
+#   v4 paired a step-function marginal (discrete epochs from fit_nonstationary_
+#   marginals) with a smooth-trend copula collapsed to a single midpoint value
+#   (.build_period_copula). This mixes two incompatible temporal representations
+#   in the joint distribution without explicit justification.
 #
-#     v3 BUG:  yr_match <- year_vec[seq_len(nrow(dc))]
-#              year_vec is the 912-element monthly year vector (1950–2025).
-#              nrow(dc) is the count of DROUGHT MONTHS (e.g. ~550 for SPI-1).
-#              Subsetting gives years for the FIRST ~550 months of the record
-#              (≈ 1950–1996), not the actual years of the drought observations.
-#              Consequently yr_range[2] is artificially truncated, the
-#              "recent" epoch ends decades before the record end (e.g. 1998
-#              instead of 2025), and change-point fractions are inflated so
-#              late change points are misclassified as "near record edge".
+#  FIX — three changes:
 #
-#     v4 FIX:  yr_match <- dc$year
+#   (A) .build_period_copula() [REVISED]:
+#       Priority-path logic replacing the single midpoint-evaluation call:
+#         Path 1: Segmented copula from tv_res$seg_result — epoch-consistent
+#                 with the discrete marginal (both are step-functions sharing
+#                 the same cp_year boundary). PREFERRED.
+#         Path 2: TV copula evaluated at epoch midpoint — only when seg_result
+#                 is NULL (insufficient data per segment). Logs a WARNING.
+#         Path 3: Stationary copula — last-resort fallback.
+#       New parameter: which_seg ("ref" or "recent") selects seg1 vs seg2.
+#
+#   (B) .resolve_epoch() [NEW internal helper]:
+#       Epoch year vectors are now derived exclusively from ns_result$ref_years /
+#       ns_result$recent_years — the same object that produced mu_period and
+#       sigma_period.  Both SAF functions share one source of truth for epoch
+#       boundaries; the copula and marginal are guaranteed to use the same split.
+#
+#   (C) .assert_epoch_consistency() [NEW internal helper]:
+#       Compares the change-point year embedded in ns_result$epoch_src against
+#       tv_copula_result$cp_result$cp_year. Logs a WARNING [EPOCH MISMATCH] if
+#       they differ so the analyst is alerted rather than silently misled.
+#
+#   (D) derive_SAF_nonstationary() and derive_SAF_nonstationary_kendall() [REVISED]:
+#       * Accept ns_result as a new required argument (replaces internal
+#         re-derivation of period_yrs from cp_year).
+#       * Call .resolve_epoch() and .assert_epoch_consistency() before selecting
+#         the copula object.
+#       * New output column copula_path = "segmented" | "tv_midpoint" |
+#         "stationary" written to every row of the CSV for auditability.
+#       * Kendall function: K_C now computed from pseudo-observations evaluated
+#         under cop_obj_ns (the period-specific copula) rather than always the
+#         full-record stationary copula. This is consistent with De Michele et al.
+#         (2013): K_C must match the copula used in the SAF inversion.
+#
+#   CALLING CODE CHANGE REQUIRED:
+#       Both SAF functions now require ns_result as an explicit argument:
+#         derive_SAF_nonstationary(..., ns_result = ns, ...)
+#         derive_SAF_nonstationary_kendall(..., ns_result = ns, ...)
+#       where ns is the return value of fit_nonstationary_marginals().
+#
+#
+#   fit_nonstationary_marginals() — epoch boundary truncation 
+#
+#
+#       yr_match <- dc$year
 #              Uses the actual calendar year stored in each drought-month row.
-#              yr_range now correctly spans 1950–2025 and recent_years extends
+#              yr_range now correctly spans 1950-2025 and recent_years extends
 #              to the record end.  The GAMLSS trend fit also receives correct
 #              year_std values for every observation.
 #
 #              Impact on results:
-#                SPI-1 : recent epoch 1965–2025 (was 1965–1998; +27 yr)
-#                SPEI-1: recent epoch 1996–2025 (was auto-split due to
+#                SPI-1 : recent epoch 1965-2025 (was 1965-1998; +27 yr)
+#                SPEI-1: recent epoch 1996-2025 (was auto-split due to
 #                         artificial near-edge flag; now uses CP correctly)
-#                SPI-3 : recent epoch 1973–2025 (was 1973–1998; +27 yr)
-#                SPEI-3: recent epoch 1987–2025 (was 1987–1999; +26 yr)
+#                SPI-3 : recent epoch 1973-2025 (was 1973-1998; +27 yr)
+#                SPEI-3: recent epoch 1987-2025 (was 1987-1999; +26 yr)
 #============================================================================
 
 for (pkg in c("gamlss", "gamlss.dist")) {
@@ -50,25 +89,144 @@ if (!exists("log_event"))
   stop("log_event() not found. Source Nechako_Drought_SAF_Analysis.R first.")
 
 # ---------------------------------------------------------------------------
-# INTERNAL HELPER: build a period-specific copula from a TV copula result
+# INTERNAL HELPER: .build_period_copula  [REVISED v5]
 #
+# Selects the copula object for a discrete epoch via a three-path priority
+# rule, replacing the v4 single midpoint-evaluation call.
+#
+# Priority
+#   Path 1 — Segmented copula (tv_res$seg_result not NULL):
+#     Uses the per-segment stationary copula from fit_segmented_copula().
+#     This is the preferred path: both the marginal and the copula are
+#     step-functions sharing the same cp_year boundary, so the joint
+#     distribution is internally consistent.
+#
+#   Path 2 — TV midpoint evaluation (seg_result NULL, make_cop_fn available):
+#     Evaluates the continuous linear-trend copula at the epoch midpoint year.
+#     This is an approximation that mixes a step-function marginal with a
+#     smooth-trend copula collapsed to a single point.  Acceptable when
+#     seg_result is unavailable (e.g., too few observations per segment),
+#     but the analyst must be aware of the hybrid nature.  A WARNING is
+#     logged every time this path is taken.
+#
+#   Path 3 — Stationary fallback:
+#     Returns NULL; both SAF functions fall back to
+#     copula_fit_obj$best_copula_fit@copula.  Logged for transparency.
+#
+# Parameters
 #   tv_res       : return value of fit_timevarying_copula()
-#   period_years : integer vector of calendar years in this epoch
-#
-# Returns a copula object with θ evaluated at the epoch midpoint year.
+#   period_years : integer vector of calendar years for this epoch
+#   which_seg    : "ref" or "recent" — selects seg1 vs seg2 in seg_result
 # ---------------------------------------------------------------------------
-.build_period_copula <- function(tv_res, period_years) {
-  mid_yr   <- mean(range(period_years, na.rm = TRUE))
-  yr_std_m <- (mid_yr - tv_res$yr_mean) / tv_res$yr_sd
-  theta_r  <- tv_res$a_hat + tv_res$b_hat * yr_std_m
-  # make_cop_fn is the closure returned by fit_timevarying_copula — it
-  # already incorporates family selection, bounds clamping, and rotCopula
-  # wrapping for SurvClayton, so no further switch needed here.
-  tryCatch(tv_res$make_cop_fn(theta_r), error = function(e) NULL)
+.build_period_copula <- function(tv_res, period_years, which_seg = "recent") {
+  
+  # ------------------------------------------------------------------ Path 1
+  seg <- tv_res$seg_result
+  if (!is.null(seg)) {
+    cop_obj <- if (which_seg == "ref") {
+      tryCatch(seg$seg1$best_copula_fit@copula, error = function(e) NULL)
+    } else {
+      tryCatch(seg$seg2$best_copula_fit@copula, error = function(e) NULL)
+    }
+    if (!is.null(cop_obj)) {
+      log_event(sprintf(
+        "  .build_period_copula [%s]: PATH 1 - segmented copula (%s). Epoch-consistent with discrete marginal.",
+        which_seg,
+        if (which_seg == "ref") seg$seg1$best_copula_name
+        else                    seg$seg2$best_copula_name))
+      return(cop_obj)
+    }
+    log_event(sprintf(
+      "  .build_period_copula [%s]: seg_result present but copula object extraction failed. Trying Path 2.",
+      which_seg))
+  }
+  
+  # ------------------------------------------------------------------ Path 2
+  if (!is.null(tv_res$make_cop_fn) && !is.na(tv_res$a_hat) &&
+      !is.null(tv_res$yr_mean)     && !is.null(tv_res$yr_sd)) {
+    mid_yr   <- mean(range(period_years, na.rm = TRUE))
+    yr_std_m <- (mid_yr - tv_res$yr_mean) / tv_res$yr_sd
+    theta_r  <- tv_res$a_hat + tv_res$b_hat * yr_std_m
+    cop_obj  <- tryCatch(tv_res$make_cop_fn(theta_r), error = function(e) NULL)
+    if (!is.null(cop_obj)) {
+      log_event(sprintf(
+        "  .build_period_copula [%s]: PATH 2 - TV copula at epoch midpoint yr=%.1f (theta_raw=%.4f). WARNING: marginal is a step-function; copula is a point-evaluated smooth trend. Document this hybrid approximation.",
+        which_seg, mid_yr, theta_r))
+      return(cop_obj)
+    }
+    log_event(sprintf(
+      "  .build_period_copula [%s]: TV midpoint evaluation failed. Falling back to stationary.",
+      which_seg))
+  }
+  
+  # ------------------------------------------------------------------ Path 3
+  log_event(sprintf(
+    "  .build_period_copula [%s]: PATH 3 - stationary full-record copula (no non-stationarity in dependence).",
+    which_seg))
+  return(NULL)   # caller uses copula_fit_obj$best_copula_fit@copula
 }
 
+
 # ---------------------------------------------------------------------------
-# 1. NON-STATIONARY MARGINAL FITTING  (updated v3)
+# INTERNAL HELPER: .resolve_epoch  [NEW v5]
+#
+# Derives the epoch year vector and which_seg label from ns_result — the
+# single source of truth for epoch boundaries shared by marginal and copula.
+# Both SAF functions call this instead of re-deriving period_yrs internally.
+#
+# Parameters
+#   ns_result    : return value of fit_nonstationary_marginals()
+#   period_label : character; expected to contain "ref" or "recent"
+#
+# Returns a list:
+#   period_yrs  : integer vector of calendar years for this epoch
+#   which_seg   : "ref" or "recent"
+#   cp_yr_mar   : change-point year as understood by the marginal, or NA
+# ---------------------------------------------------------------------------
+.resolve_epoch <- function(ns_result, period_label) {
+  is_ref     <- grepl("ref", tolower(period_label), fixed = FALSE)
+  which_seg  <- if (is_ref) "ref" else "recent"
+  period_yrs <- if (is_ref) ns_result$ref_years else ns_result$recent_years
+  
+  # Extract cp_year from epoch_src string if the marginal used a change-point
+  cp_yr_mar <- if (grepl("change-point", ns_result$epoch_src, fixed = TRUE)) {
+    m <- regmatches(ns_result$epoch_src,
+                    regexpr("[0-9]{4}", ns_result$epoch_src))
+    if (length(m) == 1L) as.integer(m) else NA_integer_
+  } else {
+    NA_integer_
+  }
+  
+  list(period_yrs = period_yrs,
+       which_seg  = which_seg,
+       cp_yr_mar  = cp_yr_mar)
+}
+
+
+# ---------------------------------------------------------------------------
+# INTERNAL HELPER: .assert_epoch_consistency  [NEW v5]
+#
+# Compares the change-point year used to define the copula epochs
+# (tv_copula_result$cp_result$cp_year) against the one used for the
+# marginal epochs (cp_yr_mar extracted from ns_result$epoch_src).
+# Logs a WARNING [EPOCH MISMATCH] when they differ so the analyst is
+# alerted rather than silently receiving an inconsistent joint distribution.
+# ---------------------------------------------------------------------------
+.assert_epoch_consistency <- function(tv_copula_result, cp_yr_mar,
+                                      index_name, period_label) {
+  if (is.null(tv_copula_result)) return(invisible(NULL))
+  cp_yr_cop <- tv_copula_result$cp_result$cp_year
+  if (!is.na(cp_yr_cop) && !is.na(cp_yr_mar) && cp_yr_cop != cp_yr_mar) {
+    log_event(sprintf(
+      "  [%s | %s] WARNING [EPOCH MISMATCH]: copula cp_year=%d != marginal cp_year=%d. The joint distribution uses inconsistent epoch boundaries. Review cp_result passed to fit_nonstationary_marginals and fit_timevarying_copula.",
+      index_name, period_label, cp_yr_cop, cp_yr_mar))
+  }
+  invisible(NULL)
+}
+
+
+# ---------------------------------------------------------------------------
+# 1. NON-STATIONARY MARGINAL FITTING  (unchanged from v4)
 #
 #    Three GAMLSS Gamma models are fitted and compared by AIC:
 #      M0 (stationary):    mu ~ 1,         sigma ~ 1
@@ -79,10 +237,10 @@ if (!exists("log_event"))
 #    sigma values are derived for two epochs (reference and recent).
 #
 #    Epoch definition (precedence order):
-#      1. Explicit ref_years / recent_years arguments — highest priority.
-#      2. cp_result$detected == TRUE — cp_year splits:
-#           reference = record start … cp_year - 1
-#           recent    = cp_year … record end
+#      1. Explicit ref_years / recent_years arguments - highest priority.
+#      2. cp_result$detected == TRUE - cp_year splits:
+#           reference = record start ... cp_year - 1
+#           recent    = cp_year ... record end
 #         Note: if the change point is very early or very late (< 20% or
 #         > 80% of record), the 40%/30% split is used instead with a warning.
 #      3. Default automatic split: first 40% / last 30% of record.
@@ -108,17 +266,11 @@ fit_nonstationary_marginals <- function(drought_data, index_name, year_vec,
     return(NULL)
   }
   if (!requireNamespace("gamlss", quietly = TRUE)) {
-    log_event(sprintf("  [%s] gamlss not available — skipping.", index_name))
+    log_event(sprintf("  [%s] gamlss not available - skipping.", index_name))
     return(NULL)
   }
   
   # FIX (v4): use the calendar year stored in each drought-observation row.
-  # The previous yr_match <- year_vec[seq_len(nrow(dc))] took the first
-  # nrow(dc) elements of the 912-element monthly year vector, yielding years
-  # for the FIRST nrow(dc) months of the record (e.g. 1950–1996 for ~550
-  # drought months) rather than the actual observation years.  This truncated
-  # yr_range[2] and caused recent_years to end decades before 2025, and
-  # inflated change-point fractions so late CPs were misclassified as edge cases.
   yr_match <- dc$year
   yr_range <- range(yr_match, na.rm = TRUE)
   yr_span  <- diff(yr_range)
@@ -129,14 +281,13 @@ fit_nonstationary_marginals <- function(drought_data, index_name, year_vec,
   
   if (!is.null(ref_years) && !is.null(recent_years)) {
     epoch_src <- "user override"
-    # ref_years and recent_years already set by caller
     
   } else if (!is.null(cp_result) && isTRUE(cp_result$detected) && !is.na(cp_result$cp_year)) {
     cp_yr   <- cp_result$cp_year
-    cp_frac <- (cp_yr - yr_range[1]) / yr_span   # 0-1 position in record
+    cp_frac <- (cp_yr - yr_range[1]) / yr_span
     if (cp_frac < 0.20 || cp_frac > 0.80) {
       log_event(sprintf(
-        "  [%s] Change-point at %d is near record edge (%.0f%% of full record) — using auto 40%%/30%% split instead.",
+        "  [%s] Change-point at %d is near record edge (%.0f%% of full record) - using auto 40%%/30%% split instead.",
         index_name, cp_yr, 100 * cp_frac))
       ref_years    <- auto_ref
       recent_years <- auto_recent
@@ -178,7 +329,6 @@ fit_nonstationary_marginals <- function(drought_data, index_name, year_vec,
                    family = gamlss.dist::GA(), data = df, trace = FALSE),
     error = function(e) NULL)
   
-  # M2: both location and scale trend
   m2 <- tryCatch(
     gamlss::gamlss(severity ~ year_std,
                    sigma.formula = ~ year_std,
@@ -186,7 +336,7 @@ fit_nonstationary_marginals <- function(drought_data, index_name, year_vec,
     error = function(e) NULL)
   
   if (is.null(m0)) {
-    log_event(sprintf("  [%s] Stationary GAMLSS fit failed — aborting.", index_name))
+    log_event(sprintf("  [%s] Stationary GAMLSS fit failed - aborting.", index_name))
     return(NULL)
   }
   
@@ -200,9 +350,6 @@ fit_nonstationary_marginals <- function(drought_data, index_name, year_vec,
     index_name, aic_v[1], aic_v[2], aic_v[3], best_nm))
   
   # ---- Period-specific mu extraction (via coefficient, not predict) ------
-  #  FIX (Bug 2): predict.gamlss() may return a closure in some versions.
-  #  Coefficients are extracted directly and the GA() log-link applied
-  #  manually: mu(t) = exp(b0 + b1 * year_std(t)).
   coef_mu   <- coef(m_best, what = "mu")
   has_mu_tr <- length(coef_mu) >= 2
   
@@ -266,77 +413,109 @@ fit_nonstationary_marginals <- function(drought_data, index_name, year_vec,
   result
 }
 
+
 # ---------------------------------------------------------------------------
-# 2. NON-STATIONARY SAF CURVES — CONDITIONAL METHOD  (updated v3)
+# 2. NON-STATIONARY SAF CURVES - CONDITIONAL METHOD  (v5)
 #
-#    Derives SAF curves with period-specific Gamma marginal (mu_period,
-#    sigma_period) for drought severity.
+#    Derives SAF curves with period-specific Gamma marginal for drought
+#    severity (mu_period / sigma_period from fit_nonstationary_marginals)
+#    paired with a period-specific copula via .build_period_copula().
 #
-#    Copula selection (new in v3):
-#      If tv_copula_result is provided AND lr_p < 0.05 (significant trend
-#      in dependence), the copula object is evaluated at the midpoint of
-#      the epoch rather than using the stationary fit.  This propagates
-#      non-stationarity in BOTH marginals and dependence into the SAF curve.
-#      If the TV copula is not significant, the stationary copula is used
-#      (original behaviour).
+#    Changes vs v4:
+#      * ns_result is now a required argument. Epoch year vectors come
+#        exclusively from ns_result$ref_years / ns_result$recent_years
+#        via .resolve_epoch(), guaranteeing copula and marginal share the
+#        same epoch boundaries.
+#      * .build_period_copula() follows the three-path priority:
+#          Path 1: segmented copula  (epoch-consistent, preferred)
+#          Path 2: TV copula at epoch midpoint  (hybrid, warned)
+#          Path 3: stationary copula  (fallback)
+#      * .assert_epoch_consistency() logs a WARNING on cp_year mismatch.
+#      * New output column copula_path records the path taken.
 #
 #    Parameters
 #    ----------
-#    mu_period, sigma_period : period-specific Gamma parameters (mean, CV)
+#    mu_period, sigma_period : scalars; Gamma mean and CV for this epoch,
+#                              from fit_nonstationary_marginals()
 #    copula_fit_obj          : stationary copula result from fit_copulas()
 #    marginal_fits           : output of fit_marginal_distributions()
-#    drought_data            : characteristics data frame
-#    index_name, period_label, output_dir : metadata / paths
-#    tv_copula_result        : optional; output of fit_timevarying_copula() [NEW]
+#    drought_data            : full characteristics data frame
+#    ns_result               : output of fit_nonstationary_marginals() [NEW v5]
+#    index_name              : character label for logging
+#    period_label            : e.g. "reference" or "recent"
+#    output_dir              : directory for CSV output
+#    tv_copula_result        : optional; output of fit_timevarying_copula()
 # ---------------------------------------------------------------------------
 derive_SAF_nonstationary <- function(mu_period, sigma_period,
                                      copula_fit_obj, marginal_fits,
-                                     drought_data,   index_name,
-                                     period_label,   output_dir,
+                                     drought_data,   ns_result,
+                                     index_name,     period_label,
+                                     output_dir,
                                      tv_copula_result = NULL) {
+  
   if (is.null(copula_fit_obj) || is.null(marginal_fits)) return(NULL)
+  if (is.null(ns_result)) {
+    log_event(sprintf(
+      "  [%s | %s] derive_SAF_nonstationary: ns_result is NULL - cannot resolve epoch years. Aborting.",
+      index_name, period_label))
+    return(NULL)
+  }
+  
   dc    <- drought_data[drought_data$severity > 0 & drought_data$area_pct > 0, ]
   n_tot <- nrow(drought_data)
   n_dr  <- nrow(dc)
   if (n_dr == 0) return(NULL)
   mu_T  <- n_tot / n_dr
   
-  # -- Select copula object -----------------------------------------------
-  period_yrs <- if (grepl("ref", tolower(period_label), fixed = FALSE) &&
-                    !is.null(tv_copula_result$cp_result$cp_year)) {
-    seq(min(drought_data$year, na.rm = TRUE),
-        tv_copula_result$cp_result$cp_year - 1L)
-  } else {
-    seq(if (!is.null(tv_copula_result$cp_result$cp_year))
-      tv_copula_result$cp_result$cp_year
-      else min(drought_data$year, na.rm = TRUE),
-      max(drought_data$year, na.rm = TRUE))
-  }
+  # ---- Resolve epoch (single source of truth: ns_result) ------------------
+  epoch      <- .resolve_epoch(ns_result, period_label)
+  period_yrs <- epoch$period_yrs
+  which_seg  <- epoch$which_seg
   
+  # ---- Epoch-consistency check --------------------------------------------
+  .assert_epoch_consistency(tv_copula_result, epoch$cp_yr_mar,
+                            index_name, period_label)
+  
+  # ---- Select copula object via priority-path helper ----------------------
   use_tv <- !is.null(tv_copula_result) &&
     isTRUE(tv_copula_result$significant) &&
     !is.null(tv_copula_result$make_cop_fn)
+  
+  copula_path <- "stationary"
+  cop_obj_ns  <- NULL
+  
   if (use_tv) {
-    cop_obj_ns <- tryCatch(.build_period_copula(tv_copula_result, period_yrs),
-                           error = function(e) NULL)
+    cop_obj_ns <- tryCatch(
+      .build_period_copula(tv_copula_result, period_yrs, which_seg),
+      error = function(e) {
+        log_event(sprintf("  [%s] .build_period_copula error: %s", index_name, e$message))
+        NULL
+      })
     if (!is.null(cop_obj_ns)) {
-      log_event(sprintf("  [%s] Conditional NS SAF: using TV copula @ epoch midpoint for %s",
-                        index_name, period_label))
+      copula_path <- if (!is.null(tv_copula_result$seg_result)) "segmented" else "tv_midpoint"
     } else {
-      log_event(sprintf("  [%s] TV copula build failed — falling back to stationary.", index_name))
-      cop_obj_ns <- copula_fit_obj$best_copula_fit@copula
+      log_event(sprintf(
+        "  [%s | %s] All non-stationary copula paths failed - using stationary fallback.",
+        index_name, period_label))
     }
-  } else {
-    cop_obj_ns <- copula_fit_obj$best_copula_fit@copula
   }
   
-  beta_par <- marginal_fits$area_fit$estimate
+  if (is.null(cop_obj_ns)) {
+    cop_obj_ns  <- copula_fit_obj$best_copula_fit@copula
+    copula_path <- "stationary"
+  }
   
-  # Period-specific Gamma: sigma_period is the coefficient of variation (CV)
-  # so  shape = 1/CV^2,  rate = shape/mu
+  log_event(sprintf(
+    "  [%s | %s] Conditional NS SAF: copula_path=%s | mu=%.4f | sigma=%.4f",
+    index_name, period_label, copula_path, mu_period, sigma_period))
+  
+  # ---- Period-specific Gamma marginal -------------------------------------
+  # sigma_period is the coefficient of variation (CV), so:
+  #   shape = 1 / CV^2,   rate = shape / mu
   ns_shape <- 1 / (sigma_period^2)
   ns_rate  <- ns_shape / mu_period
   
+  beta_par <- marginal_fits$area_fit$estimate
   T_years  <- c(10, 25, 50, 100)
   area_pct <- seq(5, 95, by = 5)
   saf_ns   <- data.frame()
@@ -344,104 +523,159 @@ derive_SAF_nonstationary <- function(mu_period, sigma_period,
   for (T in T_years) {
     target <- 1 - mu_T / (T * 12)
     if (target <= 0 || target >= 1) next
+    
     sev <- numeric(length(area_pct))
     for (i in seq_along(area_pct)) {
       v   <- pbeta(area_pct[i] / 100, beta_par[1], beta_par[2])
       obj <- function(s) {
         u_ns <- pgamma(s, shape = ns_shape, rate = ns_rate)
-        (copula::cCopula(cbind(u_ns, v), copula = cop_obj_ns, indices = 2) - target)^2
+        val  <- tryCatch(
+          copula::cCopula(cbind(u_ns, v), copula = cop_obj_ns, indices = 2),
+          error = function(e) NA_real_)
+        if (!is.finite(val)) return(1e6)
+        (val - target)^2
       }
-      res    <- tryCatch(optimize(obj, interval = c(0.001, 50)),
-                         error = function(e) list(minimum = 0))
+      res    <- tryCatch(optimize(obj, interval = c(1e-6, 50)),
+                         error = function(e) list(minimum = NA_real_))
       sev[i] <- res$minimum
     }
+    
     saf_ns <- rbind(saf_ns,
-                    data.frame(ReturnPeriod_years = T,
-                               Area_pct           = area_pct,
-                               Severity           = sev,
-                               Method             = "Conditional_NS",
-                               Period             = period_label,
-                               mu_period          = round(mu_period,    4),
-                               sigma_period       = round(sigma_period, 4),
-                               tv_copula_used     = use_tv && !is.null(cop_obj_ns),
-                               Index              = index_name))
+                    data.frame(
+                      ReturnPeriod_years = T,
+                      Area_pct           = area_pct,
+                      Severity           = sev,
+                      Method             = "Conditional_NS",
+                      Period             = period_label,
+                      mu_period          = round(mu_period,    4),
+                      sigma_period       = round(sigma_period, 4),
+                      copula_path        = copula_path,
+                      Index              = index_name))
   }
   
   write.csv(saf_ns,
-            file.path(output_dir, sprintf("%s_SAF_nonstationary_%s.csv", index_name,
-                                          gsub("[^A-Za-z0-9]", "_", period_label))),
+            file.path(output_dir,
+                      sprintf("%s_SAF_nonstationary_%s.csv", index_name,
+                              gsub("[^A-Za-z0-9]", "_", period_label))),
             row.names = FALSE)
-  log_event(sprintf("  [%s] Conditional NS SAF written: %s (TV copula used: %s)",
-                    index_name, period_label, use_tv))
+  
+  log_event(sprintf(
+    "  [%s] Conditional NS SAF written: %s (copula_path=%s)",
+    index_name, period_label, copula_path))
+  
   saf_ns
 }
 
+
 # ---------------------------------------------------------------------------
-# 3. NON-STATIONARY SAF CURVES — KENDALL-CORRECTED  (updated v3)
+# 3. NON-STATIONARY SAF CURVES - KENDALL-CORRECTED  (v5)
 #
 #    Mirrors derive_SAF_nonstationary() but uses the Kendall distribution
-#    K_C(t) = P(C(U,V) ≤ t) to convert the target non-exceedance probability
-#    into a copula level t_val, then inverts the copula at each area value.
+#    K_C(t) = P(C(U,V) <= t) to convert the target non-exceedance
+#    probability into a copula level t_val, then inverts at each area value.
 #
-#    The Kendall distribution is estimated from the pseudo-observations of
-#    the APPROPRIATE copula (stationary or period-specific TV), consistent
-#    with De Michele et al. (2013) and extensions.
+#    Changes vs v4:
+#      * Epoch boundaries and copula selection follow the same revised logic
+#        as derive_SAF_nonstationary() — see that function for full details.
+#      * K_C is now computed from pseudo-observations re-evaluated under
+#        cop_obj_ns (the period-specific copula) rather than always the
+#        full-record stationary copula. This is consistent with De Michele
+#        et al. (2013): K_C must match the copula used in the SAF inversion,
+#        otherwise t_val is miscalibrated.
+#      * New output column copula_path mirrors the conditional method.
 #
-#    tv_copula_result: same semantics as in derive_SAF_nonstationary().
+#    Parameters - same as derive_SAF_nonstationary() above.
 # ---------------------------------------------------------------------------
 derive_SAF_nonstationary_kendall <- function(mu_period, sigma_period,
                                              copula_fit_obj, marginal_fits,
-                                             drought_data,   index_name,
-                                             period_label,   output_dir,
+                                             drought_data,   ns_result,
+                                             index_name,     period_label,
+                                             output_dir,
                                              tv_copula_result = NULL) {
+  
   if (is.null(copula_fit_obj) || is.null(marginal_fits)) return(NULL)
+  if (is.null(ns_result)) {
+    log_event(sprintf(
+      "  [%s | %s] derive_SAF_nonstationary_kendall: ns_result is NULL - cannot resolve epoch years. Aborting.",
+      index_name, period_label))
+    return(NULL)
+  }
+  
   dc    <- drought_data[drought_data$severity > 0 & drought_data$area_pct > 0, ]
   n_tot <- nrow(drought_data)
   n_dr  <- nrow(dc)
   if (n_dr == 0) return(NULL)
   mu_T  <- n_tot / n_dr
   
-  # -- Select copula object -----------------------------------------------
-  period_yrs <- if (grepl("ref", tolower(period_label), fixed = FALSE) &&
-                    !is.null(tv_copula_result$cp_result$cp_year)) {
-    seq(min(drought_data$year, na.rm = TRUE),
-        tv_copula_result$cp_result$cp_year - 1L)
-  } else {
-    seq(if (!is.null(tv_copula_result$cp_result$cp_year))
-      tv_copula_result$cp_result$cp_year
-      else min(drought_data$year, na.rm = TRUE),
-      max(drought_data$year, na.rm = TRUE))
-  }
+  # ---- Resolve epoch (single source of truth: ns_result) ------------------
+  epoch      <- .resolve_epoch(ns_result, period_label)
+  period_yrs <- epoch$period_yrs
+  which_seg  <- epoch$which_seg
   
+  # ---- Epoch-consistency check --------------------------------------------
+  .assert_epoch_consistency(tv_copula_result, epoch$cp_yr_mar,
+                            index_name, period_label)
+  
+  # ---- Select copula object via priority-path helper ----------------------
   use_tv <- !is.null(tv_copula_result) &&
     isTRUE(tv_copula_result$significant) &&
     !is.null(tv_copula_result$make_cop_fn)
+  
+  copula_path <- "stationary"
+  cop_obj_ns  <- NULL
+  
   if (use_tv) {
-    cop_obj_ns <- tryCatch(.build_period_copula(tv_copula_result, period_yrs),
-                           error = function(e) NULL)
+    cop_obj_ns <- tryCatch(
+      .build_period_copula(tv_copula_result, period_yrs, which_seg),
+      error = function(e) {
+        log_event(sprintf("  [%s] .build_period_copula error: %s", index_name, e$message))
+        NULL
+      })
     if (!is.null(cop_obj_ns)) {
-      log_event(sprintf("  [%s] Kendall NS SAF: using TV copula @ epoch midpoint for %s",
-                        index_name, period_label))
+      copula_path <- if (!is.null(tv_copula_result$seg_result)) "segmented" else "tv_midpoint"
     } else {
-      cop_obj_ns <- copula_fit_obj$best_copula_fit@copula
+      log_event(sprintf(
+        "  [%s | %s] All non-stationary copula paths failed - using stationary fallback.",
+        index_name, period_label))
     }
-  } else {
-    cop_obj_ns <- copula_fit_obj$best_copula_fit@copula
   }
   
-  beta_par <- marginal_fits$area_fit$estimate
+  if (is.null(cop_obj_ns)) {
+    cop_obj_ns  <- copula_fit_obj$best_copula_fit@copula
+    copula_path <- "stationary"
+  }
   
+  log_event(sprintf(
+    "  [%s | %s] Kendall NS SAF: copula_path=%s | mu=%.4f | sigma=%.4f",
+    index_name, period_label, copula_path, mu_period, sigma_period))
+  
+  # ---- Period-specific Gamma marginal -------------------------------------
   ns_shape <- 1 / (sigma_period^2)
   ns_rate  <- ns_shape / mu_period
   
-  # Empirical Kendall distribution from the period-specific (or stationary)
-  # copula evaluated at the observed pseudo-observations
+  beta_par <- marginal_fits$area_fit$estimate
+  
+  # ---- Kendall distribution from the period-specific copula ---------------
+  # K_C must be the Kendall distribution of the SAME copula used in the SAF
+  # inversion (cop_obj_ns). Using the full-record copula's pseudo-observations
+  # with a different period-specific copula object would miscalibrate t_val.
+  # We evaluate pCopula() at the full-record pseudo-observations under
+  # cop_obj_ns. When cop_obj_ns IS the stationary copula (Path 3), this
+  # reduces exactly to the original v4 behaviour.
   uS_fit   <- copula_fit_obj$u_severity
   uA_fit   <- copula_fit_obj$u_area
-  cop_vals <- tryCatch(copula::pCopula(cbind(uS_fit, uA_fit), cop_obj_ns),
-                       error = function(e) copula::pCopula(cbind(uS_fit, uA_fit),
-                                                           copula_fit_obj$best_copula_fit@copula))
-  kc_fn    <- function(t) mean(cop_vals <= t)
+  
+  cop_vals <- tryCatch(
+    copula::pCopula(cbind(uS_fit, uA_fit), cop_obj_ns),
+    error = function(e) {
+      log_event(sprintf(
+        "  [%s | %s] pCopula failed for period-specific cop_obj_ns - falling back to full-record copula for K_C.",
+        index_name, period_label))
+      copula::pCopula(cbind(uS_fit, uA_fit),
+                      copula_fit_obj$best_copula_fit@copula)
+    })
+  
+  kc_fn <- function(t) mean(cop_vals <= t)
   
   T_years  <- c(10, 25, 50, 100)
   area_pct <- seq(5, 95, by = 5)
@@ -451,9 +685,9 @@ derive_SAF_nonstationary_kendall <- function(mu_period, sigma_period,
     target_kc <- 1 - mu_T / (T * 12)
     if (target_kc <= 0 || target_kc >= 1) next
     
-    t_sol <- tryCatch(optimize(function(t) (kc_fn(t) - target_kc)^2,
-                               interval = c(1e-4, 1 - 1e-4)),
-                      error = function(e) list(minimum = 0.5))
+    t_sol <- tryCatch(
+      optimize(function(t) (kc_fn(t) - target_kc)^2, interval = c(1e-4, 1 - 1e-4)),
+      error = function(e) list(minimum = 0.5))
     t_val <- t_sol$minimum
     
     sev <- numeric(length(area_pct))
@@ -472,25 +706,31 @@ derive_SAF_nonstationary_kendall <- function(mu_period, sigma_period,
     }
     
     saf_ns_k <- rbind(saf_ns_k,
-                      data.frame(ReturnPeriod_years = T,
-                                 Area_pct           = area_pct,
-                                 Severity           = sev,
-                                 Method             = "Kendall_NS",
-                                 Period             = period_label,
-                                 mu_period          = round(mu_period,    4),
-                                 sigma_period       = round(sigma_period, 4),
-                                 tv_copula_used     = use_tv && !is.null(cop_obj_ns),
-                                 Index              = index_name))
+                      data.frame(
+                        ReturnPeriod_years = T,
+                        Area_pct           = area_pct,
+                        Severity           = sev,
+                        Method             = "Kendall_NS",
+                        Period             = period_label,
+                        mu_period          = round(mu_period,    4),
+                        sigma_period       = round(sigma_period, 4),
+                        copula_path        = copula_path,
+                        Index              = index_name))
   }
   
   write.csv(saf_ns_k,
-            file.path(output_dir, sprintf("%s_SAF_nonstationary_kendall_%s.csv", index_name,
-                                          gsub("[^A-Za-z0-9]", "_", period_label))),
+            file.path(output_dir,
+                      sprintf("%s_SAF_nonstationary_kendall_%s.csv", index_name,
+                              gsub("[^A-Za-z0-9]", "_", period_label))),
             row.names = FALSE)
-  log_event(sprintf("  [%s] Kendall NS SAF written: %s (TV copula used: %s)",
-                    index_name, period_label, use_tv))
+  
+  log_event(sprintf(
+    "  [%s] Kendall NS SAF written: %s (copula_path=%s)",
+    index_name, period_label, copula_path))
+  
   saf_ns_k
 }
+
 
 # ---------------------------------------------------------------------------
 # 4. PLACE A HISTORICAL EVENT ON THE SAF SURFACE  (unchanged from v2)
@@ -536,11 +776,11 @@ place_event_on_saf <- function(drought_data, copula_fit_obj, marginal_fits,
             file.path(output_dir, sprintf("%s_event_%s_on_SAF.csv", index_name,
                                           paste(range(event_years), collapse = "_"))),
             row.names = FALSE)
-  log_event(sprintf("  [%s] Event %s--%s: S=%.3f, A=%.1f%%, T≈%d yr",
+  log_event(sprintf("  [%s] Event %s--%s: S=%.3f, A=%.1f%%, T~%d yr",
                     index_name,
                     min(event_years), max(event_years),
                     s_peak, a_peak, round(T_joint)))
   result
 }
 
-log_event("Extensions 2 (v4) loaded: fit_nonstationary_marginals | derive_SAF_nonstationary | derive_SAF_nonstationary_kendall | place_event_on_saf")
+log_event("Extensions 2 (v5) loaded: fit_nonstationary_marginals | derive_SAF_nonstationary | derive_SAF_nonstationary_kendall | place_event_on_saf")
