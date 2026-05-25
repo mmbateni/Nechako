@@ -505,7 +505,16 @@ derive_SAF_nonstationary <- function(mu_period, sigma_period,
   saf_ns   <- data.frame()
   
   for (T in T_years) {
-    target <- 1 - mu_T / (T * 12)
+    # Pass mu_T_adj_months, renewal_shape_k, renewal_rate_k, and iat_cv from rp table
+    # or compute them inline from the drought data if passed as arguments.
+    # Example inline usage (adapt variable names to your scope):
+    target <- .compute_renewal_saf_target(
+      T_years      = T,
+      mu_T_months  = mu_T_adj,    # Replace with iat_mean * 12
+      shape_k      = shape_k_val, # Replace with 1 / (iat_cv^2)
+      rate_k       = rate_k_val,  # Replace with shape_k / iat_mean
+      cv_val       = iat_cv_val   # Replace with computed iat_cv
+    )
     if (target <= 0 || target >= 1) next
     sev <- numeric(length(area_pct))
     for (i in seq_along(area_pct)) {
@@ -746,8 +755,16 @@ derive_SAF_nonstationary_kendall <- function(mu_period, sigma_period,
   saf_ns_k <- data.frame()
   
   for (T in T_years) {
-    target_kc <- 1 - mu_T / (T * 12)
-    if (target_kc <= 0 || target_kc >= 1) next
+    # Pass mu_T_adj_months, renewal_shape_k, renewal_rate_k, and iat_cv from rp table
+    # or compute them inline from the drought data if passed as arguments.
+    # Example inline usage (adapt variable names to your scope):
+    target_kc <- .compute_renewal_saf_target(
+      T_years      = T,
+      mu_T_months  = mu_T_adj,    # Replace with iat_mean * 12
+      shape_k      = shape_k_val, # Replace with 1 / (iat_cv^2)
+      rate_k       = rate_k_val,  # Replace with shape_k / iat_mean
+      cv_val       = iat_cv_val   # Replace with computed iat_cv
+    )    if (target_kc <= 0 || target_kc >= 1) next
     
     t_sol <- tryCatch(
       optimize(function(t) (kc_fn(t) - target_kc)^2, interval = opt_int),
