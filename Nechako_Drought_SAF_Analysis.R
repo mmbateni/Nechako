@@ -1,1253 +1,791 @@
 #============================================================================
-# NECHAKO DROUGHT SAF — MASTER RUN SCRIPT
-# Single entry point for the complete analysis pipeline.
+# DROUGHT SEVERITY-AREA-FREQUENCY ANALYSIS FOR NECHAKO BASIN
+# SPI-1, SPEI-1, SPI-3, SPEI-3  |  Duration classification  |  Dual SAF methods
 #
-# USAGE:
-#   setwd("D:/Nechako_Drought/Nechako")   # set once, then:
-#   source("Nechako_Drought_RUN_ALL.R")
-#
-# WHAT THIS DOES (in order):
-#   Step 1 — Verify inputs (QuickStart)
-#   Step 2 — Load utility / methodology helpers (MethodologyGuide)
-#   Step 3 — Run main SAF pipeline: extract characteristics, fit marginals &
-#             copulas, derive SAF curves for SPI-1, SPEI-1, SPI-3, SPEI-3
-#   Step 4 — Load enhancement functions (ext1 : GOF, TV-copula;
-#                                        ext2 : NS marginals)
-#   Step 5 — Run all enhancements on the pipeline results
-#   Step 6 — Optional: run seasonal / spatial / cross-index utility analyses
-#   Step 7 — Generate Publication Figures & Excel Tables
-#
-#
-#   [QuickStart] total_events now sourced from nrow(ev_file) when the raw event
-#          CSV exists (authoritative); sum(rp$n_events) retained as fallback and
-#          cross-check target.  MISMATCH flag compares the two counts.
-#
-# FIXES applied to this version:
-#   FIX-1A  derive_SAF_nonstationary*(): added missing required argument
-#           ns_result = ns to all four calls (ref/rec × conditional/Kendall).
-#           Without it R aborts with "argument 'ns_result' is missing".
-#   FIX-1B  Fig 16 change-point field names corrected:
-#           pettitt_yr → pettitt_cp, cusum_yr → cusum_cp,
-#           prutf_yr → prutf_cp, consensus_yr → cp_year.
-#   FIX-1C  Table 3 TV-copula significance field corrected:
-#           tv$lr_sig → tv$significant.
-#   FIX-1D  Fig 18 change-point field corrected:
-#           cp_result$consensus_yr → cp_result$cp_year.
-#   FIX-1E  Fig 6 dependency field corrected:
-#           dep$kendall_tau → dep$kendall.
-#   FIX-1F  Fig 14 / Table 3 cp_year extraction corrected: ns$cp_year does not
-#           exist in fit_nonstationary_marginals() return value; cp_year is now
-#           parsed from ns$epoch_src (consistent with .resolve_epoch() in ext2).
-#   FIX-5   quick_diagnostic() hardcodes "drought_analysis" but all output is
-#           written to "spatial_drought". Patched inline after sourcing QuickStart.
-#   FIX-8   Step 4 version label corrected from "ext2 v4" to "ext2 v5".
+# FIXES :
+#   - derive_SAF_curves_kendall now uses the empirical Kendall distribution
+#     K_C(t) = P(C(U,V) <= t) instead of the incorrect t-(1-C(t,t))/t formula
+#   - fit_copulas now stores LogLik in the comparison CSV (was missing)
+#   - Minimum per-class event count raised from 10 to 15
 #============================================================================
+# NOTE: rm(list=ls()) removed intentionally.  When sourced via RUN_ALL.R this
+# script runs AFTER QuickStart.R; a blanket rm() would destroy quick_diagnostic
+# and any other objects already in the workspace.  Cleanup is the caller's
+# responsibility.  If running standalone, call rm(list=ls()) manually first.
+
+# 0. SETUP & LIBRARIES -------------------------------------------------------
+pkgs <- c("terra", "copula", "fitdistrplus", "MASS",
+          "ggplot2", "gridExtra", "viridis", "dplyr", "scales")
+for (p in pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+  library(p, character.only = TRUE)
+}
 
 setwd("D:/Nechako_Drought/Nechako")
+DROUGHT_THRESHOLD <- -0.5
+OUT_ROOT          <- "spatial_drought"
+dir.create(OUT_ROOT, recursive = TRUE, showWarnings = FALSE)
 
-# ---------------------------------------------------------------------------
-# STEP 1 — Input verification
-# ---------------------------------------------------------------------------
-cat("\n", paste(rep("=", 70), collapse=""), "\n")
-cat("STEP 1: Input verification\n")
-cat(paste(rep("=", 70), collapse=""), "\n")
-source("Nechako_Drought_QuickStart.R")
+LOG_FILE <- file.path(OUT_ROOT, "SAF_analysis_log.txt")
+cat(paste(rep("=", 70), collapse = ""), "\n",
+    "DROUGHT S-A-F ANALYSIS — NECHAKO BASIN\n",
+    "Analysis started:", format(Sys.time()), "\n",
+    paste(rep("=", 70), collapse = ""), "\n\n",
+    file = LOG_FILE)
 
-# FIX-5: quick_diagnostic() as defined in QuickStart.R searches the wrong
-# directory ("drought_analysis"). All pipeline output is written under
-# OUT_ROOT = "spatial_drought". Override the function here so the diagnostic
-# at the end of this script finds its files correctly.
-# The body below is identical to the QuickStart version except for the
-# list.files() path argument.
-quick_diagnostic <- function() {
-  sep_major <- paste(rep("=", 72), collapse = "")
-  sep_minor <- paste(rep("-", 72), collapse = "")
+log_event <- function(msg) {
+  ts   <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+  line <- paste0(ts, " | ", msg, "\n")
+  cat(line, file = LOG_FILE, append = TRUE)
+  message(line, appendLF = FALSE)
+}
+
+# 1. DURATION CLASSIFICATION -------------------------------------------------
+classify_duration_class <- function(dur, scale = 1) {
+  if (scale == 1) {
+    dplyr::case_when(
+      dur >= 1  & dur <= 2  ~ "D1-2 (Very-short)",
+      dur >= 3  & dur <= 6  ~ "D3-6 (Short-term)",
+      dur >= 7  & dur <= 12 ~ "D7-12 (Medium-term)",
+      dur >= 13             ~ "D13+ (Long-term)",   # FIX: label corrected from "D12+" to match condition (dur >= 13)
+      TRUE                  ~ "D0 (Sub-threshold)")
+  } else {
+    dplyr::case_when(
+      dur >= 3  & dur <= 6  ~ "D3-6 (Short-term)",
+      dur >= 7  & dur <= 12 ~ "D7-12 (Medium-term)",
+      dur >= 13             ~ "D13+ (Long-term)",   # FIX: label corrected from "D12+" to match condition (dur >= 13)
+      TRUE                  ~ "D0 (Sub-threshold)")
+  }
+}
+
+# 2. DATA LOADING ------------------------------------------------------------
+assemble_index_raster <- function(nc_dir, scale_tag, month_names, prefix = "spi") {
+  lst <- lapply(1:12, function(m) {
+    f <- file.path(nc_dir,
+                   sprintf("%s_%s_month%02d_%s.nc", prefix, scale_tag, m, month_names[m]))
+    if (!file.exists(f)) stop("File not found: ", f)
+    terra::rast(f)
+  })
+  r_all <- do.call(c, lst)
+  r_all[[order(terra::time(r_all))]]
+}
+
+month_names   <- c("Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec")
+spi1          <- assemble_index_raster("spi_results_seasonal",  "01", month_names, "spi")
+spei1         <- assemble_index_raster("spei_results_seasonal", "01", month_names, "spei")
+spi3          <- assemble_index_raster("spi_results_seasonal",  "03", month_names, "spi")
+spei3         <- assemble_index_raster("spei_results_seasonal", "03", month_names, "spei")
+
+dates         <- as.Date(terra::time(spi1))
+n_months      <- length(dates)
+month_indices <- as.integer(format(dates, "%m"))
+year_indices  <- as.integer(format(dates, "%Y"))
+record_len    <- max(year_indices) - min(year_indices) + 1L
+# terra::cellSize() computes geodesic cell areas directly on the reference
+# ellipsoid (WGS84 by default for geographic CRS, or native projected units
+# converted to km² for projected CRS).  An equal-area / isometric projection
+# is NOT required: terra integrates the latitude band for geographic CRS and
+# uses the projected-unit area for metric CRS.  Derived from SPI-1 layer 1;
+# all four index grids share the same grid definition so this is computed once.
+cell_area_km2  <- terra::cellSize(spi1[[1]], unit = "km")
+total_area_km2 <- terra::global(cell_area_km2, "sum", na.rm = TRUE)[1, 1]
+
+log_event(sprintf("Loaded indices. Period: %s to %s (%d months). Basin area: %.2f km²",
+                  min(dates), max(dates), n_months, total_area_km2))
+
+# 3. DROUGHT CHARACTERISTICS -------------------------------------------------
+extract_drought_characteristics_spi <- function(index_rast, cell_area, threshold, index_name) {
+  log_event(sprintf("[%s] Extracting characteristics (threshold=%.2f)...", index_name, threshold))
+  n_time    <- terra::nlyr(index_rast)
+  severity  <- numeric(n_time)
+  area_pct  <- numeric(n_time)
+  pb <- txtProgressBar(1, n_time, style = 3)
+  for (t in 1:n_time) {
+    v     <- terra::values(index_rast[[t]], mat = FALSE)
+    valid <- is.finite(v)
+    dry   <- valid & v < threshold
+    if (sum(dry) > 0 && sum(valid) > 0) {
+      area_pct[t] <- 100 * sum(dry) / sum(valid)
+      severity[t] <- mean(threshold - v[dry], na.rm = TRUE)
+    }
+    setTxtProgressBar(pb, t)
+  }
+  close(pb)
+  data.frame(date     = dates,
+             year     = year_indices,
+             month    = month_indices,
+             severity = severity,
+             area_pct = area_pct)
+}
+
+# 4. EVENT IDENTIFICATION & RETURN PERIODS -----------------------------------
+identify_duration_classified_events <- function(drought_chars, index_name, scale = 1) {
+  log_event(sprintf("[%s] Identifying duration-classified events...", index_name))
+  dc   <- drought_chars[order(drought_chars$date), ]
+  vals <- dc$severity; area <- dc$area_pct
+  indr <- vals > 0 & area > 0
+  events <- list(); in_d <- FALSE; s_idx <- NA_integer_
   
-  cat("\n", sep_major, "\n", sep = "")
-  cat("DIAGNOSTIC — drought event summary by index and duration class\n")
-  cat(sep_major, "\n", sep = "")
+  for (i in seq_len(nrow(dc))) {
+    if (!in_d && indr[i]) {
+      in_d <- TRUE; s_idx <- i
+    } else if (in_d && !indr[i]) {
+      e_idx <- i - 1L; dur <- e_idx - s_idx + 1L
+      events[[length(events) + 1L]] <- data.frame(
+        index            = index_name,
+        start_date       = dc$date[s_idx],  end_date         = dc$date[e_idx],
+        start_year       = dc$year[s_idx],  end_year         = dc$year[e_idx],
+        duration_months  = dur,
+        duration_class   = classify_duration_class(dur, scale),
+        mean_severity    = mean(vals[s_idx:e_idx], na.rm = TRUE),
+        max_severity     = max(vals[s_idx:e_idx],  na.rm = TRUE),
+        mean_area_pct    = mean(area[s_idx:e_idx],  na.rm = TRUE),
+        max_area_pct     = max(area[s_idx:e_idx],   na.rm = TRUE),
+        stringsAsFactors = FALSE)
+      in_d <- FALSE; s_idx <- NA_integer_
+    }
+  }
+  # Handle event still open at end of record
+  if (in_d && !is.na(s_idx)) {
+    e_idx <- nrow(dc); dur <- e_idx - s_idx + 1L
+    events[[length(events) + 1L]] <- data.frame(
+      index            = index_name,
+      start_date       = dc$date[s_idx],  end_date         = dc$date[e_idx],
+      start_year       = dc$year[s_idx],  end_year         = dc$year[e_idx],
+      duration_months  = dur,
+      duration_class   = classify_duration_class(dur, scale),
+      mean_severity    = mean(vals[s_idx:e_idx], na.rm = TRUE),
+      max_severity     = max(vals[s_idx:e_idx],  na.rm = TRUE),
+      mean_area_pct    = mean(area[s_idx:e_idx],  na.rm = TRUE),
+      max_area_pct     = max(area[s_idx:e_idx],   na.rm = TRUE),
+      stringsAsFactors = FALSE)
+  }
+  if (length(events) == 0) {
+    log_event(sprintf("[%s] No events detected.", index_name)); return(data.frame())
+  }
+  out <- do.call(rbind, events)
+  log_event(sprintf("[%s] %d events identified.", index_name, nrow(out)))
+  out
+}
+
+compute_return_periods_by_class <- function(events_df, index_name, record_years, scale = 1) {
+  classes <- if (scale == 1)
+    c("D1-2 (Very-short)", "D3-6 (Short-term)", "D7-12 (Medium-term)", "D13+ (Long-term)")
+  else
+    c("D3-6 (Short-term)", "D7-12 (Medium-term)", "D13+ (Long-term)")
   
-  # FIX-5: corrected from "drought_analysis" → "spatial_drought"
-  dirs <- list.files("spatial_drought", pattern = "_analysis$", full.names = TRUE)
-  if (length(dirs) == 0) {
-    cat("  No analysis folders found. Run Nechako_Drought_SAF_Analysis.R first.\n")
-    return(invisible(NULL))
+  out <- lapply(classes, function(cl) {
+    sub <- events_df[events_df$duration_class == cl, ]
+    n   <- nrow(sub)
+    
+    if (n == 0)
+      return(data.frame(
+        index = index_name, duration_class = cl, n_events = 0L,
+        record_years = record_years,
+        freq_per_year = 0, return_period_years = Inf,
+        rp_ci_lo_years = Inf, rp_ci_hi_years = Inf,
+        iat_mean_years = NA_real_, iat_cv = NA_real_,
+        poisson_assumption = "untestable",
+        mean_duration_months = NA_real_,
+        mean_severity = NA_real_, max_severity = NA_real_,
+        mean_area_pct = NA_real_, max_area_pct = NA_real_,
+        stringsAsFactors = FALSE))
+    
+    # ---- Point estimate (unchanged) ----------------------------------------
+    lambda_hat <- n / record_years          # events per year
+    rp_hat     <- record_years / n          # years per event
+    
+    # ---- Exact Poisson confidence interval on the rate ---------------------
+    # Treat n as a Poisson observation with exposure = record_years.
+    # 95% CI on lambda: uses relationship between Poisson and chi-squared:
+    #   lambda_lo = qchisq(0.025, df=2*n)   / (2 * record_years)
+    #   lambda_hi = qchisq(0.975, df=2*(n+1)) / (2 * record_years)
+    # Invert to get CI on RP (note: lo lambda -> hi RP and vice versa).
+    lambda_lo <- qchisq(0.025, df = 2 * n)       / (2 * record_years)
+    lambda_hi <- qchisq(0.975, df = 2 * (n + 1)) / (2 * record_years)
+    rp_ci_lo  <- if (lambda_hi > 0) 1 / lambda_hi else Inf   # hi lambda = lo RP
+    rp_ci_hi  <- if (lambda_lo > 0) 1 / lambda_lo else Inf   # lo lambda = hi RP
+    
+    #  ---- Inter-arrival time diagnostics (Gamma Renewal Adjustment) -------------
+    # Replaces homogeneous Poisson assumption with empirical renewal process.
+    # When iat_cv != 1.0, mu_T and the exceedance probability are adjusted
+    # using a Gamma-distributed inter-arrival model (shape k = 1/CV^2).
+    iat_mean  <- NA_real_
+    iat_cv    <- NA_real_
+    poisson_flag  <- "untestable (n < 2)"
+    mu_T_adj_months <- NA_real_  # Empirical mean waiting time (months)
+    renewal_shape_k <- NA_real_  # Gamma shape parameter
+    renewal_rate_k  <- NA_real_  # Gamma rate parameter
+    
+    if (n >= 2) {
+      sub_sorted  <- sub[order(sub$start_date), ]
+      # Inter-arrival in years (start-to-start)
+      iat_yrs  <- as.numeric(diff(as.Date(sub_sorted$start_date))) / 365.25
+      iat_mean  <- mean(iat_yrs, na.rm = TRUE)
+      iat_sd    <- sd(iat_yrs,   na.rm = TRUE)
+      iat_cv    <- if (iat_mean > 0) iat_sd / iat_mean else NA_real_
+      
+      # GAMMA RENEWAL PARAMETERS
+      # k < 1  => Clustering (over-dispersed, heavy-tailed gaps)
+      # k > 1  => Regularity (under-dispersed, uniform gaps)
+      # k = 1  => Exponential (Poisson)
+      if (!is.na(iat_cv) && iat_cv > 0) {
+        renewal_shape_k <- 1 / (iat_cv^2)
+        renewal_rate_k  <- renewal_shape_k / iat_mean
+        # Empirical mu_T (months) replaces theoretical n_record / n_dr
+        mu_T_adj_months <- iat_mean * 12
+      } else {
+        # Fallback to theoretical Poisson if CV is degenerate
+        mu_T_adj_months <- (record_years / n) * 12
+        renewal_shape_k <- 1
+        renewal_rate_k  <- 1 / iat_mean
+      }
+      
+      # Flag clustering/regularity with process type label
+      poisson_flag  <- if (is.na(iat_cv))           "untestable" else
+        if (iat_cv > 1.5)             "CLUSTERED (Gamma k<1; use renewal-adjusted SAF target)" else
+          if (iat_cv < 0.5)             "REGULAR (Gamma k>1; use renewal-adjusted SAF target)" else
+            "approx Poisson (0.5 <= CV <= 1.5)"
+    }
+    
+    data.frame(
+      index                = index_name,
+      duration_class       = cl,
+      n_events             = n,
+      record_years         = record_years,
+      freq_per_year        = ifelse(n>0, n/record_years, 0),
+      return_period_years  = ifelse(n>0, record_years/n, Inf),
+      rp_ci_lo_years       = round(ifelse(n>0, 1/qchisq(0.975, df=2*(n+1))/(2*record_years), Inf), 1),
+      rp_ci_hi_years       = round(ifelse(n>0, 1/qchisq(0.025, df=2*n)/(2*record_years), Inf), 1),
+      iat_mean_years       = round(iat_mean, 2),
+      iat_cv               = round(iat_cv, 2),
+      poisson_assumption   = poisson_flag,
+      mu_T_adj_months      = round(mu_T_adj_months, 2),      # NEW: empirical waiting time
+      renewal_shape_k      = round(renewal_shape_k, 4),      # NEW: Gamma shape
+      renewal_rate_k       = round(renewal_rate_k, 4),       # NEW: Gamma rate
+      mean_duration_months = mean(sub$duration_months, na.rm = TRUE),
+      mean_severity        = mean(sub$mean_severity,   na.rm = TRUE),
+      max_severity         = max(sub$max_severity,     na.rm = TRUE),
+      mean_area_pct        = mean(sub$mean_area_pct,   na.rm = TRUE),
+      max_area_pct         = max(sub$max_area_pct,     na.rm = TRUE),
+      stringsAsFactors     = FALSE)
+  })
+  do.call(rbind, out)
+}
+# ============================================================================
+# HELPER: Clustering-Adjusted SAF Target Probability
+# Computes 1 - p_eff/12 using Gamma renewal survival function when iat_cv != 1
+# Falls back to standard Poisson target when process is ~Poisson or parameters missing
+# ============================================================================
+.compute_renewal_saf_target <- function(T_years, mu_T_months, shape_k, rate_k, cv_val) {
+  # Guard: use standard Poisson if CV is near 1 or parameters are invalid
+  if (is.na(cv_val) || is.na(shape_k) || shape_k <= 0 || rate_k <= 0 || 
+      (cv_val >= 0.5 && cv_val <= 1.5)) {
+    return(1 - mu_T_months / (T_years * 12))
   }
   
-  summary_rows <- list()
+  # Gamma renewal survival: P(no event within T years) = 1 - F_Gamma(T; k, rate)
+  # Effective annual exceedance probability adjusted for clustering variance
+  p_no_event_T_years <- 1 - pgamma(T_years, shape = shape_k, rate = rate_k)
+  p_annual_exceed    <- (1 - p_no_event_T_years) / T_years
   
-  for (d in sort(dirs)) {
-    index_tag <- sub("_analysis$", "", basename(d))
-    
-    rp_file <- file.path(d, sprintf("%s_return_periods_by_class.csv", index_tag))
-    ev_file <- file.path(d, sprintf("%s_duration_classified_events.csv", index_tag))
-    
-    if (!file.exists(rp_file)) {
-      cat(sprintf("\n  [%s] return_periods_by_class.csv not found — skipping.\n", index_tag))
+  # Convert to monthly target for SAF inversion
+  target_adj <- 1 - (p_annual_exceed / 12)
+  return(pmax(1e-9, pmin(1 - 1e-9, target_adj)))
+}
+# 5. MARGINAL & COPULA FITTING -----------------------------------------------
+fit_marginal_distributions <- function(drought_data, index_name, out_dir) {
+  dc <- drought_data[drought_data$severity > 0 & drought_data$area_pct > 0, ]
+  if (nrow(dc) < 10) return(NULL)
+  A        <- pmax(pmin(dc$area_pct / 100, 1 - 1e-6), 1e-6)
+  fit_beta <- tryCatch(fitdistrplus::fitdist(A, "beta", method = "mle"), error = function(e) NULL)
+  if (is.null(fit_beta)) return(NULL)
+  
+  dists <- list(list("Exponential","exp",NULL),
+                list("Gamma",      "gamma",  list(shape=1, rate=1)),
+                list("Weibull",    "weibull", list(shape=1, scale=1)),
+                list("Log-Normal", "lnorm",  NULL),
+                list("Normal",     "norm",   NULL),
+                list("Logistic",   "logis",  NULL))
+  res  <- data.frame(Distribution=character(), AIC=numeric(), BIC=numeric(),
+                     stringsAsFactors=FALSE)
+  fits <- list()
+  for (d in dists) {
+    fit <- tryCatch(
+      if (is.null(d[[3]]))
+        fitdistrplus::fitdist(dc$severity, d[[2]], method = "mle")
+      else
+        fitdistrplus::fitdist(dc$severity, d[[2]], method = "mle", start = d[[3]]),
+      error = function(e) NULL)
+    if (!is.null(fit)) {
+      res  <- rbind(res, data.frame(Distribution = d[[1]], AIC = fit$aic, BIC = fit$bic))
+      fits[[d[[1]]]] <- fit
+    }
+  }
+  if (nrow(res) == 0) return(NULL)
+  best <- res$Distribution[which.min(res$AIC)]
+  write.csv(res, file.path(out_dir, sprintf("%s_severity_dist_comparison.csv", index_name)),
+            row.names = FALSE)
+  list(area_fit           = fit_beta,
+       severity_fit       = fits[[best]],
+       severity_dist_name = best,
+       severity_results   = res)
+}
+
+fit_copulas <- function(drought_data, marginal_fits, index_name, out_dir) {
+  dc <- drought_data[drought_data$severity > 0 & drought_data$area_pct > 0, ]
+  if (nrow(dc) < 10 || is.null(marginal_fits)) return(NULL)
+  
+  A    <- dc$area_pct / 100
+  uA   <- pbeta(A, shape1 = marginal_fits$area_fit$estimate["shape1"],
+                shape2 = marginal_fits$area_fit$estimate["shape2"])
+  dist <- marginal_fits$severity_dist_name
+  pars <- marginal_fits$severity_fit$estimate
+  uS   <- switch(dist,
+                 Exponential = pexp(dc$severity, rate   = pars["rate"]),
+                 Gamma       = pgamma(dc$severity, shape = pars["shape"], rate  = pars["rate"]),
+                 Weibull     = pweibull(dc$severity, shape= pars["shape"], scale = pars["scale"]),
+                 `Log-Normal`= plnorm(dc$severity, meanlog=pars["meanlog"], sdlog=pars["sdlog"]),
+                 Normal      = pnorm(dc$severity, mean  = pars["mean"],  sd    = pars["sd"]),
+                 Logistic    = plogis(dc$severity, location=pars["location"], scale=pars["scale"]),
+                 pgamma(dc$severity, shape = 1, rate = 1))
+  uS  <- pmax(pmin(uS, 1 - 1e-6), 1e-6)
+  uA  <- pmax(pmin(uA, 1 - 1e-6), 1e-6)
+  uM  <- cbind(uS, uA); n <- nrow(uM)
+  
+  # Copula candidate set:
+  #   Frank       — symmetric, no tail dependence (Archimedean)
+  #   Gumbel      — upper-tail dependence (Archimedean)
+  #   Plackett    — symmetric, light tails (one-parameter)
+  #   SurvClayton — survival (180°-rotated) Clayton: upper-tail dependence,
+  #                 complementary to standard Clayton's lower-tail focus
+  #   Joe         — strong upper-tail dependence (Archimedean)
+  # Standard Clayton and Gaussian Normal have been intentionally excluded.
+  cops <- list(
+    Frank       = frankCopula(dim = 2),
+    Gumbel      = gumbelCopula(dim = 2),
+    Plackett    = plackettCopula(),
+    SurvClayton = rotCopula(claytonCopula(dim = 2)),
+    Joe         = joeCopula(dim = 2),
+    # New robust candidates:
+    Gaussian    = normalCopula(param = 0.5, dim = 2, dispstr = "un"),
+    StudentT    = tCopula(param = 0.5, df = 4, dim = 2)
+  )
+  res  <- data.frame(Copula=character(), Parameter=numeric(),
+                     LogLik=numeric(), AIC=numeric(), BIC=numeric(),
+                     stringsAsFactors=FALSE)
+  fits <- list()
+  for (nm in names(cops)) {
+    # "mpl" here maximises the copula log-likelihood given the parametric CDF
+    # transforms uS/uA (IFM-style two-stage MLE, not rank-based pseudo-obs).
+    # FIX: added optim.method="BFGS" + maxit=1000 to suppress convergence
+    #      code=52 warnings; falls back to Nelder-Mead if BFGS errors out.
+    # NOTE: for SurvClayton (rotCopula), fitCopula / loglikCopula dispatch
+    #       through dCopula which is generic and correctly handles rotCopula
+    #       objects; coef() returns the base Clayton parameter.
+    fit <- tryCatch(
+      fitCopula(cops[[nm]], uM, method = "mpl",
+                optim.method  = "BFGS",
+                optim.control = list(maxit = 1000, reltol = 1e-8)),
+      error = function(e)
+        tryCatch(
+          fitCopula(cops[[nm]], uM, method = "mpl",
+                    optim.method  = "Nelder-Mead",
+                    optim.control = list(maxit = 2000)),
+          error = function(e2) NULL))
+    if (!is.null(fit)) {
+      p  <- coef(fit)
+      ll <- loglikCopula(p, uM, cops[[nm]])
+      k  <- length(p)
+      res  <- rbind(res, data.frame(Copula    = nm,
+                                    Parameter = p[1],
+                                    LogLik    = ll,
+                                    AIC       = -2*ll + 2*k,
+                                    BIC       = -2*ll + log(n)*k))
+      fits[[nm]] <- fit
+    }
+  }
+  if (nrow(res) == 0) return(NULL)
+  best  <- res$Copula[which.min(res$AIC)]
+  
+  # 1. Calculate empirical tail dependence FIRST
+  emp_td <- tryCatch({
+    u_q_hi <- 0.95
+    C_hi   <- mean(uS >= u_q_hi & uA >= u_q_hi)
+    C_hi   <- max(C_hi, 1e-8)
+    lam_U_emp <- max(0, min(1, 2 - log(C_hi) / log(u_q_hi)))
+    list(lambda_U = lam_U_emp)
+  }, error = function(e) list(lambda_U = NA_real_))
+  
+  # 2. Theoretical tail dependence for best copula
+  best_par   <- coef(fits[[best]])[1]
+  theo_td    <- tryCatch({
+    switch(best,
+           Gumbel      = list(lambda_U = 2 - 2^(1/max(best_par, 1.001))),
+           Joe         = list(lambda_U = 2 - 2^(1/max(best_par, 1.001))),
+           SurvClayton = list(lambda_U = 2^(-1/max(best_par, 1e-6))),
+           Frank       = list(lambda_U = 0),
+           Plackett    = list(lambda_U = 0),
+           Gaussian    = list(lambda_U = 0),
+           StudentT    = { rho <- max(min(best_par, 0.9999), -0.9999)
+           df_par <- max(coef(fits[[best]])[2], 1.5)
+           list(lambda_U = 2 * pt(-sqrt((df_par + 1)*(1-rho)/(1+rho)), df=df_par+1)) },
+           list(lambda_U = NA_real_))
+  }, error = function(e) list(lambda_U = NA_real_))
+  
+  # 3. Recommendation & mismatch check
+  td_recommendation <- if (!is.finite(emp_td$lambda_U)) "Tail dependence inconclusive" 
+  else if (emp_td$lambda_U > 0.10) "Upper-tail dependence detected: Gumbel/Joe/SurvClayton preferred" 
+  else "No meaningful upper-tail dependence: Frank/Plackett adequate"
+  
+  zero_tail_families <- c("Frank", "Plackett", "Gaussian")
+  td_mismatch <- isTRUE(emp_td$lambda_U > 0.10) && best %in% zero_tail_families && !is.na(emp_td$lambda_U)
+  
+  log_event(sprintf("[%s] Tail dependence — empirical λ_U=%.4f | theoretical (best=%s) λ_U=%.4f",
+                    index_name, emp_td$lambda_U, best, if(is.finite(theo_td$lambda_U)) theo_td$lambda_U else NA))
+  log_event(sprintf("[%s] TD recommendation: %s", index_name, td_recommendation))
+  if (td_mismatch) log_event(sprintf("[%s] WARNING [TD-U]: AIC-best (%s) has λ_U=0 but empirical λ_U=%.4f>0.10.",
+                                     index_name, best, emp_td$lambda_U))
+  
+  # 4. Append to results table
+  res$emp_lambda_U   <- round(emp_td$lambda_U, 4)
+  theo_U <- vapply(names(cops), function(nm) {
+    if (is.null(fits[[nm]])) return(NA_real_)
+    p <- coef(fits[[nm]])
+    switch(nm,
+           Gumbel=2-2^(1/max(p[1],1.001)), Joe=2-2^(1/max(p[1],1.001)),
+           SurvClayton=2^(-1/max(p[1],1e-6)), Frank=0, Plackett=0, Gaussian=0,
+           StudentT={ rho<-max(min(p[1],0.9999),-0.9999); df_p<-max(if(length(p)>=2)p[2] else 4,1.5)
+           2*pt(-sqrt((df_p+1)*(1-rho)/(1+rho)), df=df_p+1) },
+           NA_real_)
+  }, numeric(1L))
+  res$theo_lambda_U    <- round(theo_U, 4)
+  res$td_mismatch      <- td_mismatch & (res$Copula == best)
+  res$td_recommendation <- td_recommendation
+  
+  write.csv(res, file.path(out_dir, sprintf("%s_copula_comparison.csv", index_name)), row.names = FALSE)
+  
+  list(best_copula_name=best, best_copula_fit=fits[[best]], all_results=res,
+       u_severity=uS, u_area=uA, emp_lambda_U=emp_td$lambda_U,
+       theo_lambda_U_best=theo_td$lambda_U, td_mismatch=td_mismatch,
+       td_recommendation=td_recommendation, extreme_warning=td_mismatch)
+  }
+
+# 6. HELPER: CDF of severity under fitted marginal ---------------------------
+compute_u_severity <- function(s_val, marginal_fits) {
+  dist <- marginal_fits$severity_dist_name
+  pars <- marginal_fits$severity_fit$estimate
+  switch(dist,
+         Exponential = pexp(s_val,  rate     = pars["rate"]),
+         Gamma       = pgamma(s_val, shape   = pars["shape"],  rate  = pars["rate"]),
+         Weibull     = pweibull(s_val, shape = pars["shape"],  scale = pars["scale"]),
+         `Log-Normal`= plnorm(s_val, meanlog = pars["meanlog"], sdlog= pars["sdlog"]),
+         Normal      = pnorm(s_val,  mean    = pars["mean"],   sd    = pars["sd"]),
+         Logistic    = plogis(s_val, location= pars["location"],scale = pars["scale"]),
+         pgamma(s_val, shape = 1, rate = 1))
+}
+
+# 7. SAF CURVE DERIVATION ----------------------------------------------------
+
+# Method A: Conditional copula  P(S > s | A = a) = 1 - T_eff
+derive_SAF_curves_conditional <- function(drought_data, marginal_fits, copula_fit,
+                                          index_name, out_dir, duration_class = "all",
+                                          record_n_months = NULL){
+  if (is.null(marginal_fits) || is.null(copula_fit)) return(NULL)
+  log_event(sprintf("[%s | %s] SAF — Conditional Copula...", index_name, duration_class))
+  dc    <- drought_data[drought_data$severity > 0 & drought_data$area_pct > 0, ]
+  n_tot <- nrow(drought_data); n_dr <- nrow(dc); if (n_dr == 0) return(NULL)
+  mu_T  <- n_tot / n_dr
+  
+  cop_obj  <- copula_fit$best_copula_fit@copula
+  beta_par <- marginal_fits$area_fit$estimate
+  T_years  <- c(10, 25, 50, 100)
+  area_pct <- seq(5, 95, by = 5); area_prop <- area_pct / 100
+  out <- data.frame()
+  
+  for (T in T_years) {
+    # Pass mu_T_adj_months, renewal_shape_k, renewal_rate_k, and iat_cv from rp table
+    # or compute them inline from the drought data if passed as arguments.
+    # Example inline usage (adapt variable names to your scope):
+    target <- .compute_renewal_saf_target(
+      T_years      = T,
+      mu_T_months  = mu_T_adj,    # Replace with iat_mean * 12
+      shape_k      = shape_k_val, # Replace with 1 / (iat_cv^2)
+      rate_k       = rate_k_val,  # Replace with shape_k / iat_mean
+      cv_val       = iat_cv_val   # Replace with computed iat_cv
+    )
+    if (target <= 0 || target >= 1) next
+    if (copula_fit$extreme_warning && T >= 50) {
+      log_event(sprintf("  [%s] T=%d: Skipping Kendall (zero-tail copula). Use Conditional method.", index_name, T))
       next
     }
-    
-    rp <- read.csv(rp_file, stringsAsFactors = FALSE)
-    
-    total_events <- if (file.exists(ev_file)) nrow(read.csv(ev_file)) else sum(rp$n_events, na.rm = TRUE)
-    rp_total     <- sum(rp$n_events, na.rm = TRUE)
-    source_label <- if (file.exists(ev_file)) "event list (authoritative)" else "rp table (fallback)"
-    
-    cat("\n", sep_minor, "\n", sep = "")
-    cat(sprintf("  INDEX : %s\n", index_tag))
-    cat(sprintf("  Total drought events : %d  [source: %s]", total_events, source_label))
-    if (file.exists(ev_file)) {
-      match_flag <- ifelse(rp_total == total_events, "OK", "MISMATCH — investigate aggregation!")
-      cat(sprintf("\n  Cross-check vs rp table sum  : %d — %s", rp_total, match_flag))
-    }
-    cat("\n")
-    cat(sep_minor, "\n", sep = "")
-    
-    cat(sprintf("  %-30s  %8s  %12s  %10s  %10s\n",
-                "Duration Class", "N Events", "RP (years)", "Mean Sev", "Mean Area%"))
-    cat(sprintf("  %-30s  %8s  %12s  %10s  %10s\n",
-                paste(rep("-", 30), collapse=""),
-                "--------", "------------", "----------", "----------"))
-    
-    for (i in seq_len(nrow(rp))) {
-      r        <- rp[i, ]
-      n_ev     <- r$n_events
-      rp_yr    <- ifelse(is.infinite(r$return_period_years) | n_ev == 0,
-                         "—", sprintf("%.1f", r$return_period_years))
-      ms       <- ifelse(is.na(r$mean_severity), "—", sprintf("%.4f", r$mean_severity))
-      ma       <- ifelse(is.na(r$mean_area_pct), "—", sprintf("%.2f", r$mean_area_pct))
-      saf_flag <- if (n_ev >= 15) "" else "  [SAF skipped: n<15]"
-      cat(sprintf("  %-30s  %8d  %12s  %10s  %10s%s\n",
-                  r$duration_class, n_ev, rp_yr, ms, ma, saf_flag))
-    }
-    
-    summary_rows[[index_tag]] <- data.frame(
-      Index            = index_tag,
-      Total_Events     = total_events,
-      Total_Events_rp  = rp_total,
-      N_Classes        = nrow(rp),
-      stringsAsFactors = FALSE
-    )
-  }
-  
-  if (length(summary_rows) > 0) {
-    cat("\n", sep_major, "\n", sep = "")
-    cat("  CROSS-INDEX SUMMARY\n")
-    cat(sep_major, "\n", sep = "")
-    cat(sprintf("  %-20s  %14s  %14s  %10s\n", "Index", "Total(ev_file)", "Total(rp sum)", "N Classes"))
-    cat(sprintf("  %-20s  %14s  %14s  %10s\n",
-                paste(rep("-",20),collapse=""),
-                "--------------", "--------------", "----------"))
-    for (nm in names(summary_rows)) {
-      r    <- summary_rows[[nm]]
-      flag <- if (!is.na(r$Total_Events_rp) && r$Total_Events_rp != r$Total_Events) " !" else ""
-      cat(sprintf("  %-20s  %14d  %14d%s  %10d\n",
-                  r$Index, r$Total_Events, r$Total_Events_rp, flag, r$N_Classes))
-    }
-    cat(sep_major, "\n\n", sep = "")
-  }
-  
-  invisible(summary_rows)
-}
-
-# ---------------------------------------------------------------------------
-# STEP 2 — Utility / methodology helper functions (no execution, safe to load first)
-# ---------------------------------------------------------------------------
-cat("\n", paste(rep("=", 70), collapse=""), "\n")
-cat("STEP 2: Loading methodology helper functions\n")
-cat(paste(rep("=", 70), collapse=""), "\n")
-source("Nechako_Drought_Methodology_Guide.R")
-
-# ---------------------------------------------------------------------------
-# STEP 3 — Main SAF pipeline
-#   Defines all core functions AND immediately executes for all 4 indices.
-#   On completion the following objects exist in the workspace:
-#     res_spi1, res_spei1, res_spi3, res_spei3
-#   Each is a list with: dc, events, rp, marginals, copulas,
-#                        saf_conditional, saf_kendall, saf_cond_by_class,
-#                        saf_kend_by_class
-# ---------------------------------------------------------------------------
-cat("\n", paste(rep("=", 70), collapse=""), "\n")
-cat("STEP 3: Main SAF pipeline (SPI-1, SPEI-1, SPI-3, SPEI-3)\n")
-cat(paste(rep("=", 70), collapse=""), "\n")
-source("Nechako_Drought_SAF_Analysis.R")
-
-# ---------------------------------------------------------------------------
-# STEP 4 — Load extension functions (no rm, no duplicate definitions)
-# ---------------------------------------------------------------------------
-cat("\n", paste(rep("=", 70), collapse=""), "\n")
-# FIX-8: corrected version label from "ext2 v4" to "ext2 v5"
-cat("STEP 4: Loading enhancement functions (ext1 v6 + ext2 v5)\n")
-cat(paste(rep("=", 70), collapse=""), "\n")
-source("Nechako_Drought_SAF_Analysis_ext1.R")
-source("Nechako_Drought_SAF_Analysis_ext2.R")
-
-# ---------------------------------------------------------------------------
-# STEP 5 — Run enhancements on existing pipeline results
-# ---------------------------------------------------------------------------
-cat("\n", paste(rep("=", 70), collapse=""), "\n")
-cat("STEP 5: Running enhancements\n")
-cat(paste(rep("=", 70), collapse=""), "\n")
-
-# Helper: named list of all four index results with their output directories
-INDEX_RESULTS <- list(
-  SPI1  = list(res = res_spi1,  dir = "spatial_drought/SPI1_analysis",  scale = 1),
-  SPEI1 = list(res = res_spei1, dir = "spatial_drought/SPEI1_analysis", scale = 1),
-  SPI3  = list(res = res_spi3,  dir = "spatial_drought/SPI3_analysis",  scale = 3),
-  SPEI3 = list(res = res_spei3, dir = "spatial_drought/SPEI3_analysis", scale = 3)
-)
-
-# Collect all enhancement results for easy inspection
-enh_results <- list()
-
-for (nm in names(INDEX_RESULTS)) {
-  entry   <- INDEX_RESULTS[[nm]]
-  res     <- entry$res
-  out_dir <- entry$dir
-  
-  cat(sprintf("\n--- %s ---\n", nm))
-  
-  # Guard: skip if main pipeline failed for this index
-  if (is.null(res) || is.null(res$copulas) || is.null(res$marginals)) {
-    cat(sprintf("  [%s] Main pipeline result unavailable — skipping enhancements.\n", nm))
-    next
-  }
-  
-  u_mat <- cbind(res$copulas$u_severity, res$copulas$u_area)
-  
-  # 5a) Kendall / Spearman dependency test
-  dep <- test_dependency(res$dc, nm)
-  
-  # 5b) Copula goodness-of-fit (bootstrap, 499 replicates)
-  #     Set N_boot = 99 for a quicker run during development
-  gof <- gof_copula(res$copulas, u_mat, nm, N_boot = 499L)
-  
-  # 5c) Time-varying copula (tests if dependence strengthens / weakens over time)
-  #     Now also runs detect_copula_changepoints() internally (Pettitt/CUSUM/PRUTF)
-  #     and Rosenblatt PIT GOF after fitting.  The returned object contains
-  #     cp_result and make_cop_fn, which are passed to 5d and 5e below.
-  tv  <- fit_timevarying_copula(res$dc, res$copulas, res$marginals,
-                                year_indices, nm, out_dir)
-  
-  # ---------------------------------------------------------------------------
-  # DIAGNOSTICS (runs after GOF & TV fit)
-  # ---------------------------------------------------------------------------
-  if (!is.null(gof) && gof$decision == "REJECTED") {
-    plot_copula_diagnostic(u_mat, res$copulas$best_copula_fit@copula, nm, out_dir)
-    # Guard against NA parameters when the segmented model is selected
-    if (!is.null(tv) && !is.null(tv$rosenblatt) && !is.na(tv$a_hat)) {
-      # FIX (3.3): u_mat has n_drought rows (severity>0 & area_pct>0 only).
-      # res$dc contains ALL months, so res$dc$year[i] mis-maps to the wrong
-      # calendar year for every row after the first non-drought month.
-      # Filter to drought months first so index i aligns with u_mat row i.
-      dc_drought <- res$dc[res$dc$severity > 0 & res$dc$area_pct > 0, ]
-      e2_vals <- vapply(seq_len(nrow(u_mat)), function(i) {
-        yr_std_i <- (dc_drought$year[i] - tv$yr_mean) / tv$yr_sd
-        cop_i <- tv$make_cop_fn(tv$a_hat + tv$b_hat * yr_std_i)
-        .h_func_fd(u_mat[i,1], u_mat[i,2], cop_i)
-      }, numeric(1))
-      plot_rosenblatt_diagnostic(u_mat[,1], e2_vals, nm, out_dir)
-    }
-  }
-  plot_rolling_tau(res$dc, nm, out_dir)
-  if (!is.null(tv)) plot_tv_parameter(tv, nm, out_dir)
-  # ---------------------------------------------------------------------------
-  
-  # 5d) Non-stationary severity marginals.
-  #     cp_result from 5c is passed so that a statistically detected change
-  #     point is used to define epoch boundaries automatically (instead of the
-  #     fixed 40%/30% split).  Three GAMLSS models are compared: stationary,
-  #     mu-trend, and mu+sigma-trend; period-specific sigma is returned for
-  #     whichever model wins by AIC.
-  #     Manual override example:
-  #       ns <- fit_nonstationary_marginals(..., ref_years=1960:1990, recent_years=2005:2023)
-  cp_res <- if (!is.null(tv)) tv$cp_result else NULL
-  ns  <- fit_nonstationary_marginals(res$dc, nm, year_indices, out_dir,
-                                     cp_result = cp_res)
-  
-  # 5e) Non-stationary SAF curves (reference and recent periods).
-  #     Both conditional (Method A) and Kendall-corrected (Method B) variants.
-  #     If 5c detected a significant trend in dependence (lr_p < 0.05), the
-  #     copula in each SAF curve is replaced with a period-specific instance
-  #     via .build_period_copula() priority-path logic (ext2 v5).
-  #
-  #     FIX-1A: ns_result = ns added to all four calls.  ext2 v5 made this a
-  #     required argument; omitting it caused R to abort with
-  #     "argument 'ns_result' is missing, with no default".
-  saf_ns_ref   <- NULL
-  saf_ns_rec   <- NULL
-  saf_ns_ref_k <- NULL
-  saf_ns_rec_k <- NULL
-  
-  if (!is.null(ns)) {
-    ref_lbl <- sprintf("reference_%d_%d", min(ns$ref_years), max(ns$ref_years))
-    rec_lbl <- sprintf("recent_%d_%d",    min(ns$recent_years), max(ns$recent_years))
-    
-    saf_ns_ref <- derive_SAF_nonstationary(
-      mu_period        = ns$mu_ref,
-      sigma_period     = ns$sigma_ref,
-      copula_fit_obj   = res$copulas,
-      marginal_fits    = res$marginals,
-      drought_data     = res$dc,
-      ns_result        = ns,           # FIX-1A: was missing; caused abort
-      index_name       = nm,
-      period_label     = ref_lbl,
-      output_dir       = out_dir,
-      tv_copula_result = tv)
-    
-    saf_ns_rec <- derive_SAF_nonstationary(
-      mu_period        = ns$mu_rec,
-      sigma_period     = ns$sigma_rec,
-      copula_fit_obj   = res$copulas,
-      marginal_fits    = res$marginals,
-      drought_data     = res$dc,
-      ns_result        = ns,           # FIX-1A: was missing; caused abort
-      index_name       = nm,
-      period_label     = rec_lbl,
-      output_dir       = out_dir,
-      tv_copula_result = tv)
-    
-    saf_ns_ref_k <- derive_SAF_nonstationary_kendall(
-      mu_period        = ns$mu_ref,
-      sigma_period     = ns$sigma_ref,
-      copula_fit_obj   = res$copulas,
-      marginal_fits    = res$marginals,
-      drought_data     = res$dc,
-      ns_result        = ns,           # FIX-1A: was missing; caused abort
-      index_name       = nm,
-      period_label     = ref_lbl,
-      output_dir       = out_dir,
-      tv_copula_result = tv)
-    
-    saf_ns_rec_k <- derive_SAF_nonstationary_kendall(
-      mu_period        = ns$mu_rec,
-      sigma_period     = ns$sigma_rec,
-      copula_fit_obj   = res$copulas,
-      marginal_fits    = res$marginals,
-      drought_data     = res$dc,
-      ns_result        = ns,           # FIX-1A: was missing; caused abort
-      index_name       = nm,
-      period_label     = rec_lbl,
-      output_dir       = out_dir,
-      tv_copula_result = tv)
-  }
-  
-  enh_results[[nm]] <- list(
-    dependency         = dep,
-    gof                = gof,
-    tv_copula          = tv,
-    ns_marginals       = ns,
-    saf_ns_ref         = saf_ns_ref,
-    saf_ns_rec         = saf_ns_rec,
-    saf_ns_ref_kendall = saf_ns_ref_k,
-    saf_ns_rec_kendall = saf_ns_rec_k
-  )
-}
-
-# ---------------------------------------------------------------------------
-# STEP 6 — Optional utility analyses (uncomment as needed)
-# ---------------------------------------------------------------------------
-cat("\n", paste(rep("=", 70), collapse=""), "\n")
-cat("STEP 6: Optional utility analyses\n")
-cat(paste(rep("=", 70), collapse=""), "\n")
-
-# 6a) Threshold sensitivity (area fraction under drought at -0.5, -1.0, -1.5)
-# analyze_multiple_thresholds(spi1, cell_area_km2, dates, thresholds = c(-0.5, -1.0, -1.5), index_name = "SPI1")
-
-# 6b) Seasonal breakdown of severity and area
-# seasonal_drought_analysis(res_spi1$dc, "SPI1", "spatial_drought/SPI1_analysis")
-# seasonal_drought_analysis(res_spi3$dc, "SPI3", "spatial_drought/SPI3_analysis")
-
-# 6c) Pixel-level drought frequency and severity maps
-# map_drought_frequency(spi1,  index_name = "SPI1",  output_dir = "drought_maps")
-# map_drought_frequency(spei1, index_name = "SPEI1", output_dir = "drought_maps")
-
-# 6d) Cross-index correlation (SPI-1 vs SPI-3 severity)
-# cross_correlate_indices(res_spi1$dc, res_spi3$dc, output_dir = "spatial_drought")
-
-# 6e) Place a specific historical event on the SAF surface
-# Replace event_years with the actual years of the event of interest
-# place_event_on_saf(res_spi1$dc, res_spi1$copulas, res_spi1$marginals,
-#                    event_years = c(2003, 2004), index_name = "SPI1",
-#                    output_dir  = "spatial_drought/SPI1_analysis")
-
-# ---------------------------------------------------------------------------
-# STEP 7 — Generate Publication Figures & Excel Tables
-# ---------------------------------------------------------------------------
-cat("\n", paste(rep("=", 70), collapse=""), "\n")
-cat("STEP 7: Generating Publication Figures & Excel Tables\n")
-cat(paste(rep("=", 70), collapse=""), "\n")
-
-# ---- 0. SETUP FOR FIGURES ---------------------------------------------------
-for (pkg in c("ggplot2","gridExtra","viridis","dplyr","scales","openxlsx","patchwork","ggExtra")) {
-  if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg)
-  library(pkg, character.only = TRUE)
-}
-
-PUB_DIR <- "spatial_drought/pub_figures"
-dir.create(PUB_DIR, recursive = TRUE, showWarnings = FALSE)
-
-# Consistent theme for all publication figures
-pub_theme <- function(base_size = 13) {
-  theme_bw(base_size = base_size) +
-    theme(
-      plot.title        = element_text(face = "bold", hjust = 0.5, size = base_size + 1),
-      plot.subtitle     = element_text(hjust = 0.5, colour = "grey40", size = base_size - 1),
-      axis.title        = element_text(face = "bold"),
-      legend.background = element_rect(colour = "grey80"),
-      legend.key.size   = unit(0.6, "cm"),
-      strip.background  = element_rect(fill = "grey92"),
-      strip.text        = element_text(face = "bold")
-    )
-}
-
-# Helper: save as PDF + JPEG
-save_pub <- function(plot_obj, name, width = 10, height = 7, dpi = 300) {
-  pdf_file  <- file.path(PUB_DIR, paste0(name, ".pdf"))
-  jpeg_file <- file.path(PUB_DIR, paste0(name, ".jpeg"))
-  pdf(pdf_file, width = width, height = height)
-  if (inherits(plot_obj, "gg") || inherits(plot_obj, "patchwork")) {
-    print(plot_obj)
-  } else if (is.list(plot_obj)) {
-    gridExtra::grid.arrange(grobs = plot_obj)
-  } else {
-    print(plot_obj)
-  }
-  dev.off()
-  jpeg(jpeg_file, width = width, height = height, units = "in", res = dpi)
-  if (inherits(plot_obj, "gg") || inherits(plot_obj, "patchwork")) {
-    print(plot_obj)
-  } else if (is.list(plot_obj)) {
-    gridExtra::grid.arrange(grobs = plot_obj)
-  } else {
-    print(plot_obj)
-  }
-  dev.off()
-  invisible(list(pdf = pdf_file, jpeg = jpeg_file))
-}
-
-# Colour palette for 4 indices
-INDEX_COLOURS <- c(SPI1 = "#1b7837", SPEI1 = "#762a83",
-                   SPI3 = "#2166ac", SPEI3 = "#d6604d")
-
-# Return period colours (viridis 4)
-RP_COLOURS <- setNames(viridis::viridis(4), c("10","25","50","100"))
-
-INDEX_RESULTS <- list(
-  SPI1  = list(res = res_spi1,  dir = "spatial_drought/SPI1_analysis",  scale = 1),
-  SPEI1 = list(res = res_spei1, dir = "spatial_drought/SPEI1_analysis", scale = 1),
-  SPI3  = list(res = res_spi3,  dir = "spatial_drought/SPI3_analysis",  scale = 3),
-  SPEI3 = list(res = res_spei3, dir = "spatial_drought/SPEI3_analysis", scale = 3)
-)
-
-cat("=== NECHAKO DROUGHT — PUBLICATION FIGURES ===\n")
-cat(sprintf("Output directory: %s\n\n", PUB_DIR))
-
-# ============================================================================
-# SECTION 1: STUDY AREA & DATA OVERVIEW
-# ============================================================================
-cat("--- Section 1: Data overview ---\n")
-
-# Fig 1: Monthly time series of severity and area_pct for all 4 indices ------
-{
-  all_dc <- dplyr::bind_rows(lapply(names(INDEX_RESULTS), function(nm) {
-    dc <- INDEX_RESULTS[[nm]]$res$dc
-    dc$Index <- nm
-    dc
-  }))
-  all_dc$date <- as.Date(all_dc$date)
-  
-  p1a <- ggplot(all_dc, aes(x = date, y = severity, colour = Index)) +
-    geom_line(linewidth = 0.55, alpha = 0.85) +
-    scale_colour_manual(values = INDEX_COLOURS) +
-    scale_x_date(date_breaks = "10 years", date_labels = "%Y") +
-    labs(x = NULL, y = "Mean Drought Severity", title = NULL,
-         colour = "Index") +
-    pub_theme()
-  
-  p1b <- ggplot(all_dc, aes(x = date, y = area_pct, colour = Index)) +
-    geom_line(linewidth = 0.55, alpha = 0.85) +
-    scale_colour_manual(values = INDEX_COLOURS) +
-    scale_x_date(date_breaks = "10 years", date_labels = "%Y") +
-    labs(x = "Year", y = "Drought-Affected Area (%)", colour = "Index") +
-    pub_theme()
-  
-  fig01 <- p1a / p1b +
-    plot_annotation(
-      title    = "Nechako Basin: Monthly Drought Characteristics (1950–2025)",
-      subtitle = "Threshold = −0.5  |  SPI-1, SPEI-1, SPI-3, SPEI-3",
-      theme    = pub_theme()
-    ) + plot_layout(guides = "collect")
-  
-  save_pub(fig01, "Fig01_basin_drought_timeseries", width = 12, height = 8)
-  cat("  Fig01 saved.\n")
-}
-
-# Fig 2: Event scatter — severity vs area, coloured by duration class --------
-{
-  all_ev <- dplyr::bind_rows(lapply(names(INDEX_RESULTS), function(nm) {
-    ev <- INDEX_RESULTS[[nm]]$res$events
-    ev$Index <- nm
-    ev
-  }))
-  
-  fig02 <- ggplot(all_ev, aes(x = mean_area_pct, y = mean_severity,
-                              colour = duration_class, shape = Index)) +
-    geom_point(size = 2.2, alpha = 0.75) +
-    scale_colour_viridis_d(name = "Duration Class", option = "plasma") +
-    scale_shape_manual(values = c(SPI1=16, SPEI1=17, SPI3=15, SPEI3=18)) +
-    labs(x = "Mean Drought-Affected Area (%)",
-         y = "Mean Drought Severity",
-         title = "Drought Event Characteristics",
-         subtitle = "All identified events, all indices (1950–2025)") +
-    pub_theme() +
-    theme(legend.position = "right")
-  
-  save_pub(fig02, "Fig02_event_characteristics_scatter", width = 10, height = 7)
-  cat("  Fig02 saved.\n")
-}
-
-# Fig 3: Event duration histogram by index -----------------------------------
-{
-  all_ev2 <- dplyr::bind_rows(lapply(names(INDEX_RESULTS), function(nm) {
-    ev <- INDEX_RESULTS[[nm]]$res$events
-    ev$Index <- nm
-    ev
-  }))
-  
-  fig03 <- ggplot(all_ev2, aes(x = duration_months, fill = Index)) +
-    geom_histogram(binwidth = 1, colour = "white", alpha = 0.85) +
-    facet_wrap(~Index, scales = "free_y", ncol = 2) +
-    scale_fill_manual(values = INDEX_COLOURS) +
-    labs(x = "Event Duration (months)", y = "Count",
-         title = "Distribution of Drought Event Durations") +
-    pub_theme() + theme(legend.position = "none")
-  
-  save_pub(fig03, "Fig03_event_duration_histogram", width = 10, height = 7)
-  cat("  Fig03 saved.\n")
-}
-
-# ============================================================================
-# SECTION 2: MARGINAL DISTRIBUTIONS
-# ============================================================================
-cat("--- Section 2: Marginal distributions ---\n")
-
-# Fig 4: Severity — empirical vs best-fit marginal (4-panel) -----------------
-{
-  plot_severity_marginal <- function(nm) {
-    dc  <- INDEX_RESULTS[[nm]]$res$dc
-    dc  <- dc[dc$severity > 0, ]
-    mf  <- INDEX_RESULTS[[nm]]$res$marginals
-    if (is.null(mf)) return(NULL)
-    x_seq <- seq(0.001, max(dc$severity, na.rm = TRUE) * 1.05, length.out = 400)
-    pars  <- mf$severity_fit$estimate
-    dn    <- mf$severity_dist_name
-    y_fit <- switch(dn,
-                    Gamma       = dgamma(x_seq, shape = pars["shape"], rate  = pars["rate"]),
-                    Weibull     = dweibull(x_seq, shape = pars["shape"], scale = pars["scale"]),
-                    `Log-Normal`= dlnorm(x_seq, meanlog = pars["meanlog"], sdlog = pars["sdlog"]),
-                    Exponential = dexp(x_seq, rate = pars["rate"]),
-                    dnorm(x_seq, mean = pars["mean"], sd = pars["sd"]))
-    df_fit <- data.frame(x = x_seq, y = y_fit)
-    
-    ggplot(dc, aes(x = severity)) +
-      geom_histogram(aes(y = after_stat(density)), bins = 25,
-                     fill = INDEX_COLOURS[nm], colour = "white", alpha = 0.7) +
-      geom_line(data = df_fit, aes(x = x, y = y),
-                colour = "black", linewidth = 1.1) +
-      labs(title = nm, subtitle = sprintf("Best fit: %s", dn),
-           x = "Drought Severity", y = "Density") +
-      pub_theme()
-  }
-  
-  panels <- lapply(names(INDEX_RESULTS), plot_severity_marginal)
-  panels <- panels[!sapply(panels, is.null)]
-  fig04  <- wrap_plots(panels, ncol = 2) +
-    plot_annotation(title = "Marginal Distribution Fit: Drought Severity",
-                    theme = pub_theme())
-  save_pub(fig04, "Fig04_marginal_fits_severity", width = 10, height = 8)
-  cat("  Fig04 saved.\n")
-}
-
-# Fig 5: Area — empirical vs Beta fit (4-panel) ------------------------------
-{
-  plot_area_marginal <- function(nm) {
-    dc   <- INDEX_RESULTS[[nm]]$res$dc
-    dc   <- dc[dc$area_pct > 0, ]
-    mf   <- INDEX_RESULTS[[nm]]$res$marginals
-    if (is.null(mf)) return(NULL)
-    prop <- dc$area_pct / 100
-    pars <- mf$area_fit$estimate
-    x_seq <- seq(0.001, 0.999, length.out = 400)
-    y_fit <- dbeta(x_seq, shape1 = pars["shape1"], shape2 = pars["shape2"])
-    df_fit <- data.frame(x = x_seq * 100, y = y_fit / 100)
-    
-    ggplot(dc, aes(x = area_pct)) +
-      geom_histogram(aes(y = after_stat(density)), bins = 25,
-                     fill = INDEX_COLOURS[nm], colour = "white", alpha = 0.7) +
-      geom_line(data = df_fit, aes(x = x, y = y),
-                colour = "black", linewidth = 1.1) +
-      labs(title = nm, subtitle = "Best fit: Beta",
-           x = "Drought-Affected Area (%)", y = "Density") +
-      pub_theme()
-  }
-  
-  panels <- lapply(names(INDEX_RESULTS), plot_area_marginal)
-  panels <- panels[!sapply(panels, is.null)]
-  fig05  <- wrap_plots(panels, ncol = 2) +
-    plot_annotation(title = "Marginal Distribution Fit: Drought-Affected Area",
-                    theme = pub_theme())
-  save_pub(fig05, "Fig05_marginal_fits_area", width = 10, height = 8)
-  cat("  Fig05 saved.\n")
-}
-
-# ============================================================================
-# SECTION 3: COPULA DEPENDENCE STRUCTURE
-# ============================================================================
-cat("--- Section 3: Copula dependence ---\n")
-
-# Fig 6: Pseudo-observation scatter with fitted copula contours (4-panel) ----
-{
-  plot_pseudo_obs <- function(nm) {
-    res   <- INDEX_RESULTS[[nm]]$res
-    if (is.null(res$copulas)) return(NULL)
-    uS <- res$copulas$u_severity
-    uA <- res$copulas$u_area
-    cop <- res$copulas$best_copula_fit@copula
-    best_name <- res$copulas$best_copula_name
-    
-    # Compute copula density contours on a grid
-    g    <- seq(0.01, 0.99, length.out = 80)
-    grid <- expand.grid(u1 = g, u2 = g)
-    grid$density <- tryCatch(
-      copula::dCopula(as.matrix(grid), cop),
-      error = function(e) rep(NA_real_, nrow(grid)))
-    grid <- grid[is.finite(grid$density), ]
-    
-    ggplot() +
-      geom_contour(data = grid, aes(x = u1, y = u2, z = density),
-                   colour = "steelblue", bins = 10, linewidth = 0.5, alpha = 0.7) +
-      geom_point(aes(x = uS, y = uA), size = 1.4, alpha = 0.5,
-                 colour = INDEX_COLOURS[nm]) +
-      labs(title = nm,
-           # FIX-1E: was dep$kendall_tau — field does not exist;
-           #         correct name is dep$kendall (from test_dependency() return list)
-           subtitle = sprintf("Best copula: %s  |  τ=%.3f",
-                              best_name,
-                              enh_results[[nm]]$dependency$kendall),
-           x = "U(Severity)", y = "U(Area)") +
-      coord_fixed() +
-      pub_theme()
-  }
-  
-  panels <- lapply(names(INDEX_RESULTS), plot_pseudo_obs)
-  panels <- panels[!sapply(panels, is.null)]
-  fig06  <- wrap_plots(panels, ncol = 2) +
-    plot_annotation(title = "Pseudo-Observations and Fitted Copula Contours",
-                    theme = pub_theme())
-  save_pub(fig06, "Fig06_pseudo_obs_scatter", width = 10, height = 9)
-  cat("  Fig06 saved.\n")
-}
-
-# Fig 7: Kendall τ summary barplot + class breakdown -------------------------
-{
-  tau_df <- dplyr::bind_rows(lapply(names(INDEX_RESULTS), function(nm) {
-    dep <- enh_results[[nm]]$dependency
-    if (is.null(dep)) return(NULL)
-    data.frame(Index     = nm,
-               Class     = "All events",
-               tau       = dep$kendall,
-               rho       = dep$spearman,
-               p_kendall = dep$p_value)
-  }))
-  
-  fig07 <- ggplot(tau_df, aes(x = Index, y = tau, fill = Index)) +
-    geom_col(width = 0.6, colour = "grey30") +
-    geom_errorbar(aes(ymin = tau - 0.02, ymax = tau + 0.02), width = 0.2) +
-    geom_text(aes(label = sprintf("τ=%.3f\nρ=%.3f", tau, rho)),
-              vjust = -0.5, size = 3.5) +
-    scale_fill_manual(values = INDEX_COLOURS) +
-    scale_y_continuous(limits = c(0, 1), expand = expansion(mult = c(0, 0.1))) +
-    labs(x = "Drought Index", y = "Kendall τ",
-         title = "Severity–Area Rank Correlation by Index",
-         subtitle = "All identified drought events  |  p < 0.001 for all") +
-    pub_theme() + theme(legend.position = "none")
-  
-  save_pub(fig07, "Fig07_kendall_tau_barplot", width = 8, height = 6)
-  cat("  Fig07 saved.\n")
-}
-
-# Fig 8: Copula AIC comparison (grouped bar) ---------------------------------
-{
-  aic_list <- lapply(names(INDEX_RESULTS), function(nm) {
-    res <- INDEX_RESULTS[[nm]]$res
-    if (is.null(res$copulas$all_results)) return(NULL)
-    df <- res$copulas$all_results
-    df$Index <- nm
-    df
-  })
-  aic_df <- dplyr::bind_rows(aic_list[!sapply(aic_list, is.null)])
-  
-  if (nrow(aic_df) > 0 && "AIC" %in% names(aic_df) && "Copula" %in% names(aic_df)) {
-    aic_df <- aic_df %>%
-      group_by(Index) %>%
-      mutate(delta_AIC = AIC - min(AIC, na.rm = TRUE)) %>%
-      ungroup()
-    
-    fig08 <- ggplot(aic_df, aes(x = Copula, y = delta_AIC, fill = Index)) +
-      geom_col(position = "dodge", colour = "grey30", width = 0.7) +
-      scale_fill_manual(values = INDEX_COLOURS) +
-      scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
-      labs(x = "Copula Family", y = "ΔAIC (relative to best)",
-           title = "Copula Model Selection by Index",
-           subtitle = "Lower ΔAIC = better fit  |  Best model at ΔAIC = 0") +
-      pub_theme() +
-      theme(axis.text.x = element_text(angle = 30, hjust = 1))
-    
-    save_pub(fig08, "Fig08_copula_aic_comparison", width = 10, height = 6)
-    cat("  Fig08 saved.\n")
-  } else {
-    cat("  Fig08 skipped (AIC table unavailable).\n")
-  }
-}
-
-# ============================================================================
-# SECTION 4: SAF CURVES
-# ============================================================================
-cat("--- Section 4: SAF curves ---\n")
-
-# Fig 9 & 10: SAF at specific return periods — all indices on one panel ------
-{
-  make_saf_allindices <- function(rp_filter, method = "Conditional", fig_name) {
-    all_saf <- dplyr::bind_rows(lapply(names(INDEX_RESULTS), function(nm) {
-      res  <- INDEX_RESULTS[[nm]]$res
-      saf  <- if (method == "Conditional") res$saf_conditional else res$saf_kendall
-      if (is.null(saf)) return(NULL)
-      saf[saf$ReturnPeriod_years == rp_filter & is.finite(saf$Severity), ]
-    }))
-    if (nrow(all_saf) == 0) { cat(sprintf("  %s skipped — no data.\n", fig_name)); return(NULL) }
-    
-    p <- ggplot(all_saf, aes(x = Area_pct, y = Severity, colour = Index, linetype = Index)) +
-      geom_line(linewidth = 1.2) + geom_point(size = 2.5) +
-      scale_colour_manual(values = INDEX_COLOURS) +
-      scale_linetype_manual(values = c(SPI1="solid", SPEI1="dashed",
-                                       SPI3="dotdash", SPEI3="dotted")) +
-      labs(x = "Drought-Affected Area (%)", y = "Drought Severity",
-           title = sprintf("SAF Curves at %d-Year Return Period", rp_filter),
-           subtitle = sprintf("Method: %s  |  All four indices, full record", method)) +
-      pub_theme()
-    p
-  }
-  
-  fig09 <- make_saf_allindices(10,  "Conditional", "Fig09")
-  fig10 <- make_saf_allindices(100, "Conditional", "Fig10")
-  if (!is.null(fig09)) { save_pub(fig09, "Fig09_SAF_allindices_RP10",  width = 9, height = 6); cat("  Fig09 saved.\n") }
-  if (!is.null(fig10)) { save_pub(fig10, "Fig10_SAF_allindices_RP100", width = 9, height = 6); cat("  Fig10 saved.\n") }
-}
-
-# Fig 11: Conditional vs Kendall, 4-panel grid --------------------------------
-{
-  plot_method_comp <- function(nm) {
-    res  <- INDEX_RESULTS[[nm]]$res
-    cond <- res$saf_conditional
-    kend <- res$saf_kendall
-    if (is.null(cond) || is.null(kend)) return(NULL)
-    comb <- rbind(cond[is.finite(cond$Severity), ],
-                  kend[is.finite(kend$Severity), ])
-    
-    ggplot(comb, aes(x = Area_pct, y = Severity,
-                     colour = factor(ReturnPeriod_years),
-                     linetype = Method)) +
-      geom_line(linewidth = 1.0) +
-      scale_colour_manual(values = RP_COLOURS, name = "RP (yr)") +
-      scale_linetype_manual(values = c(Conditional="solid", Kendall="dashed"),
-                            name = "Method") +
-      labs(title = nm, x = "Area (%)", y = "Severity") +
-      pub_theme(base_size = 11)
-  }
-  
-  panels <- lapply(names(INDEX_RESULTS), plot_method_comp)
-  panels <- panels[!sapply(panels, is.null)]
-  fig11  <- wrap_plots(panels, ncol = 2) +
-    plot_annotation(
-      title    = "SAF Curves: Conditional vs Kendall Method",
-      subtitle = "Return periods: 10, 25, 50, 100 years  |  Full record 1950–2025",
-      theme    = pub_theme())
-  save_pub(fig11, "Fig11_SAF_method_comparison_4panel", width = 12, height = 9)
-  cat("  Fig11 saved.\n")
-}
-
-# Fig 12: Per-class SAF curves for SPI-1 and SPI-3 ----------------------------
-{
-  make_class_saf <- function(nm, method = "Conditional") {
-    res   <- INDEX_RESULTS[[nm]]$res
-    cls_saf <- if (method == "Conditional") res$saf_cond_by_class else res$saf_kend_by_class
-    if (is.null(cls_saf) || length(cls_saf) == 0) return(NULL)
-    
-    all_cls <- dplyr::bind_rows(lapply(names(cls_saf), function(cl) {
-      df <- cls_saf[[cl]]
-      if (!is.null(df)) df[is.finite(df$Severity), ] else NULL
-    }))
-    if (nrow(all_cls) == 0) return(NULL)
-    
-    ggplot(all_cls, aes(x = Area_pct, y = Severity,
-                        colour = factor(ReturnPeriod_years),
-                        linetype = DurationClass)) +
-      geom_line(linewidth = 1.0) +
-      scale_colour_manual(values = RP_COLOURS, name = "RP (yr)") +
-      scale_linetype_discrete(name = "Duration Class") +
-      labs(title = nm,
-           x = "Drought-Affected Area (%)", y = "Drought Severity") +
-      pub_theme(base_size = 11)
-  }
-  
-  p12a <- make_class_saf("SPI1")
-  p12b <- make_class_saf("SPI3")
-  if (!is.null(p12a) && !is.null(p12b)) {
-    fig12 <- p12a / p12b +
-      plot_annotation(title = "SAF Curves by Duration Class: SPI-1 and SPI-3",
-                      theme = pub_theme())
-    save_pub(fig12, "Fig12_SAF_by_duration_class", width = 10, height = 10)
-    cat("  Fig12 saved.\n")
-  } else {
-    cat("  Fig12 skipped (per-class SAF unavailable).\n")
-  }
-}
-
-# ============================================================================
-# SECTION 5: NON-STATIONARITY
-# ============================================================================
-cat("--- Section 5: Non-stationarity ---\n")
-
-# Fig 13: NS SAF — reference vs recent, conditional, all 4 indices -----------
-{
-  plot_ns_comp <- function(nm) {
-    enh  <- enh_results[[nm]]
-    if (is.null(enh$saf_ns_ref) || is.null(enh$saf_ns_rec)) return(NULL)
-    
-    ns_ref <- enh$saf_ns_ref; ns_rec <- enh$saf_ns_rec
-    ns_ref$Epoch <- "Reference"; ns_rec$Epoch <- "Recent"
-    comb <- rbind(ns_ref[is.finite(ns_ref$Severity), ],
-                  ns_rec[is.finite(ns_rec$Severity), ])
-    if (nrow(comb) == 0) return(NULL)
-    
-    ggplot(comb, aes(x = Area_pct, y = Severity,
-                     colour = factor(ReturnPeriod_years),
-                     linetype = Epoch)) +
-      geom_line(linewidth = 1.0) +
-      scale_colour_manual(values = RP_COLOURS, name = "RP (yr)") +
-      scale_linetype_manual(values = c(Reference="solid", Recent="dashed"),
-                            name = "Epoch") +
-      labs(title = nm,
-           x = "Area (%)", y = "Severity") +
-      pub_theme(base_size = 11)
-  }
-  
-  panels <- lapply(names(INDEX_RESULTS), plot_ns_comp)
-  panels <- panels[!sapply(panels, is.null)]
-  if (length(panels) > 0) {
-    fig13 <- wrap_plots(panels, ncol = 2) +
-      plot_annotation(
-        title    = "Non-Stationary SAF Curves: Reference vs Recent Epoch",
-        subtitle = "Conditional method  |  Period-specific marginals (GAMLSS)",
-        theme    = pub_theme())
-    save_pub(fig13, "Fig13_NS_epoch_comparison_4panel", width = 12, height = 9)
-    cat("  Fig13 saved.\n")
-  } else cat("  Fig13 skipped.\n")
-}
-
-# Fig 14: GAMLSS model selection table rendered as a figure ------------------
-{
-  # FIX-1F: ns$cp_year does not exist in fit_nonstationary_marginals() return
-  #         value.  The change-point year is encoded in ns$epoch_src as a
-  #         string (e.g. "change-point (1987)").  Parse it with the same regex
-  #         used by .resolve_epoch() in ext2.R, consistent with how ext2
-  #         itself reads the epoch boundary.
-  extract_cp_year_from_ns <- function(ns) {
-    if (is.null(ns) || !grepl("change-point", ns$epoch_src, fixed = TRUE))
-      return(NA_integer_)
-    m <- regmatches(ns$epoch_src, regexpr("[0-9]{4}", ns$epoch_src))
-    if (length(m) == 1L) as.integer(m) else NA_integer_
-  }
-  
-  ns_aic_df <- dplyr::bind_rows(lapply(names(INDEX_RESULTS), function(nm) {
-    ns <- enh_results[[nm]]$ns_marginals
-    if (is.null(ns)) return(NULL)
-    data.frame(
-      Index      = nm,
-      CP_year    = extract_cp_year_from_ns(ns),  # FIX-1F
-      AIC_M0     = round(ns$aic_m0, 2),
-      AIC_M1     = round(ns$aic_m1, 2),
-      AIC_M2     = round(ns$aic_m2, 2),
-      Best_model = ns$best_model,
-      mu_ref     = round(ns$mu_ref, 4),
-      mu_rec     = round(ns$mu_rec, 4),
-      sigma_ref  = round(ns$sigma_ref, 4),
-      sigma_rec  = round(ns$sigma_rec, 4)
-    )
-  }))
-  
-  if (nrow(ns_aic_df) > 0) {
-    tbl <- gridExtra::tableGrob(ns_aic_df, rows = NULL,
-                                theme = gridExtra::ttheme_minimal(base_size = 11))
-    fig14 <- gridExtra::grid.arrange(tbl,
-                                     top    = grid::textGrob("GAMLSS Non-Stationary Marginal: Model Selection Summary",
-                                                             gp = grid::gpar(fontface = "bold", fontsize = 12)),
-                                     bottom = grid::textGrob("M0=Stationary  |  M1=μ-trend  |  M2=μ+σ-trend",
-                                                             gp = grid::gpar(fontsize = 9, col = "grey40")),
-                                     heights = grid::unit.c(grid::unit(1, "line"),
-                                                            grid::unit(1, "null"),
-                                                            grid::unit(1, "line")))
-    save_pub(fig14, "Fig14_GAMLSS_model_selection_table", width = 12, height = 3.5)
-    cat("  Fig14 saved.\n")
-  } else cat("  Fig14 skipped.\n")
-}
-
-# Fig 15: Severity distribution by epoch — split violin / boxplot -----------
-{
-  epoch_sev_df <- dplyr::bind_rows(lapply(names(INDEX_RESULTS), function(nm) {
-    ns  <- enh_results[[nm]]$ns_marginals
-    res <- INDEX_RESULTS[[nm]]$res
-    if (is.null(ns)) return(NULL)
-    dc  <- res$dc[res$dc$severity > 0, ]
-    dc$Epoch <- dplyr::if_else(dc$year %in% ns$ref_years, "Reference", "Recent")
-    dc$Index <- nm
-    dc
-  }))
-  
-  if (nrow(epoch_sev_df) > 0) {
-    fig15 <- ggplot(epoch_sev_df, aes(x = Epoch, y = severity, fill = Epoch)) +
-      geom_violin(trim = TRUE, alpha = 0.6, colour = NA) +
-      geom_boxplot(width = 0.15, outlier.size = 1, colour = "grey30", fill = "white") +
-      facet_wrap(~Index, ncol = 2, scales = "free_y") +
-      scale_fill_manual(values = c(Reference = "#4575b4", Recent = "#d73027")) +
-      labs(x = NULL, y = "Drought Severity",
-           title = "Drought Severity by Epoch",
-           subtitle = "Reference (pre-CP) vs Recent (post-CP) periods") +
-      pub_theme() + theme(legend.position = "none")
-    
-    save_pub(fig15, "Fig15_severity_trend_by_epoch", width = 10, height = 8)
-    cat("  Fig15 saved.\n")
-  } else cat("  Fig15 skipped.\n")
-}
-
-# ============================================================================
-# SECTION 6: COPULA DIAGNOSTICS & CHANGE-POINT
-# ============================================================================
-cat("--- Section 6: Copula diagnostics ---\n")
-
-# Fig 16: Change-point detection summary -------------------------------------
-{
-  cp_df <- dplyr::bind_rows(lapply(names(INDEX_RESULTS), function(nm) {
-    tv <- enh_results[[nm]]$tv_copula
-    if (is.null(tv) || is.null(tv$cp_result)) return(NULL)
-    cp <- tv$cp_result
-    
-    # FIX-1B: detect_copula_changepoints() returns field names
-    #   pettitt_cp, cusum_cp, prutf_cp, cp_year (consensus)
-    # Previous code used pettitt_yr / cusum_yr / prutf_yr / consensus_yr,
-    # none of which exist, producing all-NA data frames and a blank figure.
-    data.frame(
-      Index    = nm,
-      Method   = c("Pettitt", "CUSUM", "PRUTF", "Consensus"),
-      CP_year  = c(cp$pettitt_cp, cp$cusum_cp, cp$prutf_cp, cp$cp_year),
-      p_value  = c(cp$pettitt_p,  cp$cusum_p,  cp$prutf_p,  NA),
-      Detected = c(isTRUE(cp$pettitt_p < 0.05),
-                   isTRUE(cp$cusum_p   < 0.05),
-                   isTRUE(cp$prutf_p   < 0.05),
-                   isTRUE(cp$detected))
-    )
-  }))
-  
-  if (nrow(cp_df) > 0) {
-    fig16 <- ggplot(cp_df[cp_df$Method != "Consensus", ],
-                    aes(x = Index, y = CP_year, colour = Method, shape = Detected)) +
-      geom_jitter(size = 4, width = 0.12, height = 0) +
-      geom_hline(data = cp_df[cp_df$Method == "Consensus", ],
-                 aes(yintercept = CP_year, colour = Index), linetype = "dashed",
-                 linewidth = 0.9, show.legend = FALSE) +
-      scale_shape_manual(values = c("TRUE" = 16, "FALSE" = 1),
-                         name = "Significant\n(p < 0.05)") +
-      scale_colour_viridis_d(name = "Method/Index") +
-      labs(x = "Index", y = "Change-Point Year",
-           title = "Detected Change Points in Copula Dependence",
-           subtitle = "Pettitt / CUSUM / PRUTF  |  Dashed line = consensus year") +
-      pub_theme()
-    
-    save_pub(fig16, "Fig16_changepoint_summary", width = 9, height = 6)
-    cat("  Fig16 saved.\n")
-  } else cat("  Fig16 skipped.\n")
-}
-
-# Fig 17: Rosenblatt PIT diagnostic — 4-panel (save JPEG like the attached) --
-{
-  plot_rosenblatt <- function(nm) {
-    res   <- INDEX_RESULTS[[nm]]$res
-    if (is.null(res$copulas)) return(NULL)
-    uS    <- res$copulas$u_severity
-    uA    <- res$copulas$u_area
-    cop   <- res$copulas$best_copula_fit@copula
-    best  <- res$copulas$best_copula_name
-    
-    e1 <- uS
-    
-    h  <- 1e-5
-    e2 <- vapply(seq_along(uS), function(i) {
-      u1_lo <- max(uS[i] - h, 1e-7)
-      u1_hi <- min(uS[i] + h, 1 - 1e-7)
-      denom <- u1_hi - u1_lo
-      if (denom <= 0) return(NA_real_)
-      (copula::pCopula(c(u1_hi, uA[i]), cop) -
-          copula::pCopula(c(u1_lo, uA[i]), cop)) / denom
-    }, numeric(1))
-    e2 <- pmax(pmin(e2, 1), 0)
-    e2[!is.finite(e2)] <- NA_real_
-    valid <- is.finite(e1) & is.finite(e2)
-    e1v <- e1[valid]; e2v <- e2[valid]
-    
-    df_e2 <- data.frame(e2 = e2v)
-    p_hist <- ggplot(df_e2, aes(x = e2)) +
-      geom_histogram(aes(y = after_stat(density)), bins = 15,
-                     fill = "#6baed6", colour = "white") +
-      geom_hline(yintercept = 1, colour = "red", linewidth = 1) +
-      labs(title = "e2 Histogram vs Uniform[0,1]",
-           x = "e2 value", y = "Density") +
-      pub_theme(base_size = 11)
-    
-    n   <- length(e2v)
-    theoretical <- (seq_len(n) - 0.5) / n
-    empirical   <- sort(e2v)
-    df_qq <- data.frame(t = theoretical, s = empirical)
-    p_qq  <- ggplot(df_qq, aes(x = t, y = s)) +
-      geom_point(size = 0.9, alpha = 0.7) +
-      geom_abline(slope = 1, intercept = 0, colour = "red", linewidth = 0.9) +
-      labs(title = "e2 QQ-Plot",
-           x = "Theoretical Quantiles", y = "Sample Quantiles") +
-      pub_theme(base_size = 11)
-    
-    df_sc <- data.frame(e1 = e1v, e2 = e2v)
-    p_sc  <- ggplot(df_sc, aes(x = e1, y = e2)) +
-      geom_point(size = 1.2, alpha = 0.45, colour = "grey30") +
-      geom_smooth(method = "lm", formula = y ~ x, se = FALSE,
-                  colour = "red", linetype = "dashed", linewidth = 0.8) +
-      labs(title = "e1 vs e2 (independence check)",
-           x = "e1", y = "e2") +
-      pub_theme(base_size = 11)
-    
-    (p_hist | p_qq) / (p_sc | plot_spacer()) +
-      plot_annotation(
-        title    = nm,
-        subtitle = sprintf("Rosenblatt PIT  |  Copula: %s  |  n=%d valid", best, sum(valid)),
-        theme    = pub_theme(base_size = 12)
-      )
-  }
-  
-  panels_rob <- lapply(names(INDEX_RESULTS), function(nm) {
-    tryCatch(plot_rosenblatt(nm), error = function(e) NULL)
-  })
-  names(panels_rob) <- names(INDEX_RESULTS)
-  
-  for (nm in names(panels_rob)) {
-    if (!is.null(panels_rob[[nm]])) {
-      out_dir_idx <- INDEX_RESULTS[[nm]]$dir
-      jpeg(file.path(out_dir_idx, sprintf("%s_rosenblatt_diagnostic.jpeg", nm)),
-           width = 9, height = 7, units = "in", res = 300)
-      print(panels_rob[[nm]])
-      dev.off()
-      save_pub(panels_rob[[nm]], sprintf("Fig17_%s_rosenblatt", nm),
-               width = 9, height = 7)
-    }
-  }
-  
-  valid_panels <- panels_rob[!sapply(panels_rob, is.null)]
-  if (length(valid_panels) == 4) {
-    fig17_comb <- (valid_panels[[1]] | valid_panels[[2]]) /
-      (valid_panels[[3]] | valid_panels[[4]]) +
-      plot_annotation(title = "Rosenblatt PIT Diagnostic — All Indices",
-                      theme = pub_theme())
-    save_pub(fig17_comb, "Fig17_rosenblatt_4panel_combined", width = 18, height = 14)
-  }
-  cat("  Fig17 saved (individual + combined).\n")
-}
-
-# Fig 18: Rolling Kendall τ, 4-panel ------------------------------------------
-{
-  compute_rolling_tau <- function(dc, window = 10) {
-    dc2 <- dc[dc$severity > 0 & dc$area_pct > 0, ]
-    dc2 <- dc2[order(dc2$year), ]
-    n   <- nrow(dc2)
-    if (n < window) return(NULL)
-    out_yr  <- numeric(n - window + 1)
-    out_tau <- numeric(n - window + 1)
-    for (i in seq_len(n - window + 1)) {
-      idx <- i:(i + window - 1)
-      s_w <- dc2$severity[idx]; a_w <- dc2$area_pct[idx]
-      if (sd(s_w) == 0 || sd(a_w) == 0) {
-        out_tau[i] <- NA_real_
-      } else {
-        out_tau[i] <- cor(s_w, a_w, method = "kendall")
+    sev <- numeric(length(area_prop))
+    for (i in seq_along(area_prop)) {
+      v   <- pbeta(area_prop[i], shape1 = beta_par[1], shape2 = beta_par[2])
+      obj <- function(s) {
+        u <- compute_u_severity(s, marginal_fits)
+        (copula::cCopula(cbind(u, v), copula = cop_obj, indices = 2) - target)^2
       }
-      out_yr[i] <- mean(dc2$year[idx])
+      res    <- tryCatch(optimize(obj, interval = c(1e-6, 50)),
+                         error = function(e) list(minimum = NA_real_))
+      sev[i] <- res$minimum
     }
-    data.frame(year = out_yr, tau = out_tau)
+    out <- rbind(out, data.frame(ReturnPeriod_years  = T,
+                                 ReturnPeriod_months = T * 12,
+                                 Area_pct            = area_pct,
+                                 Severity            = sev,
+                                 Method              = "Conditional",
+                                 Index               = index_name,
+                                 DurationClass       = duration_class))
   }
+  write.csv(out,
+            file.path(out_dir, sprintf("%s_SAF_conditional_%s.csv", index_name,
+                                       gsub("[^A-Za-z0-9]", "_", duration_class))),
+            row.names = FALSE)
+  out
+}
+
+# Method B: Kendall distribution  K_C(t_K) = 1 - mu_T / (T*12)
+# FIX: uses empirical K_C(t) = P(C(U,V) <= t) estimated from the fitted
+#      pseudo-observations, replacing the incorrect t-(1-C(t,t))/t formula.
+derive_SAF_curves_kendall <- function(drought_data, marginal_fits, copula_fit,
+                                      index_name, out_dir, duration_class = "all",
+                                      record_n_months = NULL) {
+  if (is.null(marginal_fits) || is.null(copula_fit)) return(NULL)
   
-  rt_plots <- lapply(names(INDEX_RESULTS), function(nm) {
-    res <- INDEX_RESULTS[[nm]]$res
-    rt  <- tryCatch(compute_rolling_tau(res$dc), error = function(e) NULL)
-    if (is.null(rt)) return(NULL)
-    
-    # FIX-1D: detect_copula_changepoints() returns cp_result$cp_year
-    #         (the consensus year), not cp_result$consensus_yr.
-    cp_yr <- tryCatch(
-      enh_results[[nm]]$tv_copula$cp_result$cp_year,
-      error = function(e) NA)
-    
-    p <- ggplot(rt, aes(x = year, y = tau)) +
-      geom_line(colour = INDEX_COLOURS[nm], linewidth = 0.9) +
-      geom_smooth(method = "loess", formula = y ~ x, se = TRUE,
-                  colour = "grey30", linetype = "dashed", linewidth = 0.7, alpha = 0.2) +
-      geom_hline(yintercept = 0, linetype = "dotted", colour = "grey50") +
-      { if (!is.na(cp_yr)) geom_vline(xintercept = cp_yr, colour = "red",
-                                      linetype = "dashed", linewidth = 0.8) else NULL } +
-      labs(title = nm, x = "Year", y = "Rolling Kendall τ (10-yr window)") +
-      pub_theme(base_size = 11)
-    p
-  })
-  rt_plots <- rt_plots[!sapply(rt_plots, is.null)]
-  if (length(rt_plots) > 0) {
-    fig18 <- wrap_plots(rt_plots, ncol = 2) +
-      plot_annotation(
-        title    = "Rolling Kendall τ: Severity–Area Dependence Over Time",
-        subtitle = "10-year moving window  |  Red dashed = consensus change-point year",
-        theme    = pub_theme())
-    save_pub(fig18, "Fig18_rolling_tau_4panel", width = 12, height = 8)
-    cat("  Fig18 saved.\n")
-  }
-}
-
-# ============================================================================
-# SECTION 7: EXCEL SUMMARY TABLES
-# ============================================================================
-cat("--- Section 7: Excel tables ---\n")
-
-# Table 1: Return periods consolidated ---------------------------------------
-{
-  rp_all <- dplyr::bind_rows(lapply(names(INDEX_RESULTS), function(nm) {
-    rp <- INDEX_RESULTS[[nm]]$res$rp
-    rp$Index <- nm
-    rp
-  }))
-  wb1 <- createWorkbook()
-  addWorksheet(wb1, "Return_Periods")
-  writeData(wb1, "Return_Periods", rp_all)
-  headerStyle <- createStyle(fontColour = "#FFFFFF", fgFill = "#2c5f8a",
-                             halign = "CENTER", fontName = "Calibri",
-                             border = "Bottom", bold = TRUE)
-  addStyle(wb1, 1, headerStyle, rows = 1, cols = seq_len(ncol(rp_all)), gridExpand = TRUE)
-  setColWidths(wb1, 1, cols = seq_len(ncol(rp_all)), widths = "auto")
-  saveWorkbook(wb1, file.path(PUB_DIR, "Table01_return_periods_all_indices.xlsx"), overwrite = TRUE)
-  cat("  Table01 saved.\n")
-}
-
-# Table 2: Copula fit summary ------------------------------------------------
-{
-  cop_all <- dplyr::bind_rows(lapply(names(INDEX_RESULTS), function(nm) {
-    res <- INDEX_RESULTS[[nm]]$res
-    if (is.null(res$copulas$all_results)) return(NULL)
-    df <- res$copulas$all_results
-    df$Index <- nm
-    df$Best  <- df$Copula == res$copulas$best_copula_name
-    df
-  }))
-  if (nrow(cop_all) > 0) {
-    wb2 <- createWorkbook()
-    addWorksheet(wb2, "Copula_Comparison")
-    writeData(wb2, "Copula_Comparison", cop_all)
-    best_rows <- which(cop_all$Best) + 1L
-    if (length(best_rows) > 0) {
-      bestStyle <- createStyle(fgFill = "#d4edda", border = "TopBottom")
-      addStyle(wb2, 1, bestStyle, rows = best_rows,
-               cols = seq_len(ncol(cop_all)), gridExpand = TRUE)
+  log_event(sprintf("[%s | %s] SAF — Kendall Distribution (analytical K_C)...",
+                    index_name, duration_class))
+  
+  # Explicit nomenclature: record length vs class-specific drought count
+  n_record     <- if (is.null(record_n_months)) nrow(drought_data) else record_n_months
+  dc           <- drought_data[drought_data$severity > 0 & drought_data$area_pct > 0, ]
+  n_class_dr   <- nrow(dc)
+  if (n_class_dr == 0) return(NULL)
+  mu_T         <- n_record / n_class_dr  # Conditional mean inter-arrival (months)
+  
+  cop_obj  <- copula_fit$best_copula_fit@copula
+  cop_name <- copula_fit$best_copula_name
+  beta_par <- marginal_fits$area_fit$estimate
+  uS       <- copula_fit$u_severity
+  uA       <- copula_fit$u_area
+  
+  # USE ANALYTICAL K_C FOR ARCHIMEDEAN COPULAS
+  use_analytical <- cop_name %in% c("Frank", "Gumbel", "Joe", "SurvClayton")
+  
+  if (use_analytical) {
+    # Analytical K_C(t) = t - φ(t)/φ'(t) for Archimedean families
+    analytical_K_C <- function(t, cop_obj, fam) {
+      t <- pmax(1e-10, pmin(t, 1 - 1e-10))
+      theta <- cop_obj@parameters[1]
+      
+      if (fam == "Frank") {
+        phi  <- -log((exp(-theta * t) - 1) / (exp(-theta) - 1))
+        phi_prime <- theta * exp(-theta * t) / (1 - exp(-theta * t))
+      } else if (fam == "Gumbel") {
+        log_t <- log(t)
+        phi  <- (-log_t)^theta
+        phi_prime <- -theta * (-log_t)^(theta - 1) / t
+      } else if (fam == "Joe") {
+        one_m_t <- 1 - t
+        phi  <- -log(1 - one_m_t^theta)
+        phi_prime <- theta * one_m_t^(theta - 1) / (1 - one_m_t^theta)
+      } else { # SurvClayton
+        phi  <- (t^(-theta) - 1) / theta
+        phi_prime <- -t^(-theta - 1)
+      }
+      pmax(1e-10, pmin(1 - 1e-10, t - phi / phi_prime))
     }
-    setColWidths(wb2, 1, cols = seq_len(ncol(cop_all)), widths = "auto")
-    saveWorkbook(wb2, file.path(PUB_DIR, "Table02_copula_fit_summary.xlsx"), overwrite = TRUE)
-    cat("  Table02 saved.\n")
-  }
-}
-
-# Table 3: Non-stationary marginal summary -----------------------------------
-{
-  # FIX-1F: ns$cp_year does not exist; parse from ns$epoch_src (same helper as Fig 14).
-  # FIX-1C: tv$lr_sig does not exist; the significance flag is tv$significant.
-  extract_cp_year_from_ns <- function(ns) {
-    if (is.null(ns) || !grepl("change-point", ns$epoch_src, fixed = TRUE))
-      return(NA_integer_)
-    m <- regmatches(ns$epoch_src, regexpr("[0-9]{4}", ns$epoch_src))
-    if (length(m) == 1L) as.integer(m) else NA_integer_
+    kc_fn <- function(t) analytical_K_C(t, cop_obj, cop_name)
+    opt_int <- c(1e-8, 1 - 1e-8)
+    log_event(sprintf("  [%s] Using analytical K_C for %s (valid extrapolation)", index_name, cop_name))
+  } else {
+    cop_vals <- copula::pCopula(cbind(uS, uA), cop_obj)
+    kc_fn <- function(t) mean(cop_vals <= t)
+    opt_int <- c(1e-4, 1 - 1e-4)
+    log_event(sprintf("  [%s] Using empirical K_C for %s", index_name, cop_name))
   }
   
-  ns_all <- dplyr::bind_rows(lapply(names(INDEX_RESULTS), function(nm) {
-    ns  <- enh_results[[nm]]$ns_marginals
-    tv  <- enh_results[[nm]]$tv_copula
-    gof <- enh_results[[nm]]$gof
-    if (is.null(ns)) return(NULL)
-    data.frame(
-      Index         = nm,
-      CP_year       = extract_cp_year_from_ns(ns),              # FIX-1F
-      Ref_period    = sprintf("%d\u2013%d", min(ns$ref_years),    max(ns$ref_years)),
-      Recent_period = sprintf("%d\u2013%d", min(ns$recent_years), max(ns$recent_years)),
-      GAMLSS_best   = ns$best_model,
-      AIC_M0        = round(ns$aic_m0, 2),
-      AIC_M1        = round(ns$aic_m1, 2),
-      AIC_M2        = round(ns$aic_m2, 2),
-      mu_ref        = round(ns$mu_ref, 4),
-      mu_rec        = round(ns$mu_rec, 4),
-      sigma_ref     = round(ns$sigma_ref, 4),
-      sigma_rec     = round(ns$sigma_rec, 4),
-      TV_copula_sig = ifelse(!is.null(tv), isTRUE(tv$significant), NA),  # FIX-1C
-      Copula_GOF_p  = ifelse(!is.null(gof), round(gof$p_value, 4), NA),
-      Copula_GOF    = ifelse(!is.null(gof), gof$decision, NA)
-    )
-  }))
+  T_years  <- c(10, 25, 50, 100)
+  area_pct <- seq(5, 95, by = 5); area_prop <- area_pct / 100
   
-  if (nrow(ns_all) > 0) {
-    wb3 <- createWorkbook()
-    addWorksheet(wb3, "NS_Summary")
-    writeData(wb3, "NS_Summary", ns_all)
-    setColWidths(wb3, 1, cols = seq_len(ncol(ns_all)), widths = "auto")
-    saveWorkbook(wb3, file.path(PUB_DIR, "Table03_nonstationary_summary.xlsx"), overwrite = TRUE)
-    cat("  Table03 saved.\n")
+  out <- data.frame()
+  T_years  <- c(10, 25, 50, 100)
+  area_pct <- seq(5, 95, by = 5); area_prop <- area_pct / 100
+  out <- data.frame()
+  
+  for (T in T_years) {
+    # Pass mu_T_adj_months, renewal_shape_k, renewal_rate_k, and iat_cv from rp table
+    # or compute them inline from the drought data if passed as arguments.
+    # Example inline usage (adapt variable names to your scope):
+    target_kc <- .compute_renewal_saf_target(
+      T_years      = T,
+      mu_T_months  = mu_T_adj,    # Replace with iat_mean * 12
+      shape_k      = shape_k_val, # Replace with 1 / (iat_cv^2)
+      rate_k       = rate_k_val,  # Replace with shape_k / iat_mean
+      cv_val       = iat_cv_val   ) # Replace with computed iat_cv
+    if (target_kc <= 0 || target_kc >= 1) next
+    
+    # Solve K_C(t_val) = target_kc
+    kc_obj <- function(t) (kc_fn(t) - target_kc)^2
+    
+    # WIDER search interval for analytical K_C (enables extrapolation)
+    if (use_analytical) {
+      t_sol <- tryCatch(optimize(kc_obj, interval = c(1e-8, 1 - 1e-8)),
+                        error = function(e) list(minimum = 0.5))
+    } else {
+      t_sol <- tryCatch(optimize(kc_obj, interval = c(1e-4, 1 - 1e-4)),
+                        error = function(e) list(minimum = 0.5))
+    }
+    
+    t_val <- t_sol$minimum
+    
+    sev <- numeric(length(area_prop))
+    for (i in seq_along(area_prop)) {
+      v   <- pbeta(area_prop[i], shape1 = beta_par[1], shape2 = beta_par[2])
+      obj <- function(s) {
+        u   <- compute_u_severity(s, marginal_fits)
+        val <- tryCatch(copula::pCopula(cbind(u, v), cop_obj), error = function(e) NA_real_)
+        if (!is.finite(val)) return(1e6)   # guard: pCopula can return NA/NaN for some copulas
+        (val - t_val)^2
+      }
+      res    <- tryCatch(optimize(obj, interval = c(1e-6, 50)),
+                         error = function(e) list(minimum = NA_real_))
+      sev[i] <- res$minimum
+    }
+    out <- rbind(out, data.frame(ReturnPeriod_years  = T,
+                                 ReturnPeriod_months = T * 12,
+                                 Area_pct            = area_pct,
+                                 Severity            = sev,
+                                 Method              = "Kendall",
+                                 Index               = index_name,
+                                 DurationClass       = duration_class))
   }
+  write.csv(out,
+            file.path(out_dir, sprintf("%s_SAF_kendall_%s.csv", index_name,
+                                       gsub("[^A-Za-z0-9]", "_", duration_class))),
+            row.names = FALSE)
+  out
 }
 
-# ============================================================================
-# FINAL SUMMARY
-# ============================================================================
-all_files <- list.files(PUB_DIR, recursive = FALSE)
-cat("\n============================================================\n")
-cat(sprintf("All publication outputs written to: %s\n", PUB_DIR))
-cat(sprintf("Total files: %d\n", length(all_files)))
-cat("------------------------------------------------------------\n")
-pdf_files  <- all_files[grepl("\\.pdf$",  all_files)]
-jpeg_files <- all_files[grepl("\\.jpeg$", all_files)]
-xlsx_files <- all_files[grepl("\\.xlsx$", all_files)]
-cat(sprintf("  PDFs : %d\n  JPEGs: %d\n  XLSX : %d\n",
-            length(pdf_files), length(jpeg_files), length(xlsx_files)))
-cat("============================================================\n")
-cat("\nNOTE: Individual index-level Rosenblatt JPEG files are ALSO saved\n")
-cat("      in each index analysis folder (e.g., spatial_drought/SPI1_analysis/).\n")
+create_comparative_SAF_plots <- function(saf_cond, saf_kend, index_name, out_dir) {
+  if (is.null(saf_cond) || is.null(saf_kend)) return(invisible(NULL))
+  comb <- rbind(saf_cond, saf_kend)
+  # FIX: remove NA/Inf rows before plotting to suppress ggplot "removed rows"
+  #      warning.  These arise at the tail of the SAF curve where the
+  #      conditional probability hits 0 or 1 (extrapolation boundary).
+  comb <- comb[is.finite(comb$Area_pct) & is.finite(comb$Severity), ]
+  # Derive axis limits from the finite data so the boundary is intentional
+  max_rp <- if (nrow(comb) > 0) max(comb$Area_pct, na.rm = TRUE) else 100
+  p <- ggplot(comb, aes(x = Area_pct, y = Severity,
+                        color    = factor(ReturnPeriod_years),
+                        linetype = Method, shape = Method)) +
+    geom_line(linewidth = 1.1) + geom_point(size = 2.5) +
+    scale_color_viridis_d(name = "Return Period\n(years)") +
+    scale_linetype_manual(values = c(Conditional = "solid", Kendall = "dashed"),
+                          name = "Method") +
+    scale_shape_manual(values = c(Conditional = 19, Kendall = 17), name = "Method") +
+    scale_x_continuous(limits = c(0, max_rp),
+                       oob    = scales::oob_keep) +
+    labs(x = "Percent of Area Under Drought (%)", y = "Drought Severity",
+         title = sprintf("%s: SAF Curves (Conditional vs Kendall)", index_name)) +
+    theme_bw(base_size = 14) +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+          legend.position = "right")
+  pdf(file.path(out_dir, sprintf("%s_SAF_overlay.pdf", index_name)),
+      width = 10, height = 8)
+  print(p); dev.off()
+}
 
-# ---------------------------------------------------------------------------
-# DONE
-# ---------------------------------------------------------------------------
-cat("\n", paste(rep("=", 70), collapse=""), "\n")
-cat("ALL STEPS COMPLETE\n")
-cat("Output directory: spatial_drought/\n")
-cat(paste(rep("=", 70), collapse=""), "\n\n")
+subset_drought_chars_by_class <- function(drought_chars, events_df, class_label, record_n_months) {
+  ev <- events_df[events_df$duration_class == class_label, ]
+  if (nrow(ev) == 0) return(NULL)
+  
+  in_class <- logical(nrow(drought_chars))
+  for (i in seq_len(nrow(ev)))
+    in_class <- in_class | (drought_chars$date >= ev$start_date[i] & drought_chars$date <= ev$end_date[i])
+  
+  dc_sub <- drought_chars[in_class, , drop = FALSE]
+  attr(dc_sub, "record_n_months") <- record_n_months  # Explicit metadata
+  dc_sub
+}
 
-# Quick summary of what was produced
-# FIX-5: quick_diagnostic() was redefined at the top of this script to search
-#        "spatial_drought" instead of the hardcoded "drought_analysis" path
-#        in QuickStart.R; that override is active here.
-quick_diagnostic()
+# 8. MASTER PIPELINE ---------------------------------------------------------
+run_saf_pipeline <- function(index_name, index_rast, out_dir, scale = 1) {
+  log_event(paste(rep("=", 70), collapse = ""))
+  log_event(sprintf("RUNNING SAF PIPELINE: %s", index_name))
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  # a) Drought characteristics
+  dc <- extract_drought_characteristics_spi(index_rast, cell_area_km2,
+                                            DROUGHT_THRESHOLD, index_name)
+  write.csv(dc,
+            file.path(out_dir, sprintf("%s_drought_characteristics.csv", index_name)),
+            row.names = FALSE)
+  
+  # b) Events & empirical return periods
+  events <- identify_duration_classified_events(dc, index_name, scale)
+  if (nrow(events) > 0)
+    write.csv(events,
+              file.path(out_dir, sprintf("%s_duration_classified_events.csv", index_name)),
+              row.names = FALSE)
+  rp <- compute_return_periods_by_class(events, index_name, record_len, scale)
+  write.csv(rp,
+            file.path(out_dir, sprintf("%s_return_periods_by_class.csv", index_name)),
+            row.names = FALSE)
+  
+  # c) Marginals & copula
+  m <- fit_marginal_distributions(dc, index_name, out_dir)
+  if (is.null(m)) { log_event(sprintf("[%s] Marginal fitting failed. Skipping.", index_name)); return(invisible(NULL)) }
+  cop <- fit_copulas(dc, m, index_name, out_dir)
+  if (is.null(cop)) { log_event(sprintf("[%s] Copula fitting failed. Skipping.", index_name)); return(invisible(NULL)) }
+  
+  # d) Full-record SAF curves (both methods)
+  saf_cond <- derive_SAF_curves_conditional(dc, m, cop, index_name, out_dir, "all")
+  saf_kend <- derive_SAF_curves_kendall(dc, m, cop, index_name, out_dir, "all")
+  create_comparative_SAF_plots(saf_cond, saf_kend, index_name, out_dir)
+  
+  # e) Per-class SAF (FIX: threshold raised to 15 events for reliable fitting)
+  dc_labels       <- if (scale == 1)
+    c("D1-2 (Very-short)", "D3-6 (Short-term)", "D7-12 (Medium-term)", "D13+ (Long-term)")
+  else
+    c("D3-6 (Short-term)", "D7-12 (Medium-term)", "D13+ (Long-term)")
+  saf_cond_cls <- list(); saf_kend_cls <- list()
+  
+  for (cl in dc_labels) {
+    n_ev <- sum(events$duration_class == cl, na.rm = TRUE)
+    if (n_ev < 15) {
+      log_event(sprintf("[%s | %s] Only %d events — skipping class SAF.", index_name, cl, n_ev))
+      next
+    }
+    dc_sub <- subset_drought_chars_by_class(dc, events, cl, n_months)
+    if (is.null(dc_sub)) next
+    lbl    <- paste0(index_name, "_", cl)
+    m_sub  <- fit_marginal_distributions(dc_sub, lbl, out_dir)
+    c_sub  <- if (!is.null(m_sub)) fit_copulas(dc_sub, m_sub, lbl, out_dir) else NULL
+    
+    rec_len <- attr(dc_sub, "record_n_months")
+    if (!is.null(m_sub) && !is.null(c_sub)) {
+      saf_cond_cls[[cl]] <- derive_SAF_curves_conditional(dc_sub, m_sub, c_sub, index_name, out_dir, cl, rec_len)
+      saf_kend_cls[[cl]] <- derive_SAF_curves_kendall(dc_sub, m_sub, c_sub, index_name, out_dir, cl, rec_len)
+    }
+  }
+  
+  log_event(sprintf("[%s] Pipeline complete.", index_name))
+  invisible(list(dc               = dc,
+                 events           = events,
+                 rp               = rp,
+                 marginals        = m,
+                 copulas          = cop,
+                 saf_conditional  = saf_cond,
+                 saf_kendall      = saf_kend,
+                 saf_cond_by_class= saf_cond_cls,
+                 saf_kend_by_class= saf_kend_cls))
+}
+
+# 9. EXECUTE -----------------------------------------------------------------
+res_spi1  <- run_saf_pipeline("SPI1",  spi1,  file.path(OUT_ROOT, "SPI1_analysis"),  scale = 1)
+res_spei1 <- run_saf_pipeline("SPEI1", spei1, file.path(OUT_ROOT, "SPEI1_analysis"), scale = 1)
+res_spi3  <- run_saf_pipeline("SPI3",  spi3,  file.path(OUT_ROOT, "SPI3_analysis"),  scale = 3)
+res_spei3 <- run_saf_pipeline("SPEI3", spei3, file.path(OUT_ROOT, "SPEI3_analysis"), scale = 3)
+
+log_event("=== MAIN PIPELINE COMPLETE. Check drought_analysis/ for results. ===")
