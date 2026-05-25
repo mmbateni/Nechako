@@ -206,33 +206,46 @@ compute_return_periods_by_class <- function(events_df, index_name, record_years,
     rp_ci_lo  <- if (lambda_hi > 0) 1 / lambda_hi else Inf   # hi lambda = lo RP
     rp_ci_hi  <- if (lambda_lo > 0) 1 / lambda_lo else Inf   # lo lambda = hi RP
     
-    # ---- Inter-arrival time diagnostics ------------------------------------
-    # Sort events by start date and compute gaps between successive starts.
-    # Under a Poisson process, inter-arrival times are Exp(lambda) with CV = 1.
-    # CV >> 1 suggests clustering; CV << 1 suggests regularity.
-    # Requires at least 2 events.
-    iat_mean <- NA_real_
-    iat_cv   <- NA_real_
-    poisson_flag <- "untestable (n < 2)"
+    #  ---- Inter-arrival time diagnostics (Gamma Renewal Adjustment) -------------
+    # Replaces homogeneous Poisson assumption with empirical renewal process.
+    # When iat_cv != 1.0, mu_T and the exceedance probability are adjusted
+    # using a Gamma-distributed inter-arrival model (shape k = 1/CV^2).
+    iat_mean  <- NA_real_
+    iat_cv    <- NA_real_
+    poisson_flag  <- "untestable (n < 2)"
+    mu_T_adj_months <- NA_real_  # Empirical mean waiting time (months)
+    renewal_shape_k <- NA_real_  # Gamma shape parameter
+    renewal_rate_k  <- NA_real_  # Gamma rate parameter
     
     if (n >= 2) {
-      sub_sorted <- sub[order(sub$start_date), ]
+      sub_sorted  <- sub[order(sub$start_date), ]
       # Inter-arrival in years (start-to-start)
-      iat_yrs <- as.numeric(diff(as.Date(sub_sorted$start_date))) / 365.25
-      iat_mean <- mean(iat_yrs, na.rm = TRUE)
-      iat_sd   <- sd(iat_yrs,   na.rm = TRUE)
-      iat_cv   <- if (iat_mean > 0) iat_sd / iat_mean else NA_real_
+      iat_yrs  <- as.numeric(diff(as.Date(sub_sorted$start_date))) / 365.25
+      iat_mean  <- mean(iat_yrs, na.rm = TRUE)
+      iat_sd    <- sd(iat_yrs,   na.rm = TRUE)
+      iat_cv    <- if (iat_mean > 0) iat_sd / iat_mean else NA_real_
       
-      # Flag clustering: CV > 1.5 or < 0.5 departs markedly from Poisson (CV=1)
-      poisson_flag <- if (is.na(iat_cv))          "untestable" else
-        if (iat_cv > 1.5)            "CLUSTERED (CV>1.5; Poisson RP may be optimistic)" else
-          if (iat_cv < 0.5)            "REGULAR (CV<0.5; Poisson RP may be conservative)" else
+      # GAMMA RENEWAL PARAMETERS
+      # k < 1  => Clustering (over-dispersed, heavy-tailed gaps)
+      # k > 1  => Regularity (under-dispersed, uniform gaps)
+      # k = 1  => Exponential (Poisson)
+      if (!is.na(iat_cv) && iat_cv > 0) {
+        renewal_shape_k <- 1 / (iat_cv^2)
+        renewal_rate_k  <- renewal_shape_k / iat_mean
+        # Empirical mu_T (months) replaces theoretical n_record / n_dr
+        mu_T_adj_months <- iat_mean * 12
+      } else {
+        # Fallback to theoretical Poisson if CV is degenerate
+        mu_T_adj_months <- (record_years / n) * 12
+        renewal_shape_k <- 1
+        renewal_rate_k  <- 1 / iat_mean
+      }
+      
+      # Flag clustering/regularity with process type label
+      poisson_flag  <- if (is.na(iat_cv))           "untestable" else
+        if (iat_cv > 1.5)             "CLUSTERED (Gamma k<1; use renewal-adjusted SAF target)" else
+          if (iat_cv < 0.5)             "REGULAR (Gamma k>1; use renewal-adjusted SAF target)" else
             "approx Poisson (0.5 <= CV <= 1.5)"
-      
-      if (iat_cv > 1.5 || iat_cv < 0.5)
-        log_event(sprintf(
-          "  [%s | %s] Inter-arrival CV=%.2f — %s. RP=%.1f yr (95%% CI: %.1f-%.1f yr).",
-          index_name, cl, iat_cv, poisson_flag, rp_hat, rp_ci_lo, rp_ci_hi))
     }
     
     data.frame(
@@ -240,13 +253,16 @@ compute_return_periods_by_class <- function(events_df, index_name, record_years,
       duration_class       = cl,
       n_events             = n,
       record_years         = record_years,
-      freq_per_year        = lambda_hat,
-      return_period_years  = rp_hat,
-      rp_ci_lo_years       = round(rp_ci_lo, 1),   # 95% Poisson exact lower bound
-      rp_ci_hi_years       = round(rp_ci_hi, 1),   # 95% Poisson exact upper bound
-      iat_mean_years       = round(iat_mean, 2),    # mean inter-arrival time
-      iat_cv               = round(iat_cv,   2),    # CV: 1.0 = ideal Poisson
-      poisson_assumption   = poisson_flag,           # human-readable flag
+      freq_per_year        = ifelse(n>0, n/record_years, 0),
+      return_period_years  = ifelse(n>0, record_years/n, Inf),
+      rp_ci_lo_years       = round(ifelse(n>0, 1/qchisq(0.975, df=2*(n+1))/(2*record_years), Inf), 1),
+      rp_ci_hi_years       = round(ifelse(n>0, 1/qchisq(0.025, df=2*n)/(2*record_years), Inf), 1),
+      iat_mean_years       = round(iat_mean, 2),
+      iat_cv               = round(iat_cv, 2),
+      poisson_assumption   = poisson_flag,
+      mu_T_adj_months      = round(mu_T_adj_months, 2),      # NEW: empirical waiting time
+      renewal_shape_k      = round(renewal_shape_k, 4),      # NEW: Gamma shape
+      renewal_rate_k       = round(renewal_rate_k, 4),       # NEW: Gamma rate
       mean_duration_months = mean(sub$duration_months, na.rm = TRUE),
       mean_severity        = mean(sub$mean_severity,   na.rm = TRUE),
       max_severity         = max(sub$max_severity,     na.rm = TRUE),
@@ -256,7 +272,27 @@ compute_return_periods_by_class <- function(events_df, index_name, record_years,
   })
   do.call(rbind, out)
 }
-
+# ============================================================================
+# HELPER: Clustering-Adjusted SAF Target Probability
+# Computes 1 - p_eff/12 using Gamma renewal survival function when iat_cv != 1
+# Falls back to standard Poisson target when process is ~Poisson or parameters missing
+# ============================================================================
+.compute_renewal_saf_target <- function(T_years, mu_T_months, shape_k, rate_k, cv_val) {
+  # Guard: use standard Poisson if CV is near 1 or parameters are invalid
+  if (is.na(cv_val) || is.na(shape_k) || shape_k <= 0 || rate_k <= 0 || 
+      (cv_val >= 0.5 && cv_val <= 1.5)) {
+    return(1 - mu_T_months / (T_years * 12))
+  }
+  
+  # Gamma renewal survival: P(no event within T years) = 1 - F_Gamma(T; k, rate)
+  # Effective annual exceedance probability adjusted for clustering variance
+  p_no_event_T_years <- 1 - pgamma(T_years, shape = shape_k, rate = rate_k)
+  p_annual_exceed    <- (1 - p_no_event_T_years) / T_years
+  
+  # Convert to monthly target for SAF inversion
+  target_adj <- 1 - (p_annual_exceed / 12)
+  return(pmax(1e-9, pmin(1 - 1e-9, target_adj)))
+}
 # 5. MARGINAL & COPULA FITTING -----------------------------------------------
 fit_marginal_distributions <- function(drought_data, index_name, out_dir) {
   dc <- drought_data[drought_data$severity > 0 & drought_data$area_pct > 0, ]
@@ -468,7 +504,16 @@ derive_SAF_curves_conditional <- function(drought_data, marginal_fits, copula_fi
   out <- data.frame()
   
   for (T in T_years) {
-    target <- 1 - mu_T / (T * 12)
+    # Pass mu_T_adj_months, renewal_shape_k, renewal_rate_k, and iat_cv from rp table
+    # or compute them inline from the drought data if passed as arguments.
+    # Example inline usage (adapt variable names to your scope):
+    target <- .compute_renewal_saf_target(
+      T_years      = T,
+      mu_T_months  = mu_T_adj,    # Replace with iat_mean * 12
+      shape_k      = shape_k_val, # Replace with 1 / (iat_cv^2)
+      rate_k       = rate_k_val,  # Replace with shape_k / iat_mean
+      cv_val       = iat_cv_val   # Replace with computed iat_cv
+    )
     if (target <= 0 || target >= 1) next
     if (copula_fit$extreme_warning && T >= 50) {
       log_event(sprintf("  [%s] T=%d: Skipping Kendall (zero-tail copula). Use Conditional method.", index_name, T))
@@ -569,8 +614,16 @@ derive_SAF_curves_kendall <- function(drought_data, marginal_fits, copula_fit,
   out <- data.frame()
   
   for (T in T_years) {
-    target_kc <- 1 - mu_T / (T * 12)
-    if (target_kc <= 0 || target_kc >= 1) next
+    # Pass mu_T_adj_months, renewal_shape_k, renewal_rate_k, and iat_cv from rp table
+    # or compute them inline from the drought data if passed as arguments.
+    # Example inline usage (adapt variable names to your scope):
+    target_kc <- .compute_renewal_saf_target(
+      T_years      = T,
+      mu_T_months  = mu_T_adj,    # Replace with iat_mean * 12
+      shape_k      = shape_k_val, # Replace with 1 / (iat_cv^2)
+      rate_k       = rate_k_val,  # Replace with shape_k / iat_mean
+      cv_val       = iat_cv_val   # Replace with computed iat_cv
+    )    if (target_kc <= 0 || target_kc >= 1) next
     
     # Solve K_C(t_val) = target_kc
     kc_obj <- function(t) (kc_fn(t) - target_kc)^2
