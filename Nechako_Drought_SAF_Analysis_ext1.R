@@ -917,7 +917,7 @@ fit_segmented_copula <- function(drought_data, copula_fit_obj,
   
   families_match <- (seg1$best_copula_name == copula_fit_obj$best_copula_name &&
                        seg2$best_copula_name == copula_fit_obj$best_copula_name)
-  lr_valid <- families_match   # LR test is only chi-sq valid when families are nested
+  lr_valid <- families_match   
   
   # Primary criterion for preferring segmented model
   seg_preferred_aic <- delta_aic < -2   # threshold: meaningful AIC improvement
