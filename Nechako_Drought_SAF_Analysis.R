@@ -186,6 +186,9 @@ compute_return_periods_by_class <- function(events_df, index_name, record_years,
         rp_ci_lo_years = Inf, rp_ci_hi_years = Inf,
         iat_mean_years = NA_real_, iat_cv = NA_real_,
         poisson_assumption = "untestable",
+        mu_T_adj_months  = NA_real_,   # ← ADD THIS
+        renewal_shape_k  = NA_real_,   # ← ADD THIS
+        renewal_rate_k   = NA_real_,   # ← ADD THIS
         mean_duration_months = NA_real_,
         mean_severity = NA_real_, max_severity = NA_real_,
         mean_area_pct = NA_real_, max_area_pct = NA_real_,
@@ -469,7 +472,7 @@ fit_copulas <- function(drought_data, marginal_fits, index_name, out_dir) {
        u_severity=uS, u_area=uA, emp_lambda_U=emp_td$lambda_U,
        theo_lambda_U_best=theo_td$lambda_U, td_mismatch=td_mismatch,
        td_recommendation=td_recommendation, extreme_warning=td_mismatch)
-  }
+}
 
 # 6. HELPER: CDF of severity under fitted marginal ---------------------------
 compute_u_severity <- function(s_val, marginal_fits) {
@@ -496,7 +499,25 @@ derive_SAF_curves_conditional <- function(drought_data, marginal_fits, copula_fi
   dc    <- drought_data[drought_data$severity > 0 & drought_data$area_pct > 0, ]
   n_tot <- nrow(drought_data); n_dr <- nrow(dc); if (n_dr == 0) return(NULL)
   mu_T  <- n_tot / n_dr
-  
+  # Compute renewal parameters from event inter-arrival times
+  indr_all    <- drought_data$severity > 0 & drought_data$area_pct > 0
+  is_start    <- indr_all & !c(FALSE, head(indr_all, -1))
+  ev_starts   <- as.Date(drought_data$date[is_start])
+  iat_cv_val  <- NA_real_
+  shape_k_val <- NA_real_
+  rate_k_val  <- NA_real_
+  mu_T_adj    <- mu_T * 12          # default: Poisson (months)
+  if (length(ev_starts) >= 2) {
+    iat_yrs    <- as.numeric(diff(ev_starts)) / 365.25
+    iat_mean_v <- mean(iat_yrs, na.rm = TRUE)
+    iat_sd_v   <- sd(iat_yrs,   na.rm = TRUE)
+    iat_cv_val <- if (iat_mean_v > 0) iat_sd_v / iat_mean_v else NA_real_
+    mu_T_adj   <- iat_mean_v * 12
+    if (!is.na(iat_cv_val) && iat_cv_val > 0) {
+      shape_k_val <- 1 / (iat_cv_val^2)
+      rate_k_val  <- shape_k_val / iat_mean_v
+    }
+  }
   cop_obj  <- copula_fit$best_copula_fit@copula
   beta_par <- marginal_fits$area_fit$estimate
   T_years  <- c(10, 25, 50, 100)
@@ -562,7 +583,25 @@ derive_SAF_curves_kendall <- function(drought_data, marginal_fits, copula_fit,
   n_class_dr   <- nrow(dc)
   if (n_class_dr == 0) return(NULL)
   mu_T         <- n_record / n_class_dr  # Conditional mean inter-arrival (months)
-  
+  # Compute renewal parameters from event inter-arrival times
+  indr_all    <- drought_data$severity > 0 & drought_data$area_pct > 0
+  is_start    <- indr_all & !c(FALSE, head(indr_all, -1))
+  ev_starts   <- as.Date(drought_data$date[is_start])
+  iat_cv_val  <- NA_real_
+  shape_k_val <- NA_real_
+  rate_k_val  <- NA_real_
+  mu_T_adj    <- mu_T * 12          # default: Poisson (months)
+  if (length(ev_starts) >= 2) {
+    iat_yrs    <- as.numeric(diff(ev_starts)) / 365.25
+    iat_mean_v <- mean(iat_yrs, na.rm = TRUE)
+    iat_sd_v   <- sd(iat_yrs,   na.rm = TRUE)
+    iat_cv_val <- if (iat_mean_v > 0) iat_sd_v / iat_mean_v else NA_real_
+    mu_T_adj   <- iat_mean_v * 12
+    if (!is.na(iat_cv_val) && iat_cv_val > 0) {
+      shape_k_val <- 1 / (iat_cv_val^2)
+      rate_k_val  <- shape_k_val / iat_mean_v
+    }
+  }
   cop_obj  <- copula_fit$best_copula_fit@copula
   cop_name <- copula_fit$best_copula_name
   beta_par <- marginal_fits$area_fit$estimate

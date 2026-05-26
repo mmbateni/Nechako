@@ -454,6 +454,25 @@ derive_SAF_nonstationary <- function(mu_period, sigma_period,
   if (n_dr == 0) return(NULL)
   mu_T  <- n_tot / n_dr
   
+  # Compute renewal parameters from event inter-arrival times
+  indr_all    <- drought_data$severity > 0 & drought_data$area_pct > 0
+  is_start    <- indr_all & !c(FALSE, head(indr_all, -1))
+  ev_starts   <- as.Date(drought_data$date[is_start])
+  iat_cv_val  <- NA_real_
+  shape_k_val <- NA_real_
+  rate_k_val  <- NA_real_
+  mu_T_adj    <- mu_T * 12
+  if (length(ev_starts) >= 2) {
+    iat_yrs    <- as.numeric(diff(ev_starts)) / 365.25
+    iat_mean_v <- mean(iat_yrs, na.rm = TRUE)
+    iat_sd_v   <- sd(iat_yrs,   na.rm = TRUE)
+    iat_cv_val <- if (iat_mean_v > 0) iat_sd_v / iat_mean_v else NA_real_
+    mu_T_adj   <- iat_mean_v * 12
+    if (!is.na(iat_cv_val) && iat_cv_val > 0) {
+      shape_k_val <- 1 / (iat_cv_val^2)
+      rate_k_val  <- shape_k_val / iat_mean_v
+    }
+  }  
   # ---- Resolve epoch (single source of truth: ns_result) ------------------
   epoch      <- .resolve_epoch(ns_result, period_label)
   period_yrs <- epoch$period_yrs
@@ -602,6 +621,25 @@ derive_SAF_nonstationary_kendall <- function(mu_period, sigma_period,
   if (n_dr == 0) return(NULL)
   mu_T  <- n_tot / n_dr
   
+  # Compute renewal parameters from event inter-arrival times
+  indr_all    <- drought_data$severity > 0 & drought_data$area_pct > 0
+  is_start    <- indr_all & !c(FALSE, head(indr_all, -1))
+  ev_starts   <- as.Date(drought_data$date[is_start])
+  iat_cv_val  <- NA_real_
+  shape_k_val <- NA_real_
+  rate_k_val  <- NA_real_
+  mu_T_adj    <- mu_T * 12
+  if (length(ev_starts) >= 2) {
+    iat_yrs    <- as.numeric(diff(ev_starts)) / 365.25
+    iat_mean_v <- mean(iat_yrs, na.rm = TRUE)
+    iat_sd_v   <- sd(iat_yrs,   na.rm = TRUE)
+    iat_cv_val <- if (iat_mean_v > 0) iat_sd_v / iat_mean_v else NA_real_
+    mu_T_adj   <- iat_mean_v * 12
+    if (!is.na(iat_cv_val) && iat_cv_val > 0) {
+      shape_k_val <- 1 / (iat_cv_val^2)
+      rate_k_val  <- shape_k_val / iat_mean_v
+    }
+  }  
   # ---- Resolve epoch (single source of truth: ns_result) ------------------
   epoch      <- .resolve_epoch(ns_result, period_label)
   period_yrs <- epoch$period_yrs
@@ -764,7 +802,8 @@ derive_SAF_nonstationary_kendall <- function(mu_period, sigma_period,
       shape_k      = shape_k_val, # Replace with 1 / (iat_cv^2)
       rate_k       = rate_k_val,  # Replace with shape_k / iat_mean
       cv_val       = iat_cv_val   # Replace with computed iat_cv
-    )    if (target_kc <= 0 || target_kc >= 1) next
+    )
+    if (target_kc <= 0 || target_kc >= 1) next
     
     t_sol <- tryCatch(
       optimize(function(t) (kc_fn(t) - target_kc)^2, interval = opt_int),
