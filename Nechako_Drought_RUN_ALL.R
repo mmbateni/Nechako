@@ -241,10 +241,10 @@ for (nm in names(INDEX_RESULTS)) {
       # calendar year for every row after the first non-drought month.
       # Filter to drought months first so index i aligns with u_mat row i.
       dc_drought <- res$dc[res$dc$severity > 0 & res$dc$area_pct > 0, ]
-      e2_vals <- vapply(seq_len(nrow(u_mat)), function(i) {
-        yr_std_i <- (dc_drought$year[i] - tv$yr_mean) / tv$yr_sd
-        cop_i <- tv$make_cop_fn(tv$a_hat + tv$b_hat * yr_std_i)
-        .h_func_fd(u_mat[i,1], u_mat[i,2], cop_i)
+      e2_vals  <- vapply(seq_len(nrow(u_mat)), function(i) {
+        yr_std_i  <- (dc_drought$year[i] - tv$yr_mean) / tv$yr_sd
+        cop_i  <- tv$make_cop_fn(tv$a_hat + tv$b_hat * yr_std_i)
+        .h_func_fd(u_mat[i,1], u_mat[i,2], cop_i, cop_family = tv$copula)
       }, numeric(1))
       plot_rosenblatt_diagnostic(u_mat[,1], e2_vals, nm, out_dir)
     }

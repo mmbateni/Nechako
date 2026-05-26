@@ -319,32 +319,49 @@ detect_copula_changepoints <- function(drought_data, copula_fit_obj,
 #             Smaller values improve accuracy but may amplify floating-point
 #             noise; 1e-4 is safe for the [0,1]^2 domain.
 # ---------------------------------------------------------------------------
-# REPLACE the existing .h_func_fd with this version:
-.h_func_fd <- function(u1, u2, cop_obj, eps = 1e-4) {
-  # ADAPTIVE step-size: shrink near boundaries to avoid overflow
-  # eps_base is the nominal step, but we scale it by distance to boundary
-  eps_base <- eps
+# Analytical h-function for Archimedean copulas
+.h_func_fd  <- function(u1, u2, cop_obj, cop_family) {
+  theta <- cop_obj@parameters[1]
   
-  # Compute adaptive step for each observation
-  # Minimum distance to either boundary (0 or 1)
-  dist_to_boundary <- pmin(u1, 1 - u1)
+  # Clamp to avoid boundary issues
+  u1 <- pmax(1e-10, pmin(u1, 1 - 1e-10))
+  u2 <- pmax(1e-10, pmin(u2, 1 - 1e-10))
   
-  # Scale eps by distance to boundary, but keep minimum step of 1e-8
-  eps_adj <- pmax(eps_base * dist_to_boundary, 1e-8)
-  
-  # Apply adaptive step
-  u1_lo <- pmax(1e-10, u1 - eps_adj)
-  u1_hi <- pmin(1 - 1e-10, u1 + eps_adj)
-  
-  num <- copula::pCopula(cbind(u1_hi, u2), cop_obj) -
-    copula::pCopula(cbind(u1_lo, u2), cop_obj)
-  den <- u1_hi - u1_lo
-  
-  # Avoid division by zero
-  den <- ifelse(den < 1e-12, 1e-12, den)
+  if (cop_family == "Gumbel") {
+    # Gumbel: C(u1,u2) = exp(-[(-log u1)^θ + (-log u2)^θ]^(1/θ))
+    log_u1 <- -log(u1)
+    log_u2 <- -log(u2)
+    sum_pow <- (log_u1^theta + log_u2^theta)
+    inner <- sum_pow^(1/theta - 1)
+    h_val <- exp(-sum_pow^(1/theta)) * inner * log_u1^(theta - 1) / u1
+    
+  } else if (cop_family == "Frank") {
+    # Frank: C(u,v) = -1/θ log[1 + (e^(-θu)-1)(e^(-θv)-1)/(e^(-θ)-1)]
+    exp_m_theta <- exp(-theta)
+    exp_m_theta_u1 <- exp(-theta * u1)
+    exp_m_theta_u2 <- exp(-theta * u2)
+    num <- (exp_m_theta_u1 - 1) * (exp_m_theta_u2 - 1)
+    denom <- exp_m_theta - 1
+    C_val <- -log(1 + num/denom) / theta
+    h_val <- (exp_m_theta_u1 * (exp_m_theta_u2 - 1)) / 
+      ((exp_m_theta - 1) * (1 + num/denom))
+    
+  } else if (cop_family == "Joe") {
+    # Joe copula analytical derivative
+    one_m_u1 <- 1 - u1
+    one_m_u2 <- 1 - u2
+    term1 <- (1 - one_m_u1^theta)
+    term2 <- (1 - one_m_u2^theta)
+    prod <- term1 * term2
+    h_val <- theta * one_m_u1^(theta - 1) * term2 / (1 - prod)
+    
+  } else {
+    # Fallback to finite difference for other families
+    return(.h_func_fd(u1, u2, cop_obj))
+  }
   
   # Clamp to valid probability range
-  pmax(1e-8, pmin(1 - 1e-8, num / den))
+  pmax(1e-8, pmin(1 - 1e-8, h_val))
 }
 
 # ---------------------------------------------------------------------------
@@ -584,21 +601,25 @@ fit_timevarying_copula <- function(drought_data, copula_fit_obj, marginal_fits,
   }
   
   #-- (v) MODEL SELECTION LOGIC ------------------------------------------
-  tv_sig        <- (p_val < 0.05)
+  #-- (v) MODEL SELECTION LOGIC ------------------------------------------
+  tv_sig        <- isTRUE(p_val < 0.05)
   cp_strong     <- isTRUE(cp_result$detected)
-  tv_better_aic <- (aic_tv < aic_seg)
-  pit_tv_ok     <- (!is.null(ros_tv) && ros_tv$adequate)
+  tv_better_aic <- isTRUE(aic_tv < aic_seg)
+  pit_tv_ok     <- isTRUE(!is.null(ros_tv) && ros_tv$adequate)
   pit_tv_score  <- if (!is.null(ros_tv)) mean(c(ros_tv$ks_e2_p, ros_tv$tau_ind_p), na.rm = TRUE) else 0
+  if (is.nan(pit_tv_score)) pit_tv_score <- 0  # Guard against NaN from all-NA p-values
   
-  seg_better_aic <- (aic_seg < aic_tv)
-  pit_seg_improved <- if (!is.null(ros_seg) && !is.null(ros_tv)) {
-    mean(c(ros_seg$ks_e2_p, ros_seg$tau_ind_p), na.rm = TRUE) > pit_tv_score
-  } else FALSE
+  seg_better_aic <- isTRUE(aic_seg < aic_tv)
+  pit_seg_improved <- isTRUE(
+    if (!is.null(ros_seg) && !is.null(ros_tv)) {
+      mean(c(ros_seg$ks_e2_p, ros_seg$tau_ind_p), na.rm = TRUE) > pit_tv_score
+    } else FALSE
+  )
   
-  selected <- "stationary"
-  if (tv_sig && !cp_strong && tv_better_aic && pit_tv_ok) {
+  selected  <- "stationary"
+  if (isTRUE(tv_sig) && !isTRUE(cp_strong) && isTRUE(tv_better_aic) && isTRUE(pit_tv_ok)) {
     selected <- "tv"
-  } else if (cp_strong && seg_better_aic && pit_seg_improved) {
+  } else if (isTRUE(cp_strong) && isTRUE(seg_better_aic) && isTRUE(pit_seg_improved)) {
     selected <- "segmented"
   }
   
@@ -931,15 +952,24 @@ fit_segmented_copula <- function(drought_data, copula_fit_obj,
   
   # ---- Upper-tail dependence comparison between segments --------------------
   # Lower-tail dependence is not assessed (irrelevant for drought SAF).
-  td_seg <- function(uM, label) {
-    u_q_hi <- 0.95
-    C_hi   <- max(mean(uM[,1] >= u_q_hi & uM[,2] >= u_q_hi), 1e-8)
-    lU     <- max(0, min(1, 2 - log(C_hi) / log(u_q_hi)))
-    log_event(sprintf("  [%s]   Tail dep segment %s: λ_U=%.4f", index_name, label, lU))
+  # ---- Upper-tail dependence comparison between segments --------------------
+  #   Lower-tail dependence is not assessed (irrelevant for drought SAF).
+  td_seg <- function(uM, label, fam_name) {
+    if (fam_name %in% c("Gumbel", "Joe", "SurvClayton")) {
+      A_05 <- compute_cfg_pickands(uM[,1], uM[,2], t_val = 0.5)
+      lU   <- max(0, 2 * (1 - A_05))
+      meth <- "CFG"
+    } else {
+      u_q_hi <- 0.95
+      C_hi   <- max(mean(uM[,1] >= u_q_hi & uM[,2] >= u_q_hi), 1e-8)
+      lU     <- max(0, min(1, 2 - log(C_hi) / log(u_q_hi)))
+      meth   <- "Quantile_0.95"
+    }
+    log_event(sprintf("  [%s]   Tail dep segment %s: λ_U=%.4f [%s]", index_name, label, lU, meth))
     c(lambda_U = lU)
   }
-  td1 <- td_seg(uM1, sprintf("1 [<%d]",  cp_year))
-  td2 <- td_seg(uM2, sprintf("2 [≥%d]",  cp_year))
+  td1 <- td_seg(uM1, sprintf("1 [<%d]", cp_year), seg1$best_copula_name)
+  td2 <- td_seg(uM2, sprintf("2 [≥%d]", cp_year), seg2$best_copula_name)
   
   # ---- Write summary CSV ----------------------------------------------------
   sum_df <- data.frame(

@@ -334,59 +334,53 @@ fit_marginal_distributions <- function(drought_data, index_name, out_dir) {
        severity_dist_name = best,
        severity_results   = res)
 }
-
+#
+compute_cfg_pickands <- function(u, v, t_val = 0.5, n_grid = 300) {
+  u_grid <- seq(1e-5, 1 - 1e-5, length.out = n_grid)
+  c_vals <- vapply(seq_along(u_grid), function(k) {
+    mean(u <= u_grid[k]^(1 - t_val) & v <= u_grid[k]^t_val)
+  }, numeric(1))
+  exp(mean(log(pmax(c_vals, 1e-12))))
+}
+#
 fit_copulas <- function(drought_data, marginal_fits, index_name, out_dir) {
   dc <- drought_data[drought_data$severity > 0 & drought_data$area_pct > 0, ]
   if (nrow(dc) < 10 || is.null(marginal_fits)) return(NULL)
   
-  A    <- dc$area_pct / 100
-  uA   <- pbeta(A, shape1 = marginal_fits$area_fit$estimate["shape1"],
-                shape2 = marginal_fits$area_fit$estimate["shape2"])
-  dist <- marginal_fits$severity_dist_name
-  pars <- marginal_fits$severity_fit$estimate
-  uS   <- switch(dist,
-                 Exponential = pexp(dc$severity, rate   = pars["rate"]),
-                 Gamma       = pgamma(dc$severity, shape = pars["shape"], rate  = pars["rate"]),
-                 Weibull     = pweibull(dc$severity, shape= pars["shape"], scale = pars["scale"]),
-                 `Log-Normal`= plnorm(dc$severity, meanlog=pars["meanlog"], sdlog=pars["sdlog"]),
-                 Normal      = pnorm(dc$severity, mean  = pars["mean"],  sd    = pars["sd"]),
-                 Logistic    = plogis(dc$severity, location=pars["location"], scale=pars["scale"]),
-                 pgamma(dc$severity, shape = 1, rate = 1))
-  uS  <- pmax(pmin(uS, 1 - 1e-6), 1e-6)
-  uA  <- pmax(pmin(uA, 1 - 1e-6), 1e-6)
-  uM  <- cbind(uS, uA); n <- nrow(uM)
+  A     <- dc$area_pct / 100
+  uA    <- pbeta(A, shape1 = marginal_fits$area_fit$estimate["shape1"],
+                 shape2 = marginal_fits$area_fit$estimate["shape2"])
+  dist  <- marginal_fits$severity_dist_name
+  pars  <- marginal_fits$severity_fit$estimate
+  uS    <- switch(dist,
+                  Exponential = pexp(dc$severity, rate   = pars["rate"]),
+                  Gamma       = pgamma(dc$severity, shape = pars["shape"], rate  = pars["rate"]),
+                  Weibull     = pweibull(dc$severity, shape= pars["shape"], scale = pars["scale"]),
+                  `Log-Normal` = plnorm(dc$severity, meanlog=pars["meanlog"], sdlog=pars["sdlog"]),
+                  Normal      = pnorm(dc$severity, mean  = pars["mean"],  sd    = pars["sd"]),
+                  Logistic    = plogis(dc$severity, location=pars["location"], scale=pars["scale"]),
+                  pgamma(dc$severity, shape = 1, rate = 1))
+  uS   <- pmax(pmin(uS, 1 - 1e-6), 1e-6)
+  uA   <- pmax(pmin(uA, 1 - 1e-6), 1e-6)
+  uM   <- cbind(uS, uA); n  <- nrow(uM)
   
-  # Copula candidate set:
-  #   Frank       — symmetric, no tail dependence (Archimedean)
-  #   Gumbel      — upper-tail dependence (Archimedean)
-  #   Plackett    — symmetric, light tails (one-parameter)
-  #   SurvClayton — survival (180°-rotated) Clayton: upper-tail dependence,
-  #                 complementary to standard Clayton's lower-tail focus
-  #   Joe         — strong upper-tail dependence (Archimedean)
-  # Standard Clayton and Gaussian Normal have been intentionally excluded.
-  cops <- list(
+  # Copula candidate set
+  cops  <- list(
     Frank       = frankCopula(dim = 2),
     Gumbel      = gumbelCopula(dim = 2),
     Plackett    = plackettCopula(),
     SurvClayton = rotCopula(claytonCopula(dim = 2)),
     Joe         = joeCopula(dim = 2),
-    # New robust candidates:
     Gaussian    = normalCopula(param = 0.5, dim = 2, dispstr = "un"),
     StudentT    = tCopula(param = 0.5, df = 4, dim = 2)
   )
-  res  <- data.frame(Copula=character(), Parameter=numeric(),
-                     LogLik=numeric(), AIC=numeric(), BIC=numeric(),
-                     stringsAsFactors=FALSE)
-  fits <- list()
+  
+  res   <- data.frame(Copula=character(), Parameter=numeric(),
+                      LogLik=numeric(), AIC=numeric(), BIC=numeric(),
+                      stringsAsFactors=FALSE)
+  fits  <- list()
   for (nm in names(cops)) {
-    # "mpl" here maximises the copula log-likelihood given the parametric CDF
-    # transforms uS/uA (IFM-style two-stage MLE, not rank-based pseudo-obs).
-    # FIX: added optim.method="BFGS" + maxit=1000 to suppress convergence
-    #      code=52 warnings; falls back to Nelder-Mead if BFGS errors out.
-    # NOTE: for SurvClayton (rotCopula), fitCopula / loglikCopula dispatch
-    #       through dCopula which is generic and correctly handles rotCopula
-    #       objects; coef() returns the base Clayton parameter.
-    fit <- tryCatch(
+    fit  <- tryCatch(
       fitCopula(cops[[nm]], uM, method = "mpl",
                 optim.method  = "BFGS",
                 optim.control = list(maxit = 1000, reltol = 1e-8)),
@@ -397,30 +391,77 @@ fit_copulas <- function(drought_data, marginal_fits, index_name, out_dir) {
                     optim.control = list(maxit = 2000)),
           error = function(e2) NULL))
     if (!is.null(fit)) {
-      p  <- coef(fit)
-      ll <- loglikCopula(p, uM, cops[[nm]])
-      k  <- length(p)
-      res  <- rbind(res, data.frame(Copula    = nm,
-                                    Parameter = p[1],
-                                    LogLik    = ll,
-                                    AIC       = -2*ll + 2*k,
-                                    BIC       = -2*ll + log(n)*k))
-      fits[[nm]] <- fit
+      p   <- coef(fit)
+      ll  <- loglikCopula(p, uM, cops[[nm]])
+      k   <- length(p)
+      res   <- rbind(res, data.frame(Copula    = nm,
+                                     Parameter = p[1],
+                                     LogLik    = ll,
+                                     AIC       = -2*ll + 2*k,
+                                     BIC       = -2*ll + log(n)*k))
+      fits[[nm]]  <- fit
     }
   }
   if (nrow(res) == 0) return(NULL)
-  best  <- res$Copula[which.min(res$AIC)]
   
-  # 1. Calculate empirical tail dependence FIRST
-  emp_td <- tryCatch({
-    u_q_hi <- 0.95
-    C_hi   <- mean(uS >= u_q_hi & uA >= u_q_hi)
-    C_hi   <- max(C_hi, 1e-8)
-    lam_U_emp <- max(0, min(1, 2 - log(C_hi) / log(u_q_hi)))
-    list(lambda_U = lam_U_emp)
-  }, error = function(e) list(lambda_U = NA_real_))
+  #==========================================================================
+  # TAIL-DEPENDENCE PRIORITY LOGIC (as per methodology guide)
+  #==========================================================================
   
-  # 2. Theoretical tail dependence for best copula
+  # 1. Calculate empirical tail dependence using CFG estimator
+  extreme_fams  <- c("Gumbel", "Joe", "SurvClayton")
+  
+  # CFG estimator for upper tail dependence
+  A_05  <- compute_cfg_pickands(uS, uA, t_val = 0.5)
+  emp_lambda_U <- max(0, 2 * (1 - A_05))
+  
+  # 2. Calculate overall rank correlation (Kendall's tau)
+  tau_val <- cor(uS, uA, method = "kendall")
+  
+  # 3. Calculate Spearman's rho for comparison
+  rho_val <- cor(uS, uA, method = "spearman")
+  
+  # 4. TAIL-DEPENDENCE PRIORITY DECISION
+  # Prioritize Joe/Gumbel when extreme dependence > overall correlation
+  td_threshold <- 0.10
+  prioritize_tail_dep <- (emp_lambda_U > td_threshold) && (emp_lambda_U > abs(tau_val))
+  
+  if (prioritize_tail_dep) {
+    log_event(sprintf("[%s] TAIL-DEPENDENCE PRIORITY: λ_U=%.4f > |τ|=%.4f. Enforcing Joe/Gumbel selection.",
+                      index_name, emp_lambda_U, abs(tau_val)))
+    
+    # Filter to tail-dependent families only
+    td_candidates <- res[res$Copula %in% c("Joe", "Gumbel", "SurvClayton", "StudentT"), ]
+    
+    if (nrow(td_candidates) > 0) {
+      # Prioritize Joe and Gumbel (Archimedean with upper tail)
+      jg_candidates <- td_candidates[td_candidates$Copula %in% c("Joe", "Gumbel"), ]
+      
+      if (nrow(jg_candidates) > 0) {
+        # Select best among Joe/Gumbel by AIC
+        best <- jg_candidates$Copula[which.min(jg_candidates$AIC)]
+        log_event(sprintf("[%s] Selected '%s' (AIC=%.2f) from Joe/Gumbel family (prioritized for tail dependence)",
+                          index_name, best, min(jg_candidates$AIC)))
+      } else {
+        # Fallback to any tail-dependent family
+        best <- td_candidates$Copula[which.min(td_candidates$AIC)]
+        log_event(sprintf("[%s] Selected '%s' (AIC=%.2f) from tail-dependent families",
+                          index_name, best, min(td_candidates$AIC)))
+      }
+    } else {
+      # No tail-dependent candidates - use standard AIC
+      best <- res$Copula[which.min(res$AIC)]
+    }
+  } else {
+    # Standard AIC selection
+    best <- res$Copula[which.min(res$AIC)]
+    log_event(sprintf("[%s] Standard AIC selection: '%s' (λ_U=%.4f ≤ |τ|=%.4f)",
+                      index_name, best, emp_lambda_U, abs(tau_val)))
+  }
+  
+  #==========================================================================
+  # THEORETICAL TAIL DEPENDENCE FOR BEST COPULA
+  #==========================================================================
   best_par   <- coef(fits[[best]])[1]
   theo_td    <- tryCatch({
     switch(best,
@@ -430,50 +471,79 @@ fit_copulas <- function(drought_data, marginal_fits, index_name, out_dir) {
            Frank       = list(lambda_U = 0),
            Plackett    = list(lambda_U = 0),
            Gaussian    = list(lambda_U = 0),
-           StudentT    = { rho <- max(min(best_par, 0.9999), -0.9999)
-           df_par <- max(coef(fits[[best]])[2], 1.5)
-           list(lambda_U = 2 * pt(-sqrt((df_par + 1)*(1-rho)/(1+rho)), df=df_par+1)) },
+           StudentT    = { 
+             rho <- max(min(best_par, 0.9999), -0.9999)
+             df_par <- max(coef(fits[[best]])[2], 1.5)
+             list(lambda_U = 2 * pt(-sqrt((df_par + 1)*(1-rho)/(1+rho)), df=df_par+1)) 
+           },
            list(lambda_U = NA_real_))
   }, error = function(e) list(lambda_U = NA_real_))
   
-  # 3. Recommendation & mismatch check
-  td_recommendation <- if (!is.finite(emp_td$lambda_U)) "Tail dependence inconclusive" 
-  else if (emp_td$lambda_U > 0.10) "Upper-tail dependence detected: Gumbel/Joe/SurvClayton preferred" 
+  #==========================================================================
+  # VALIDATION & RECOMMENDATION
+  #==========================================================================
+  td_recommendation <- if (!is.finite(emp_lambda_U)) "Tail dependence inconclusive"
+  else if (emp_lambda_U > 0.10) "Upper-tail dependence detected: Joe/Gumbel prioritized (CFG validated)"
   else "No meaningful upper-tail dependence: Frank/Plackett adequate"
   
   zero_tail_families <- c("Frank", "Plackett", "Gaussian")
-  td_mismatch <- isTRUE(emp_td$lambda_U > 0.10) && best %in% zero_tail_families && !is.na(emp_td$lambda_U)
+  td_mismatch <- isTRUE(emp_lambda_U > 0.10) && best %in% zero_tail_families && !is.na(emp_lambda_U)
   
-  log_event(sprintf("[%s] Tail dependence — empirical λ_U=%.4f | theoretical (best=%s) λ_U=%.4f",
-                    index_name, emp_td$lambda_U, best, if(is.finite(theo_td$lambda_U)) theo_td$lambda_U else NA))
+  log_event(sprintf("[%s] CFG Validation — empirical λ_U=%.4f | theoretical (best=%s) λ_U=%.4f | τ=%.4f",
+                    index_name, emp_lambda_U, best, 
+                    if(is.finite(theo_td$lambda_U)) theo_td$lambda_U else NA,
+                    tau_val))
   log_event(sprintf("[%s] TD recommendation: %s", index_name, td_recommendation))
-  if (td_mismatch) log_event(sprintf("[%s] WARNING [TD-U]: AIC-best (%s) has λ_U=0 but empirical λ_U=%.4f>0.10.",
-                                     index_name, best, emp_td$lambda_U))
   
-  # 4. Append to results table
-  res$emp_lambda_U   <- round(emp_td$lambda_U, 4)
+  if (td_mismatch) {
+    log_event(sprintf("[%s] WARNING [TD-U]: Selected copula (%s) has λ_U=0 but empirical λ_U=%.4f>0.10",
+                      index_name, best, emp_lambda_U))
+  }
+  
+  #==========================================================================
+  # APPEND TO RESULTS TABLE
+  #==========================================================================
+  res$emp_lambda_U      <- round(emp_lambda_U, 4)
+  res$kendall_tau       <- round(tau_val, 4)
+  res$spearman_rho      <- round(rho_val, 4)
+  
   theo_U <- vapply(names(cops), function(nm) {
     if (is.null(fits[[nm]])) return(NA_real_)
     p <- coef(fits[[nm]])
     switch(nm,
-           Gumbel=2-2^(1/max(p[1],1.001)), Joe=2-2^(1/max(p[1],1.001)),
-           SurvClayton=2^(-1/max(p[1],1e-6)), Frank=0, Plackett=0, Gaussian=0,
-           StudentT={ rho<-max(min(p[1],0.9999),-0.9999); df_p<-max(if(length(p)>=2)p[2] else 4,1.5)
-           2*pt(-sqrt((df_p+1)*(1-rho)/(1+rho)), df=df_p+1) },
+           Gumbel=2-2^(1/max(p[1],1.001)), 
+           Joe=2-2^(1/max(p[1],1.001)),
+           SurvClayton=2^(-1/max(p[1],1e-6)), 
+           Frank=0, Plackett=0, Gaussian=0,
+           StudentT={ 
+             rho<-max(min(p[1],0.9999),-0.9999)
+             df_p<-max(if(length(p)>=2)p[2] else 4,1.5)
+             2*pt(-sqrt((df_p+1)*(1-rho)/(1+rho)), df=df_p+1) 
+           },
            NA_real_)
   }, numeric(1L))
-  res$theo_lambda_U    <- round(theo_U, 4)
-  res$td_mismatch      <- td_mismatch & (res$Copula == best)
+  
+  res$theo_lambda_U     <- round(theo_U, 4)
+  res$td_mismatch       <- td_mismatch & (res$Copula == best)
   res$td_recommendation <- td_recommendation
+  res$tail_dep_priority <- prioritize_tail_dep
   
   write.csv(res, file.path(out_dir, sprintf("%s_copula_comparison.csv", index_name)), row.names = FALSE)
   
-  list(best_copula_name=best, best_copula_fit=fits[[best]], all_results=res,
-       u_severity=uS, u_area=uA, emp_lambda_U=emp_td$lambda_U,
-       theo_lambda_U_best=theo_td$lambda_U, td_mismatch=td_mismatch,
-       td_recommendation=td_recommendation, extreme_warning=td_mismatch)
+  list(best_copula_name=best, 
+       best_copula_fit=fits[[best]], 
+       all_results=res,
+       u_severity=uS, 
+       u_area=uA, 
+       emp_lambda_U=emp_lambda_U,
+       theo_lambda_U_best=theo_td$lambda_U, 
+       kendall_tau=tau_val,
+       spearman_rho=rho_val,
+       td_mismatch=td_mismatch,
+       td_recommendation=td_recommendation, 
+       tail_dep_priority=prioritize_tail_dep,
+       cfg_estimator=A_05)
 }
-
 # 6. HELPER: CDF of severity under fitted marginal ---------------------------
 compute_u_severity <- function(s_val, marginal_fits) {
   dist <- marginal_fits$severity_dist_name
@@ -536,7 +606,7 @@ derive_SAF_curves_conditional <- function(drought_data, marginal_fits, copula_fi
       cv_val       = iat_cv_val   # Replace with computed iat_cv
     )
     if (target <= 0 || target >= 1) next
-    if (copula_fit$extreme_warning && T >= 50) {
+    if (isTRUE(copula_fit$td_mismatch) && T >= 50) {
       log_event(sprintf("  [%s] T=%d: Skipping Kendall (zero-tail copula). Use Conditional method.", index_name, T))
       next
     }
