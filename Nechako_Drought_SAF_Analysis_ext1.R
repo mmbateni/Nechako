@@ -347,17 +347,32 @@ detect_copula_changepoints <- function(drought_data, copula_fit_obj,
       ((exp_m_theta - 1) * (1 + num/denom))
     
   } else if (cop_family == "Joe") {
-    # Joe copula analytical derivative
+    # Joe copula: C(u,v) = 1 - [(1-u)^θ + (1-v)^θ - (1-u)^θ(1-v)^θ]^(1/θ)
+    # h(u2|u1) = ∂C/∂u1 = f^(1/θ-1) · (1-u1)^(θ-1) · [1-(1-u2)^θ]
+    # where f = (1-u1)^θ + (1-u2)^θ - (1-u1)^θ(1-u2)^θ
+    #
+    # FIXED: was `theta * one_m_u1^(theta-1) * term2 / (1-prod)` which equals
+    # theta*(1-prod)^(-1)*..., NOT (1-prod)^(1/theta-1)*... . The bug caused
+    # h > 1 for ~62% of (u1,u2) pairs (theta=2), all clamped to 1-1e-8,
+    # producing the observed clustering at 1.00 in the QQ-plot.
     one_m_u1 <- 1 - u1
     one_m_u2 <- 1 - u2
-    term1 <- (1 - one_m_u1^theta)
-    term2 <- (1 - one_m_u2^theta)
-    prod <- term1 * term2
-    h_val <- theta * one_m_u1^(theta - 1) * term2 / (1 - prod)
+    term2 <- 1 - one_m_u2^theta          # = 1-(1-u2)^θ
+    f     <- one_m_u1^theta + one_m_u2^theta - one_m_u1^theta * one_m_u2^theta  # = 1-prod
+    h_val <- f^(1/theta - 1) * one_m_u1^(theta - 1) * term2
     
   } else {
-    # Fallback to finite difference for other families
-    return(.h_func_fd(u1, u2, cop_obj))
+    # Fallback: try cCopula first, then true central finite difference
+    h_val <- tryCatch({
+      copula::cCopula(cbind(u1, u2), copula = cop_obj, indices = 2)[, 1L]
+    }, error = function(e) {
+      # True central finite-difference fallback (h-step 1e-5 is safe on [0,1]^2)
+      eps <- 1e-5
+      u1_lo <- max(eps, u1 - eps);  u1_hi <- min(1 - eps, u1 + eps)
+      C_lo  <- copula::pCopula(c(u1_lo, u2), cop_obj)
+      C_hi  <- copula::pCopula(c(u1_hi, u2), cop_obj)
+      (C_hi - C_lo) / (u1_hi - u1_lo)
+    })
   }
   
   # Clamp to valid probability range
@@ -403,17 +418,20 @@ rosenblatt_pit_gof <- function(uDat, make_cop_fn, a_hat, b_hat,
   e1 <- uDat[, 1]   # u_severity — trivially U[0,1] by marginal construction
   
   # Compute e2_i = C(u_area_i | u_severity_i; θ_i)
-  # Each observation uses its own θ_i from the TV copula fit.
   e2 <- vapply(seq_len(n), function(i) {
     tryCatch({
       cop_i <- make_cop_fn(a_hat + b_hat * year_std[i])
-      .h_func_fd(uDat[i, 1L], uDat[i, 2L], cop_i)
+      # FIX: Add cop_family argument
+      .h_func_fd(uDat[i, 1L], uDat[i, 2L], cop_i, cop_family = cop_name)
     }, error = function(e) NA_real_)
   }, numeric(1L))
+  
   
   e2_ok <- e2[is.finite(e2)]
   e1_ok <- e1[is.finite(e2)]
   frac  <- length(e2_ok) / n
+  log_event(sprintf("[%s] e2 summary: min=%.4f, max=%.4f, mean=%.4f, sd=%.4f, n_valid=%d",
+                    index_name, min(e2_ok), max(e2_ok), mean(e2_ok), sd(e2_ok), length(e2_ok)))
   
   ks_e1 <- tryCatch(ks.test(e1_ok, "punif"),
                     error = function(e) list(statistic = NA_real_, p.value = NA_real_))
@@ -591,7 +609,7 @@ fit_timevarying_copula <- function(drought_data, copula_fit_obj, marginal_fits,
       else make_cop(link_info$link(coef(seg_result$seg2$best_copula_fit)[1]))
     }
     e2_seg <- vapply(seq_len(n), function(i) {
-      tryCatch(.h_func_fd(uDat[i,1], uDat[i,2], make_seg_cop(i)), error=function(e) NA_real_)
+      tryCatch(.h_func_fd(uDat[i,1], uDat[i,2], make_seg_cop(i), cop_family = cop_name), error=function(e) NA_real_)
     }, numeric(1L))
     e2_ok <- e2_seg[is.finite(e2_seg)]
     e1_ok <- uDat[is.finite(e2_seg), 1]

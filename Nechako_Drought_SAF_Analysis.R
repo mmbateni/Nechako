@@ -347,21 +347,14 @@ fit_copulas <- function(drought_data, marginal_fits, index_name, out_dir) {
   dc <- drought_data[drought_data$severity > 0 & drought_data$area_pct > 0, ]
   if (nrow(dc) < 10 || is.null(marginal_fits)) return(NULL)
   
-  A     <- dc$area_pct / 100
-  uA    <- pbeta(A, shape1 = marginal_fits$area_fit$estimate["shape1"],
-                 shape2 = marginal_fits$area_fit$estimate["shape2"])
-  dist  <- marginal_fits$severity_dist_name
-  pars  <- marginal_fits$severity_fit$estimate
-  uS    <- switch(dist,
-                  Exponential = pexp(dc$severity, rate   = pars["rate"]),
-                  Gamma       = pgamma(dc$severity, shape = pars["shape"], rate  = pars["rate"]),
-                  Weibull     = pweibull(dc$severity, shape= pars["shape"], scale = pars["scale"]),
-                  `Log-Normal` = plnorm(dc$severity, meanlog=pars["meanlog"], sdlog=pars["sdlog"]),
-                  Normal      = pnorm(dc$severity, mean  = pars["mean"],  sd    = pars["sd"]),
-                  Logistic    = plogis(dc$severity, location=pars["location"], scale=pars["scale"]),
-                  pgamma(dc$severity, shape = 1, rate = 1))
-  uS   <- pmax(pmin(uS, 1 - 1e-6), 1e-6)
-  uA   <- pmax(pmin(uA, 1 - 1e-6), 1e-6)
+  # Rank-based pseudo-observations (Empirical Marginal Transformation)
+  n_obs <- nrow(dc)
+  
+  # Transform severity to uniform [0,1] using ranks
+  uS <- rank(dc$severity, ties.method = "average") / (n_obs + 1)
+  
+  # Transform area_pct to uniform [0,1] using ranks
+  uA <- rank(dc$area_pct, ties.method = "average") / (n_obs + 1)
   uM   <- cbind(uS, uA); n  <- nrow(uM)
   
   # Copula candidate set
@@ -413,7 +406,7 @@ fit_copulas <- function(drought_data, marginal_fits, index_name, out_dir) {
   
   # CFG estimator for upper tail dependence
   A_05  <- compute_cfg_pickands(uS, uA, t_val = 0.5)
-  emp_lambda_U <- max(0, 2 * (1 - A_05))
+  emp_lambda_U <- min(max(0, 2 * (1 - A_05)),1.00)
   
   # 2. Calculate overall rank correlation (Kendall's tau)
   tau_val <- cor(uS, uA, method = "kendall")
@@ -424,7 +417,7 @@ fit_copulas <- function(drought_data, marginal_fits, index_name, out_dir) {
   # 4. TAIL-DEPENDENCE PRIORITY DECISION
   # Prioritize Joe/Gumbel when extreme dependence > overall correlation
   td_threshold <- 0.10
-  prioritize_tail_dep <- (emp_lambda_U > td_threshold) && (emp_lambda_U > abs(tau_val))
+  prioritize_tail_dep <- (emp_lambda_U > td_threshold) && ((emp_lambda_U) > abs(tau_val))
   
   if (prioritize_tail_dep) {
     log_event(sprintf("[%s] TAIL-DEPENDENCE PRIORITY: λ_U=%.4f > |τ|=%.4f. Enforcing Joe/Gumbel selection.",
