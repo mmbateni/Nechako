@@ -72,7 +72,7 @@ PIPELINE_MODE <- "BOTH"
 # ── SECTION 2 ──  PIPELINE 1  SETTINGS  (basin-wide GeoLakes)
 # ============================================================================
 
-P1_INPUT_FILE <- "BEST_ESTIMATE_basin_total_Mm3.csv"
+P1_INPUT_FILE <- "Lakes/Glolakes/nechako_extracted/BEST_ESTIMATE_basin_total_Mm3.csv"
 # Required columns: date, total_storage_Mm3
 
 # ============================================================================
@@ -91,18 +91,41 @@ NECHAKO_DATA_SOURCE <- "GEOLAKES"
 # File that contains per-lake GeoLakes storage time series.
 # Must have columns for lake identifier, date, and storage.
 #
-GEOLAKES_FILE        <- "GeoLakes_storage_timeseries.csv"   # adjust as needed
+GEOLAKES_FILE <- "Lakes/Glolakes/nechako_extracted/LandsatPlusICESat2_long.csv"
 
 # HydroLAKES ID for the Nechako Reservoir.
 # To find it: open your GeoLakes shapefile / CSV and look for the Nechako
 # Reservoir polygon (centroid near 53.75°N, 126.0°W).
 # Replace the placeholder value below with the real ID.
-NECHAKO_HYDROID      <- 1267900   # ← REPLACE with actual HydroLAKES_ID
+# Column names in the GeoLakes long-format file
+GEOLAKES_DATE_COL    <- "date"            # date column
+GEOLAKES_STORAGE_COL <- "storage_Mm3"    # storage column (Mm³)
+GEOLAKES_LAT_COL     <- "lat"            # latitude column
+GEOLAKES_LON_COL     <- "lon"            # longitude column
 
-# Column names in the GeoLakes file
-GEOLAKES_ID_COL      <- "Hylak_id"        # lake identifier column
-GEOLAKES_DATE_COL    <- "date"             # date column
-GEOLAKES_STORAGE_COL <- "storage_Mm3"     # storage column (Mm³)
+# Nechako Reservoir identified as file_idx=2437 (highest storage ~208 Mm³ mean)
+# lake_id and lake_name are NA in this file; filter by centroid coordinates instead.
+NECHAKO_LAT  <- 54.2493   # confirmed from LandsatPlusICESat2_long.csv
+NECHAKO_LON  <- -125.7896
+NECHAKO_TOL  <- 0.01      # tight tolerance — exact centroid known
+
+# ── Find the Nechako Reservoir lake_id ────────────────────────────────────────
+# Run this snippet ONCE in the console to identify the correct ID, then set
+# NECHAKO_HYDROID (as a string) to match.
+#
+#   df_tmp <- read_csv(GEOLAKES_FILE, show_col_types = FALSE)
+#   df_tmp %>%
+#     filter(!is.na(lake_name)) %>%
+#     filter(grepl("nechako|ootsa|kenney", lake_name, ignore.case = TRUE)) %>%
+#     dplyr::select(lake_id, lake_name, lat, lon) %>%
+#     distinct()
+#
+# If the above returns nothing, try searching by coordinates:
+#   df_tmp %>%
+#     filter(between(lat, 53.0, 54.5), between(lon, -127.5, -124.5)) %>%
+#     dplyr::select(lake_id, lake_name, lat, lon) %>%
+#     distinct()
+# ─────────────────────────────────────────────────────────────────────────────
 
 # --- 3c. Local CSV option ----------------------------------------------------
 #
@@ -262,7 +285,11 @@ compute_tsdi <- function(df_in,
   df <- df %>%
     mutate(cumulative_TSD = cumsum(replace_na(TSD, 0)))
   
-  # ── Identify dominant (longest) continuously negative TSD period ──────────
+  # ── Identify dominant drought period for calibration ─────────────────────
+  # Strategy: find the continuously-negative TSD run whose *endpoint* has the
+  # most negative cumulative TSD value (deepest deficit).  This is more robust
+  # than picking the longest run, which can be very short when the record is
+  # dominated by a single wet or dry phase and produces p outside (0,1).
   is_dry <- df$TSD < 0
   r      <- rle(is_dry)
   
@@ -275,12 +302,24 @@ compute_tsdi <- function(df_in,
     stop(label, ": no drought periods detected (no consecutive negative TSD months).")
   }
   
-  longest_run <- dry_runs[which.max(r$lengths[dry_runs])]
-  dry_start   <- starts[longest_run]
-  dry_end     <- ends[longest_run]
+  # Score each dry run by the cumulative TSD at its endpoint (most negative = worst)
+  run_scores <- sapply(dry_runs, function(ri) df$cumulative_TSD[ends[ri]])
+  deepest_run <- dry_runs[which.min(run_scores)]
+  dry_start   <- starts[deepest_run]
+  dry_end     <- ends[deepest_run]
   
   drought_df <- df[dry_start:dry_end, ] %>%
     mutate(drought_time = seq_len(n()))
+  
+  if (nrow(drought_df) < 6) {
+    # Fallback: use the longest dry run if the deepest is implausibly short
+    longest_run <- dry_runs[which.max(r$lengths[dry_runs])]
+    dry_start   <- starts[longest_run]
+    dry_end     <- ends[longest_run]
+    drought_df  <- df[dry_start:dry_end, ] %>%
+      mutate(drought_time = seq_len(n()))
+    message(label, ": deepest-deficit episode < 6 months; falling back to longest dry run.")
+  }
   
   cat(
     "\n", label, " — dominant drought episode:\n",
@@ -289,7 +328,12 @@ compute_tsdi <- function(df_in,
   )
   
   # ── Drought monograph linear regression ──────────────────────────────────
-  fit <- lm(cumulative_TSD ~ drought_time, data = drought_df)
+  # Compute episode-local cumulative TSD here, AFTER any fallback selection,
+  # so it always applies to the final drought_df (deepest or longest run).
+  drought_df <- drought_df %>%
+    mutate(local_cum_TSD = cumsum(TSD))
+  
+  fit <- lm(local_cum_TSD ~ drought_time, data = drought_df)
   m   <- coef(fit)[2]
   b   <- coef(fit)[1]
   
@@ -328,11 +372,20 @@ compute_tsdi <- function(df_in,
   # ── Recursive TSDI  (Eq. 2) ──────────────────────────────────────────────
   n    <- nrow(df)
   TSDI <- rep(NA_real_, n)
-  TSDI[1] <- 0.02 * df$TSD[1]   # initial condition (Yirdaw et al. 2008)
   
-  for (i in 2:n) {
+  # Seed: use first non-NA TSD value (Yirdaw et al. 2008 initial condition)
+  first_valid <- which(!is.na(df$TSD))[1]
+  if (!is.na(first_valid)) {
+    TSDI[first_valid] <- 0.02 * df$TSD[first_valid]
+  }
+  
+  for (i in seq_len(n)[-seq_len(max(1L, first_valid - 1L))][-1L]) {
     if (!is.na(df$TSD[i])) {
-      TSDI[i] <- p * TSDI[i - 1] + q * df$TSD[i]
+      prev <- if (!is.na(TSDI[i - 1])) TSDI[i - 1] else 0
+      TSDI[i] <- p * prev + q * df$TSD[i]
+    } else {
+      # Gap: carry forward the last valid index value unchanged
+      TSDI[i] <- TSDI[i - 1]
     }
   }
   
@@ -349,7 +402,7 @@ compute_tsdi <- function(df_in,
       norm_col_value = qnorm(u_blom)
     ) %>%
     rename(!!paste0(label, "_norm") := norm_col_value) %>%
-    select(date, rank_tsdi, n_valid, u_blom, !!paste0(label, "_norm"))
+    dplyr::select(date, rank_tsdi, n_valid, u_blom, !!paste0(label, "_norm"))
   
   df <- left_join(df, tsdi_valid, by = "date")
   
@@ -575,24 +628,32 @@ run_pipeline_2 <- function() {
     cat("Columns found:", paste(names(df_geo), collapse = ", "), "\n")
     
     # Validate required columns
-    stopifnot(
-      GEOLAKES_ID_COL      %in% names(df_geo),
-      GEOLAKES_DATE_COL    %in% names(df_geo),
-      GEOLAKES_STORAGE_COL %in% names(df_geo)
+    missing_cols <- setdiff(
+      c(GEOLAKES_DATE_COL, GEOLAKES_STORAGE_COL, GEOLAKES_LAT_COL, GEOLAKES_LON_COL),
+      names(df_geo)
     )
+    if (length(missing_cols) > 0) {
+      stop("Missing columns: ", paste(missing_cols, collapse=", "),
+           "\nAvailable: ", paste(names(df_geo), collapse=", "))
+    }
     
-    # Filter to Nechako Reservoir by HydroLAKES ID
+    # Filter by centroid coordinates (lake_id / lake_name are NA in this file)
+    cat(sprintf("  Filtering: lat=%.4f ± %.3f, lon=%.4f ± %.3f\n",
+                NECHAKO_LAT, NECHAKO_TOL, NECHAKO_LON, NECHAKO_TOL))
+    
     df_nechako <- df_geo %>%
-      filter(.data[[GEOLAKES_ID_COL]] == NECHAKO_HYDROID)
+      filter(abs(.data[[GEOLAKES_LAT_COL]] - NECHAKO_LAT) <= NECHAKO_TOL,
+             abs(.data[[GEOLAKES_LON_COL]] - NECHAKO_LON) <= NECHAKO_TOL)
     
     if (nrow(df_nechako) == 0) {
-      stop(
-        "No rows found for HydroLAKES_ID = ", NECHAKO_HYDROID,
-        " in ", GEOLAKES_FILE, ".\n",
-        "Check NECHAKO_HYDROID in Section 3b. Available IDs: ",
-        paste(unique(df_geo[[GEOLAKES_ID_COL]][1:10]), collapse = ", "), " ..."
-      )
+      all_coords <- df_geo %>%
+        dplyr::select(all_of(c(GEOLAKES_LAT_COL, GEOLAKES_LON_COL))) %>%
+        distinct() %>% mutate(across(everything(), ~ round(.x, 4)))
+      stop("No rows matched. All coordinates in file:\n",
+           paste(capture.output(print(all_coords)), collapse="\n"),
+           "\nUpdate NECHAKO_LAT / NECHAKO_LON in Section 3b.")
     }
+    cat("  Matched", nrow(df_nechako), "rows\n")
     
     cat("Nechako Reservoir rows found:", nrow(df_nechako), "\n")
     
@@ -707,8 +768,8 @@ plot_comparison <- function(res1, res2) {
   cat("\n\n== Generating comparison plot ==\n")
   
   comp <- inner_join(
-    res1$data %>% select(date, TSDI, TSDI_norm),
-    res2$data %>% select(date, NTSDI, NTSDI_norm),
+    res1$data %>% dplyr::select(date, TSDI, TSDI_norm),
+    res2$data %>% dplyr::select(date, NTSDI, NTSDI_norm),
     by = "date"
   )
   
