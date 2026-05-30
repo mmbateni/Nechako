@@ -44,7 +44,6 @@
 ####################################################################################
 
 rm(list=ls()); gc()
-SCRIPT_START <- proc.time()          # wall-clock anchor for the entire run
 source("DROUGHT_ANALYSIS_utils.R")
 source("utils_teleconnection_addon.R")
 
@@ -57,41 +56,9 @@ setwd(WD_PATH)
 MM_DIR <- file.path(WD_PATH, "moderated_mediation")
 dir.create(MM_DIR, showWarnings=FALSE, recursive=TRUE)
 
-####################################################################################
-# TIMING HELPERS
-####################################################################################
-
-# Format an elapsed-seconds value as "Xh Ym Zs" (or "Ym Zs" / "Zs" when compact).
-fmt_dur <- function(secs) {
-  secs <- max(0, round(secs))
-  h <- secs %/% 3600L
-  m <- (secs %% 3600L) %/% 60L
-  s <- secs %% 60L
-  if (h > 0) sprintf("%dh %02dm %02ds", h, m, s)
-  else if (m > 0) sprintf("%dm %02ds", m, s)
-  else sprintf("%ds", s)
-}
-
-# Return wall-clock seconds elapsed since a proc.time() snapshot.
-elapsed_sec <- function(t0) (proc.time() - t0)[["elapsed"]]
-
-# Pretty progress bar: [=========>        ] 55% | elapsed 1m 02s | ETA 0m 51s
-fmt_progress <- function(done, total, elapsed_s, eta_s, width=40L) {
-  pct   <- if (total > 0) done / total else 0
-  filled <- round(pct * width)
-  bar    <- paste0(strrep("=", max(0, filled - 1L)),
-                   if (filled > 0 && done < total) ">" else if (filled > 0) "=" else "",
-                   strrep(" ", max(0, width - filled)))
-  sprintf("  [%s] %3.0f%% | %d/%d | elapsed %s | ETA %s",
-          bar, pct * 100, done, total,
-          fmt_dur(elapsed_s),
-          if (done >= total) "done" else fmt_dur(eta_s))
-}
-
 cat("\n╔════════════════════════════════════════════════════════╗\n")
 cat("║  w8  MODERATED MEDIATION + GAM TENSOR SMOOTHS          ║\n")
 cat("╚════════════════════════════════════════════════════════╝\n\n")
-cat(sprintf("  Started : %s\n\n", format(Sys.time(), "%Y-%m-%d %H:%M:%S")))
 
 ####################################################################################
 # CONFIGURATION
@@ -159,9 +126,8 @@ TELE_MASTER <- Reduce(
   function(a, b) merge(a, b, by="date", all=FALSE),
   list(oni_master, pdo_master, pna_master)
 )
-cat(sprintf("  ✓ TELE_MASTER: %d months (%s – %s)  [+%s]\n\n",
-            nrow(TELE_MASTER), min(TELE_MASTER$date), max(TELE_MASTER$date),
-            fmt_dur(elapsed_sec(SCRIPT_START))))
+cat(sprintf("  ✓ TELE_MASTER: %d months (%s – %s)\n\n",
+            nrow(TELE_MASTER), min(TELE_MASTER$date), max(TELE_MASTER$date)))
 
 rm(oni_master, pdo_master, pna_master); gc()
 
@@ -511,8 +477,8 @@ plot_path_diagram <- function(mm_result, lag, index_label) {
 # global export.
 ####################################################################################
 
-cat(sprintf("\n── Launching parallel outer loop | %d indices | %d workers | script elapsed %s ──\n\n",
-            length(ALL_INDICES), N_WORKERS, fmt_dur(elapsed_sec(SCRIPT_START))))
+cat(sprintf("\n── Launching parallel outer loop | %d indices | %d workers ──\n\n",
+            length(ALL_INDICES), N_WORKERS))
 
 # Reset to sequential first — this shuts down any PSOCK workers left over from a
 # previous run of this script (or from the old nested-cluster JN code).  Without
@@ -531,8 +497,6 @@ future::plan(future::multisession, workers=N_WORKERS)
   "build_lavaan_model","fit_moderated_mediation",".get_est",
   "compute_jn_floodlight","plot_conditional_ie","plot_jn_floodlight",
   "plot_path_diagram",
-  # timing helpers (used inside workers)
-  "fmt_dur","elapsed_sec","fmt_progress","SCRIPT_START",
   # w8 configuration constants
   "LAGS_TO_TEST","N_BOOTSTRAP","BOOTSTRAP_SEED",
   "BLOCK_LENGTH","GAM_SCREEN_P","N_BOOT_SCREEN","JN_BOOT_N",
@@ -560,9 +524,6 @@ results_list <- future.apply::future_lapply(
     IDX_DIR     <- file.path(MM_DIR, index_label)
     dir.create(IDX_DIR, showWarnings=FALSE, recursive=TRUE)
     
-    idx_t0        <- proc.time()          # start time for this index worker
-    lag_sec_vec__ <- numeric(0L)          # accumulates per-lag wall times for ETA
-    
     all_mm_results   <- list()
     all_gam_fits     <- list()
     mm_lag_profile   <- list()
@@ -570,20 +531,14 @@ results_list <- future.apply::future_lapply(
     convergence_rows <- list()
     
     cat(sprintf("\n╔%s╗\n", strrep("═", 58)))
-    cat(sprintf("  INDEX: %s | Lags 0–%d | script elapsed %s\n",
-                index_label, max(LAGS_TO_TEST), fmt_dur(elapsed_sec(SCRIPT_START))))
+    cat(sprintf("  INDEX: %s | Lags 0–%d\n", index_label, max(LAGS_TO_TEST)))
     cat(sprintf("╚%s╝\n\n", strrep("═", 58)))
     
     # ════════════════════════════════════════════════════════
     # INNER LAG LOOP
     # ════════════════════════════════════════════════════════
     for (lag in LAGS_TO_TEST) {
-      lag_t0__   <- proc.time()    # per-lag wall-clock start
-      lag_pos__  <- which(LAGS_TO_TEST == lag)   # 1-based position in the lag sequence
-      cat(sprintf("\n▶▶ LAG = %d months  [%d/%d | index elapsed %s | script elapsed %s]\n",
-                  lag, lag_pos__, length(LAGS_TO_TEST),
-                  fmt_dur(elapsed_sec(idx_t0)),
-                  fmt_dur(elapsed_sec(SCRIPT_START))))
+      cat(sprintf("\n▶▶ LAG = %d months ─────────────────────────────────────\n", lag))
       
       # PERF-1: pass pre-loaded teleconnections
       df_lag <- tryCatch(
@@ -734,22 +689,12 @@ results_list <- future.apply::future_lapply(
         Boot_reps        = n_boot_this,
         Block_length     = BLOCK_LENGTH,
         stringsAsFactors=FALSE)
-      
-      # ── Lag timing & ETA ────────────────────────────────────────────────────
-      lag_sec_vec__ <- c(lag_sec_vec__, elapsed_sec(lag_t0__))
-      lags_done__   <- length(lag_sec_vec__)
-      lags_left__   <- length(LAGS_TO_TEST) - lags_done__
-      eta_lag__     <- mean(lag_sec_vec__) * lags_left__
-      cat(fmt_progress(lags_done__, length(LAGS_TO_TEST),
-                       elapsed_sec(idx_t0), eta_lag__), "\n")
-      
     }  # end lag loop
     
     ##############################################################################
     # GAM LAG PROFILE FIGURE + TABLE
     ##############################################################################
-    cat(sprintf("\n── GAM lag profile  [index elapsed %s] ──\n",
-                fmt_dur(elapsed_sec(idx_t0))))
+    cat("\n── GAM lag profile ──\n")
     
     if (length(gam_lag_prof) > 0) {
       gam_lp_df <- do.call(rbind, gam_lag_prof)
@@ -974,13 +919,9 @@ results_list <- future.apply::future_lapply(
     xlsx_out <- file.path(IDX_DIR, sprintf("results_summary_%s.xlsx", index_label))
     openxlsx::saveWorkbook(wb, xlsx_out, overwrite=TRUE)
     cat(sprintf("  Saved: %s\n", basename(xlsx_out)))
-    idx_elapsed__ <- elapsed_sec(idx_t0)
-    cat(sprintf("\n  ✓ %s complete in %s | script elapsed %s | outputs: %s\n",
-                index_label, fmt_dur(idx_elapsed__),
-                fmt_dur(elapsed_sec(SCRIPT_START)), IDX_DIR))
+    cat(sprintf("\n  ✓ %s complete. Outputs: %s\n", index_label, IDX_DIR))
     
-    list(index=index_label, status="complete", optimal_lag=optimal_lag,
-         elapsed_sec=idx_elapsed__)
+    list(index=index_label, status="complete", optimal_lag=optimal_lag)
     
   },  # end future_lapply FUN
   future.globals  = .w8_globals,
@@ -992,25 +933,12 @@ results_list <- future.apply::future_lapply(
 # Restore sequential plan
 future::plan(future::sequential)
 
-# ── Post-run timing summary ────────────────────────────────────────────────────
-total_wall__ <- elapsed_sec(SCRIPT_START)
-cat(sprintf("\n── Parallel run complete | total wall time: %s ──\n", fmt_dur(total_wall__)))
-cat(sprintf("  %-14s  %s\n", "Index", "Worker time"))
-cat(sprintf("  %-14s  %s\n", strrep("-",14), strrep("-",12)))
-for (r__ in results_list) {
-  if (!is.null(r__) && !is.null(r__$elapsed_sec))
-    cat(sprintf("  %-14s  %s\n", r__$index, fmt_dur(r__$elapsed_sec)))
-}
-cat(sprintf("  %-14s  %s  (wall clock — workers ran in parallel)\n",
-            "TOTAL", fmt_dur(total_wall__)))
-
 ####################################################################################
 # DONE
 ####################################################################################
 cat("\n╔════════════════════════════════════════════════════════╗\n")
 cat("║  w8 COMPLETE — ALL INDICES                             ║\n")
 cat("╚════════════════════════════════════════════════════════╝\n")
-cat(sprintf("  Total wall time : %s\n", fmt_dur(elapsed_sec(SCRIPT_START))))
 cat(sprintf("  Root output directory: %s\n", MM_DIR))
 cat("  Per-index subdirectories:\n")
 for (idx_spec in ALL_INDICES) {
