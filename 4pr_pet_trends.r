@@ -24,8 +24,8 @@
 #   data_processing.log
 ####################################################################################
 
-rm(list = ls())
-gc()
+# rm(list = ls())  # commented out: safe to source from a master script
+# gc()             # commented out: safe to source from a master script
 
 library(ncdf4)
 library(terra)
@@ -37,6 +37,15 @@ library(sf)
 library(changepoint)
 library(trend)
 library(modifiedmk)
+
+# ── Shared statistical functions (VC-MK, TFPW-MK, PELT, spectral) ──────────────
+# check_min_value_threshold(), calculate_variance_with_ties(),
+# detect_regime_shift_pelt(), and mk_tfpw_spectral_for_series() are defined in
+# DROUGHT_ANALYSIS_utils.R (Section J).  Parameters max_min_value_pct_precip,
+# max_min_value_pct_pet, min_positive_value, and min_obs_changepoint are passed
+# explicitly to mk_tfpw_spectral_for_series() from the local variables set below.
+source("DROUGHT_ANALYSIS_utils.R")
+
 
 # ================= USER / ENV =================
 setwd("D:/Nechako_Drought/Nechako/")
@@ -134,45 +143,8 @@ saveRDS(basin_boundary, file.path(out_dir, "basin_boundary.rds"))
 ####################################################################################
 # ── HELPER FUNCTIONS
 ####################################################################################
-check_min_value_threshold <- function(ts_clean, min_val_threshold = 0.01, max_pct = 50,
-                                      is_precip = FALSE) {
-  n_min_vals   <- sum(ts_clean <= min_val_threshold, na.rm = TRUE)
-  pct_min_vals <- n_min_vals / length(ts_clean) * 100
-  max_allowed  <- if (is_precip) max_min_value_pct_precip else max_min_value_pct_pet
-  list(exceeds_threshold = pct_min_vals > max_allowed, pct_min_vals = pct_min_vals)
-}
 
-calculate_variance_with_ties <- function(S, n, x) {
-  tie_table  <- table(x)
-  tie_counts <- tie_table[tie_table > 1]
-  var_s      <- n * (n - 1) * (2 * n + 5) / 18
-  if (length(tie_counts))
-    var_s <- var_s - sum(tie_counts * (tie_counts - 1) * (2 * tie_counts + 5)) / 18
-  var_s
-}
 
-detect_regime_shift_pelt <- function(ts_vec, min_obs = 20, start_year = NULL) {
-  ts_clean <- na.omit(ts_vec)
-  n <- length(ts_clean)
-  empty <- list(changepoint_detected = FALSE, changepoint_position = NA_integer_,
-                n_changepoints = 0L, first_changepoint_year = NA_integer_,
-                mean_before = NA_real_, mean_after = NA_real_, magnitude_shift = NA_real_)
-  if (n < min_obs) return(empty)
-  tryCatch({
-    cpt      <- cpt.mean(ts_clean, method = "PELT", penalty = "BIC")
-    cpts_det <- cpts(cpt)
-    if (!length(cpts_det)) return(empty)
-    fc <- cpts_det[1]
-    list(changepoint_detected   = TRUE,
-         changepoint_position   = fc,
-         n_changepoints         = length(cpts_det),
-         first_changepoint_year = as.integer(if (!is.null(start_year)) start_year + fc - 1 else fc),
-         mean_before            = mean(ts_clean[1:fc], na.rm = TRUE),
-         mean_after             = mean(ts_clean[(fc+1):n], na.rm = TRUE),
-         magnitude_shift        = mean(ts_clean[(fc+1):n], na.rm = TRUE) -
-           mean(ts_clean[1:fc], na.rm = TRUE))
-  }, error = function(e) empty)
-}
 
 aggregate_to_annual_fast <- function(monthly_matrix, years, method = "sum") {
   y_levels      <- unique(years)
@@ -209,135 +181,6 @@ compute_month_index <- function(months) split(seq_along(months), months)
 ####################################################################################
 # ── CORE TREND ANALYSIS FUNCTION
 ####################################################################################
-mk_tfpw_spectral_for_series <- function(ts_vec, is_precip, alpha, max_tie_pct,
-                                        n_sim_spectral, conf_cache_env,
-                                        start_year       = NULL,
-                                        min_nonzero_count = NULL,
-                                        skip_min_filter  = FALSE) {
-  ts_clean <- na.omit(ts_vec)
-  n        <- length(ts_clean)
-  
-  na_result <- function(reason, n_ties = 0, pct_ties = 0, pct_min = 0) {
-    list(
-      vc   = list(tau=NA_real_, p=NA_real_, sl=NA_real_, S=NA_real_, varS=NA_real_,
-                  n=n, rho1=NA_real_, vc_corrected=FALSE, n_ties=n_ties,
-                  percent_ties=pct_ties, n_min_vals=0, percent_min_vals=pct_min,
-                  tau_b_adjusted=FALSE, filtered=TRUE, reason=reason),
-      tf   = list(tau=NA_real_, p=NA_real_, sl=NA_real_, S=NA_real_, varS=NA_real_,
-                  n=n, rho1=NA_real_, tfpw_applied=FALSE, n_ties=n_ties,
-                  percent_ties=pct_ties, n_min_vals=0, percent_min_vals=pct_min,
-                  tau_b_adjusted=FALSE, filtered=TRUE, reason=reason),
-      spec = list(n_peaks=0L, dominant_period=NA_real_, conf=NA_real_),
-      cpt  = list(changepoint_detected=FALSE, changepoint_position=NA_integer_,
-                  n_changepoints=0L, first_changepoint_year=NA_integer_,
-                  mean_before=NA_real_, mean_after=NA_real_, magnitude_shift=NA_real_)
-    )
-  }
-  
-  if (n < 10) return(na_result("low_n"))
-  
-  if (skip_min_filter) {
-    min_check <- list(exceeds_threshold = FALSE, pct_min_vals = 0)
-  } else if (!is.null(min_nonzero_count)) {
-    n_nonzero    <- sum(ts_clean > min_positive_value, na.rm = TRUE)
-    pct_min_vals <- (1 - n_nonzero / n) * 100
-    if (n_nonzero < min_nonzero_count)
-      return(na_result("insufficient_nonzero", pct_min = pct_min_vals))
-    min_check <- list(exceeds_threshold = FALSE, pct_min_vals = pct_min_vals)
-  } else {
-    min_val_threshold <- if (is_precip) 0.0 else min_positive_value
-    min_check <- check_min_value_threshold(
-      ts_clean, min_val_threshold,
-      max_pct = if (is_precip) max_min_value_pct_precip else max_min_value_pct_pet,
-      is_precip = is_precip)
-    if (min_check$exceeds_threshold)
-      return(na_result("excessive_min_vals", pct_min = min_check$pct_min_vals))
-  }
-  
-  n_unique     <- length(unique(ts_clean))
-  n_ties       <- n - n_unique
-  percent_ties <- n_ties / n * 100
-  if (percent_ties > max_tie_pct)
-    return(na_result("excessive_ties", n_ties, percent_ties, min_check$pct_min_vals))
-  
-  sen_slope <- trend::sens.slope(ts_clean)$estimates
-  if (is.na(sen_slope) || is.infinite(sen_slope) || length(sen_slope) == 0)
-    return(na_result("sens_slope_fail", n_ties, percent_ties, min_check$pct_min_vals))
-  
-  time_index <- seq_len(n)
-  trend_line <- sen_slope * time_index
-  detrended  <- ts_clean - trend_line
-  
-  acf_result <- tryCatch(acf(detrended, lag.max=1, plot=FALSE, na.action=na.pass),
-                         error=function(e) NULL, warning=function(w) NULL)
-  rho1 <- if (!is.null(acf_result)) acf_result$acf[2] else NA_real_
-  
-  tau_b_adjusted <- (percent_ties > 5)
-  vc_corrected   <- FALSE
-  p_vc <- NA_real_; S_vc <- NA_real_; tau_vc <- NA_real_; varS_final <- NA_real_
-  vc_res <- tryCatch(modifiedmk::mk3(ts_clean), error=function(e) NULL)
-  if (!is.null(vc_res)) {
-    tau_vc     <- vc_res$tau;  p_vc   <- vc_res$p.value
-    S_vc       <- vc_res$S;    varS_final <- vc_res$varS
-    if (!is.na(rho1) && abs(rho1) > 0.1) vc_corrected <- TRUE
-  }
-  vc_list <- list(tau=tau_vc, p=p_vc, sl=sen_slope, S=S_vc, varS=varS_final,
-                  n=n, rho1=rho1, vc_corrected=vc_corrected,
-                  n_ties=n_ties, percent_ties=percent_ties,
-                  n_min_vals=0, percent_min_vals=min_check$pct_min_vals,
-                  tau_b_adjusted=tau_b_adjusted, filtered=FALSE, reason="none")
-  
-  tfpw_applied <- FALSE
-  if (!is.na(rho1) && abs(rho1) > 0.1) {
-    pw <- numeric(n); pw[1] <- detrended[1]
-    for (j in 2:n) pw[j] <- detrended[j] - rho1 * detrended[j-1]
-    corrected <- pw + trend_line; tfpw_applied <- TRUE
-  } else {
-    corrected <- ts_clean
-  }
-  s_mat_tf <- sign(outer(corrected, corrected, `-`))
-  S_tf     <- sum(s_mat_tf[upper.tri(s_mat_tf)], na.rm=TRUE)
-  varS_tf  <- calculate_variance_with_ties(S_tf, n, corrected)
-  n_pairs  <- n * (n-1) / 2
-  tau_tf   <- S_tf / n_pairs
-  p_tf     <- if (varS_tf <= 0) NA_real_ else 2 * pnorm(-abs(S_tf / sqrt(varS_tf)))
-  tf_list  <- list(tau=tau_tf, p=p_tf, sl=sen_slope, S=S_tf, varS=varS_tf,
-                   n=n, rho1=rho1, tfpw_applied=tfpw_applied,
-                   n_ties=n_ties, percent_ties=percent_ties,
-                   n_min_vals=0, percent_min_vals=min_check$pct_min_vals,
-                   tau_b_adjusted=tau_b_adjusted, filtered=FALSE, reason="none")
-  
-  dstd <- detrended - mean(detrended)
-  sd_d <- stats::sd(dstd); if (!is.finite(sd_d) || sd_d==0) sd_d <- 1
-  dstd <- dstd / sd_d
-  key  <- paste0("n_", n)
-  if (!exists(key, envir=conf_cache_env, inherits=FALSE)) {
-    half        <- floor(n/2)
-    max_spectra <- vapply(seq_len(n_sim_spectral), function(jj) {
-      r <- rnorm(n,0,1); fr <- fft(r - mean(r))
-      max(Mod(fr[1:half])^2 / n, na.rm=TRUE)
-    }, numeric(1))
-    assign(key, stats::quantile(max_spectra, 1-alpha, na.rm=TRUE), envir=conf_cache_env)
-  }
-  conf_limit       <- get(key, envir=conf_cache_env, inherits=FALSE)
-  half             <- floor(n/2)
-  ff               <- fft(dstd)
-  spectral_density <- Mod(ff[1:half])^2 / n
-  freqs            <- seq(0, 0.5, length.out=half)
-  peak_idx         <- which(spectral_density > conf_limit)
-  peak_periods     <- if (length(peak_idx)) {
-    pf  <- freqs[peak_idx]
-    pp  <- ifelse(pf > 0, 1/pf, NA_real_)
-    pp[order(spectral_density[peak_idx], decreasing=TRUE)]
-  } else numeric(0)
-  spec_list <- list(n_peaks=length(peak_periods),
-                    dominant_period=if (length(peak_periods)) peak_periods[1] else NA_real_,
-                    conf=conf_limit)
-  
-  cpt_result <- detect_regime_shift_pelt(ts_clean, min_obs=min_obs_changepoint,
-                                         start_year=start_year)
-  list(vc=vc_list, tf=tf_list, spec=spec_list, cpt=cpt_result)
-}
 
 ####################################################################################
 # ── DATA LOADING & PREPROCESSING
@@ -380,7 +223,7 @@ years  <- as.integer(format(dates, "%Y"))
 months <- as.integer(format(dates, "%m"))
 
 # ── Unit conversions ─────────────────────────────────────────────────────────────
-precip_full <- precip_full * 1    # mm→ mm/day
+precip_full <- precip_full * 1000    # m → mm/day
 month_days_base  <- c(31,28,31,30,31,30,31,31,30,31,30,31)
 is_leap <- function(yr) (yr%%4==0) & (yr%%100!=0 | yr%%400==0)
 days_in_month <- month_days_base[months]

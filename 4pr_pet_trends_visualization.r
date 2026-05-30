@@ -41,6 +41,13 @@ library(ggplot2)
 library(patchwork)
 library(scales)
 setwd("D:/Nechako_Drought/Nechako/")
+
+# ── Shared project constants and basin utilities ────────────────────────────────
+# DROUGHT_ANALYSIS_utils.R supplies WD_PATH, EQUAL_AREA_CRS, FIG_* constants,
+# load_basin(), safe_pdf(), save_figure(), and the Section J statistical
+# functions (not used here — this script reads pre-computed .rds results).
+source("DROUGHT_ANALYSIS_utils.R")
+
 out_dir <- "trend_analysis_pr_pet"
 if (!dir.exists(out_dir)) dir.create(out_dir, recursive=TRUE)
 ####################################################################################
