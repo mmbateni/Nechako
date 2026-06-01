@@ -37,10 +37,10 @@
 #     R-vine: PRIMARY model — data-driven MST structure imposes no physical
 #             cascade assumption and is robust to operational management.
 #
-#  ⚠ SEASONAL STRATIFICATION
-#     Snow season (Oct–Apr):  all 5 variables
-#     Warm season (May–Sep):  4 variables — SWEI excluded (no snow signal)
-#     A full-year vine (5 vars) is also fitted for comparison.
+#  ⚠ SEASONAL STRATIFICATION (OPTION A — EXCLUSIVE)
+#     Snow season (Oct–Apr):  all 5 variables — fit vines_snow5
+#     Warm season (May–Sep):  4 variables — SWEI excluded, fit vines_warm4
+#     Full-year vine REMOVED — structurally incompatible with seasonal SWEI
 #
 # METHOD ENHANCEMENTS OVER DRAFT
 # ─────────────────────────────────────────────────────────────────────────────
@@ -95,15 +95,14 @@ cfg <- list(
   ssi_soil_file = "ssi_results_seasonal/ssi_L1_3_01_basin_averaged_by_month.csv",
   
   # SGI  — long CSV:  columns 'month_label' (YYYY-MM), 'sgi_median', 'date'
-  sgi_file      = "sgi_nechako_monthly.csv",
+  sgi_file = "sgi_nechako_multisource.csv",
   
   # WSC streamflow SSI — RDS files saved by 7WSC_StreamFlow.R
   # Each RDS is a data frame with columns: date (YYYY-MM-15), ssi, ...
-  ssi_wsc_rds   = c(
+  ssi_wsc_rds = c(
     "streamflow_results/ssi/monthly_data/08JE001_monthly_ssi.rds",
-    "streamflow_results/ssi/monthly_data/08JC001_monthly_ssi.rds"
+    "streamflow_results/ssi/monthly_data/08JC002_monthly_ssi.rds"
   ),
-  
   # NTSDI — long CSV from 9NTSDI_GeoLakes_Extended.r Pipeline 2
   # Columns: date, NTSDI_norm  (Blom-standardised reservoir index)
   ntsdi_file    = "Nechako_NTSDI_Pipeline2_Output.csv",
@@ -153,7 +152,7 @@ cfg <- list(
   dvine_order_4B = c(1L, 2L, 4L, 3L),        # SSI_soil → SGI → SSI_wsc → NTSDI
   
   # Vine truncation levels to compare (NULL = fit full vine only)
-  truncation_levels = c(1L, 2L, NULL),
+  truncation_levels = c(1L, 2L),
   
   # Monte-Carlo samples for vine CDF integration (pvinecop) and Kendall dist.
   n_mc          = 2e4L,           # increase to 1e5 for publication
@@ -176,44 +175,35 @@ dir.create(cfg$out_dir, showWarnings = FALSE, recursive = TRUE)
 ## 3a. Pivot wide month-CSV (Year + 3-letter month cols) → long data frame ----
 pivot_wide_monthly <- function(path, value_name) {
   df <- read_csv(path, show_col_types = FALSE)
-  df |>
-    pivot_longer(-Year, names_to = "month_abbr", values_to = value_name) |>
-    mutate(date = as.Date(paste0(Year, "-", month_abbr, "-01"), "%Y-%b-%d")) |>
-    filter(!is.na(date), !is.na(.data[[value_name]])) |>
-    select(date, all_of(value_name))
-}
+  result <- df %>%
+    pivot_longer(-Year, names_to = "month_abbr", values_to = value_name) %>%
+    mutate(date = as.Date(paste0(Year, "-", month_abbr, "-01"), "%Y-%b-%d")) %>%
+    filter(!is.na(date), !is.na(.data[[value_name]]))
+  result[, c("date", value_name), drop = FALSE]}
 
 ## 3b. Reference-period empirical CDF transform (per calendar month) ----------
-# Fits a separate ECDF for each calendar month using only the reference period
-# and returns a function that transforms any value to U[0,1].
-#
-# Why per-calendar-month?  Even after standardisation, residual seasonality in
-# the JOINT distribution means marginal rank-order can differ by season.  This
-# step removes any remaining marginal seasonality before vine fitting.
 calibrate_marginals <- function(df, value_col, ref_start, ref_end) {
-  ref  <- df |>
+  ref <- df |>
     filter(date >= ref_start, date <= ref_end) |>
     mutate(mon = month(date))
   
-  ecdfs <- lapply(1:12, function(m) {
+  lapply(1:12, function(m) {
     vals <- ref[[value_col]][ref$mon == m]
     vals <- vals[!is.na(vals)]
     if (length(vals) < 5L) return(NULL)
-    ecdf(vals)
+    list(fn = ecdf(vals), n = length(vals))   # store n explicitly alongside ecdf
   })
-  ecdfs
 }
 
 ## 3c. Apply calibrated ECDFs to full series → U[0,1] -------------------------
 apply_marginals <- function(df, value_col, ecdfs) {
-  u <- rep(NA_real_, nrow(df))
+  u    <- rep(NA_real_, nrow(df))
   mons <- month(df$date)
   for (m in 1:12) {
     idx <- which(mons == m & !is.na(df[[value_col]]))
     if (length(idx) == 0L || is.null(ecdfs[[m]])) next
-    raw    <- ecdfs[[m]](df[[value_col]][idx])
-    # Scale to strict interior (Hazen) to avoid boundary issues in vine fitting
-    n_ref  <- environment(ecdfs[[m]])$n   # number of ref obs fed to ecdf()
+    n_ref  <- ecdfs[[m]]$n                          # safe: stored explicitly
+    raw    <- ecdfs[[m]]$fn(df[[value_col]][idx])   # apply the ecdf
     raw    <- pmax(1 / (n_ref + 1), pmin(n_ref / (n_ref + 1), raw))
     u[idx] <- raw
   }
@@ -288,7 +278,73 @@ extract_drought_events <- function(date_vec, msdi_vec,
                   severity = numeric(0), drought_class = character(0)))
   events
 }
-
+## 3h. Assemble SSI soil from per-month CSVs -----------------------------------
+# The upstream script saved one CSV per calendar month, not a wide basin file.
+# This function reads all 12, extracts a basin representative value (median
+# across grid cells), and returns a long data frame identical in structure to
+# pivot_wide_monthly() output.
+#
+# Assumptions about the per-month CSV structure (adjust col name if needed):
+#   - Contains a numeric column named "ssi" (or similar — detected automatically)
+#   - Each row is a grid cell or pixel for that calendar month
+#   - Files are named  ssi_L1_3_01_month01_Jan.csv … _month12_Dec.csv
+assemble_ssi_from_monthly_csvs <- function(folder, prefix, value_name,
+                                           years_range = NULL) {
+  month_files <- tibble(
+    mon   = 1:12,
+    abbr  = c("Jan","Feb","Mar","Apr","May","Jun",
+              "Jul","Aug","Sep","Oct","Nov","Dec"),
+    path  = file.path(folder,
+                      sprintf("%s_month%02d_%s.csv",
+                              prefix,
+                              1:12,
+                              c("Jan","Feb","Mar","Apr","May","Jun",
+                                "Jul","Aug","Sep","Oct","Nov","Dec")))
+  )
+  
+  purrr::map_dfr(seq_len(nrow(month_files)), function(i) {
+    p <- month_files$path[i]
+    if (!file.exists(p)) { warning("Missing: ", p); return(NULL) }
+    
+    raw <- read_csv(p, show_col_types = FALSE)
+    
+    # Auto-detect the SSI value column (first numeric col that isn't Year/year/pixel)
+    num_cols <- names(raw)[sapply(raw, is.numeric)]
+    id_cols  <- grep("^(year|Year|pixel|id|lon|lat|x|y)$",
+                     num_cols, value = TRUE, ignore.case = TRUE)
+    val_col  <- setdiff(num_cols, id_cols)[1]
+    if (is.na(val_col)) { warning("No numeric value col in ", p); return(NULL) }
+    
+    # Detect year column
+    yr_col <- grep("^year$", names(raw), value = TRUE, ignore.case = TRUE)[1]
+    
+    if (!is.na(yr_col)) {
+      # Long format: multiple years, one row per (year × pixel)
+      raw %>%
+        group_by(Year = .data[[yr_col]]) %>%
+        summarise(!!value_name := median(.data[[val_col]], na.rm = TRUE),
+                  .groups = "drop") %>%
+        mutate(date = as.Date(paste0(Year, "-", month_files$mon[i], "-01"))) %>%
+        select(date, !!value_name)
+    } else {
+      # Wide format: one row per pixel, columns = years
+      yr_cols <- names(raw)[grepl("^\\d{4}$", names(raw))]
+      if (length(yr_cols) == 0) { warning("Can't detect year cols in ", p); return(NULL) }
+      raw %>%
+        select(all_of(yr_cols)) %>%
+        summarise(across(everything(), ~ median(.x, na.rm = TRUE))) %>%
+        pivot_longer(everything(), names_to = "Year", values_to = value_name) %>%
+        mutate(Year = as.integer(Year),
+               date = as.Date(paste0(Year, "-", month_files$mon[i], "-01"))) %>%
+        select(date, !!value_name)
+    }
+  }) %>%
+    filter(!is.na(date), !is.na(.data[[value_name]])) %>%
+    { if (!is.null(years_range))
+      filter(., between(year(date), years_range[1], years_range[2]))
+      else . } %>%
+    arrange(date)
+}
 # ==============================================================================
 # 4.  LOAD & MERGE INDICES
 # ==============================================================================
@@ -311,14 +367,17 @@ if (cfg$snow_index == "sspi1" && file.exists(cfg$sspi1_file)) {
 }
 
 # ── 4b. SSI soil moisture ─────────────────────────────────────────────────
-ssi_soil_long <- pivot_wide_monthly(cfg$ssi_soil_file, "SSI_soil")
-cat(sprintf("  SSI soil:       %d records (%s – %s)\n",
+ssi_soil_long <- assemble_ssi_from_monthly_csvs(
+  folder     = "ssi_results_seasonal",
+  prefix     = "ssi_L1_3_01",          # timescale-1, layers 1-3, basin 01
+  value_name = "SSI_soil"
+)
+cat(sprintf("  SSI soil:       %d records (%s – %s)\n",                      
             nrow(ssi_soil_long), min(ssi_soil_long$date), max(ssi_soil_long$date)))
-
 # ── 4c. SGI groundwater ───────────────────────────────────────────────────
 # 10SGI.R saves: month_label (YYYY-MM), sgi_median, date
 sgi_raw  <- read_csv(cfg$sgi_file, show_col_types = FALSE)
-sgi_long <- sgi_raw |>
+sgi_long <- sgi_raw |>                                                       
   mutate(date = if ("date" %in% names(sgi_raw))
     floor_date(as.Date(date), "month")
     else
@@ -372,7 +431,7 @@ cat(sprintf("  SSI stream:     %d records (%s – %s)\n",
 #
 # 9NTSDI writes: date, NTSDI_norm  (column name = paste0("NTSDI","_norm"))
 ntsdi_raw  <- read_csv(cfg$ntsdi_file, show_col_types = FALSE)
-ntsdi_long <- ntsdi_raw |>
+ntsdi_long <- ntsdi_raw |>                                                       
   mutate(date = floor_date(as.Date(date), "month")) |>
   select(date, NTSDI = NTSDI_norm) |>
   filter(!is.na(NTSDI))
@@ -465,12 +524,13 @@ cat(strrep("=", 60), "\n  PAIRWISE KENDALL TAU (reference period)\n",
 print(round(tau_mat, 3))
 
 # ==============================================================================
-# 8.  VINE COPULA FITTING — SEASONAL STRATIFICATION
+# 8.  VINE COPULA FITTING — SEASONAL STRATIFICATION (OPTION A ONLY)
 # ==============================================================================
-# Three vine regimes are fitted and evaluated:
-#   (A) Full-year  5-variable vine (D + R)
+# Two vine regimes are fitted (Option A — exclusive seasonal stratification):
 #   (B) Snow-season 5-variable vine (D + R)  — Oct–Apr
 #   (C) Warm-season 4-variable vine (D + R)  — May–Sep (Snow excluded)
+#
+# Full-year 5-variable vine REMOVED — structurally incompatible with seasonal SWEI
 #
 # D-vine cascade logic:
 #   • Positions 1–3 (natural, unambiguous):  Snow → SSI_soil → SGI
@@ -513,11 +573,8 @@ fit_vine_pair <- function(u_mat_fit, dvine_ord_A, dvine_ord_B, label) {
   cat(sprintf("  D-vine tail ordering selected: Variant %s (ΔBIC vs other = %.2f)\n",
               dvine_winner, abs(BIC(vine_dA) - BIC(vine_dB))))
   
-  cat(sprintf("  NOTE: Variant A tail = [NTSDI → SSI_wsc]; ",
-              "Variant B tail = [SSI_wsc → NTSDI]\n"))
-  cat(sprintf("        Neither tail ordering has a causal physical basis ",
-              "(managed reservoir); BIC selection is purely statistical.\n"))
-  
+  cat("  NOTE: Variant A tail = [NTSDI → SSI_wsc]; Variant B tail = [SSI_wsc → NTSDI]\n")
+  cat("        Neither tail ordering has a causal physical basis (managed reservoir); BIC selection is purely statistical.\n")
   # ── R-vine (data-driven — PRIMARY for managed system) ────────────────────
   cat(sprintf("  Fitting R-vine  [%s] (PRIMARY) …  ", label))
   vine_r <- vinecop(
@@ -562,62 +619,48 @@ fit_vine_pair <- function(u_mat_fit, dvine_ord_A, dvine_ord_B, label) {
   )
 }
 
-# ── 8A. Full-year (all months, 5 variables) ───────────────────────────────
+# ── 8B. Snow season (Oct–Apr, 5 variables) ────────────────────────────────
 cat("\n", strrep("=", 60),
-    "\n  VINE FITTING — FULL-YEAR (5 variables)\n",
-    strrep("=", 60), sep = "")
+    "\n  VINE FITTING — SNOW SEASON Oct–Apr (5 variables)\n",
+    strrep("=", 60), "\n", sep = "")
 
-full5_ref <- all_raw |>
-  filter(date >= cfg$ref_start, date <= cfg$ref_end) |>
-  select(all_of(u_cols)) |>
-  drop_na()
-
-if (nrow(full5_ref) < 60L)
-  warning("Fewer than 60 complete months for full-year vine — estimates unreliable.")
-
-u_full5 <- as.matrix(full5_ref)
-colnames(u_full5) <- var_list
-vines_full5 <- fit_vine_pair(u_full5, cfg$dvine_order_5, "Full-year")
-saveRDS(vines_full5, file.path(cfg$out_dir, "vines_full5.rds"))
-
-# ── 8B. Snow season (Oct–Apr, 5 variables) ───────────────────────────────
-cat("\n", strrep("=", 60),
-    "\n  VINE FITTING — SNOW SEASON (Oct–Apr, 5 variables)\n",
-    strrep("=", 60), sep = "")
-
-snow_ref <- all_raw |>
+snow5_ref <- all_raw |>
   filter(date >= cfg$ref_start, date <= cfg$ref_end,
          month(date) %in% cfg$snow_months) |>
   select(all_of(u_cols)) |>
   drop_na()
 
-cat(sprintf("  Reference snow-season rows: %d\n", nrow(snow_ref)))
-u_snow5 <- as.matrix(snow_ref)
+if (nrow(snow5_ref) < 40L)
+  warning("Fewer than 40 complete snow-season months — estimates unreliable.")
+
+u_snow5 <- as.matrix(snow5_ref)
 colnames(u_snow5) <- var_list
-vines_snow5 <- fit_vine_pair(u_snow5, cfg$dvine_order_5, "Snow-season")
+
+vines_snow5 <- fit_vine_pair(u_snow5, cfg$dvine_order_5A, cfg$dvine_order_5B, "Snow-season")
 saveRDS(vines_snow5, file.path(cfg$out_dir, "vines_snow5.rds"))
 
-# ── 8C. Warm season (May–Sep, 4 variables — SWEI excluded) ───────────────
+# ── 8C. Warm season (May–Sep, 4 variables — Snow excluded) ───────────────
 cat("\n", strrep("=", 60),
-    "\n  VINE FITTING — WARM SEASON (May–Sep, 4 variables)\n",
-    strrep("=", 60), sep = "")
+    "\n  VINE FITTING — WARM SEASON May–Sep (4 variables)\n",
+    strrep("=", 60), "\n", sep = "")
 
-# Warm-season 4-variable subset (Snow excluded).
-# Column order within the warm submatrix: SSI_soil=1, SGI=2, NTSDI=3, SSI_wsc=4.
-# This matches dvine_order_4A / 4B defined in cfg.
-warm_vars   <- c("SSI_soil", "SGI", "NTSDI", "SSI_wsc")
-warm_u_cols <- paste0("u_", warm_vars)
+# Drop Snow column; variable order becomes: SSI_soil=1, SGI=2, NTSDI=3, SSI_wsc=4
+u_cols_warm <- paste0("u_", c("SSI_soil", "SGI", "NTSDI", "SSI_wsc"))
+var_list_warm <- c("SSI_soil", "SGI", "NTSDI", "SSI_wsc")
 
-warm_ref <- all_raw |>
+warm4_ref <- all_raw |>
   filter(date >= cfg$ref_start, date <= cfg$ref_end,
          month(date) %in% cfg$warm_months) |>
-  select(all_of(warm_u_cols)) |>
+  select(all_of(u_cols_warm)) |>
   drop_na()
 
-cat(sprintf("  Reference warm-season rows: %d\n", nrow(warm_ref)))
-u_warm4 <- as.matrix(warm_ref)
-colnames(u_warm4) <- warm_vars
-vines_warm4 <- fit_vine_pair(u_warm4, cfg$dvine_order_4, "Warm-season")
+if (nrow(warm4_ref) < 30L)
+  warning("Fewer than 30 complete warm-season months — estimates unreliable.")
+
+u_warm4 <- as.matrix(warm4_ref)
+colnames(u_warm4) <- var_list_warm
+
+vines_warm4 <- fit_vine_pair(u_warm4, cfg$dvine_order_4A, cfg$dvine_order_4B, "Warm-season")
 saveRDS(vines_warm4, file.path(cfg$out_dir, "vines_warm4.rds"))
 
 # ==============================================================================
@@ -626,18 +669,7 @@ saveRDS(vines_warm4, file.path(cfg$out_dir, "vines_warm4.rds"))
 cat("\n", strrep("=", 60), "\n  EVALUATING VINE CDF (full record)\n",
     strrep("=", 60), "\n\n", sep = "")
 
-# Full-year 5-variable evaluation (used for reference / comparison)
-full5_all <- all_raw |> select(all_of(u_cols)) |> drop_na()
-p_full5_d <- pvinecop(as.matrix(full5_all |> rename_with(~var_list)),
-                      vines_full5$d, n_mc = cfg$n_mc)
-p_full5_r <- pvinecop(as.matrix(full5_all |> rename_with(~var_list)),
-                      vines_full5$r, n_mc = cfg$n_mc)
-cat(sprintf("  Full-year D-vine CDF: [%.4f, %.4f]\n",
-            min(p_full5_d), max(p_full5_d)))
-cat(sprintf("  Full-year R-vine CDF: [%.4f, %.4f]\n",
-            min(p_full5_r), max(p_full5_r)))
-
-# Seasonal evaluation: snow season (5 vars) + warm season (4 vars)
+# Seasonal evaluation only (Option A): snow season (5 vars) + warm season (4 vars)
 all_snow <- all_raw |>
   filter(month(date) %in% cfg$snow_months) |>
   select(date, all_of(u_cols)) |>
@@ -645,7 +677,7 @@ all_snow <- all_raw |>
 
 all_warm <- all_raw |>
   filter(month(date) %in% cfg$warm_months) |>
-  select(date, all_of(warm_u_cols)) |>
+  select(date, all_of(u_cols_warm)) |>
   drop_na()
 
 p_snow_best <- pvinecop(
@@ -653,7 +685,7 @@ p_snow_best <- pvinecop(
   vines_snow5$best, n_mc = cfg$n_mc
 )
 p_warm_best <- pvinecop(
-  as.matrix(all_warm[, warm_u_cols]),
+  as.matrix(all_warm[, u_cols_warm]),
   vines_warm4$best, n_mc = cfg$n_mc
 )
 
@@ -663,25 +695,19 @@ p_warm_best <- pvinecop(
 cat("\n  Estimating Kendall distributions (MC, n =",
     format(cfg$n_kc_sim, big.mark = ","), ") …\n")
 
-KC_full5_d <- estimate_kendall_cdf(vines_full5$d, cfg$n_kc_sim, cfg$n_mc)
-KC_full5_r <- estimate_kendall_cdf(vines_full5$r, cfg$n_kc_sim, cfg$n_mc)
+# Seasonal Kendall distributions only (Option A)
 KC_snow5   <- estimate_kendall_cdf(vines_snow5$best, cfg$n_kc_sim, cfg$n_mc)
 KC_warm4   <- estimate_kendall_cdf(vines_warm4$best, cfg$n_kc_sim, cfg$n_mc)
 cat("  Kendall distributions estimated.\n\n")
 
 # ==============================================================================
-# 11. MSDI COMPUTATION
+# 11. MSDI COMPUTATION — SEASONAL ONLY (OPTION A)
 # ==============================================================================
-# Full-year MSDI (D-vine and R-vine, for comparison)
-full5_dates <- all_raw |> filter(!if_any(all_of(u_cols), is.na)) |> pull(date)
-MSDI_fy_d   <- vine_to_msdi(p_full5_d, KC_full5_d)
-MSDI_fy_r   <- vine_to_msdi(p_full5_r, KC_full5_r)
-
 # Seasonal MSDI (best-structure vine per season)
 MSDI_snow <- vine_to_msdi(p_snow_best, KC_snow5)
 MSDI_warm <- vine_to_msdi(p_warm_best, KC_warm4)
 
-# Combine seasonal MSDI into a single time series
+# Combine seasonal MSDI into a single continuous time series (primary output)
 seasonal_out <- bind_rows(
   tibble(date = all_snow$date, MSDI_seasonal = MSDI_snow,
          season = "Snow (Oct-Apr)"),
@@ -690,7 +716,7 @@ seasonal_out <- bind_rows(
 ) |> arrange(date)
 
 # ==============================================================================
-# 12. COMPONENT CONTRIBUTION SCORES
+# 12. COMPONENT CONTRIBUTION SCORES — SEASONAL
 # ==============================================================================
 # For each observation and variable, estimate how much that variable's anomaly
 # drives the joint drought.  Method: compute vine CDF with that variable's
@@ -720,11 +746,21 @@ compute_contributions <- function(u_full_mat, vine_obj, var_names, n_mc) {
   as.data.frame(contrib_norm)
 }
 
-# Run on full-year D-vine (best structure)
-best_full <- if (vines_full5$which == "D-vine") vines_full5$d else vines_full5$r
-u_full5_mat <- as.matrix(full5_all |> rename_with(~var_list))
-contrib_df  <- compute_contributions(u_full5_mat, best_full, var_list,
-                                     n_mc = min(5000L, cfg$n_mc))
+# Run on seasonal best models separately, then merge chronologically
+contrib_snow <- compute_contributions(
+  as.matrix(all_snow[, u_cols]), vines_snow5$best, var_list,
+  n_mc = min(5000L, cfg$n_mc)
+)
+contrib_warm <- compute_contributions(
+  as.matrix(all_warm[, u_cols_warm]), vines_warm4$best, var_list_warm,
+  n_mc = min(5000L, cfg$n_mc)
+)
+
+# Merge contributions chronologically with seasonal labels
+contrib_df <- bind_rows(
+  tibble(date = all_snow$date, contrib_snow, season = "Snow"),
+  tibble(date = all_warm$date, contrib_warm, season = "Warm")
+) |> arrange(date)
 
 # ==============================================================================
 # 13. DROUGHT EVENT IDENTIFICATION & RANKING
@@ -771,8 +807,8 @@ write_csv(drought_severe,   file.path(cfg$out_dir, "drought_events_severe.csv"))
 # ==============================================================================
 cat("\n", strrep("=", 60), "\n  DIAGNOSTICS\n", strrep("=", 60), "\n\n", sep = "")
 
-# ── 14a. KS normality test ─────────────────────────────────────────────────
-for (nm in c("MSDI_fy_d", "MSDI_fy_r", "MSDI_snow", "MSDI_warm")) {
+# ── 14a. KS normality test — seasonal MSDI only ───────────────────────────
+for (nm in c("MSDI_snow", "MSDI_warm")) {
   x   <- get(nm)
   ks  <- ks.test(x, "pnorm")
   sw  <- if (length(x) >= 7L) shapiro.test(sample(x, min(5000L, length(x))))
@@ -783,20 +819,17 @@ for (nm in c("MSDI_fy_d", "MSDI_fy_r", "MSDI_snow", "MSDI_warm")) {
               sw$p.value, mean(x, na.rm = TRUE), sd(x, na.rm = TRUE)))
 }
 
-# ── 14b. D-vine vs R-vine model comparison table ───────────────────────────
+# ── 14b. D-vine vs R-vine model comparison table — seasonal only ──────────
 model_cmp <- tibble(
-  Season     = c("Full-year", "Full-year", "Snow (Oct-Apr)", "Snow (Oct-Apr)",
+  Season     = c("Snow (Oct-Apr)", "Snow (Oct-Apr)",
                  "Warm (May-Sep)", "Warm (May-Sep)"),
-  Model      = rep(c("D-vine", "R-vine"), 3),
-  d          = c(5L, 5L, 5L, 5L, 4L, 4L),
-  logLik     = c(logLik(vines_full5$d), logLik(vines_full5$r),
-                 logLik(vines_snow5$d),  logLik(vines_snow5$r),
+  Model      = rep(c("D-vine", "R-vine"), 2),
+  d          = c(5L, 5L, 4L, 4L),
+  logLik     = c(logLik(vines_snow5$d),  logLik(vines_snow5$r),
                  logLik(vines_warm4$d),  logLik(vines_warm4$r)),
-  AIC        = c(AIC(vines_full5$d), AIC(vines_full5$r),
-                 AIC(vines_snow5$d),  AIC(vines_snow5$r),
+  AIC        = c(AIC(vines_snow5$d),  AIC(vines_snow5$r),
                  AIC(vines_warm4$d),  AIC(vines_warm4$r)),
-  BIC        = c(BIC(vines_full5$d), BIC(vines_full5$r),
-                 BIC(vines_snow5$d),  BIC(vines_snow5$r),
+  BIC        = c(BIC(vines_snow5$d),  BIC(vines_snow5$r),
                  BIC(vines_warm4$d),  BIC(vines_warm4$r))
 )
 model_cmp <- model_cmp |>
@@ -809,37 +842,16 @@ print(model_cmp |> mutate(across(where(is.numeric), \(x) round(x, 2))),
       n = nrow(model_cmp))
 write_csv(model_cmp, file.path(cfg$out_dir, "model_comparison.csv"))
 
-# ── 14c. Rosenblatt GOF (VineCopula package) ─────────────────────────────
+# ── 14c. Rosenblatt GOF (VineCopula package) — seasonal only ─────────────
 cat("\n  Rosenblatt GOF (White test, B=100):\n")
-for (lab in c("Full-year D-vine", "Full-year R-vine")) {
-  vine_obj <- if (grepl("D-vine", lab)) vines_full5$d else vines_full5$r
-  tryCatch({
-    vc   <- as_VineCopula(vine_obj)
-    gof  <- RVineGOFTest(u_full5_mat, vc, method = "White",
-                         B = 100, verbose = FALSE)
-    cat(sprintf("    %-22s  stat=%.4f  p=%.4f\n",
-                lab, gof$statistic, gof$p.value))
-  }, error = function(e) cat(sprintf("    %-22s  skipped: %s\n", lab, e$message)))
-}
+# Skip if as_VineCopula not available; seasonal models use rvinecopulib directly
+cat("    (skipped — rvinecopulib does not export as_VineCopula; use VineCopula::RVineGOFTest with manual conversion if needed)\n")
 
 # ==============================================================================
-# 15. ASSEMBLE MAIN OUTPUT TABLE
+# 15. ASSEMBLE MAIN OUTPUT TABLE — SEASONAL MSDI PRIMARY
 # ==============================================================================
-msdi_out <- full5_dates |>
-  tibble(date = _) |>
-  left_join(
-    tibble(date = full5_dates,
-           MSDI_fullyear_d = MSDI_fy_d,
-           MSDI_fullyear_r = MSDI_fy_r) |>
-      bind_cols(as.data.frame(u_full5_mat) |>
-                  rename_with(~paste0("u_", var_list))) |>
-      bind_cols(contrib_df),
-    by = "date"
-  ) |>
-  left_join(
-    seasonal_out |> select(date, MSDI_seasonal, season),
-    by = "date"
-  ) |>
+msdi_out <- seasonal_out |>
+  left_join(contrib_df, by = c("date", "season")) |>
   left_join(all_raw |> select(date, all_of(var_list)), by = "date") |>
   mutate(
     # Drought classification for primary (seasonal) MSDI
@@ -854,41 +866,70 @@ msdi_out <- full5_dates |>
   )
 
 write_csv(msdi_out, file.path(cfg$out_dir, "Nechako_MSDI_VineCopula.csv"))
-cat("\n  Main CSV written: Nechako_MSDI_VineCopula.csv\n")
+cat("\n  Main CSV written: Nechako_MSDI_VineCopula.csv\n")                 
 
 # ==============================================================================
-# 16. OPTIONAL BOOTSTRAP CONFIDENCE BANDS
+# 16. OPTIONAL BOOTSTRAP CONFIDENCE BANDS — SEASONAL (OPTIONAL)
 # ==============================================================================
 if (cfg$run_bootstrap) {
   cat("\n", strrep("=", 60), "\n  BOOTSTRAP (n = ", cfg$n_boot, ")\n",
       strrep("=", 60), "\n\n", sep = "")
   
   set.seed(2024L)
-  n_obs   <- nrow(u_full5_mat)
-  boot_msdi <- matrix(NA_real_, nrow = n_obs, ncol = cfg$n_boot)
+  # Bootstrap on seasonal data separately, then combine
+  boot_msdi_snow <- matrix(NA_real_, nrow = nrow(all_snow), ncol = cfg$n_boot)
+  boot_msdi_warm <- matrix(NA_real_, nrow = nrow(all_warm), ncol = cfg$n_boot)
   
-  pb <- txtProgressBar(min = 0, max = cfg$n_boot, style = 3)
-  for (b in seq_len(cfg$n_boot)) {
-    idx_b <- sample(n_obs, n_obs, replace = TRUE)
-    u_b   <- u_full5_mat[idx_b, , drop = FALSE]
-    tryCatch({
-      vb   <- vinecop(u_b, structure  = dvine_structure(cfg$dvine_order_5),
-                      family_set = cfg$family_set,
-                      par_method = cfg$par_method,
-                      selcrit    = cfg$selcrit, cores = 1L)
-      KC_b <- estimate_kendall_cdf(vb, n_sim = 10000L, n_mc = 2000L)
-      p_b  <- pvinecop(u_full5_mat, vb, n_mc = 2000L)
-      boot_msdi[, b] <- vine_to_msdi(p_b, KC_b)
-    }, error = function(e) NULL)
-    setTxtProgressBar(pb, b)
+  # Snow season bootstrap
+  if (nrow(all_snow) > 10) {
+    pb <- txtProgressBar(min = 0, max = cfg$n_boot, style = 3)
+    for (b in seq_len(cfg$n_boot)) {
+      idx_b <- sample(nrow(all_snow), nrow(all_snow), replace = TRUE)
+      u_b   <- as.matrix(all_snow[, u_cols])[idx_b, , drop = FALSE]
+      tryCatch({
+        vb   <- vinecop(u_b, family_set = cfg$family_set,
+                        par_method = cfg$par_method,
+                        selcrit    = cfg$selcrit, cores = 1L)
+        KC_b <- estimate_kendall_cdf(vb, n_sim = 10000L, n_mc = 2000L)
+        p_b  <- pvinecop(as.matrix(all_snow[, u_cols]), vb, n_mc = 2000L)
+        boot_msdi_snow[, b] <- vine_to_msdi(p_b, KC_b)
+      }, error = function(e) NULL)
+      setTxtProgressBar(pb, b)
+    }
+    close(pb)
   }
-  close(pb)
   
-  msdi_boot_ci <- tibble(
-    date   = full5_dates,
-    MSDI_lo = apply(boot_msdi, 1, quantile, 0.05, na.rm = TRUE),
-    MSDI_hi = apply(boot_msdi, 1, quantile, 0.95, na.rm = TRUE)
-  )
+  # Warm season bootstrap
+  if (nrow(all_warm) > 10) {
+    pb <- txtProgressBar(min = 0, max = cfg$n_boot, style = 3)
+    for (b in seq_len(cfg$n_boot)) {
+      idx_b <- sample(nrow(all_warm), nrow(all_warm), replace = TRUE)
+      u_b   <- as.matrix(all_warm[, u_cols_warm])[idx_b, , drop = FALSE]
+      tryCatch({
+        vb   <- vinecop(u_b, family_set = cfg$family_set,
+                        par_method = cfg$par_method,
+                        selcrit    = cfg$selcrit, cores = 1L)
+        KC_b <- estimate_kendall_cdf(vb, n_sim = 10000L, n_mc = 2000L)
+        p_b  <- pvinecop(as.matrix(all_warm[, u_cols_warm]), vb, n_mc = 2000L)
+        boot_msdi_warm[, b] <- vine_to_msdi(p_b, KC_b)
+      }, error = function(e) NULL)
+      setTxtProgressBar(pb, b)
+    }
+    close(pb)
+  }
+  
+  # Combine bootstrap CIs chronologically
+  msdi_boot_ci <- bind_rows(
+    tibble(date = all_snow$date,
+           MSDI_lo = apply(boot_msdi_snow, 1, quantile, 0.05, na.rm = TRUE),
+           MSDI_hi = apply(boot_msdi_snow, 1, quantile, 0.95, na.rm = TRUE),
+           season = "Snow"),
+    tibble(date = all_warm$date,
+           MSDI_lo = apply(boot_msdi_warm, 1, quantile, 0.05, na.rm = TRUE),
+           MSDI_hi = apply(boot_msdi_warm, 1, quantile, 0.95, na.rm = TRUE),
+           season = "Warm")
+  ) |> arrange(date)
+  
   write_csv(msdi_boot_ci, file.path(cfg$out_dir, "MSDI_bootstrap_CI.csv"))
   cat("  Bootstrap CI saved.\n")
 } else {
@@ -916,10 +957,10 @@ p1 <- ggplot(seasonal_out, aes(date, MSDI_seasonal)) +
   geom_ribbon(aes(ymin = 0, ymax = pmax(MSDI_seasonal, 0)),
               fill = "#4575b4", alpha = 0.25) +
   geom_line(linewidth = 0.7, colour = "grey20") +
-  geom_hline(yintercept = c(-2, -1.5, -1, 0),
-             linetype   = c("dotted", "dashed", "dashed", "solid"),
-             colour     = c("#a50026", "#d73027", "#fc8d59", "grey40"),
-             linewidth  = 0.5) +
+  geom_hline(yintercept = -2, linetype = "dotted", colour = "#a50026", linewidth = 0.5) +
+  geom_hline(yintercept = -1.5, linetype = "dashed", colour = "#d73027", linewidth = 0.5) +
+  geom_hline(yintercept = -1, linetype = "dashed", colour = "#fc8d59", linewidth = 0.5) +
+  geom_hline(yintercept = 0, linetype = "solid", colour = "grey40", linewidth = 0.5) +
   { if (!is.null(msdi_boot_ci))
     list(
       geom_ribbon(data = msdi_boot_ci |>
@@ -939,28 +980,8 @@ ggsave(file.path(cfg$out_dir, "plot1_MSDI_seasonal.png"),
        p1, width = 13, height = 7, dpi = 300)
 cat("  Plot 1: MSDI seasonal time series\n")
 
-# ── Plot 2: Full-year MSDI comparison (D-vine vs R-vine) ─────────────────
-p2_data <- tibble(date = full5_dates,
-                  `D-vine` = MSDI_fy_d,
-                  `R-vine` = MSDI_fy_r) |>
-  pivot_longer(-date, names_to = "model", values_to = "MSDI")
-
-p2 <- ggplot(p2_data, aes(date, MSDI, colour = model)) +
-  geom_hline(yintercept = c(-2, -1.5, -1, 0),
-             linetype = "dashed", colour = "grey70", linewidth = 0.4) +
-  geom_line(linewidth = 0.7, alpha = 0.85) +
-  scale_colour_manual(values = c("D-vine" = "#1a6faf", "R-vine" = "#c0392b")) +
-  labs(title  = "Nechako Basin — Full-year Vine MSDI Comparison",
-       subtitle = "D-vine (physical cascade) vs R-vine (data-driven, MST)",
-       x = NULL, y = "MSDI", colour = "Vine structure",
-       caption = "D-vine order: SWEI → SSI-soil → SGI → SSI-WSC → NTSDI") +
-  theme_bw(base_size = 11) +
-  theme(legend.position = "top", plot.title = element_text(face = "bold"),
-        panel.grid.minor = element_blank())
-
-ggsave(file.path(cfg$out_dir, "plot2_MSDI_fullyr_dvine_rvine.png"),
-       p2, width = 13, height = 4.5, dpi = 300)
-cat("  Plot 2: D-vine vs R-vine full-year comparison\n")
+# ── Plot 2 REMOVED (Option A: no full-year comparison) ───────────────────
+# Plot 2 (D-vine vs R-vine full-year) deleted per Option A
 
 # ── Plot 3: MSDI heat map (Year × Month) ─────────────────────────────────
 hm_data <- seasonal_out |>
@@ -987,10 +1008,11 @@ ggsave(file.path(cfg$out_dir, "plot3_MSDI_heatmap.png"),
 cat("  Plot 3: MSDI heat map\n")
 
 # ── Plot 4: Component contribution stacked area chart ─────────────────────
-if (ncol(contrib_df) == 5L) {
-  contrib_long <- tibble(date = full5_dates) |>
-    bind_cols(contrib_df) |>
-    pivot_longer(-date,
+# Use seasonal contributions merged chronologically
+if (any(grepl("^contrib_", names(contrib_df)))) {
+  contrib_long <- contrib_df |>
+    select(date, season, starts_with("contrib_")) |>
+    pivot_longer(-c(date, season),
                  names_to  = "variable",
                  values_to = "contribution") |>
     mutate(
@@ -1020,15 +1042,30 @@ if (ncol(contrib_df) == 5L) {
 
 # ── Plot 5: Pair scatter (pseudo-obs, coloured by seasonal MSDI) ──────────
 # Uses the snow-season observations only (all 5 vars available)
+
+# Get the dates corresponding to u_snow5 (reference period, snow months, complete cases)
+# FIX: Include 'date' in select() before pull()
+snow5_dates <- all_raw |>
+  filter(date >= cfg$ref_start, date <= cfg$ref_end,
+         month(date) %in% cfg$snow_months) |>
+  select(date, all_of(u_cols)) |>  # Added 'date' here
+  drop_na() |>
+  pull(date)  # Now pull() works correctly
+
+# Subset MSDI_snow to match the same dates
+MSDI_snow_plot <- seasonal_out |>
+  filter(date %in% snow5_dates) |>
+  pull(MSDI_seasonal)
+
 pd5 <- as_tibble(u_snow5) |>
   setNames(var_list) |>
-  mutate(MSDI = MSDI_snow,
+  mutate(MSDI = MSDI_snow_plot,
          Drought = cut(MSDI, c(-Inf, -2, -1.5, -1, 0, Inf),
                        labels = c("Extreme", "Severe", "Moderate", "Minor", "Normal")))
 
 if (requireNamespace("GGally", quietly = TRUE)) {
   library(GGally)
-  p5 <- ggpairs(
+  p5  <- ggpairs(
     pd5, columns = 1:5,
     aes(colour = Drought, alpha = 0.5),
     upper = list(continuous = wrap("cor", method = "kendall", size = 3.2)),
@@ -1043,19 +1080,17 @@ if (requireNamespace("GGally", quietly = TRUE)) {
     ) +
     labs(title = "Snow-season Pseudo-obs Pair Plot (Kendall τ in upper panel)") +
     theme_bw(base_size = 9)
-  
   ggsave(file.path(cfg$out_dir, "plot5_pair_plot_snow.png"),
          p5, width = 10, height = 9, dpi = 250)
   cat("  Plot 5: Pair scatter matrix (snow season)\n")
 } else {
   cat("  Plot 5 skipped (GGally not installed)\n")
 }
-
 # ── Plot 6: Drought event severity vs duration scatter ───────────────────
 if (nrow(drought_minor) > 0) {
-  p6 <- ggplot(drought_minor,
-               aes(duration_months, severity, colour = drought_class,
-                   size = abs(peak_msdi), label = format(start_date, "%Y-%m"))) +
+  p6  <- ggplot(drought_minor,
+                aes(duration_months, severity, colour = drought_class,
+                    size = abs(peak_msdi), label = format(start_date, "%Y-%m"))) +
     geom_point(alpha = 0.8) +
     ggrepel::geom_text_repel(size = 3, max.overlaps = 15,
                              show.legend = FALSE) +
@@ -1063,23 +1098,21 @@ if (nrow(drought_minor) > 0) {
                                    Extreme  = "#a50026"),
                         name = "Peak class") +
     scale_size_continuous(range = c(2, 8), name = "|Peak MSDI|") +
-    labs(title    = "Nechako Drought Event Catalogue (MSDI < −1.0)",
+    labs(title    = "Nechako Drought Event Catalogue (MSDI  < −1.0)",
          x = "Duration (months)", y = "Severity (deficit sum)") +
     theme_bw(base_size = 11) +
     theme(plot.title = element_text(face = "bold"))
-  
   # ggrepel is optional; fall back to geom_text if unavailable
   if (!requireNamespace("ggrepel", quietly = TRUE)) {
     p6 <- p6 + geom_text(size = 3, vjust = -0.8, show.legend = FALSE)
   }
-  
   ggsave(file.path(cfg$out_dir, "plot6_drought_event_scatter.png"),
          p6, width = 8, height = 6, dpi = 250)
   cat("  Plot 6: Drought event severity vs duration\n")
 }
 
 # ── Plot 7: Tail-dependence bar chart ─────────────────────────────────────
-p7 <- td_df |>
+p7  <- td_df |>
   mutate(pair = paste0(Var1, "\n", Var2)) |>
   pivot_longer(c(lambda_L, lambda_U), names_to = "type", values_to = "lambda") |>
   mutate(type = recode(type, lambda_L = "Lower tail (λ_L)",
@@ -1103,22 +1136,18 @@ ggsave(file.path(cfg$out_dir, "plot7_tail_dependence.png"),
 cat("  Plot 7: Tail-dependence bar chart\n")
 
 # ==============================================================================
-# 18. FINAL SUMMARY
+# 18. FINAL SUMMARY — SEASONAL ONLY (OPTION A)
 # ==============================================================================
 cat("\n", strrep("=", 60),
-    "\n  VINE COPULA MSDI — COMPLETE\n",
+    "\n  VINE COPULA MSDI — COMPLETE (Option A: Seasonal Stratification Only)\n",
     strrep("=", 60), "\n\n", sep = "")
 
-cat(sprintf("  Records (full-year vine):  %d months (%s – %s)\n",
-            length(full5_dates), min(full5_dates), max(full5_dates)))
+cat(sprintf("  Records (seasonal MSDI):  %d months (%s – %s)\n",
+            nrow(seasonal_out), min(seasonal_out$date), max(seasonal_out$date)))
 
-best_full_label <- vines_full5$which
 best_snow_label <- vines_snow5$which
 best_warm_label <- vines_warm4$which
 
-cat(sprintf("  Full-year best model:      %s (BIC=%.1f)\n",
-            best_full_label,
-            min(BIC(vines_full5$d), BIC(vines_full5$r))))
 cat(sprintf("  Snow-season best model:    %s (BIC=%.1f)\n",
             best_snow_label,
             min(BIC(vines_snow5$d), BIC(vines_snow5$r))))
