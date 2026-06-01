@@ -821,11 +821,6 @@ for (sc in EXPORT_SCALES) {
   write.csv(df_thw, out_csv_thw, row.names = FALSE, quote = FALSE)
   cat(sprintf("    Written: %s\n", out_csv_thw))
   
-  # Also write a copy to the working directory root (mirrors PM series location)
-  wd_copy_thw <- sprintf("spei_thw_%02d_basin_average.csv", sc)
-  write.csv(df_thw, wd_copy_thw, row.names = FALSE, quote = FALSE)
-  cat(sprintf("    Copied to WD: %s\n", wd_copy_thw))
-  
   # --- PM (needed for f_thm) ---
   cat(sprintf("  Scale %d: assembling PM  basin-average series...\n", sc))
   df_pm <- assemble_basin_avg(sc, out_dir, month_names, dates)
@@ -964,6 +959,5 @@ if (!is.null(trend_spei2)) {
 cat("\nOutput files written:\n")
 for (sc in EXPORT_SCALES) {
   cat(sprintf("  spei_results_seasonal_thw/spei_thw_%02d_basin_average.csv\n", sc))
-  cat(sprintf("  spei_thw_%02d_basin_average.csv  (WD copy)\n", sc))
 }
 cat("============================================================\n")
