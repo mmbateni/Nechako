@@ -28,27 +28,27 @@ cfg <- list(
   src_wsc         = FALSE,  # Water Survey of Canada (tidyhydat)
   src_bc_realtime = FALSE,  # BC Real-Time (ArcGIS)
   src_gwells      = TRUE,   # BC GWELLS API [NOW ENABLED]
-
+  
   # === PGOWN (primary) ===
   url_pgown_ts   = "https://catalogue.data.gov.bc.ca/dataset/a74f1b97-17f7-499b-84e7-6455e169e425/resource/35162de7-803e-42f2-93d4-563330bb7dc9/download/monthlywell_ts.csv",
   url_pgown_attr = "https://catalogue.data.gov.bc.ca/dataset/a74f1b97-17f7-499b-84e7-6455e169e425/resource/a8933793-eadb-4a9c-992c-da4f6ac8ca51/download/gw_well_table.csv",
-
+  
   # === GIN/NGWD (Federal) ===
   gin_cache      = "gin_nechako_subset.csv",
-
+  
   # === WSC (tidyhydat) ===
   wsc_radius_km  = 50,
   wsc_daily_agg  = "median",
-
+  
   # === BC Real-Time (ArcGIS) ===
   bc_rt_layer    = "https://maps.gov.bc.ca/arcserver/rest/services/pub/Water/BC_Water_Levels/MapServer/1",
-
+  
   # === GWELLS API ===
   # Endpoint returns paginated JSON; we filter spatially by basin bbox
   gwells_api_base  = "https://apps.nrs.gov.bc.ca/gwells/api/v2",
   gwells_min_obs   = 5,        # minimum water-level records per well
   gwells_page_size = 1000,     # results per page (API max)
-
+  
   # === Aquifer boundaries (BC WFS) ===
   # WHSE_WATER_MANAGEMENT.GW_AQUIFERS_CLASSIFICATION_SVW served via OGC WFS
   # Filtered to basin bbox at fetch time; cache locally as GeoPackage
@@ -60,22 +60,23 @@ cfg <- list(
     "&outputFormat=application/json&srsName=EPSG:4326"
   ),
   aquifer_cache    = "cache/aquifers_nechako.gpkg",  # local GeoPackage cache
-
+  
   # === Basin boundary ===
   basin_kmz = "Spatial/nechakoBound_dissolve.kmz",
-
+  
   # === Caching ===
-  cache_dir = "cache/",
-
+  cache_dir = file.path("sgi_results", "cache"),
+  
   # === Quality filters ===
   min_years    = 10,
   max_gap_frac = 0.50,
-
+  
   # === Output ===
   target_months = NULL,
   output_prefix = "sgi_nechako_multisource"
 )
-
+out_dir <- "sgi_results"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 if (!dir.exists(cfg$cache_dir)) dir.create(cfg$cache_dir, recursive = TRUE)
 
 #---- 2. Helpers -------------------------------------------------------------
@@ -137,33 +138,33 @@ load_aquifers <- function() {
     aq <- sf::st_read(cfg$aquifer_cache, quiet = TRUE)
     return(aq)
   }
-
+  
   message("  [download] BC aquifer boundaries (WFS) …")
-
+  
   # Build a CQL bbox filter so only aquifers overlapping the basin are fetched
   # CQL spatial filter: BBOX(GEOMETRY, minx, miny, maxx, maxy)
   bb  <- basin_bbox
   cql <- sprintf("BBOX(GEOMETRY,%f,%f,%f,%f)", bb["xmin"], bb["ymin"],
                  bb["xmax"], bb["ymax"])
   url <- paste0(cfg$aquifer_wfs_url, "&CQL_FILTER=", utils::URLencode(cql, reserved = TRUE))
-
+  
   resp <- httr::GET(url, httr::timeout(120))
   httr::stop_for_status(resp, task = "fetch aquifer WFS")
-
+  
   geojson_text <- httr::content(resp, as = "text", encoding = "UTF-8")
   aq_raw <- sf::st_read(geojson_text, quiet = TRUE) %>%
     sf::st_transform(4326) %>%
     sf::st_make_valid()
-
+  
   if (nrow(aq_raw) == 0) {
     warning("  No aquifer polygons returned for basin bbox – aquifer grouping skipped.")
     return(NULL)
   }
-
+  
   # Keep only polygons that actually intersect the basin (WFS bbox is a rough filter)
   in_basin_aq <- sf::st_intersects(aq_raw, basin, sparse = FALSE)[, 1]
   aq <- aq_raw[in_basin_aq, ]
-
+  
   # Standardise key attribute names (WFS layer uses uppercase)
   names(aq) <- tolower(names(aq))
   # Typical fields: aquifer_id, aquifer_name, aquifer_subtype_code, vulnerability, type_description
@@ -176,7 +177,7 @@ load_aquifers <- function() {
     aq <- dplyr::rename(aq, aq_subtype = aquifer_subtype_code)
   if ("type_description" %in% names(aq))
     aq <- dplyr::rename(aq, aq_type_desc = type_description)
-
+  
   message(sprintf("  Aquifers in basin: %d polygons", nrow(aq)))
   sf::st_write(aq, cfg$aquifer_cache, delete_dsn = TRUE, quiet = TRUE)
   aq
@@ -189,32 +190,32 @@ aquifers <- load_aquifers()   # sf or NULL
 load_pgown <- function() {
   if (!cfg$src_pgown) return(NULL)
   message("Loading PGOWN (Environmental Reporting BC) …")
-
+  
   attrs_raw <- fetch_csv(cfg$url_pgown_attr,
                          file.path(cfg$cache_dir, "pgown_attrs.csv"),
                          "well attributes")
   names(attrs_raw) <- tolower(names(attrs_raw))
   idx_cols <- grep("^\\.\\.\\.\\d+$", names(attrs_raw), value = TRUE)
   if (length(idx_cols)) attrs_raw <- dplyr::select(attrs_raw, -dplyr::all_of(idx_cols))
-
+  
   col_well <- detect_col(attrs_raw, c("^well_num$", "well_id", "obs.*well"), "well ID")
   col_lat  <- detect_col(attrs_raw, c("^lat$", "^latitude$"), "latitude")
   col_lon  <- detect_col(attrs_raw, c("^lon$", "^long$", "^longitude$"), "longitude")
-
+  
   attrs <- attrs_raw %>%
     rename(well_num = all_of(col_well), lat = all_of(col_lat), lon = all_of(col_lon)) %>%
     mutate(well_num = as.character(well_num)) %>%
     filter(!is.na(lat), !is.na(lon))
-
+  
   ts_raw <- fetch_csv(cfg$url_pgown_ts,
                       file.path(cfg$cache_dir, "pgown_ts.csv"),
                       "monthly medians")
   names(ts_raw) <- tolower(names(ts_raw))
-
+  
   col_wn  <- detect_col(ts_raw, c("^well_num$", "well_id"), "well ID")
   col_dt  <- detect_col(ts_raw, c("^date$", "datetime"), "date")
   col_val <- detect_col(ts_raw, c("med_gwl", "gwl", "value", "level"), "GWL")
-
+  
   ts <- ts_raw %>%
     rename(well_num = all_of(col_wn), date = all_of(col_dt), gw_raw = all_of(col_val)) %>%
     mutate(
@@ -225,19 +226,19 @@ load_pgown <- function() {
       source_id   = "PGOWN"
     ) %>%
     filter(!is.na(date), !is.na(gw))
-
+  
   if (nrow(ts) == 0) { message("  No valid PGOWN records."); return(NULL) }
-
+  
   ts_coords <- ts %>%
     left_join(attrs %>% dplyr::select(well_num, lat, lon), by = "well_num") %>%
     filter(!is.na(lat), !is.na(lon))
-
+  
   if (nrow(ts_coords) == 0) { message("  No PGOWN wells with coordinates."); return(NULL) }
-
+  
   wells_sf <- sf::st_as_sf(ts_coords, coords = c("lon", "lat"), crs = 4326)
   in_basin <- sf::st_within(wells_sf, basin, sparse = FALSE)[, 1]
   if (sum(in_basin) == 0) { message("  No PGOWN wells inside basin."); return(NULL) }
-
+  
   out <- ts_coords[in_basin, ] %>%
     dplyr::select(well_num, date, gw, month_label, source_id)
   message(sprintf("  PGOWN: %d wells, %d records", n_distinct(out$well_num), nrow(out)))
@@ -266,9 +267,9 @@ load_pgown <- function() {
 load_gwells <- function() {
   if (!cfg$src_gwells) return(NULL)
   message("Loading GWELLS API (BC) …")
-
+  
   bb <- basin_bbox   # named vector: xmin ymin xmax ymax
-
+  
   #-- 6a. Fetch well list inside bbox (paginated) ----------------------------
   wells_cache <- file.path(cfg$cache_dir, "gwells_wells_nechako.rds")
   if (file.exists(wells_cache)) {
@@ -302,7 +303,7 @@ load_gwells <- function() {
       page <- page + 1
       Sys.sleep(0.3)   # be polite to the API
     }
-
+    
     if (length(wells_list) == 0) {
       message("  No GWELLS wells found in basin bbox.")
       return(NULL)
@@ -310,7 +311,7 @@ load_gwells <- function() {
     wells_df <- dplyr::bind_rows(wells_list)
     saveRDS(wells_df, wells_cache)
   }
-
+  
   # Harmonise coordinate column names (API returns latitude/longitude)
   names(wells_df) <- tolower(names(wells_df))
   if (!all(c("latitude", "longitude") %in% names(wells_df))) {
@@ -321,21 +322,21 @@ load_gwells <- function() {
     filter(!is.na(latitude), !is.na(longitude)) %>%
     mutate(latitude  = as.numeric(latitude),
            longitude = as.numeric(longitude))
-
+  
   #-- 6b. Spatial filter to basin polygon ------------------------------------
   wells_sf   <- sf::st_as_sf(wells_df, coords = c("longitude", "latitude"), crs = 4326)
   in_basin   <- sf::st_within(wells_sf, basin, sparse = FALSE)[, 1]
   wells_basin <- wells_df[in_basin, ]
-
+  
   message(sprintf("  GWELLS wells inside basin: %d", nrow(wells_basin)))
   if (nrow(wells_basin) == 0) return(NULL)
-
+  
   # well_tag_number is the unique key for the water-levels endpoint
   if (!"well_tag_number" %in% names(wells_basin)) {
     warning("  GWELLS response has no 'well_tag_number' field.")
     return(NULL)
   }
-
+  
   #-- 6c. Fetch water-level records per well ---------------------------------
   wl_cache <- file.path(cfg$cache_dir, "gwells_waterlevels_nechako.rds")
   if (file.exists(wl_cache)) {
@@ -370,23 +371,23 @@ load_gwells <- function() {
     wl_all <- dplyr::bind_rows(wl_list)
     saveRDS(wl_all, wl_cache)
   }
-
+  
   #-- 6d. Clean and aggregate to monthly medians ----------------------------
   names(wl_all) <- tolower(names(wl_all))
-
+  
   # Identify date and depth columns
   date_col  <- grep("^date$|^surveyed_date$|^date_surveyed$|^measurement_date$",
                     names(wl_all), value = TRUE)[1]
   depth_col <- grep("^depth_below_ground_surface$|^static_level$|^water_depth$|^level$",
                     names(wl_all), value = TRUE)[1]
-
+  
   if (is.na(date_col) || is.na(depth_col)) {
     warning(sprintf(
       "  GWELLS water-level response missing expected columns. Found: %s",
       paste(names(wl_all), collapse = ", ")))
     return(NULL)
   }
-
+  
   wl_clean <- wl_all %>%
     rename(date_raw = all_of(date_col), depth_raw = all_of(depth_col)) %>%
     mutate(
@@ -396,21 +397,21 @@ load_gwells <- function() {
     ) %>%
     filter(!is.na(date), !is.na(gw)) %>%
     mutate(month_label = format(date, "%Y-%m"))
-
+  
   # Drop wells with fewer than cfg$gwells_min_obs observations
   obs_per_well <- wl_clean %>%
     group_by(well_tag_number) %>%
     summarise(n_obs = n(), .groups = "drop") %>%
     filter(n_obs >= cfg$gwells_min_obs)
-
+  
   wl_clean <- wl_clean %>% filter(well_tag_number %in% obs_per_well$well_tag_number)
-
+  
   if (nrow(wl_clean) == 0) {
     message(sprintf("  No GWELLS wells pass the minimum %d observations filter.",
                     cfg$gwells_min_obs))
     return(NULL)
   }
-
+  
   # Monthly median per well
   wl_monthly <- wl_clean %>%
     group_by(well_tag_number, month_label) %>%
@@ -424,7 +425,7 @@ load_gwells <- function() {
       source_id = "GWELLS"
     ) %>%
     dplyr::select(well_num, date, gw, month_label, source_id)
-
+  
   message(sprintf("  GWELLS: %d wells, %d monthly records (min %d obs filter applied)",
                   n_distinct(wl_monthly$well_num), nrow(wl_monthly),
                   cfg$gwells_min_obs))
@@ -515,14 +516,14 @@ assign_aquifer <- function(ts_df, aq_sf) {
     return(ts_df %>% mutate(aq_id = NA_integer_, aq_name = "Unmapped",
                             aq_subtype = NA_character_, aq_type_desc = NA_character_))
   }
-
+  
   # Unique well coordinates from the time-series data
   # We need coordinates: re-join from the original source data
   # (ts_filtered only has well_num, date, gw, month_label, source_id)
   # Reconstruct from the deduped data's spatial context
   well_pts <- ts_df %>%
     distinct(well_num, source_id)
-
+  
   # For PGOWN wells, retrieve coords from the cached attribute table
   pgown_attrs <- tryCatch(
     readr::read_csv(file.path(cfg$cache_dir, "pgown_attrs.csv"),
@@ -533,7 +534,7 @@ assign_aquifer <- function(ts_df, aq_sf) {
                 lon      = as.numeric(lon)),
     error = function(e) tibble(well_num = character(), lat = numeric(), lon = numeric())
   )
-
+  
   # For GWELLS wells, retrieve coords from cached well list
   gwells_locs <- tryCatch({
     wdf <- readRDS(file.path(cfg$cache_dir, "gwells_wells_nechako.rds"))
@@ -543,50 +544,50 @@ assign_aquifer <- function(ts_df, aq_sf) {
              lon      = as.numeric(longitude)) %>%
       dplyr::select(well_num, lat, lon)
   }, error = function(e) tibble(well_num = character(), lat = numeric(), lon = numeric()))
-
+  
   coords_all <- dplyr::bind_rows(pgown_attrs, gwells_locs) %>%
     filter(!is.na(lat), !is.na(lon)) %>%
     distinct(well_num, .keep_all = TRUE)
-
+  
   well_coords <- well_pts %>%
     left_join(coords_all, by = "well_num") %>%
     filter(!is.na(lat), !is.na(lon))
-
+  
   if (nrow(well_coords) == 0) {
     warning("  No well coordinates available for aquifer join.")
     return(ts_df %>% mutate(aq_id = NA_integer_, aq_name = "Unmapped",
                             aq_subtype = NA_character_, aq_type_desc = NA_character_))
   }
-
+  
   wells_sf_aq <- sf::st_as_sf(well_coords, coords = c("lon", "lat"), crs = 4326)
-
+  
   # Identify which fields to carry across from aquifer layer
   aq_cols <- intersect(c("aq_id", "aq_name", "aq_subtype", "aq_type_desc"), names(aq_sf))
   aq_lookup <- aq_sf %>% dplyr::select(dplyr::all_of(aq_cols))
-
+  
   # Spatial join: each well gets the aquifer it falls within
   joined <- sf::st_join(wells_sf_aq, aq_lookup, join = sf::st_within, left = TRUE) %>%
     sf::st_drop_geometry()
-
+  
   # A well can fall in >1 polygon (overlapping aquifer boundaries are rare but possible)
   # Keep first match per well
   joined_uniq <- joined %>%
     group_by(well_num) %>%
     slice(1) %>%
     ungroup()
-
+  
   # Fill in missing aquifer fields
   for (col in c("aq_id", "aq_name", "aq_subtype", "aq_type_desc")) {
     if (!col %in% names(joined_uniq)) joined_uniq[[col]] <- NA
   }
   joined_uniq <- joined_uniq %>%
     mutate(aq_name = ifelse(is.na(aq_name), "Unmapped", aq_name))
-
+  
   aq_assign <- joined_uniq %>% dplyr::select(well_num, aq_id, aq_name,
-                                              aq_subtype, aq_type_desc)
+                                             aq_subtype, aq_type_desc)
   n_mapped <- sum(!is.na(aq_assign$aq_id))
   message(sprintf("  Wells mapped to an aquifer: %d / %d", n_mapped, nrow(aq_assign)))
-
+  
   ts_df %>% left_join(aq_assign, by = "well_num")
 }
 
@@ -665,7 +666,7 @@ if (!all(is.na(sgi_long$aq_id))) {
         TRUE                ~ "Extreme drought"
       )
     )
-
+  
   if (!is.null(cfg$target_months))
     sgi_by_aquifer <- sgi_by_aquifer %>% filter(month_label %in% cfg$target_months)
 }
@@ -701,12 +702,12 @@ if (!is.null(sgi_by_aquifer)) {
 }
 
 # Save CSVs
-out_basin <- paste0(cfg$output_prefix, "_basin.csv")
+out_basin <- file.path("sgi_results", paste0(cfg$output_prefix, "_basin.csv"))
 readr::write_csv(sgi_basin, out_basin)
 message(sprintf("\nSaved basin SGI: %s", out_basin))
 
 if (!is.null(sgi_by_aquifer)) {
-  out_aq <- paste0(cfg$output_prefix, "_by_aquifer.csv")
+  out_aq <- file.path("sgi_results", paste0(cfg$output_prefix, "_by_aquifer.csv"))
   readr::write_csv(sgi_by_aquifer, out_aq)
   message(sprintf("Saved per-aquifer SGI: %s", out_aq))
 }
@@ -739,8 +740,7 @@ p_basin <- ggplot(sgi_basin, aes(x = date, y = sgi_median)) +
   theme(plot.title = element_text(face = "bold"),
         panel.grid.minor = element_blank())
 
-ggsave(paste0(cfg$output_prefix, "_basin.png"), p_basin,
-       width = 10, height = 4, dpi = 150)
+ggsave(file.path("sgi_results", paste0(cfg$output_prefix, "_basin.png")), p_basin, width = 10, height = 4, dpi = 150)
 message("Plot saved: ", cfg$output_prefix, "_basin.png")
 
 #-- 13b. Per-aquifer SGI facet plot (NEW) ------------------------------------
@@ -749,11 +749,11 @@ if (!is.null(sgi_by_aquifer) && nrow(sgi_by_aquifer) > 0) {
   aq_plot_df <- sgi_by_aquifer %>%
     filter(!is.na(aq_id), !is.na(sgi_median)) %>%
     mutate(aq_label = paste0(aq_name, " (ID ", aq_id, ")"))
-
+  
   if (nrow(aq_plot_df) > 0) {
     n_aq      <- n_distinct(aq_plot_df$aq_id)
     plot_h    <- max(3, 2 + n_aq * 1.6)
-
+    
     p_aq <- ggplot(aq_plot_df, aes(x = date, y = sgi_median)) +
       geom_ribbon(aes(ymin = pmin(sgi_median, 0), ymax = 0),
                   fill = "#d73027", alpha = 0.35) +
@@ -778,9 +778,8 @@ if (!is.null(sgi_by_aquifer) && nrow(sgi_by_aquifer) > 0) {
       theme(plot.title        = element_text(face = "bold"),
             panel.grid.minor  = element_blank(),
             strip.text        = element_text(face = "bold", size = 7))
-
-    ggsave(paste0(cfg$output_prefix, "_by_aquifer.png"), p_aq,
-           width = 10, height = plot_h, dpi = 150)
+    
+    ggsave(file.path("sgi_results", paste0(cfg$output_prefix, "_by_aquifer.png")), p_aq, width = 10, height = plot_h, dpi = 150)
     message("Plot saved: ", cfg$output_prefix, "_by_aquifer.png")
   }
 }
@@ -791,7 +790,7 @@ for (w in unique(sgi_long$well_num)) {
   wd         <- sgi_long %>% filter(well_num == w)
   aq_label   <- unique(wd$aq_name)[1]
   src_label  <- paste(unique(wd$source_id), collapse = "/")
-
+  
   p_well <- ggplot(wd, aes(x = date, y = sgi)) +
     geom_line(linewidth = 0.5, colour = "grey20") +
     geom_hline(yintercept = c(0, -1, -1.5, -2),
@@ -809,9 +808,8 @@ for (w in unique(sgi_long$well_num)) {
     theme_bw(base_size = 10) +
     theme(plot.title = element_text(face = "bold"),
           panel.grid.minor = element_blank())
-
-  ggsave(paste0(cfg$output_prefix, "_well_", w, ".png"), p_well,
-         width = 10, height = 4, dpi = 150)
+  
+  ggsave(file.path("sgi_results", paste0(cfg$output_prefix, "_well", w, ".png")), p_well, width = 10, height = 4, dpi = 150)  
   message("Plot saved: ", cfg$output_prefix, "_well_", w, ".png")
 }
 #---- END --------------------------------------------------------------------
