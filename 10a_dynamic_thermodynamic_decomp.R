@@ -15,6 +15,12 @@ library(tidyr)
 library(ggplot2)
 library(ggtext)
 setwd("D:/Nechako_Drought/Nechako/")
+# Source shared utilities — constants (DROUGHT_ONSET, SEVERE_THRESHOLD, EQUAL_AREA_CRS,
+# SPEI_SEAS_DIR, etc.) and statistical functions must be available before any
+# analysis code runs.  All other scripts source this file; 10a was the only one
+# that did not, which would silently use wrong values if any shared constant was
+# referenced in future edits.
+source("DROUGHT_ANALYSIS_utils.R")
 out_dir <- "decomp_results"
 if (!dir.exists(out_dir)) dir.create(out_dir)
 
@@ -1483,7 +1489,15 @@ for (sc in SEAS_SCALES) {
               sprintf("%s (%.2f)", pk_thw, min(df_sc$thw_mean, na.rm = TRUE)),
               sprintf("%s (%.2f)", pk_dyn, min(df_sc$dyn_mean, na.rm = TRUE))))
 }
-
+# NOTE: ΔSPEI warming-signal computation (observed minus counterfactual SPEI) is
+# implemented in 11_SPEI_counterfactual_comparison.R, which reads the correct
+# output directories:
+#   spei_results_seasonal/        — observed SPEI_PM
+#   spei_results_detrended/       — counterfactual SPEI_PM (detrended T)
+#   spei_results_seasonal_thw/    — observed SPEI_Thw
+#   spei_results_detrended_thw/   — counterfactual SPEI_Thw (detrended T)
+# Do NOT attempt to load single-file NetCDFs here; they do not exist in the
+# framework.  Run 11_SPEI_counterfactual_comparison.R after Scripts 3 and 3b.
 # ==============================================================================
 #   COMPLETE
 # ==============================================================================

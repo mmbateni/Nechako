@@ -11,9 +11,18 @@
 #   3. Thornthwaite PET (temperature-only) added as Section 5b.
 #   4. safe_writeCDF() helper: retry/delete prevents Windows file-lock errors.
 #   5. Comparison diagnostic plots (PM vs. Thornthwaite) added.
+#   6. [NEW — COUNTERFACTUAL BRANCH] Section 5c: PET from month-specifically
+#      detrended T2m and Tdew (outputs of 2b_detrend_temperature.R).
+#      Produces two additional NetCDF files:
+#        potential_evapotranspiration_PM_detrended.nc
+#        potential_evapotranspiration_Thw_detrended.nc
+#      All radiation, wind, and pressure fields remain at observed values.
+#      This isolates the temperature-mediated warming effect on PET.
+#      Section 5c is skipped gracefully if the 2b outputs are absent.
 ##############################################
 library(terra)
 library(ncdf4)
+library(lubridate)   # year() / month() used in Section 5c detrending
 
 # --- 1. CONFIGURATION ---
 # Working directory remains: D:/Nechako_Drought/Nechako/
@@ -437,6 +446,213 @@ log_event("THORNTHWAITE PET COMPLETE")
 log_event(sprintf("  Mean: %.3f mm/day", mean(pet_thw_summary$mean_pet, na.rm = TRUE)))
 log_event("==========================================")
 
+# ==============================================================================
+# --- 5c. COUNTERFACTUAL PET FROM DETRENDED TEMPERATURES [NEW] ---
+#
+# Requires: 2b_detrend_temperature.R to have been run first.
+#   Inputs  (monthly_data_direct/):
+#     2m_temperature_detrended_monthly.nc       -- T2m with month-specific OLS trend removed
+#     2m_dewpoint_detrended_monthly.nc          -- Tdew co-detrended (preserves VPD > 0)
+#   All other fields (u10, v10, SSRD, SP, Z) remain at OBSERVED values.
+#
+#   Outputs (monthly_data_direct/):
+#     potential_evapotranspiration_PM_detrended.nc   -- FAO-56 PM PET (detrended T)
+#     potential_evapotranspiration_Thw_detrended.nc  -- Thornthwaite PET (detrended T)
+#
+# Design rationale:
+#   Replacing only T2m and Tdew isolates the temperature-mediated warming
+#   effect on PET. Radiation and wind are kept observed so the counterfactual
+#   reflects: "what PET would have been had temperatures not trended upward?"
+#   The Thornthwaite heat index I and exponent a are recomputed from the
+#   detrended 1991-2020 climatology so its calibration also reflects the
+#   no-warming world. Day-length N is latitude-only and is reused unchanged.
+#
+# If the detrended NC files are absent this section is skipped with a warning.
+# ==============================================================================
+log_event("==========================================")
+log_event("Starting COUNTERFACTUAL PET (Section 5c) ...")
+log_event("==========================================")
+
+f_t2m_det  <- file.path(MONTHLY_DIR, "2m_temperature_detrended_monthly.nc")
+f_d2m_det  <- file.path(MONTHLY_DIR, "2m_dewpoint_detrended_monthly.nc")
+
+if (!file.exists(f_t2m_det) || !file.exists(f_d2m_det)) {
+  log_event("  WARNING: Detrended temperature files not found — skipping Section 5c.")
+  log_event("    Run 2b_detrend_temperature.R first, then re-run this script.")
+  et0_pm_det  <- NULL
+  et0_thw_det <- NULL
+} else {
+  
+  # ── 5c-1. Load detrended T2m and Tdew ──────────────────────────────────────
+  log_event("  Loading detrended T2m and Tdew...")
+  t2m_det <- rast(f_t2m_det)
+  d2m_det <- rast(f_d2m_det)
+  
+  # Convert from Kelvin to °C (matching how t2m_b is handled above as T_mean)
+  T_det  <- t2m_det - 273.15
+  Td_det <- d2m_det - 273.15
+  
+  # Sanity-check dimensions against observed stack
+  if (nlyr(T_det) != n_months) {
+    log_event(sprintf("  ERROR: Detrended T has %d layers but observed has %d — skipping 5c.",
+                      nlyr(T_det), n_months))
+    et0_pm_det  <- NULL
+    et0_thw_det <- NULL
+  } else {
+    
+    log_event(sprintf("  Loaded detrended T: %d layers, unit check OK", nlyr(T_det)))
+    
+    # Physics guard: enforce Tdew_det <= T_det so VPD >= 0 everywhere
+    viol <- global(Td_det > T_det, "sum", na.rm = TRUE)
+    n_viol <- sum(viol[, 1], na.rm = TRUE)
+    if (n_viol > 0) {
+      log_event(sprintf("  WARNING: %d cell-month instances with Tdew_det > T_det — clamping.", n_viol))
+      Td_det <- ifel(Td_det > T_det, T_det, Td_det)
+    } else {
+      log_event("  Physical constraint OK: Tdew_det <= T_det everywhere.")
+    }
+    
+    # ── 5c-2. Penman-Monteith with detrended T (observed Rn, G, u2, gamma) ──
+    log_event("  Computing PM PET (detrended T, observed radiation/wind/pressure)...")
+    
+    # Vapor pressure from detrended temperatures
+    es_det    <- 0.6108 * exp((17.27 * T_det)  / (T_det  + 237.3))
+    ea_det    <- 0.6108 * exp((17.27 * Td_det) / (Td_det + 237.3))
+    delta_det <- (4098 * es_det) / (T_det + 237.3)^2
+    
+    # Ground heat flux using detrended T (FAO-56 Eq.45)
+    # Rn and G_cap reuse the observed Rn stack (SSRD unchanged)
+    if (nlyr(T_det) > 1) {
+      t_prev_det  <- c(T_det[[1]] * 0, T_det[[1:(nlyr(T_det) - 1)]])
+      G_det       <- 0.14 * (T_det - t_prev_det)
+      G_det[[1]]  <- 0                     # January 1950: no prior month
+      G_cap_det   <- 0.3 * abs(Rn)        # cold-region cap reuses observed Rn
+      G_det       <- ifel(T_det < 0,
+                          ifel(G_det >  G_cap_det,  G_cap_det,
+                               ifel(G_det < -G_cap_det, -G_cap_det, G_det)),
+                          G_det)
+    } else {
+      G_det <- T_det * 0
+    }
+    
+    # PM numerator and denominator
+    # gamma, u2, Rn are OBSERVED (reused from Section 5 above without copying)
+    num_det <- 0.408 * delta_det * (Rn - G_det) +
+      gamma * (900 / (T_det + 273)) * u2 * (es_det - ea_det)
+    den_det <- delta_det + gamma * (1 + 0.34 * u2)
+    et0_pm_det <- ifel(num_det / den_det < 0, 0, num_det / den_det)
+    
+    names(et0_pm_det)      <- sprintf("PET_PM_DET_%04d_%02d",
+                                      as.numeric(format(dates, "%Y")),
+                                      as.numeric(format(dates, "%m")))
+    terra::time(et0_pm_det) <- dates
+    
+    s <- global(et0_pm_det, c("min", "max", "mean"), na.rm = TRUE)
+    log_event(sprintf("  PM PET (detrended): %.3f to %.3f mm/day (mean: %.3f)",
+                      min(s$min), max(s$max), mean(s$mean)))
+    
+    # Write PM detrended NetCDF
+    nc_pm_det <- file.path(MONTHLY_DIR, "potential_evapotranspiration_PM_detrended.nc")
+    safe_writeCDF(et0_pm_det, nc_pm_det,
+                  varname  = "pet_pm_det",
+                  longname = "Reference ET (FAO-56 Penman-Monteith, month-specific detrended T)",
+                  unit     = "mm/day")
+    log_event(sprintf("  Saved: %s", basename(nc_pm_det)))
+    
+    # ── 5c-3. Thornthwaite with detrended T ────────────────────────────────────
+    log_event("  Computing Thornthwaite PET (detrended T, detrended 1991-2020 clim)...")
+    
+    # Recompute heat index I and exponent a from DETRENDED 1991-2020 climatology
+    clim_idx_det <- which(year(dates) >= 1991 & year(dates) <= 2020)
+    T_clim_det_12 <- rast(lapply(1:12, function(m) {
+      idx_m <- clim_idx_det[month(dates[clim_idx_det]) == m]
+      if (length(idx_m) == 0) return(T_det[[1]] * NA)
+      mean(T_det[[idx_m]], na.rm = TRUE)
+    }))
+    names(T_clim_det_12) <- month.abb
+    
+    I_det <- T_clim_det_12[[1]] * 0
+    for (m in 1:12)
+      I_det <- I_det + (ifel(T_clim_det_12[[m]] <= 0, 0, T_clim_det_12[[m]]) / 5)^1.514
+    I_det <- ifel(I_det <= 0, NA_real_, I_det)
+    
+    a_det <- 6.75e-7 * I_det^3 - 7.71e-5 * I_det^2 + 1.792e-2 * I_det + 0.49239
+    
+    s <- global(I_det, c("min", "max", "mean"), na.rm = TRUE)
+    log_event(sprintf("  Detrended I: min=%.2f, max=%.2f, mean=%.2f", s$min, s$max, s$mean))
+    
+    # Apply Thornthwaite formula with detrended T (N_clim_12 reused from 5b)
+    et0_thw_det <- rast(lapply(seq_len(n_months), function(i) {
+      m    <- month_indices[i]
+      d_m  <- days_in_month[i]
+      T_i  <- T_det[[i]]
+      ratio <- ifel(T_i <= 0, 0, ifel((10 * T_i) / I_det < 0, 0, (10 * T_i) / I_det))
+      pet_u <- ifel(T_i <= 0, 0, ifel(is.na(I_det), 0, 16 * ratio^a_det))
+      pet_m <- ifel(pet_u * (N_clim_12[[m]] / 12) * (d_m / 30) < 0, 0,
+                    pet_u * (N_clim_12[[m]] / 12) * (d_m / 30))
+      pet_m / d_m   # mm/month -> mm/day
+    }))
+    terra::time(et0_thw_det) <- dates
+    names(et0_thw_det) <- sprintf("PET_THW_DET_%04d_%02d",
+                                  as.numeric(format(dates, "%Y")),
+                                  as.numeric(format(dates, "%m")))
+    
+    s <- global(et0_thw_det, c("min", "max", "mean"), na.rm = TRUE)
+    log_event(sprintf("  Thornthwaite PET (detrended): %.3f to %.3f mm/day (mean: %.3f)",
+                      min(s$min), max(s$max), mean(s$mean)))
+    
+    # Write Thornthwaite detrended NetCDF
+    nc_thw_det <- file.path(MONTHLY_DIR, "potential_evapotranspiration_Thw_detrended.nc")
+    safe_writeCDF(et0_thw_det, nc_thw_det,
+                  varname  = "pet_thw_det",
+                  longname = "Reference ET (Thornthwaite 1948, month-specific detrended T)",
+                  unit     = "mm/day")
+    log_event(sprintf("  Saved: %s", basename(nc_thw_det)))
+    
+    # ── 5c-4. Quick-look diagnostic: seasonal bias (obs vs. detrended) ────────
+    log_event("  Computing obs vs. detrended seasonal diagnostics...")
+    pet_det_summary <- data.frame(
+      date     = format(dates, "%Y-%m"),
+      year     = as.numeric(format(dates, "%Y")),
+      month    = as.numeric(format(dates, "%m")),
+      mean_pm_det  = global(et0_pm_det,  "mean", na.rm = TRUE)[, 1],
+      mean_thw_det = global(et0_thw_det, "mean", na.rm = TRUE)[, 1]
+    )
+    write.csv(pet_det_summary,
+              file.path(PET_CALCS_DIR, "ERA5Land_Nechako_PET_detrended_monthly_summary.csv"),
+              row.names = FALSE)
+    
+    # Per-month mean warming signal removed (obs_pm - det_pm, in mm/day)
+    monthly_det_stats <- aggregate(
+      pet_det_summary[, c("mean_pm_det", "mean_thw_det")],
+      by = list(month = pet_det_summary$month), FUN = mean, na.rm = TRUE)
+    # Warming signal removed per month (obs PET minus detrended PET, mm/day).
+    # monthly_stats (PM) and monthly_stats_thw are defined in Section 6 below.
+    # We defer the subtraction there; for now, store mean_pm_det and mean_thw_det
+    # so Section 6 can pick them up without a forward-reference.
+    #
+    # NOTE: the actual warming_removed_* columns are appended to monthly_det_stats
+    # inside Section 6 immediately after monthly_stats is created.
+    monthly_det_stats_stored <- monthly_det_stats   # saved for use in Section 6
+    write.csv(monthly_det_stats,
+              file.path(PET_CALCS_DIR, "ERA5Land_Nechako_PET_detrended_monthly_clim.csv"),
+              row.names = FALSE)
+    
+    log_event("  Basin-average warming signal removed from PET (mm/day):")
+    log_event("  (warming_removed columns will be appended after Section 6 computes monthly_stats)")
+    for (m in 1:12)
+      log_event(sprintf("    %s: PM_det=%.4f  Thw_det=%.4f",
+                        month.abb[m],
+                        monthly_det_stats$mean_pm_det[m],
+                        monthly_det_stats$mean_thw_det[m]))
+    
+  }   # end else (dimension check OK)
+}     # end else (files exist)
+
+log_event("==========================================")
+log_event("COUNTERFACTUAL PET (5c) COMPLETE")
+log_event("==========================================")
+
 # --- 6. STATISTICS & OUTPUT (Penman-Monteith) ---
 log_event("Generating PM statistics and writing files...")
 
@@ -469,6 +685,26 @@ monthly_stats <- aggregate(
   by = list(month = pet_summary$month), FUN = mean, na.rm = TRUE)
 monthly_stats$month_name <- month.name[monthly_stats$month]
 write.csv(monthly_stats, file.path(PET_CALCS_DIR, "ERA5Land_Nechako_PET_calendar_month_stats.csv"), row.names = FALSE)
+
+# ── Deferred: append warming_removed columns to monthly_det_stats now that
+#    monthly_stats (PM) and monthly_stats_thw are both available.
+#    This deferred approach fixes the forward-reference that existed when the
+#    computation was inside Section 5c (before monthly_stats was created).
+if (exists("monthly_det_stats_stored") && !is.null(monthly_det_stats_stored)) {
+  monthly_det_stats_stored$warming_removed_pm  <-
+    monthly_stats$mean_pet     - monthly_det_stats_stored$mean_pm_det
+  monthly_det_stats_stored$warming_removed_thw <-
+    monthly_stats_thw$mean_pet - monthly_det_stats_stored$mean_thw_det
+  write.csv(monthly_det_stats_stored,
+            file.path(PET_CALCS_DIR, "ERA5Land_Nechako_PET_detrended_monthly_clim.csv"),
+            row.names = FALSE)
+  log_event("  Warming signal removed from PET (mm/day, deferred Section 6 completion):")
+  for (m in 1:12)
+    log_event(sprintf("    %s: PM=%+.4f  Thw=%+.4f",
+                      month.abb[m],
+                      monthly_det_stats_stored$warming_removed_pm[m],
+                      monthly_det_stats_stored$warming_removed_thw[m]))
+}
 
 # --- 7. DIAGNOSTIC PLOTS ---
 log_event("Generating diagnostic plots...")

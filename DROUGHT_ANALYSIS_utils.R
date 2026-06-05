@@ -1048,13 +1048,19 @@ mk_tfpw_spectral_for_series <- function(ts_vec,
     error = function(e) NULL, warning = function(w) NULL)
   rho1 <- if (!is.null(acf_result)) acf_result$acf[2] else NA_real_
   
-  # ── VC-MK ────────────────────────────────────────────────────────────────────
+  # ── VC-MK (Hamed-Rao 1998) ───────────────────────────────────────────────────
+  # Use mmkh() — the same function used by .mk_vc_single() (J3) and
+  # vectorized_mann_kendall() (J7a) — so all three code paths produce
+  # consistent H-R98 variance-corrected p-values.
+  # mk3() is a different modified-MK variant and must NOT be used here.
   vc_corrected <- FALSE
   p_vc <- NA_real_; S_vc <- NA_real_; tau_vc <- NA_real_; varS_final <- NA_real_
-  vc_res <- tryCatch(modifiedmk::mk3(ts_clean), error = function(e) NULL)
+  vc_res <- tryCatch(modifiedmk::mmkh(ts_clean), error = function(e) NULL)
   if (!is.null(vc_res)) {
-    tau_vc     <- vc_res$tau;  p_vc    <- vc_res$p.value
-    S_vc       <- vc_res$S;    varS_final <- vc_res$varS
+    tau_vc     <- as.numeric(vc_res["Kendall's tau"])
+    p_vc       <- as.numeric(vc_res["new P-value"])
+    S_vc       <- as.numeric(vc_res["S"])
+    varS_final <- as.numeric(vc_res["variance of S"])
     if (!is.na(rho1) && abs(rho1) > 0.1) vc_corrected <- TRUE
   }
   vc_list <- list(tau = tau_vc, p = p_vc, sl = sen_slope, S = S_vc,

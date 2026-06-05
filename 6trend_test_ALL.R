@@ -24,8 +24,8 @@
 # tau_tfpw, p_value_tfpw, p_fdr_tfpw (BH-FDR corrected),
 # n_events, mean_duration, max_intensity            [Method 1: S&W]
 # n_events_hyst, mean_duration_hyst, max_intensity_hyst  [Method 2: Hysteresis]
-# n_events_D46, n_events_D712, n_events_D12p, n_D4p, mean_I, mean_S  [Method 1]
-# n_events_D46_hyst, …_hyst                                           [Method 2]
+# n_events_D36, n_events_D712, n_events_D12p, n_D4p, mean_I, mean_S  [Method 1]
+# n_events_D36_hyst, …_hyst                                           [Method 2]
 # regime_shift_year, regime_shift_detected, n_changepoints,
 # mean_before_shift, mean_after_shift, magnitude_shift,
 # p_value_runs, clustering,
@@ -154,7 +154,7 @@ vectorized_event_stats <- function(ts_matrix,
   n_events      <- integer(n_pix)
   mean_duration <- numeric(n_pix)
   max_intensity <- numeric(n_pix)
-  n_events_D46  <- integer(n_pix)
+  n_events_D36  <- integer(n_pix)
   n_events_D712 <- integer(n_pix)
   n_events_D12p <- integer(n_pix)
   n_D4p         <- integer(n_pix)
@@ -217,7 +217,7 @@ vectorized_event_stats <- function(ts_matrix,
       n_events[i]      <- 0L
       mean_duration[i] <- 0
       max_intensity[i] <- 0
-      n_events_D46[i]  <- 0L
+      n_events_D36[i]  <- 0L
       n_events_D712[i] <- 0L
       n_events_D12p[i] <- 0L
       n_D4p[i]         <- 0L
@@ -227,9 +227,9 @@ vectorized_event_stats <- function(ts_matrix,
       n_events[i]      <- length(durs)
       mean_duration[i] <- mean(durs)
       max_intensity[i] <- min(ints)
-      n_events_D46[i]  <- sum(durs >= 4L  & durs <= 6L)
-      n_events_D712[i] <- sum(durs >= 7L  & durs <= 12L)
-      n_events_D12p[i] <- sum(durs >= 13L)
+      n_events_D36[i]  <- sum(durs >= 3L  & durs <= 6L)   # Short: 3–6 months  (README §11)
+      n_events_D712[i] <- sum(durs >= 7L  & durs <= 12L)  # Medium: 7–12 months
+      n_events_D12p[i] <- sum(durs >= 12L)                 # Long: ≥ 12 months   (README §11)
       n_D4p[i]         <- sum(durs >= 4L)
       mean_I[i]        <- mean(I_evs, na.rm = TRUE)
       mean_S[i]        <- mean(S_evs, na.rm = TRUE)
@@ -240,7 +240,7 @@ vectorized_event_stats <- function(ts_matrix,
     n_events      = n_events,
     mean_duration = mean_duration,
     max_intensity = max_intensity,
-    n_events_D46  = n_events_D46,
+    n_events_D36  = n_events_D36,
     n_events_D712 = n_events_D712,
     n_events_D12p = n_events_D12p,
     n_D4p         = n_D4p,
@@ -467,9 +467,9 @@ compute_basin_extent_and_class_trends <- function(ts_matrix, n_years, index_labe
   }
   
   classify_dur <- function(d)
-    dplyr::case_when(d >= 4L  & d <= 6L  ~ "D4-6 (Short-term)",
+    dplyr::case_when(d >= 3L  & d <= 6L  ~ "D3-6 (Short-term)",
                      d >= 7L  & d <= 12L ~ "D7-12 (Medium-term)",
-                     d >= 13L            ~ "D12+ (Long-term)",
+                     d >= 12L            ~ "D12+ (Long-term)",
                      TRUE                ~ "D1-3 (Sub-threshold)")
   
   vals       <- basin_avg
@@ -748,7 +748,7 @@ process_index <- function(index_type, scales, find_fn, seas_dir) {
     cat("✓\n")
     
     cat("  ── Method 1 (S&W) per-pixel summaries:\n")
-    cat(sprintf("     D4-6 events  — mean: %.2f\n", mean(results$n_events_D46,  na.rm = TRUE)))
+    cat(sprintf("     D3-6 events  — mean: %.2f\n", mean(results$n_events_D36,  na.rm = TRUE)))
     cat(sprintf("     D7-12 events — mean: %.2f\n", mean(results$n_events_D712, na.rm = TRUE)))
     cat(sprintf("     D12+ events  — mean: %.2f  (max: %d)\n",
                 mean(results$n_events_D12p, na.rm = TRUE),
@@ -757,8 +757,8 @@ process_index <- function(index_type, scales, find_fn, seas_dir) {
                 mean(results$mean_I, na.rm = TRUE), mean(results$mean_S, na.rm = TRUE)))
     
     cat("  ── Method 2 (Hysteresis) per-pixel summaries:\n")
-    cat(sprintf("     D4-6 events  — mean: %.2f\n",
-                mean(results$n_events_D46_hyst,  na.rm = TRUE)))
+    cat(sprintf("     D3-6 events  — mean: %.2f\n",
+                mean(results$n_events_D36_hyst,  na.rm = TRUE)))
     cat(sprintf("     D7-12 events — mean: %.2f\n",
                 mean(results$n_events_D712_hyst, na.rm = TRUE)))
     cat(sprintf("     D12+ events  — mean: %.2f  (max: %d)\n",
@@ -879,7 +879,7 @@ process_index <- function(index_type, scales, find_fn, seas_dir) {
     
     # Duration-class map CSVs
     dur_cols_sw <- c("lon", "lat",
-                     "n_events_D46", "n_events_D712", "n_events_D12p", "n_D4p",
+                     "n_events_D36", "n_events_D712", "n_events_D12p", "n_D4p",
                      "mean_I", "mean_S")
     data.table::fwrite(
       results[, ..dur_cols_sw],
@@ -890,7 +890,7 @@ process_index <- function(index_type, scales, find_fn, seas_dir) {
                 index_type, sc))
     
     dur_cols_hyst <- c("lon", "lat",
-                       "n_events_D46_hyst", "n_events_D712_hyst", "n_events_D12p_hyst",
+                       "n_events_D36_hyst", "n_events_D712_hyst", "n_events_D12p_hyst",
                        "n_D4p_hyst", "mean_I_hyst", "mean_S_hyst")
     data.table::fwrite(
       results[, ..dur_cols_hyst],
@@ -1016,7 +1016,7 @@ cat("  Termination:  index >= -1.0  (same threshold, no hysteresis)\n")
 cat("  Min duration: none (all events retained)\n")
 cat("  Intensity:    mean(onset_thr - x)  [deficit below -1.0]\n")
 cat("  CSV columns: n_events, mean_duration, max_intensity,\n")
-cat("               n_events_D46, n_events_D712, n_events_D12p,\n")
+cat("               n_events_D36, n_events_D712, n_events_D12p,\n")
 cat("               n_D4p, mean_I, mean_S\n")
 cat("  Duration map: *_duration_class_map_SW.csv\n")
 cat("  D12+ raster:  *_D12p_pixel_frequency_SW.nc\n\n")
@@ -1031,7 +1031,7 @@ cat("    SPI/SPEI-6  : >= 4 months\n")
 cat("    SPI/SPEI-12 : >= 6 months\n")
 cat("    SWEI / other: >= 3 months (default)\n")
 cat("  CSV columns: n_events_hyst, mean_duration_hyst, max_intensity_hyst,\n")
-cat("               n_events_D46_hyst, ..., mean_I_hyst, mean_S_hyst\n")
+cat("               n_events_D36_hyst, ..., mean_I_hyst, mean_S_hyst\n")
 cat("  Duration map: *_duration_class_map_Hyst.csv\n")
 cat("  D12+ raster:  *_D12p_pixel_frequency_Hyst.nc\n\n")
 cat("Additional per-pixel columns (all indices):\n")
