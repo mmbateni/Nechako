@@ -2,13 +2,14 @@
 # w5_event_ranking.R  ·  DROUGHT EVENT RANKING & 2022-2025 CONTEXTUALIZATION
 #
 # EVENT DEFINITION — Sheffield & Wood (2008) [SW08], applied to SPEI/SPI:
-#   Onset       : index < DROUGHT_ONSET  (= -1.0)
+#   Onset       : index < DROUGHT_ONSET  (= -0.5)
 #   Termination : index >= DROUGHT_ONSET (same single threshold — NO hysteresis)
 #   Intensity   : I = mean(DROUGHT_ONSET − x_t) over event months      [≥ 0]
 #                 i.e. mean deficit below −1.0, not below 0.0
 #   Severity    : S = I × D
 #   Min duration: NONE — all events ≥ 1 month are retained
-#   Duration classes: D3-6 (Short-term), D7-12 (Medium-term), D12+ (Long-term)
+#   Duration classes: D3-6 (Short-term), D7-12 (Medium-term), D13+ (Long-term)
+#   Last monthly available data is for Dec 2025
 #
 #   This is the faithful SW08 definition adapted to standardised indices.
 #   Key difference from the previous hysteresis version (end_thr = 0.0):

@@ -1,13 +1,16 @@
 # ==============================================================================
-# w11b_PET_bias_nonstationarity.R
+# w10b_PET_bias_nonstationarity.R
+# ==============================================================================
 # THORNTHWAITE vs. PENMAN-MONTEITH PET BIAS NON-STATIONARITY ANALYSIS
 # Nechako River Basin, BC — 2022-2025 Drought Study
 #
 # PREREQUISITE:
-#   Run 3SPEI_ERALand.R with the ADD_TO_3SPEI_ERALand.R block inserted
-#   (after line 191). This writes:
+#   Run 3SPEI_ERALand.R (no modifications needed).  The export block
+#   embedded directly after the WB_Thw zero-diagnostic section writes:
 #     spei_results_seasonal/WB_basin_average_monthly.csv
 #   containing monthly basin-average WB_PM and WB_Thw in mm/month.
+#   (The former reference to ADD_TO_3SPEI_ERALand.R is obsolete — that
+#   helper no longer exists; the export is now part of 3SPEI_ERALand.R.)
 #
 # UNITS — VERIFIED:
 #   In 3SPEI_ERALand.R:
@@ -44,12 +47,16 @@
 #
 # OUTPUTS -> decomp_results/bias_nonstationarity/
 #   bias_monthly_timeseries.csv          (monthly bias, mm/day and mm/month)
-#   correction_params_by_scale.csv       (delta_bias_k, SD_WB_k, delta_SPEI_k)
+#   correction_params_by_scale.csv       (delta_bias_k, SD_WB_k, delta_SPEI_k,
+#                                         plus bootstrap CI columns:
+#                                         delta_bias_k_lo/hi, delta_SPEI_k_lo/hi,
+#                                         delta_SPEI_k_se)
+#   bootstrap_delta_SPEI_full.csv        (all B bootstrap replicates per scale×month)
 #   bias_period_seasonal_summary.csv
 #   significance_tests.csv
-#   SPEI_Thw_corrected_P3.csv
+#   SPEI_Thw_corrected_P3.csv            (also carries SPEI_Thw_corr_lo/hi columns)
 #   bias_manuscript_tables.xlsx
-#   bias_nonstationarity.pdf
+#   bias_nonstationarity.pdf             (extra panel: bootstrap uncertainty figure)
 # ==============================================================================
 
 library(zoo)
@@ -72,6 +79,7 @@ P1_START <- 1950L; P1_END <- 1990L
 P3_START <- 2022L; P3_END <- 2025L
 SCALES   <- c(1L, 2L, 3L)
 EPS      <- 1e-6
+B        <- 2000L    # bootstrap replicates for delta_SPEI_k CI (resamples n_P3=4 P3 obs)
 SPEI_PM_THR <- -0.5   # drought severity gate: Fthm is only meaningful when SPEI_PM <= this.
 # Prevents unstable fractions from near-zero denominators in wet months.
 
@@ -176,6 +184,7 @@ cat("  Saved: bias_monthly_timeseries.csv\n")
 cat("\n--- SECTION 3: Scale-specific correction parameters ---\n")
 
 correction_all <- list()
+boot_all       <- list()   # bootstrap replicates of delta_SPEI_k, one entry per scale
 
 for (k in SCALES) {
   cat(sprintf("\n  Scale k=%d:\n", k))
@@ -227,17 +236,58 @@ for (k in SCALES) {
            sd_wb_k_P1, mean_wb_k_P1,
            delta_SPEI_k)
   
+  # ── Bootstrap CI on delta_SPEI_k(m): resample n_P3 P3 obs; SD_WB and mean_P1 fixed ──
+  # Only the P3 numerator mean is uncertain (n_P3 = 4). SD_WB_k (n_P1 = 41) treated as
+  # stable and is not resampled.
+  set.seed(42L)
+  boot_list_k <- vector("list", 12L)
+  for (m in 1:12) {
+    p3_bias_m <- tmp %>%
+      filter(in_P3, !is.na(bias_k), month == m) %>%
+      pull(bias_k)
+    idx <- which(corr_k$month == m)
+    mb1 <- corr_k$mean_bias_k_P1[idx]
+    sw  <- corr_k$sd_wb_k_P1[idx]
+    
+    if (length(p3_bias_m) < 2L || is.na(sw) || sw == 0) {
+      bd <- rep(NA_real_, B);  bs <- rep(NA_real_, B)
+    } else {
+      bd <- replicate(B, mean(sample(p3_bias_m, replace = TRUE)) - mb1)
+      bs <- bd / sw
+    }
+    boot_list_k[[m]] <- data.frame(
+      scale = k, month = m, boot_id = seq_len(B),
+      boot_delta_bias_k = bd, boot_delta_SPEI_k = bs
+    )
+  }
+  boot_df_k <- bind_rows(boot_list_k)
+  
+  ci_k <- boot_df_k %>%
+    group_by(month) %>%
+    summarise(
+      delta_bias_k_lo = quantile(boot_delta_bias_k, 0.025, na.rm = TRUE),
+      delta_bias_k_hi = quantile(boot_delta_bias_k, 0.975, na.rm = TRUE),
+      delta_SPEI_k_lo = quantile(boot_delta_SPEI_k, 0.025, na.rm = TRUE),
+      delta_SPEI_k_hi = quantile(boot_delta_SPEI_k, 0.975, na.rm = TRUE),
+      delta_SPEI_k_se = sd(boot_delta_SPEI_k,      na.rm = TRUE),
+      .groups = "drop"
+    )
+  corr_k    <- corr_k    %>% left_join(ci_k, by = "month")
+  boot_all[[as.character(k)]] <- boot_df_k
+  # ── end bootstrap ────────────────────────────────────────────────────────────
+  
   correction_all[[as.character(k)]] <- corr_k
   
-  cat(sprintf("  %-5s %-6s %-14s %-14s %-14s %-14s %-12s\n",
+  cat(sprintf("  %-5s %-6s %-14s %-14s %-14s %-14s %-12s  %-22s\n",
               "Month","Season","bias_k_P1","bias_k_P3",
-              "delta_bias_k","SD_WB_k_P1","delta_SPEI_k"))
+              "delta_bias_k","SD_WB_k_P1","delta_SPEI_k", "95% CI [lo, hi]"))
   for (i in seq_len(nrow(corr_k))) {
     r <- corr_k[i, ]
-    cat(sprintf("  %-5s %-6s %+13.3f  %+13.3f  %+13.3f  %13.3f  %+11.4f\n",
+    cat(sprintf("  %-5s %-6s %+13.3f  %+13.3f  %+13.3f  %13.3f  %+11.4f  [%+.4f, %+.4f]\n",
                 r$month_name, r$season,
                 r$mean_bias_k_P1, r$mean_bias_k_P3, r$delta_bias_k,
-                r$sd_wb_k_P1,     r$delta_SPEI_k))
+                r$sd_wb_k_P1,     r$delta_SPEI_k,
+                r$delta_SPEI_k_lo, r$delta_SPEI_k_hi))
   }
 }
 
@@ -246,6 +296,12 @@ write.csv(correction_df,
           file.path(OUT_DIR, "correction_params_by_scale.csv"),
           row.names = FALSE)
 cat("\n  Saved: correction_params_by_scale.csv\n")
+
+boot_full_df <- bind_rows(boot_all)
+write.csv(boot_full_df,
+          file.path(OUT_DIR, "bootstrap_delta_SPEI_full.csv"),
+          row.names = FALSE)
+cat("  Saved: bootstrap_delta_SPEI_full.csv  (", B, "replicates × scale × month)\n")
 
 # ==============================================================================
 # SECTION 4: SEASONAL AND ANNUAL SUMMARIES (aggregated AFTER Section 3)
@@ -348,13 +404,19 @@ corrected_list <- list()
 
 for (k in SCALES) {
   corr_k  <- correction_all[[as.character(k)]]
-  delta_lk <- setNames(corr_k$delta_SPEI_k, as.character(corr_k$month))
+  delta_lk    <- setNames(corr_k$delta_SPEI_k,    as.character(corr_k$month))
+  delta_lo_lk <- setNames(corr_k$delta_SPEI_k_lo, as.character(corr_k$month))
+  delta_hi_lk <- setNames(corr_k$delta_SPEI_k_hi, as.character(corr_k$month))
   
   d_sc <- decomp %>%
     filter(scale == k, year >= P3_START, year <= P3_END) %>%
     mutate(
-      delta_SPEI_k   = delta_lk[as.character(month)],
-      SPEI_Thw_corr  = SPEI_Thw + delta_SPEI_k,
+      delta_SPEI_k      = delta_lk   [as.character(month)],
+      delta_SPEI_k_lo   = delta_lo_lk[as.character(month)],
+      delta_SPEI_k_hi   = delta_hi_lk[as.character(month)],
+      SPEI_Thw_corr     = SPEI_Thw + delta_SPEI_k,
+      SPEI_Thw_corr_lo  = SPEI_Thw + delta_SPEI_k_lo,   # lower 95% CI bound
+      SPEI_Thw_corr_hi  = SPEI_Thw + delta_SPEI_k_hi,   # upper 95% CI bound
       # Fthm is only computed where SPEI_PM <= SPEI_PM_THR (-0.5).
       # Outside that range the denominator is near zero and the fraction is unstable.
       f_thm_orig     = dplyr::if_else(SPEI_PM <= SPEI_PM_THR,
@@ -367,8 +429,9 @@ for (k in SCALES) {
       season         = season_of(month)
     ) %>%
     select(date, year, month, season, scale,
-           SPEI_PM, SPEI_Thw, delta_SPEI_k,
-           SPEI_Thw_corr, f_thm_orig, f_thm_corr, delta_f_pp)
+           SPEI_PM, SPEI_Thw, delta_SPEI_k, delta_SPEI_k_lo, delta_SPEI_k_hi,
+           SPEI_Thw_corr, SPEI_Thw_corr_lo, SPEI_Thw_corr_hi,
+           f_thm_orig, f_thm_corr, delta_f_pp)
   
   corrected_list[[as.character(k)]] <- d_sc
   
@@ -497,6 +560,26 @@ f4 <- ggplot(corr_seas_plot, aes(x=season, y=f_pct, fill=type)) +
   theme_bw(base_size=11) + theme(legend.position="bottom")
 print(f4)
 
+# Fig 5: Bootstrap uncertainty on delta_SPEI_k(m) — point estimate + 95% CI
+# Shows that the wide CI from n_P3=4 is the dominant uncertainty source.
+f5 <- ggplot(correction_df,
+             aes(x = factor(month_name, levels = month.abb),
+                 y = delta_SPEI_k, colour = season, group = scale)) +
+  geom_hline(yintercept = 0, linewidth = 0.5, linetype = "dashed") +
+  geom_errorbar(aes(ymin = delta_SPEI_k_lo, ymax = delta_SPEI_k_hi),
+                width = 0.35, linewidth = 0.7, alpha = 0.7) +
+  geom_point(size = 2.5) +
+  facet_wrap(~ paste0("SPEI-", scale), ncol = 3) +
+  scale_colour_manual(values = c(DJF = "#4393c3", MAM = "#74c476",
+                                 JJA = "#fd8d3c", SON = "#9e9ac8"),
+                      name = "Season") +
+  labs(title = "Bootstrap 95% CI on delta_SPEI_k(m)  [B = 2000 resamples of n_P3 = 4 P3 obs]",
+       subtitle = paste0("SD_WB_k (n_P1 = 41) treated as fixed. Uncertainty arises solely from the ",
+                         "P3 numerator mean.\nWide CI is expected and correctly reported."),
+       x = "Ending calendar month", y = "delta_SPEI (SPEI units)") +
+  theme_bw(base_size = 11) + theme(legend.position = "bottom")
+print(f5)
+
 dev.off()
 cat(sprintf("  Saved: %s\n", file.path(OUT_DIR, "bias_nonstationarity.pdf")))
 
@@ -507,6 +590,7 @@ cat("\n--- SECTION 8: Excel workbook ---\n")
 write_xlsx(
   list(
     "Correction_params_by_scale" = correction_df,
+    "Bootstrap_delta_SPEI"       = boot_full_df,
     "Seasonal_annual_summary"    = bind_rows(ann_summary, seas_summary),
     "Significance_tests"         = sig_df,
     "SPEI_Thw_corrected_P3"      = corrected_all_df,

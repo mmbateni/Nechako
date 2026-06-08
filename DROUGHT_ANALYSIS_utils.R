@@ -2,7 +2,7 @@
 # DROUGHT_ANALYSIS_utils.R  ·  SHARED UTILITIES FOR ALL NECHAKO DROUGHT SCRIPTS
 # ─────────────────────────────────────────────────────────────────────────────────
 # Sourced by:
-#   w1_trend_test.R              — drought index trend analysis
+#   6trend_test_ALL.R              — drought index trend analysis
 #   4pr_pet_trends.r             — Pr / PET / Temperature trend analysis
 #   (and all other w* scripts)
 #
@@ -17,20 +17,20 @@
 #   G.  ggplot helpers
 #   H.  Excel summary export
 #   I.  w9 shared-state loader
-#   J.  [SHARED STATS]  Functions used by BOTH w1_trend_test.R and
+#   J.  [SHARED STATS]  Functions used by BOTH 6trend_test_ALL.R and
 #       4pr_pet_trends.r — moved here to eliminate duplication:
 #         J1. Utility helpers  (check_min_value_threshold,
 #                               calculate_variance_with_ties)
 #         J2. PELT changepoint  (detect_regime_shift_pelt)
-#         J3. VC-MK per-series  (mk_vc_for_series)
-#         J4. TFPW-MK per-series (mk_tfpw_for_series)
-#         J5. Spectral peak detection per-series (spectral_peaks_for_series)
+#         J3. VC-MK per-series  (.mk_vc_single)
+#         J4. TFPW-MK per-series (.mk_tfpw_single)
+#         J5. Spectral peak detection per-series (.spectral_single)
 #         J6. Omnibus single-series wrapper (mk_tfpw_spectral_for_series)
 #             — used directly by 4pr_pet_trends.r
 #         J7. Vectorised pixel-matrix wrappers  (vectorized_mann_kendall,
 #             vectorized_mann_kendall_tfpw, vectorized_regime_shift_pelt,
 #             vectorized_spectral_peaks)
-#             — used directly by w1_trend_test.R
+#             — used directly by 6trend_test_ALL.R
 ####################################################################################
 
 ## A. PROJECT CONFIGURATION ───────────────────────────────────────────
@@ -88,19 +88,17 @@ FIG_HEIGHT_STD <-  8     # standard figure height (inches)
 
 ## CRS and thresholds
 EQUAL_AREA_CRS    <- "EPSG:3005"
-DROUGHT_ONSET     <- -1.0
-DROUGHT_END       <-  0.0
-SEVERE_THRESHOLD  <- -1.3
-EXTREME_THRESHOLD <- -1.6
-DROUGHT_THRESHOLD <- -1.0
+DROUGHT_ONSET     <- -0.5
+DROUGHT_END       <- -0.5
+
 
 ## Timescales
 SPI_SCALES          <- c(1, 2, 3, 6, 12)
 SPEI_SCALES         <- c(1, 2, 3, 6, 12)
 SWEI_SCALE          <- 3  # Single timescale only
 INDICES             <- c("spi", "spei", "spei_thw", "swei")
-TIMESCALES_STANDARD <- SPI_SCALES          # used by w4 for time series plots
-TIMESCALES_SPATIAL  <- SPI_SCALES          # used by w4 for spatial figures
+TIMESCALES_STANDARD <- SPI_SCALES          # used by some codes for time series plots
+TIMESCALES_SPATIAL  <- SPI_SCALES          # used by spme codes for spatial figures
 MONTH_NAMES    <- c("Jan", "Feb", "Mar", "Apr", "May", "Jun",
                     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
@@ -108,13 +106,13 @@ MONTH_NAMES    <- c("Jan", "Feb", "Mar", "Apr", "May", "Jun",
 #' Load a pre-computed basin-averaged drought index CSV and return a tidy
 #' long-format data.frame(date, value).
 #'
-#' AUTHORITATIVE SOURCE: these CSVs are produced by w1_trend_test.R via
+#' AUTHORITATIVE SOURCE: these CSVs are produced by 6trend_test_ALL.R via
 #' save_basin_avg_from_pixels() (see Section B2 below).  The methodology is:
 #'   (1) compute the drought index at every basin pixel from per-pixel inputs,
 #'   (2) take the area-weighted spatial mean of those pixel-level index values.
 #' This is the standard hydrometeorological approach: area-weighted averaging
 #' of standardised index values that were calibrated on the same spatial basis.
-#' Run w1_trend_test.R before w1_basin_timeseries.R.
+#' Run 6trend_test_ALL.R before basin_timeseries.R.
 #'
 #' File naming convention: {index}_{scale:02d}_basin_averaged_by_month.csv
 #' File structure:
@@ -168,7 +166,7 @@ load_basin_avg_csv <- function(index_type, scale, data_dir = NULL) {
 #' matrix and write the result as the standard basin_averaged_by_month.csv
 #' expected by load_basin_avg_csv().
 #'
-#' Called by w1_trend_test.R::process_index() after the pixel time-series
+#' Called by 6trend_test_ALL.R::process_index() after the pixel time-series
 #' matrix has been assembled.  The area weights are the equal-area cell sizes
 #' extracted from the raster template (already in EPSG:3005).
 #'
@@ -373,20 +371,34 @@ compute_layer_statistics  <- function(layer_idx, raster_file, basin_geom, thresh
        n_cells_valid = sum(ok),
        n_cells_drought = sum(drought_ok))
 }
-
+## E2. Area-weighted pixel-matrix column means ──────────────────────────────
+#' Compute area-weighted column means of a pixel × time matrix.
+#'
+#' @param mat     Numeric matrix [n_all_cells × n_time].
+#'                NA for non-basin or missing cells.
+#' @param weights Numeric vector [n_all_cells].
+#'                Set to 0 (not NA) for non-basin cells.
+#' @return Numeric vector of length n_time.
+area_weighted_colmeans <- function(mat, weights) {
+  apply(mat, 2L, function(col) {
+    ok <- !is.na(col) & is.finite(col) & weights > 0
+    if (!any(ok)) return(NA_real_)
+    sum(col[ok] * weights[ok]) / sum(weights[ok])
+  })
+}
 ## F. DROUGHT EVENT DETECTION ────────────────────────────────────────
 detect_drought_events <- function(df,
-                                  onset_threshold       = DROUGHT_ONSET,
-                                  termination_threshold = DROUGHT_END,
+                                  onset_threshold       = -0.5,
+                                  termination_threshold = -0.5,
                                   min_duration          = 1,
-                                  severe_thr            = SEVERE_THRESHOLD,
-                                  extreme_thr           = EXTREME_THRESHOLD) {
+                                  severe_thr            = -1.5,
+                                  extreme_thr           = -2.0) {
   stopifnot(all(c("date", "value") %in% names(df)))
   df    <- df[order(df$date), ]
   vals  <- df$value
   dates <- df$date
   
-  ## Canonical empty frame — returned when there are no events
+  # Canonical empty frame — returned when there are no events
   empty_events <- data.frame(
     event_id        = integer(),
     start_date      = as.Date(character()),
@@ -397,13 +409,12 @@ detect_drought_events <- function(df,
     stringsAsFactors = FALSE)
   
   classify_severity <- function(min_v) {
-    if      (min_v <= extreme_thr) "Extreme"
-    else if (min_v <= severe_thr)  "Severe"
-    else                           "Moderate"
+    if      (min_v <= extreme_thr) "D3: extremely dry"
+    else if (min_v <= severe_thr)  "D2: severely dry"
+    else                           "D1: moderately dry"
   }
   
   event_list <- list()
-  
   close_event <- function(s, e) {
     dur <- e - s + 1L
     if (dur < min_duration) return()
@@ -418,15 +429,15 @@ detect_drought_events <- function(df,
       stringsAsFactors = FALSE)
   }
   
-  in_drought <- FALSE
-  start_idx  <- NA_integer_
+  in_drought  <- FALSE
+  start_idx   <- NA_integer_
   for (i in seq_along(vals)) {
     if (!in_drought && !is.na(vals[i]) && vals[i] < onset_threshold) {
-      in_drought <- TRUE
-      start_idx  <- i
+      in_drought  <- TRUE
+      start_idx   <- i
     } else if (in_drought && !is.na(vals[i]) && vals[i] >= termination_threshold) {
       close_event(start_idx, i - 1L)
-      in_drought <- FALSE
+      in_drought  <- FALSE
     }
   }
   if (in_drought) close_event(start_idx, length(vals))
@@ -435,7 +446,7 @@ detect_drought_events <- function(df,
   do.call(rbind, event_list)
 }
 
-## F2. SPATIAL HELPERS (used by w4_trends_visualization.R) ──────────
+## F2. SPATIAL HELPERS (used by 4_trends_visualization.R) ──────────
 #' Load basin shapefile and reproject to equal-area CRS.
 #' KMZ files are handled via the shared .read_kmz() helper.
 load_basin <- function(shp_path = BASIN_SHP, crs = EQUAL_AREA_CRS) {
@@ -532,17 +543,16 @@ plot_raster_clean <- function(r, main, zlim = NULL, col, breaks = NULL,
     xmin = -Inf, xmax = Inf, ymin = ymin, ymax = ymax)
 }
 
-drought_band_layers  <- function() {
+drought_band_layers <- function() {
   list(
-    .band_rect(-Inf,  -2,     "#8B0000"),   # Exceptional drought
-    .band_rect(-2,    -1.5,   "#FF0000"),   # Extreme drought
-    .band_rect(-1.5,  -1,     "#FF8C00"),   # Severe drought
-    .band_rect(-1,    -0.5,   "#FFA500"),   # Moderate drought
-    .band_rect( 0.5,   1,     "#90EE90"),   # Abnormally moist
-    .band_rect( 1,     1.5,   "#00FF00"),   # Moderately moist
-    .band_rect( 1.5,   2,     "#008000"),   # Very moist
-    .band_rect( 2,     Inf,   "#006400"),   # Exceptionally moist
-    ggplot2::geom_hline(yintercept = c(-2, -1.5, -1, -0.5, 0.5, 1, 1.5, 2),
+    .band_rect(-Inf,   -2.0,     "#7B0025"),   # D3: extremely dry
+    .band_rect(-2.0,   -1.5,     "#D73027"),   # D2: severely dry
+    .band_rect(-1.5,   -1.0,     "#F46D43"),   # D1: moderately dry
+    .band_rect(-1.0,    1.0,     "#2E7D32"),   # N0: normal
+    .band_rect( 1.0,    1.5,     "#90EE90"),   # W1: moderately wet
+    .band_rect( 1.5,    2.0,     "#66BB6A"),   # W2: severely wet
+    .band_rect( 2.0,    Inf,     "#4575B4"),   # W3: extremely wet
+    ggplot2::geom_hline(yintercept = c(-2, -1.5, -1, 1, 1.5, 2),
                         linetype = "dotted", color = "gray50", linewidth = 0.3)
   )
 }
@@ -688,7 +698,7 @@ read_w9_state <- function(path) {
 ####################################################################################
 # J. SHARED STATISTICAL FUNCTIONS
 # ─────────────────────────────────────────────────────────────────────────────────
-# These were previously duplicated between w1_trend_test.R (vectorised pixel
+# These were previously duplicated between 6trend_test_ALL.R (vectorised pixel
 # versions) and 4pr_pet_trends.r (single-series version).  They are now defined
 # once here and sourced by both scripts.
 #
@@ -698,10 +708,10 @@ read_w9_state <- function(path) {
 #     unchanged.
 #   • vectorized_mann_kendall(), vectorized_mann_kendall_tfpw(),
 #     vectorized_regime_shift_pelt(), vectorized_spectral_peaks() — identical
-#     signatures to the functions previously in w1_trend_test.R.  That script
+#     signatures to the functions previously in 6trend_test_ALL.R.  That script
 #     now omits its local copies and relies on these definitions.
 #   • detect_regime_shift_pelt() — single-series PELT helper, previously in
-#     4pr_pet_trends.r under that name.  w1 used a different but equivalent
+#     4pr_pet_trends.r under that name.  "trend_test_ALL.R" used a different but equivalent
 #     vectorised wrapper; both now share this single-series core.
 ####################################################################################
 
@@ -747,7 +757,7 @@ calculate_variance_with_ties <- function(S, n, x) {
 #'   first_changepoint_year, mean_before, mean_after, magnitude_shift.
 #'
 #' Previously defined as detect_regime_shift_pelt() in 4pr_pet_trends.r;
-#' w1_trend_test.R used an inline equivalent inside vectorized_regime_shift_pelt().
+#' 6trend_test_ALL.R used an inline equivalent inside vectorized_regime_shift_pelt().
 #' Both now share this function.
 detect_regime_shift_pelt <- function(ts_vec, min_obs = 20, start_year = NULL) {
   ts_clean <- na.omit(ts_vec)
@@ -875,7 +885,7 @@ detect_regime_shift_pelt <- function(ts_vec, min_obs = 20, start_year = NULL) {
   x_dt <- x - (cf[1] + cf[2] * t_s)
   
   tryCatch({
-    # ── Method 1: AR(1) red-noise via smoothed periodogram (used by w1) ──────
+    # ── Method 1: AR(1) red-noise via smoothed periodogram (used by 6trend_test_ALL) ──────
     spec_r <- stats::spectrum(x_dt, spans = c(3L, 5L), taper = 0.1,
                               plot = FALSE, na.action = na.omit)
     freq   <- spec_r$freq
@@ -1111,10 +1121,10 @@ mk_tfpw_spectral_for_series <- function(ts_vec,
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # J7. VECTORISED PIXEL-MATRIX WRAPPERS
-#     Used directly by w1_trend_test.R.  Signatures are identical to the
+#     Used directly by 6trend_test_ALL.R.  Signatures are identical to the
 #     functions previously defined in that script.
 #     The parallel back-end variables N_CORES, is_windows, cl are expected to
-#     be set in the calling script (w1_trend_test.R) before these are called.
+#     be set in the calling script (6trend_test_ALL.R) before these are called.
 # ─────────────────────────────────────────────────────────────────────────────────
 
 ## J7a. Hamed-Rao (1998) Variance-Corrected MK + Sen's slope ──────────────────
@@ -1196,7 +1206,7 @@ vectorized_mann_kendall_tfpw <- function(ts_matrix) {
 #' Applies detect_regime_shift_pelt() to annual averages of each pixel's
 #' monthly time series.
 #' NOTE: regime_shift_year is kept as the primary column name so that
-#'       w4_trends_visualization.R (Fig 3, Panel B) works without modification.
+#'       4_trends_visualization.R (Fig 3, Panel B) works without modification.
 vectorized_regime_shift_pelt <- function(ts_matrix, years, min_obs = 20L) {
   n_pix <- nrow(ts_matrix)
   n_yrs <- length(years)

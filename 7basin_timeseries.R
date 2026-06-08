@@ -323,7 +323,7 @@ for (idx in c("mspi", "mspei")) {
 # PART 4b – MANUSCRIPT FIGURE 4  (two PET-method versions + SPEI-2 fix)
 #
 # ROOT CAUSE OF SPEI-2 MISSING:
-#   SPEI_SCALES in DROUGHT_ANALYSIS_utils.R = c(1, 3, 6, 12).  Scale 2 is
+#   SPEI_SCALES in DROUGHT_ANALYSIS_utils.R = c(1, 2, 3, 6, 12).  Scale 2 is
 #   never processed by 6trend_test.R, so no basin-averaged CSV exists.
 #   However, 3SPEI_ERALand.R writes per-calendar-month CSV files for every
 #   scale it computes (including scale 2) inside spei_results_seasonal/ and

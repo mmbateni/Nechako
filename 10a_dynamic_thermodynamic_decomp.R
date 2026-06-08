@@ -41,7 +41,7 @@ spei_thw_dir  <- "spei_results_seasonal_thw"
 if (!dir.exists(spei_pm_dir))  stop("SPEI_PM directory not found. Run 3SPEI_ERALand.R first.")
 if (!dir.exists(spei_thw_dir)) stop("SPEI_Thw directory not found. Run 3SPEI_ERALand.R first.")
 # Scales available from 3SPEI_ERALand.R
-decomp_scales <- c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 24)
+decomp_scales <- c(1, 2, 3, 6, 12)
 # Helper function to load SPEI NetCDF files for one scale
 load_spei_scale <- function(scale, pet_type, target_dir) {
   cat(sprintf("  Loading SPEI_%s-%d...\n", pet_type, scale))
@@ -109,11 +109,36 @@ local({
 target_crs <- "EPSG:3005"
 if (!same.crs(basin, target_crs)) basin <- project(basin, target_crs)
 # Get basin mask from first SPEI file (non-NA pixels)
-spei_sample <- rast(file.path(spei_pm_dir, "spei_06_month01_Jan.nc"))
-basin_mask <- !is.na(values(spei_sample))
-n_pixels <- sum(basin_mask)
+spei_sample <- rast(file.path(spei_pm_dir, "spei_03_month01_Jan.nc"))
+basin_mask  <- !is.na(values(spei_sample))
+n_pixels    <- sum(basin_mask)
 cat(sprintf("✓ Metadata loaded: %d months, %d basin pixels\n", length(dates), n_pixels))
 
+# ── Area weights for basin-average computation ──────────────────────────────
+# Project to equal-area CRS (BC Albers, EPSG:3005) to get accurate m² areas,
+# then resample back to the original grid so pixel indices align with the
+# SPEI value matrices returned by load_spei_scale().
+cat("Computing cell-area weights (EPSG:3005)...\n")
+spei_sample_ea   <- terra::project(spei_sample, EQUAL_AREA_CRS)   # from utils
+cell_areas_ea    <- terra::cellSize(spei_sample_ea, unit = "m")
+cell_areas_orig  <- terra::resample(cell_areas_ea, spei_sample, method = "bilinear")
+area_weights_all <- as.vector(terra::values(cell_areas_orig, mat = FALSE))
+
+# Set non-basin cells to 0 weight so they contribute nothing to the mean.
+area_weights_all[!basin_mask | is.na(area_weights_all) | !is.finite(area_weights_all)] <- 0
+
+# Guard: replace any basin pixel with a bad weight by the median basin weight.
+basin_w <- area_weights_all[basin_mask]
+bad_w   <- basin_w <= 0
+if (any(bad_w)) {
+  med_w <- median(basin_w[!bad_w], na.rm = TRUE)
+  replacement <- if (is.finite(med_w) && med_w > 0) med_w else 1
+  area_weights_all[basin_mask][bad_w] <- replacement
+  cat(sprintf("  WARNING: %d bad weight(s) replaced with median %.0f m²\n",
+              sum(bad_w), replacement))
+}
+cat(sprintf("  Weight range: %.0f – %.0f m²  (basin pixels: %d)\n",
+            min(basin_w[!bad_w]), max(basin_w[!bad_w]), n_pixels))
 # ==============================================================================
 #   STEP 3: COMPUTE DECOMPOSITION FROM LOADED SPEI
 # ==============================================================================
@@ -122,11 +147,17 @@ cat("\n===== STEP 3: COMPUTE DYNAMIC/THERMODYNAMIC DECOMPOSITION =====\n")
 #   SPEI_PM         = full observed drought severity
 # SPEI_Thw        = thermodynamic (temperature-driven) component
 # SPEI_PM - SPEI_Thw ≈ dynamic component (precip + radiation + wind)
-compute_decomposition <- function(spei_pm, spei_thw, dates, month_nums, year_nums, scale) {
+compute_decomposition <- function(spei_pm, spei_thw, dates, month_nums, year_nums, scale, weights = NULL) {
   n_time <- ncol(spei_pm)
   # Basin-mean timeseries
-  spei_pm_mean   <- colMeans(spei_pm,   na.rm = TRUE)
-  spei_thw_mean  <- colMeans(spei_thw,  na.rm = TRUE)
+  if (!is.null(weights) && length(weights) == nrow(spei_pm)) {
+    spei_pm_mean  <- area_weighted_colmeans(spei_pm,  weights)
+    spei_thw_mean <- area_weighted_colmeans(spei_thw, weights)
+  } else {
+    warning("compute_decomposition: no weights supplied — falling back to colMeans()")
+    spei_pm_mean  <- colMeans(spei_pm,  na.rm = TRUE)
+    spei_thw_mean <- colMeans(spei_thw, na.rm = TRUE)
+  }
   spei_dyn_mean  <- spei_pm_mean - spei_thw_mean  # dynamic component
   data.frame(
     date          = dates,
@@ -157,7 +188,8 @@ decomp_all  <- bind_rows(lapply(decomp_scales, function(sc) {
   result  <- compute_decomposition(
     pm_mat[, 1:min_time, drop=FALSE],
     thw_mat[, 1:min_time, drop=FALSE],
-    dates[1:min_time], month_nums[1:min_time], year_nums[1:min_time], sc
+    dates[1:min_time], month_nums[1:min_time], year_nums[1:min_time], sc,
+    weights = area_weights_all
   )
   cat(sprintf("  ✓ Scale %d decomposition complete\n", sc))
   result
@@ -255,7 +287,7 @@ ann_p90  <- sprintf("%+.4f yr⁻¹, %s\n(1990–2025)",
 #   fig_decomp_spei3_timeseries.pdf  — SPEI-3 full record decomposition
 # fig_annual_decomp_barplot.pdf    — annual SPEI-3 drought years bar
 # fig_thermodynamic_trend.pdf      — JJA SPEI-3 thermodynamic trend
-# fig_scale_comparison.pdf         — all scales 1-24 percentage stack
+# fig_scale_comparison.pdf         — all scales 1,2,3,6,12 percentage stack
 # MANUSCRIPT figures (new, publication quality):
 #   Fig5a_decomp_timeseries_2020_2025.pdf/.png
 # SPEIₚₘ, SPEI₀ (=SPEIᵟʰʷ), and SPEIᵟ on a single axis, scales 1–3,
@@ -319,7 +351,7 @@ dev.off()
 cat("  ✓ Supplementary S1: fig_decomp_spei3_timeseries.pdf\n")
 # S2: Annual SPEI-3 drought-year stacked bars
 drought_years_df  <- decomp_all %>%
-  dplyr::filter(scale == 3, SPEI_PM < -0.8) %>%
+  dplyr::filter(scale == 3, SPEI_PM < -0.5) %>%
   dplyr::group_by(year) %>%
   dplyr::summarise(
     SPEI_PM       = mean(SPEI_PM,       na.rm = TRUE),
@@ -1509,7 +1541,7 @@ cat("\nSUPPLEMENTARY FIGURES:\n")
 cat("  fig_decomp_spei3_timeseries.pdf  — SPEI-3 full record (1950–2025)\n")
 cat("  fig_annual_decomp_barplot.pdf    — annual SPEI-3 drought-year bars\n")
 cat("  fig_thermodynamic_trend.pdf      — JJA SPEI-3 thermodynamic trend\n")
-cat("  fig_scale_comparison.pdf         — all scales 1–24 percentage stack\n")
+cat("  fig_scale_comparison.pdf         — all scales 1,2,3,6,12 percentage stack\n")
 cat("\nMANUSCRIPT FIGURES:\n")
 cat("  Fig5a_decomp_timeseries_2020_2025.pdf/.png\n")
 cat("    → SPEIpm / SPEI0 / SPEIdyn, scales 1–3, 2020–2025 (Section 4.3)\n")

@@ -1,7 +1,7 @@
 # ==============================================================================
 #   6trend_test.R  ·  SPATIAL TREND ANALYSIS FOR ALL INDICES
 # ==============================================================================
-#   Computes per-pixel statistics for SPI, SPEI (multiple scales) and SWEI:
+#   Computes per-pixel statistics for SPI, SPEI_PM, SPEI_Thw:
 #   • Mann-Kendall — Hamed & Rao (1998) variance-corrected (VC-HR98) + Sen's slope
 #     Uses modifiedmk::mmkh() which adjusts Var(S) for lag-1…lag-(n-1) autocorrelation.
 #     Tau is the standard concordance statistic; p-value is the H-R98 corrected one.
@@ -17,14 +17,15 @@
 #   • PELT regime-shift year  [BUGFIX 7: now actually called in process_index]
 #   • Wald-Wolfowitz runs test (drought event temporal clustering)
 #     Binarised on hysteresis drought events
-#   • n_spectral_peaks — AR1 red-noise significance test on periods >= 24 months
+#   • n_spectral_peaks — Monte Carlo white-noise significance test on periods >= 24 months
+#                        (n_sim_spectral = 500; matches Script 4 null hypothesis)
 #
 # OUTPUT: {TREND_DIR}/{index}_{scale:02d}_results.csv  (one per index × scale)
 # Columns include tau_vc, p_value_vc (H-R98 corrected), p_fdr_vc (BH-FDR corrected),
 # tau_tfpw, p_value_tfpw, p_fdr_tfpw (BH-FDR corrected),
 # n_events, mean_duration, max_intensity            [Method 1: S&W]
 # n_events_hyst, mean_duration_hyst, max_intensity_hyst  [Method 2: Hysteresis]
-# n_events_D36, n_events_D712, n_events_D12p, n_D4p, mean_I, mean_S  [Method 1]
+# n_events_D36, n_events_D712, n_events_D13p, n_D4p, mean_I, mean_S  [Method 1]
 # n_events_D36_hyst, …_hyst                                           [Method 2]
 # regime_shift_year, regime_shift_detected, n_changepoints,
 # mean_before_shift, mean_after_shift, magnitude_shift,
@@ -47,7 +48,6 @@
 #     Columns suffixed _hyst. Use for climatologically meaningful event counts.
 #
 # SINGLE-FILE MODE [BUGFIX 1]:
-#   MSPI/MSPEI store all months in a single NetCDF file (912 layers for 76 years).
 #   The matrix layout is now detected automatically: single-file indices fill
 #   columns sequentially (one column per month), whereas standard SPI/SPEI use
 #   the interleaved layout (one file per calendar month, one layer per year).
@@ -62,6 +62,21 @@ utils_load_packages(c("terra", "data.table", "Kendall", "trend", "modifiedmk",
 if (!dir.exists(WD_PATH)) stop("Working directory not found: ", WD_PATH)
 setwd(WD_PATH)
 dir.create(TREND_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# ── Scale overrides ─────────────────────────────────────────────────────────
+# DROUGHT_ANALYSIS_utils.R defines SPI_SCALES = c(1, 2, 3, 6, 12) (5 scales).
+# Scripts 1SPI_ERALand.R and 3SPEI_ERALand.R compute ALL 13 timescales and
+# write NetCDF files for each.  Override here so that Script 6 runs trend
+# tests across every scale that actually exists on disk.
+SPI_SCALES  <- c(1L, 2L, 3L,  6L,  12L)
+SPEI_SCALES <- c(1L, 2L, 3L,  6L,  12L)
+
+# ── Thornthwaite SPEI directories and scales ────────────────────────────────
+# SPEI_Thw NetCDF files are written by 3SPEI_ERALand.R (Runs 3 & 4) into a
+# dedicated directory alongside the PM SPEI seasonal files.  The index_type
+# "spei_thw" is used consistently in downstream scripts (7, 8, 10a).
+SPEI_THW_SEAS_DIR <- file.path(WD_PATH, "spei_results_seasonal_thw")
+SPEI_THW_SCALES   <- c(1L, 2L, 3L,  6L,  12L)
 
 # --------------------------------------------------------------------------------
 #   Utility operators
@@ -101,7 +116,6 @@ if (N_CORES > 1) {
 #   SPI/SPEI-3  smoothed over a season; ≥ 3 months = one full accumulation window
 #   SPI/SPEI-6  half-year smoothing; ≥ 4 months filters sub-seasonal noise
 #   SPI/SPEI-12 annual smoothing; ≥ 6 months = half an accumulation window
-#   Default (SWEI, etc.): 3 months
 get_min_duration <- function(scale,
                              min_duration_map     = list("1"  = 2L,
                                                          "3"  = 3L,
@@ -115,9 +129,13 @@ get_min_duration <- function(scale,
 
 # ================================================================================
 # VECTORISED STATISTICS FUNCTIONS
-# ─── NOTE: vectorized_mann_kendall(), vectorized_mann_kendall_tfpw(),
-#          vectorized_regime_shift_pelt(), and vectorized_spectral_peaks()
-#          are now defined in DROUGHT_ANALYSIS_utils.R (Section J7).
+# ─── NOTE: vectorized_mann_kendall(), vectorized_mann_kendall_tfpw(), and
+#          vectorized_regime_shift_pelt() are defined in DROUGHT_ANALYSIS_utils.R
+#          (Section J7).
+#          vectorized_spectral_peaks() is LOCALLY OVERRIDDEN below (Section 6)
+#          with a Monte Carlo white-noise implementation (n_sim_spectral = 500)
+#          to match the null hypothesis used in Script 4.  The utils.R version
+#          (AR(1) red-noise) is shadowed and not called by this script.
 #          vectorized_event_stats() and vectorized_runs_test() remain
 #          here because they are drought-index-specific.
 # ================================================================================
@@ -156,7 +174,7 @@ vectorized_event_stats <- function(ts_matrix,
   max_intensity <- numeric(n_pix)
   n_events_D36  <- integer(n_pix)
   n_events_D712 <- integer(n_pix)
-  n_events_D12p <- integer(n_pix)
+  n_events_D13p <- integer(n_pix)
   n_D4p         <- integer(n_pix)
   mean_I        <- numeric(n_pix)
   mean_S        <- numeric(n_pix)
@@ -219,7 +237,7 @@ vectorized_event_stats <- function(ts_matrix,
       max_intensity[i] <- 0
       n_events_D36[i]  <- 0L
       n_events_D712[i] <- 0L
-      n_events_D12p[i] <- 0L
+      n_events_D13p[i] <- 0L
       n_D4p[i]         <- 0L
       mean_I[i]        <- NA_real_
       mean_S[i]        <- NA_real_
@@ -229,7 +247,7 @@ vectorized_event_stats <- function(ts_matrix,
       max_intensity[i] <- min(ints)
       n_events_D36[i]  <- sum(durs >= 3L  & durs <= 6L)   # Short: 3–6 months  (README §11)
       n_events_D712[i] <- sum(durs >= 7L  & durs <= 12L)  # Medium: 7–12 months
-      n_events_D12p[i] <- sum(durs >= 12L)                 # Long: ≥ 12 months   (README §11)
+      n_events_D13p[i] <- sum(durs >= 13L)                 # Long: ≥ 13 months   (README §11)
       n_D4p[i]         <- sum(durs >= 4L)
       mean_I[i]        <- mean(I_evs, na.rm = TRUE)
       mean_S[i]        <- mean(S_evs, na.rm = TRUE)
@@ -242,7 +260,7 @@ vectorized_event_stats <- function(ts_matrix,
     max_intensity = max_intensity,
     n_events_D36  = n_events_D36,
     n_events_D712 = n_events_D712,
-    n_events_D12p = n_events_D12p,
+    n_events_D13p = n_events_D13p,
     n_D4p         = n_D4p,
     mean_I        = mean_I,
     mean_S        = mean_S
@@ -340,22 +358,123 @@ vectorized_runs_test <- function(ts_matrix,
 # --------------------------------------------------------------------------------
 #   6. Spectral peak detection — drought-band frequencies
 # --------------------------------------------------------------------------------
-# BUGFIX 5: Fully implements spectral peak counting; replaces the placeholder 0L.
+# LOCAL OVERRIDE: vectorized_spectral_peaks() is redefined here to use a Monte
+#   Carlo white-noise null hypothesis (n_sim_spectral = 500 simulations), matching
+#   the envelope used in Script 4 (mk_tfpw_spectral_for_series / conf_env).
+#   This replaces the AR(1) red-noise test in DROUGHT_ANALYSIS_utils.R, which is
+#   more conservative when the series has positive autocorrelation (as drought
+#   indices typically do), making Script 4 and Script 6 spectral results directly
+#   comparable.
 #
 # METHOD:
 #   For each pixel, the monthly time series is demeaned and linearly detrended,
 #   then a smoothed periodogram (modified Daniell smoother, spans = c(3,5)) is
-#   computed.  An AR(1) red-noise null spectrum is fitted to the periodogram
-#   using the lag-1 autocorrelation of the detrended series, then scaled to
-#   match the observed mean spectral power.  Periodogram bins whose power exceeds
-#   the chi-squared (sig_level) quantile of the red-noise spectrum are flagged as
-#   significant; contiguous runs of significant bins are counted as one peak.
+#   computed.  The white-noise significance envelope is precomputed ONCE per
+#   unique series length using n_sim_spectral = 500 iid N(0,1) realisations,
+#   each passed through the same smoother; the sig_level quantile of the simulated
+#   spectral ordinates at each frequency bin defines the threshold.  Because
+#   smoothed periodogram ordinates of white noise are chi-squared-distributed,
+#   the envelope is exact (up to Monte Carlo error) and is then scaled by the
+#   observed pixel variance so that the threshold adapts to each pixel's power
+#   level without re-running the simulations.  Precomputation makes the per-pixel
+#   cost negligible (one variance scaling + one comparison per bin).
 #
 #   Only periods >= min_period_months (default 24 months / 2 years) are examined,
 #   excluding weather noise and focusing on multi-year drought cycles
 #   (e.g. ENSO 24-84 mo, PDO 120-360 mo).
 #
 # Requires ≥ 48 valid observations (4 years). Uses only base-R stats::spectrum().
+#
+# Arguments:
+#   ts_matrix         — pixels × months matrix
+#   min_period_months — shortest period of interest (default 24)
+#   sig_level         — Monte Carlo quantile threshold (default 0.95)
+#   n_sim_spectral    — number of white-noise simulations (default 500)
+# ================================================================================
+n_sim_spectral <- 500L   # matches Script 4 parameter
+
+vectorized_spectral_peaks <- function(ts_matrix,
+                                      min_period_months = 24L,
+                                      sig_level         = 0.95,
+                                      n_sim_spectral    = get("n_sim_spectral",
+                                                              envir = parent.env(environment()))) {
+  n_pix <- nrow(ts_matrix)
+  out   <- integer(n_pix)
+
+  # ── Cache: one white-noise envelope per unique (valid) series length ──────────
+  # Key  = series length (integer)
+  # Value= numeric vector of length equal to the number of spectral bins produced
+  #        by stats::spectrum() with spans = c(3L, 5L) for that length.
+  #        Each element is the sig_level quantile of the simulated smoothed
+  #        periodogram for a unit-variance white-noise series.
+  # The per-pixel threshold is  wn_env_cache[[key]] * var(pixel_series).
+  wn_env_cache <- list()
+
+  get_wn_envelope <- function(n_len) {
+    key <- as.character(n_len)
+    if (!is.null(wn_env_cache[[key]])) return(wn_env_cache[[key]])
+
+    set.seed(42L)   # reproducible across pixels and index × scale runs
+    sim_specs <- vapply(seq_len(n_sim_spectral), function(s) {
+      wn  <- rnorm(n_len)
+      sp  <- stats::spectrum(wn, spans = c(3L, 5L), taper = 0,
+                             detrend = FALSE, plot = FALSE)
+      sp$spec  # smoothed spectral ordinates (unit variance ⇒ integral ≈ 1)
+    }, numeric(length(
+      stats::spectrum(rnorm(n_len), spans = c(3L, 5L), taper = 0,
+                      detrend = FALSE, plot = FALSE)$spec
+    )))
+
+    # sim_specs is (n_bins × n_sim); row quantile gives the envelope
+    env <- apply(sim_specs, 1L, quantile, probs = sig_level, names = FALSE)
+    wn_env_cache[[key]] <<- env
+    env
+  }
+
+  for (i in seq_len(n_pix)) {
+    x <- ts_matrix[i, ]
+    x <- x[!is.na(x)]
+    if (length(x) < 48L) next
+
+    # Demean and linearly detrend
+    x  <- x - mean(x)
+    tt <- seq_along(x)
+    x  <- residuals(lm(x ~ tt))
+
+    pv <- var(x)
+    if (!is.finite(pv) || pv <= 0) next
+
+    sp  <- tryCatch(
+      stats::spectrum(x, spans = c(3L, 5L), taper = 0,
+                      detrend = FALSE, plot = FALSE),
+      error = function(e) NULL
+    )
+    if (is.null(sp)) next
+
+    # Period in months for each frequency bin (freq is cycles per sample)
+    periods <- 1.0 / sp$freq
+
+    # Restrict to drought-band periods
+    band <- periods >= min_period_months
+    if (!any(band)) next
+
+    # White-noise envelope scaled to this pixel's variance
+    env_unit <- get_wn_envelope(length(x))
+    if (length(env_unit) != length(sp$spec)) next   # guard against bin-count mismatch
+    threshold <- env_unit * pv
+
+    # Flag bins that exceed the threshold and lie in the drought band
+    sig_bins <- band & (sp$spec > threshold)
+
+    # Count contiguous runs of significant bins as individual peaks
+    if (any(sig_bins)) {
+      r       <- rle(sig_bins)
+      out[i]  <- sum(r$values)
+    }
+  }
+
+  data.table::data.table(n_spectral_peaks = out)
+}
 #
 # Arguments:
 #   ts_matrix          — pixels × months matrix
@@ -469,7 +588,7 @@ compute_basin_extent_and_class_trends <- function(ts_matrix, n_years, index_labe
   classify_dur <- function(d)
     dplyr::case_when(d >= 3L  & d <= 6L  ~ "D3-6 (Short-term)",
                      d >= 7L  & d <= 12L ~ "D7-12 (Medium-term)",
-                     d >= 12L            ~ "D12+ (Long-term)",
+                     d >= 13L            ~ "D13+ (Long-term)",
                      TRUE                ~ "D1-3 (Sub-threshold)")
   
   vals       <- basin_avg
@@ -616,10 +735,10 @@ process_index <- function(index_type, scales, find_fn, seas_dir) {
     n_pix   <- length(lon_vec)
     
     # [3/5] Build time-series matrix
-    # ── BUGFIX 1: Detect single-file mode for MSPI/MSPEI ──────────────────────
+    # ── BUGFIX 1: Detect single-file mode ──────────────────────
     # Standard SPI/SPEI: 12 files, one per calendar month, each with n_years
     #   layers.  Matrix layout: col = (year-1)*12 + month.
-    # Single-file indices (MSPI, MSPEI): 1 file with all n_years*12 months
+    # Single-file indices : 1 file with all n_years*12 months
     #   stored as sequential layers.  The old code treated each layer as a year,
     #   allocating a 912×12=10944 matrix and filling only every 12th column,
     #   leaving 91.8% of cells as NA.  The fix: if a single file has > 12 layers,
@@ -750,9 +869,9 @@ process_index <- function(index_type, scales, find_fn, seas_dir) {
     cat("  ── Method 1 (S&W) per-pixel summaries:\n")
     cat(sprintf("     D3-6 events  — mean: %.2f\n", mean(results$n_events_D36,  na.rm = TRUE)))
     cat(sprintf("     D7-12 events — mean: %.2f\n", mean(results$n_events_D712, na.rm = TRUE)))
-    cat(sprintf("     D12+ events  — mean: %.2f  (max: %d)\n",
-                mean(results$n_events_D12p, na.rm = TRUE),
-                max(results$n_events_D12p,  na.rm = TRUE)))
+    cat(sprintf("     D13+ events  — mean: %.2f  (max: %d)\n",
+                mean(results$n_events_D13p, na.rm = TRUE),
+                max(results$n_events_D13p,  na.rm = TRUE)))
     cat(sprintf("     mean_I: %.4f  |  mean_S: %.4f\n",
                 mean(results$mean_I, na.rm = TRUE), mean(results$mean_S, na.rm = TRUE)))
     
@@ -761,9 +880,9 @@ process_index <- function(index_type, scales, find_fn, seas_dir) {
                 mean(results$n_events_D36_hyst,  na.rm = TRUE)))
     cat(sprintf("     D7-12 events — mean: %.2f\n",
                 mean(results$n_events_D712_hyst, na.rm = TRUE)))
-    cat(sprintf("     D12+ events  — mean: %.2f  (max: %d)\n",
-                mean(results$n_events_D12p_hyst, na.rm = TRUE),
-                max(results$n_events_D12p_hyst,  na.rm = TRUE)))
+    cat(sprintf("     D13+ events  — mean: %.2f  (max: %d)\n",
+                mean(results$n_events_D13p_hyst, na.rm = TRUE),
+                max(results$n_events_D13p_hyst,  na.rm = TRUE)))
     cat(sprintf("     mean_I_hyst: %.4f  |  mean_S_hyst: %.4f\n",
                 mean(results$mean_I_hyst, na.rm = TRUE),
                 mean(results$mean_S_hyst, na.rm = TRUE)))
@@ -782,7 +901,8 @@ process_index <- function(index_type, scales, find_fn, seas_dir) {
     cat("✓\n")
     
     # Spectral peak detection (drought-band periods >= 24 months)
-    cat("  → Spectral peak detection (periods >= 24 mo, AR1 red-noise test)...    ")
+    # Uses local MC white-noise override (n_sim=500) to match Script 4 null hypothesis.
+    cat("  → Spectral peak detection (periods >= 24 mo, MC white-noise test, n_sim=500)...    ")
     results <- cbind(results, vectorized_spectral_peaks(ts_mat))
     n_pix_with_peaks <- sum(results$n_spectral_peaks > 0L, na.rm = TRUE)
     cat(sprintf("✓  (%d/%d pixels have >= 1 significant peak)\n",
@@ -797,9 +917,9 @@ process_index <- function(index_type, scales, find_fn, seas_dir) {
     #       directly from the per-calendar-month CSVs already in seas_dir,
     #       bypassing the in-memory ts_mat entirely.
     cat("  → Saving area-weighted basin-average CSV...\n")
-    seas_dir_map <- list(spi   = SPI_SEAS_DIR,   spei  = SPEI_SEAS_DIR,
-                         swei  = SWEI_SEAS_DIR,   mspi  = mspi_dir,
-                         mspei = mspei_dir)
+    seas_dir_map <- list(spi      = SPI_SEAS_DIR,
+                         spei     = SPEI_SEAS_DIR,
+                         spei_thw = SPEI_THW_SEAS_DIR)
     basin_csv_dir <- seas_dir_map[[tolower(index_type)]]
     if (is.null(basin_csv_dir) || !nzchar(basin_csv_dir))
       basin_csv_dir <- file.path(WD_PATH, paste0(index_type, "_results_seasonal"))
@@ -879,7 +999,7 @@ process_index <- function(index_type, scales, find_fn, seas_dir) {
     
     # Duration-class map CSVs
     dur_cols_sw <- c("lon", "lat",
-                     "n_events_D36", "n_events_D712", "n_events_D12p", "n_D4p",
+                     "n_events_D36", "n_events_D712", "n_events_D13p", "n_D4p",
                      "mean_I", "mean_S")
     data.table::fwrite(
       results[, ..dur_cols_sw],
@@ -890,7 +1010,7 @@ process_index <- function(index_type, scales, find_fn, seas_dir) {
                 index_type, sc))
     
     dur_cols_hyst <- c("lon", "lat",
-                       "n_events_D36_hyst", "n_events_D712_hyst", "n_events_D12p_hyst",
+                       "n_events_D36_hyst", "n_events_D712_hyst", "n_events_D13p_hyst",
                        "n_D4p_hyst", "mean_I_hyst", "mean_S_hyst")
     data.table::fwrite(
       results[, ..dur_cols_hyst],
@@ -900,23 +1020,23 @@ process_index <- function(index_type, scales, find_fn, seas_dir) {
     cat(sprintf("  ✅ Duration-class map (Hyst): %s_%02d_duration_class_map_Hyst.csv\n",
                 index_type, sc))
     
-    # D12+ frequency rasters (both methods)
+    # D13+ frequency rasters (both methods)
     if (exists("r_tmpl") && !is.null(r_tmpl)) {
-      write_d12p_nc <- function(values_vec, suffix, label_suffix) {
+      write_d13p_nc <- function(values_vec, suffix, label_suffix) {
         r_out     <- r_tmpl
         terra::values(r_out) <- NA_real_
         all_vals  <- rep(NA_real_, terra::ncell(r_tmpl))
         all_vals[valid_pix]  <- values_vec
         terra::values(r_out) <- all_vals
-        names(r_out) <- sprintf("%s_%02d_n_D12p_%s", index_type, sc, label_suffix)
+        names(r_out) <- sprintf("%s_%02d_n_D13p_%s", index_type, sc, label_suffix)
         nc_path <- file.path(TREND_DIR,
-                             sprintf("%s_%02d_D12p_pixel_frequency_%s.nc",
+                             sprintf("%s_%02d_D13p_pixel_frequency_%s.nc",
                                      index_type, sc, suffix))
         terra::writeCDF(r_out, nc_path, overwrite = TRUE)
-        cat(sprintf("  ✅ D12+ raster (%s): %s\n", suffix, basename(nc_path)))
+        cat(sprintf("  ✅ D13praster (%s): %s\n", suffix, basename(nc_path)))
       }
-      write_d12p_nc(results$n_events_D12p,      "SW",   "SW_longterm_droughts")
-      write_d12p_nc(results$n_events_D12p_hyst, "Hyst", "Hyst_longterm_droughts")
+      write_d13p_nc(results$n_events_D13p,      "SW",   "SW_longterm_droughts")
+      write_d13p_nc(results$n_events_D13p_hyst, "Hyst", "Hyst_longterm_droughts")
     }
     
     rm(ts_mat, stacks)
@@ -931,6 +1051,9 @@ cat("\n╔═══════════════════════�
 cat("║  DROUGHT TREND TEST         ║\n")
 cat("║  Dual methods: S&W single-threshold + Hyst     ║\n")
 cat("╚════════════════════════════════════════════════╝\n\n")
+cat(sprintf("  Indices  : SPI, SPEI_PM, SPEI_Thw\n"))
+cat(sprintf("  Scales   : %s\n",
+            paste(SPI_SCALES, collapse = ", ")))
 cat(sprintf("  Method 1 (S&W)  : onset = %.1f, exit = %.1f, no min duration\n",
             DROUGHT_ONSET, DROUGHT_ONSET))
 cat(sprintf("  Method 2 (Hyst) : onset = %.1f, exit = %.1f, scale-specific min duration\n",
@@ -952,57 +1075,45 @@ run_index_safe <- function(index_type, scales, find_fn, seas_dir) {
 cat("\n── SPI ──\n")
 run_index_safe("spi", SPI_SCALES, find_seasonal_nc_files, SPI_SEAS_DIR)
 
-cat("\n── SPEI ──\n")
+cat("\n── SPEI (PM) ──\n")
 run_index_safe("spei", SPEI_SCALES, find_seasonal_nc_files, SPEI_SEAS_DIR)
 
-# BUGFIX 2: find_swei_seasonal_files() in DROUGHT_ANALYSIS_utils.R does not
-# accept a `scale` argument.  The old wrapper passed `scale` directly, causing
-# "argument 'scale' is missing, with no default" on every SWEI call.
-# Fix: call find_swei_seasonal_files(data_dir) without the scale argument.
-find_swei_nc_safe <- function(data_dir, index_type, scale) {
-  tryCatch(
-    find_swei_seasonal_files(data_dir),   # ← scale not forwarded
-    error = function(e) {
-      cat(sprintf("  ⚠ SWEI file finder error: %s\n", conditionMessage(e)))
-      character(0)
-    }
+# SPEI_Thw — Thornthwaite PET variant written by 3SPEI_ERALand.R (Runs 3 & 4)
+# into spei_results_seasonal_thw/.  Files may be named with index prefix
+# "spei_thw" or, if 3SPEI_ERALand.R wrote them with the plain "spei" prefix
+# inside the thw-specific subdirectory, the wrapper tries both automatically
+# so that no manual filename wrangling is required.
+find_spei_thw_nc_safe <- function(data_dir, index_type, scale) {
+  # First attempt: files named spei_thw_NN_*.nc (preferred convention)
+  files <- tryCatch(
+    find_seasonal_nc_files(data_dir, "spei_thw", scale),
+    error = function(e) character(0)
   )
-}
-
-cat("\n── SWEI ──\n")
-run_index_safe("swei", SWEI_SCALE, find_swei_nc_safe, SWEI_SEAS_DIR)
-
-# MSPI / MSPEI (optional) — single-file mode handled automatically in process_index
-find_mspi_mspei_files <- function(data_dir, index_type, scale) {
-  pattern <- sprintf("%s_monthly_.*\\.nc$", tolower(index_type))
-  files   <- list.files(data_dir, pattern = pattern, full.names = TRUE)
-  if (length(files) == 0)
-    cat(sprintf("  ⚠ No %s NC files in %s — skipping\n",
-                toupper(index_type), data_dir))
+  # Fallback: files named spei_NN_*.nc stored in the thw subdirectory
+  if (!length(files)) {
+    files <- tryCatch(
+      find_seasonal_nc_files(data_dir, "spei", scale),
+      error = function(e) {
+        cat(sprintf("  ⚠ SPEI_Thw file finder error (both patterns failed): %s\n",
+                    conditionMessage(e)))
+        character(0)
+      }
+    )
+    if (length(files))
+      cat(sprintf("  ℹ SPEI_Thw scale-%02d: using 'spei' filename prefix in %s\n",
+                  scale, basename(data_dir)))
+  }
   files
 }
 
-MSPI_MSPEI_SCALE <- 1L
-mspi_dir  <- file.path(WD_PATH, "mspi_results")
-mspei_dir <- file.path(WD_PATH, "mspei_results")
-
-if (dir.exists(mspi_dir)) {
-  cat("\n── MSPI ──\n")
-  run_index_safe("mspi", MSPI_MSPEI_SCALE, find_mspi_mspei_files, mspi_dir)
+if (dir.exists(SPEI_THW_SEAS_DIR)) {
+  cat("\n── SPEI (Thw) ──\n")
+  run_index_safe("spei_thw", SPEI_THW_SCALES, find_spei_thw_nc_safe, SPEI_THW_SEAS_DIR)
 } else {
-  cat("\n── MSPI: directory not found, skipped ──\n")
+  cat("\n── SPEI (Thw): directory not found, skipped ──\n")
+  cat(sprintf("   Expected: %s\n", SPEI_THW_SEAS_DIR))
+  cat("   Run 3SPEI_ERALand.R with RUN_DETRENDED_BRANCH = TRUE first.\n")
 }
-
-if (dir.exists(mspei_dir)) {
-  cat("\n── MSPEI ──\n")
-  run_index_safe("mspei", MSPI_MSPEI_SCALE, find_mspi_mspei_files, mspei_dir)
-} else {
-  cat("\n── MSPEI: directory not found, skipped ──\n")
-}
-
-elapsed <- Sys.time() - total_start
-cat(sprintf("\n✅ Done.  Time: %.1f min\n  Next: run w4_trends_visualization.R\n\n",
-            as.numeric(elapsed, units = "mins")))
 
 # ────────────────────────────────────────────────────────────────────────────────
 #   FINAL SUMMARY
@@ -1011,32 +1122,32 @@ cat("═════════════════════════
 cat("DUAL DROUGHT EVENT METHOD SUMMARY  [FIXED VERSION]\n")
 cat("══════════════════════════════════════════════════════\n")
 cat("Method 1 (S&W)   — Sheffield & Wood (2008):\n")
-cat("  Onset:        index < -1.0\n")
-cat("  Termination:  index >= -1.0  (same threshold, no hysteresis)\n")
+cat("  Onset:        index < -0.5\n")
+cat("  Termination:  index >= -0.5  (same threshold, no hysteresis)\n")
 cat("  Min duration: none (all events retained)\n")
-cat("  Intensity:    mean(onset_thr - x)  [deficit below -1.0]\n")
+cat("  Intensity:    mean(onset_thr - x)  [deficit below -0.5]\n")
 cat("  CSV columns: n_events, mean_duration, max_intensity,\n")
-cat("               n_events_D36, n_events_D712, n_events_D12p,\n")
+cat("               n_events_D36, n_events_D712, n_events_D13p,\n")
 cat("               n_D4p, mean_I, mean_S\n")
 cat("  Duration map: *_duration_class_map_SW.csv\n")
-cat("  D12+ raster:  *_D12p_pixel_frequency_SW.nc\n\n")
+cat("  D13+ raster:  *_D13p_pixel_frequency_SW.nc\n\n")
 cat("Method 2 (Hyst)  — Hysteresis with scale-specific min duration:\n")
-cat("  Onset:        index < -1.0\n")
-cat("  Termination:  index >= 0.0  (drought persists through brief recoveries)\n")
+cat("  Onset:        index < -0.5\n")
+cat("  Termination:  index >= -0.5  (drought persists through brief recoveries)\n")
 cat("  Intensity:    mean(end_thr - x) = mean(-x)  [deficit below 0.0, always >= 0]\n")
 cat("  Min duration per scale:\n")
 cat("    SPI/SPEI-1  : >= 2 months\n")
 cat("    SPI/SPEI-3  : >= 3 months\n")
 cat("    SPI/SPEI-6  : >= 4 months\n")
 cat("    SPI/SPEI-12 : >= 6 months\n")
-cat("    SWEI / other: >= 3 months (default)\n")
+cat("    SPEI_Thw    : same scale-specific rules as SPEI_PM\n")
 cat("  CSV columns: n_events_hyst, mean_duration_hyst, max_intensity_hyst,\n")
 cat("               n_events_D36_hyst, ..., mean_I_hyst, mean_S_hyst\n")
 cat("  Duration map: *_duration_class_map_Hyst.csv\n")
-cat("  D12+ raster:  *_D12p_pixel_frequency_Hyst.nc\n\n")
+cat("  D13+ raster:  *_D13p_pixel_frequency_Hyst.nc\n\n")
 cat("Additional per-pixel columns (all indices):\n")
 cat("  regime_shift_year, regime_shift_detected, n_changepoints,\n")
 cat("  mean_before_shift, mean_after_shift, magnitude_shift   [PELT]\n")
 cat("  p_value_runs, clustering, filtered_runs                [Runs test]\n")
-cat("  n_spectral_peaks                                       [AR1 spectral]\n")
+cat("  n_spectral_peaks                                       [MC white-noise spectral, n_sim=500]\n")
 cat("══════════════════════════════════════════════════════\n")

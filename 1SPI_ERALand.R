@@ -252,7 +252,7 @@ variance_aware_spi <- function(v, scale, dates_vec, eps = 1e-6) {
 # ==============================================================================
 # MAIN CALCULATION LOOP - PARALLEL
 # ==============================================================================
-timescales <- c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 24)
+timescales <- c(1, 2, 3, 6, 12)
 
 # ---- Set up parallel cluster (once, reused across all timescales) ----
 n_cores <- max(1L, detectCores() - 1L)   # leave 1 core for the OS
@@ -419,7 +419,7 @@ for (sc in timescales) {
   )
   
   spi_dist_raster <- rast(precip[[1]])
-  dist_sim <- method_matrix[, 1]
+  dist_sim <- method_matrix[, 24]
   dist_sim[is.na(values(precip[[1]]))] <- NA
   values(spi_dist_raster) <- dist_sim
   
@@ -542,20 +542,28 @@ for (sc in timescales) {
   
   first_idx <- 1:min(12, ncol(s$spi_indices))
   first_spi <- s$spi_indices[, first_idx, drop = FALSE]
-  
-  cat("\nDrought frequency (first 12 months):\n", 
+  cat( "\nDrought/Wet frequency (first 12 months):\n ",
+       file = summary_combined_file, append = TRUE)
+  cat(sprintf( "  W3 Extremely wet (SPI ≥  2.0): %.1f%%\n ",
+               100 * mean(first_spi >=  2.0, na.rm = TRUE)),
       file = summary_combined_file, append = TRUE)
-  cat(sprintf("  Exceptional (SPI < -2.0): %.1f%%\n", 
-              100 * mean(first_spi < -2.0, na.rm = TRUE)), 
+  cat(sprintf( "  W2 Severely wet  (1.5 ≤ SPI < 2): %.1f%%\n ",
+               100 * mean(first_spi >=  1.5 & first_spi < 2.0, na.rm = TRUE)),
       file = summary_combined_file, append = TRUE)
-  cat(sprintf("  Extreme     (SPI < -1.6): %.1f%%\n", 
-              100 * mean(first_spi < -1.6, na.rm = TRUE)), 
+  cat(sprintf( "  W1 Moderately wet (1 ≤ SPI < 1.5): %.1f%%\n ",
+               100 * mean(first_spi >=  1.0 & first_spi < 1.5, na.rm = TRUE)),
       file = summary_combined_file, append = TRUE)
-  cat(sprintf("  Severe      (SPI < -1.3): %.1f%%\n", 
-              100 * mean(first_spi < -1.3, na.rm = TRUE)), 
+  cat(sprintf( "  N0 Normal         (-1 < SPI < 1):  %.1f%%\n ",
+               100 * mean(first_spi > -1.0 & first_spi < 1.0, na.rm = TRUE)),
       file = summary_combined_file, append = TRUE)
-  cat(sprintf("  Moderate    (SPI < -0.8): %.1f%%\n", 
-              100 * mean(first_spi < -0.8, na.rm = TRUE)), 
+  cat(sprintf( "  D1 Moderately dry (-1.5 < SPI ≤ -1): %.1f%%\n ",
+               100 * mean(first_spi <= -1.0 & first_spi > -1.5, na.rm = TRUE)),
+      file = summary_combined_file, append = TRUE)
+  cat(sprintf( "  D2 Severely dry   (-2 < SPI ≤ -1.5): %.1f%%\n ",
+               100 * mean(first_spi <= -1.5 & first_spi > -2.0, na.rm = TRUE)),
+      file = summary_combined_file, append = TRUE)
+  cat(sprintf( "  D3 Extremely dry  (SPI ≤ -2.0): %.1f%%\n ",
+               100 * mean(first_spi <= -2.0, na.rm = TRUE)),
       file = summary_combined_file, append = TRUE)
 }
 
