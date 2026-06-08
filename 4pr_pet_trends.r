@@ -223,7 +223,20 @@ years  <- as.integer(format(dates, "%Y"))
 months <- as.integer(format(dates, "%m"))
 
 # ── Unit conversions ─────────────────────────────────────────────────────────────
-precip_full <- precip_full * 1000    # m → mm/day
+# Use detect_precip_unit() to determine the correct m→mm factor for each
+# variable rather than hardcoding × 1000.  The function samples a July layer
+# and returns 1000 (m/day), 1 (already mm/day), or NA (already mm/month).
+precip_unit_info   <- detect_precip_unit(precip_full,   dates_vec = dates_full, var_label = "Precip")
+pet_unit_info      <- detect_precip_unit(pet_full,      dates_vec = dates_full, var_label = "PET_PM")
+pet_thw_unit_info  <- detect_precip_unit(pet_thw_full,  dates_vec = dates_full, var_label = "PET_Thw")
+
+if (!is.na(precip_unit_info$factor)  && precip_unit_info$factor  != 1)
+  precip_full  <- precip_full  * precip_unit_info$factor
+if (!is.na(pet_unit_info$factor)     && pet_unit_info$factor     != 1)
+  pet_full     <- pet_full     * pet_unit_info$factor
+if (!is.na(pet_thw_unit_info$factor) && pet_thw_unit_info$factor != 1)
+  pet_thw_full <- pet_thw_full * pet_thw_unit_info$factor
+
 month_days_base  <- c(31,28,31,30,31,30,31,31,30,31,30,31)
 is_leap <- function(yr) (yr%%4==0) & (yr%%100!=0 | yr%%400==0)
 days_in_month <- month_days_base[months]

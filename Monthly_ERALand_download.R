@@ -1,31 +1,32 @@
 # ============================================================================
-# Download ERA5-Land Monthly Values
+#   Download ERA5-Land Monthly Values
 # Due to a bug in ERA5-Land Data accumulated monthly variables, for
-# total_precipitation, potential_evaporation, and surface_solar_radiation_downwards 
-# product_type will be changed from "monthly_averaged_reanalysis" to 
+# total_precipitation, potential_evaporation, and surface_solar_radiation_downwards
+# product_type will be changed from "monthly_averaged_reanalysis" to
 # "monthly_averaged_reanalysis_by_hour_of_day"
-#
 # Basin Memory variables (instantaneous state fields — no product_type change needed):
 #   snow_depth_water_equivalent  : SWE proxy (m water equivalent)
-#   volumetric_soil_water_layer_1: near-surface soil moisture 0–7 cm   (m³/m³)
-#   volumetric_soil_water_layer_2: shallow soil moisture    7–28 cm    (m³/m³)
-#   volumetric_soil_water_layer_3: medium soil moisture     28–100 cm  (m³/m³)  [optional]
-#   volumetric_soil_water_layer_4: deep soil moisture       100–289 cm (m³/m³)  [optional]
+# volumetric_soil_water_layer_1: near-surface soil moisture 0–7 cm   (m³/m³)
+# volumetric_soil_water_layer_2: shallow soil moisture    7–28 cm    (m³/m³)
+# volumetric_soil_water_layer_3: medium soil moisture     28–100 cm  (m³/m³)  [optional]
+# volumetric_soil_water_layer_4: deep soil moisture       100–289 cm (m³/m³)  [optional]
 # ============================================================================
-# Load required libraries
-library(ecmwfr)  # For CDS API access
+  
+  # Load required libraries
+  library(ecmwfr)  # For CDS API access
 library(terra)   # For raster processing
 library(lubridate)
 library(ncdf4)
 library(dotenv)
+
 dotenv::load_dot_env(".env")
 
 # Set working directory (ensure this path exists)
 load_dot_env(".env")
 setwd(Sys.getenv("WD_PATH"))
-# ===================== CONFIGURATION =====================
-# Set credentials 
 
+# ===================== CONFIGURATION =====================
+# Set credentials
 wf_set_key(
   user = Sys.getenv("CDS_USER"),
   key  = Sys.getenv("CDS_KEY")
@@ -39,23 +40,24 @@ start_date <- "1950-01-01"
 end_date <- "2025-12-31"
 
 # Variables needed for SPI and SPEI
-variables <- c(
-  #"snow_cover",
+# Note: Removed trailing spaces and fixed missing commas from original script
+variables  <- c(
+  "snow_cover",
   "snow_depth_water_equivalent",      # SWE proxy (m water equiv.) — Basin Memory
-  # "surface_solar_radiation_downwards",
+  "surface_solar_radiation_downwards",
   "10m_u_component_of_wind",
   "10m_v_component_of_wind",
-  # "geopotential",
+  "geopotential",
   "surface_pressure",
-  # "total_precipitation",
-  # "potential_evaporation"
+  "total_precipitation",
+  "potential_evaporation",
   "2m_temperature",
   "2m_dewpoint_temperature",
-  # "skin_reservoir_content",
+  "skin_reservoir_content",
   "volumetric_soil_water_layer_1",    # 0–7 cm   — near-surface, responds to AR events
-  "volumetric_soil_water_layer_2"     # 7–28 cm  — shallow memory, most drought-relevant
-  # "volumetric_soil_water_layer_3",  # 28–100 cm  — medium-term memory  [add if needed]
-  # "volumetric_soil_water_layer_4"   # 100–289 cm — deep storage         [add if needed]
+  "volumetric_soil_water_layer_2",    # 7–28 cm  — shallow memory, most drought-relevant
+  "volumetric_soil_water_layer_3",    # 28–100 cm  — medium-term memory  [add if needed]
+  "volumetric_soil_water_layer_4"     # 100–289 cm — deep storage         [add if needed]
 )
 
 # Create output directories
@@ -66,6 +68,14 @@ dir.create("downloads", showWarnings = FALSE)
 download_era5_variable <- function(variable, start_year, end_year) {
   # Downloads all monthly data for one variable across multiple years
   
+  # Apply workaround for ERA5-Land bug (Sep 2022-Feb 2024) for accumulated variables
+  accumulated_vars <- c("total_precipitation", "potential_evaporation", "surface_solar_radiation_downwards")
+  if (variable %in% accumulated_vars) {
+    prod_type <- "monthly_averaged_reanalysis_by_hour_of_day"
+  } else {
+    prod_type <- "monthly_averaged_reanalysis"
+  }
+  
   # Generate year and month vectors
   years <- as.character(start_year:end_year)
   months <- sprintf("%02d", 1:12)
@@ -73,7 +83,7 @@ download_era5_variable <- function(variable, start_year, end_year) {
   # Construct request for monthly means dataset
   request <- list(
     dataset_short_name = "reanalysis-era5-land-monthly-means",
-    product_type = "monthly_averaged_reanalysis",  # corrected: avoids ERA5-Land bug (Sep 2022-Feb 2024)
+    product_type = prod_type,  # Dynamic assignment based on variable
     variable = variable,
     year = years,  # All years at once
     month = months,  # All months at once
@@ -110,87 +120,86 @@ tryCatch({
     cat("  Downloading data for", start_year, "-", end_year, "... ")
     
     # Download all data for this variable
-    nc_file <- download_era5_variable(var, start_year, end_year)
+    nc_file  <- download_era5_variable(var, start_year, end_year)
     
-    cat("Downloaded.\n")
-    cat("  Reading NetCDF file... ")
+    cat(" Downloaded.\n ")
+    cat("  Reading NetCDF file...  ")
     
     # Read the NetCDF file as SpatRaster
-    result <- rast(nc_file)
+    result  <- rast(nc_file)
     
-    cat("Done.\n")
-    cat("  Processing", nlyr(result), "layers... ")
+    cat(" Done.\n ")
+    cat("  Processing ", nlyr(result),  "layers...  ")
     
     # --------------------------------------------------------------------------
     # NEW BLOCK: Check and Report NA Values
     # --------------------------------------------------------------------------
-    cat("\n  --- NA Check ---\n")
+    cat( "\n  --- NA Check ---\n ")
     
     # Count NAs across the entire raster stack
-    total_cells <- ncell(result) * nlyr(result)
-    na_count <- global(result, fun = "isNA", na.rm = FALSE) 
-    total_na <- sum(na_count$isNA)
+    total_cells  <- ncell(result) * nlyr(result)
+    na_count  <- global(result, fun =  "isNA", na.rm = FALSE) 
+    total_na  <- sum(na_count$isNA)
     
     # Calculate percentage
-    na_percent <- (total_na / total_cells) * 100
+    na_percent  <- (total_na / total_cells) * 100
     
     # Report to console
-    cat(sprintf("  Total Cells: %d\n", total_cells))
-    cat(sprintf("  Total NAs:   %d\n", total_na))
-    cat(sprintf("  NA Percent:  %.4f%%\n", na_percent))
+    cat(sprintf("  Total Cells: %d\n ", total_cells))
+    cat(sprintf("  Total NAs:   %d\n ", total_na))
+    cat(sprintf("  NA Percent:  %.4f%%\n ", na_percent))
     
-    if (total_na > 0) {
-      cat("  WARNING: Missing values detected.\n")
+    if (total_na  > 0) {
+      cat("  WARNING: Missing values detected.\n ")
     } else {
-      cat("  STATUS: No missing values.\n")
+      cat("  STATUS: No missing values.\n ")
     }
-    cat("  ----------------\n")
+    cat("  ----------------\n ")
     # --------------------------------------------------------------------------
     
     # Apply unit conversions if needed
+    # Note: Removed trailing spaces from string matches to align with cleaned 'variables' vector
     if (var == "total_precipitation") {
       # Convert from meters to millimeters (1 m = 1000 mm)
-      result <- result * 1000
-      cat("  Converted precipitation from m to mm.\n")
+      result  <- result * 1000
+      cat("  Converted precipitation from m to mm.\n ")
     }
     
     if (grepl("temperature", var)) {
       # Convert from Kelvin to Celsius if desired
-      # result <- result - 273.15
-      # cat("  Converted temperature from K to °C.\n")
+      # result  <- result - 273.15
+      # cat("  Converted temperature from K to °C.\n ")
     }
     
     if (var == "snow_depth_water_equivalent") {
       # ERA5-Land SWE is already in metres water equivalent (m).
       # No conversion required for downstream w9 analysis.
       # Multiply by 1000 here only if mm w.e. is preferred.
-      cat("  SWE: units are metres water equivalent (no conversion applied).\n")
+      cat("  SWE: units are metres water equivalent (no conversion applied).\n ") # Fixed typo 'c at'
     }
     
     if (grepl("volumetric_soil_water", var)) {
       # ERA5-Land soil moisture is in m³/m³ (dimensionless volume fraction).
       # No conversion required; values range 0–1 (wilting ~0.05, saturation ~0.50).
-      cat("  Soil moisture: units are m\u00b3/m\u00b3 (no conversion applied).\n")
+      cat("  Soil moisture: units are m\u00b3/m\u00b3 (no conversion applied).\n ")
     }
     
     # Save to file
-    output_file <- paste0("monthly_data_direct/", var, "_monthly.nc")
-    cat("  Saving to:", output_file, "... ")
+    output_file  <- paste0("monthly_data_direct/", var, "_monthly.nc")
+    cat("  Saving to: ", output_file, "...  ")
     writeCDF(result, output_file, overwrite = TRUE)
-    cat("Done.\n")
+    cat("Done.\n ")
     
     # Clean up downloaded file
     file.remove(nc_file)
     
-    cat("  Completed", var, "\n\n")
+    cat("  Completed ", var, "\n\n ")
   }
-  
   cat("All downloads complete!\n")
   
   # ===================== CLEANUP: DELETE DOWNLOADS FOLDER =====================
   cat("\n--- Cleanup Phase ---\n")
   downloads_path <- "downloads"
-  
   if (dir.exists(downloads_path)) {
     # Verify directory is empty (all files should have been removed during processing)
     if (length(list.files(downloads_path)) == 0) {

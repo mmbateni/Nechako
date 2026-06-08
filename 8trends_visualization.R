@@ -1,4 +1,4 @@
-# w4_trends_visualization.R  ·  SPATIAL DROUGHT DIAGNOSTICS
+# 8trends_visualization.R  ·  SPATIAL DROUGHT DIAGNOSTICS
 # ─────────────────────────────────────────────────────────────────────────────────
 # COMPATIBLE WITH: DROUGHT_ANALYSIS_utils.R, w1_trend_test.R
 # SUPPORTS: SPI, SPEI, SWEI, MSPI, MSPEI (Gridded)
@@ -16,7 +16,7 @@
 #       are produced by w1_basin_timeseries.R — run that script for all
 #       non-spatial outputs.
 #
-# EXECUTION ORDER: w1_trend_test.R → w2_basin_timeseries.R → w4_trends_visualization.R
+# EXECUTION ORDER: 6trend_test.R → 7basin_timeseries.R → 8trends_visualization.R
 
 source("DROUGHT_ANALYSIS_utils.R")
 utils_load_packages(c("terra", "data.table", "ggplot2", "sf", "viridis",
@@ -697,7 +697,7 @@ create_ms_trend_maps <- function(scales_ms = c(1, 3),
     if (!has_fdr) lev_map <- c("1" = "Nominal only",
                                "2" = "Not significant")
     df_sig_raw$sig_cat <- factor(
-      lev_map[as.character(round(df_sig_raw$value))],
+      lev_map[as.character(as.integer(df_sig_raw$value))],
       levels = names(SIG_FILLS))
     df_sig <- df_sig_raw[!is.na(df_sig_raw$sig_cat), ]
     
@@ -795,7 +795,7 @@ tryCatch(
 # FINAL SUMMARY
 ################################################################################
 cat("\n╔══════════════════════════════════════╗\n")
-cat("║  w4_trends_visualization.R  DONE     ║\n")
+cat("║  8trends_visualization.R  DONE     ║\n")
 cat("╚══════════════════════════════════════╝\n\n")
 cat("Outputs:\n")
 cat("  Master diagnostics CSV : ", normalizePath(master_csv), "\n")

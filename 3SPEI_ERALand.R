@@ -53,6 +53,9 @@ library(writexl)
 library(lmomco)
 library(parallel)
 
+# ---- Shared utilities (detect_precip_unit and other helpers) ----
+source("DROUGHT_ANALYSIS_utils.R")
+
 # ---- Paths ----
 setwd("D:/Nechako_Drought/Nechako/")
 out_dir     <- "spei_results_seasonal"
@@ -257,13 +260,48 @@ cat(sprintf("Basin boundary applied (%.1f%% of raster: %d/%d pixels)\n",
             100 * basin_pixels / total_pixels, basin_pixels, total_pixels))
 
 # Days-in-month vector
-month_nums    <- as.integer(format(dates, "%m"))
-year_nums     <- as.integer(format(dates, "%Y"))
-days_in_month <- as.integer(first_next_month - first_of_month)
+month_nums       <- as.integer(format(dates, "%m"))
+year_nums        <- as.integer(format(dates, "%Y"))
+first_of_month   <- as.Date(format(dates, "%Y-%m-01"))
+first_next_month <- seq(first_of_month[1], by = "month", length.out = length(dates) + 1L)[-1L]
+days_in_month    <- as.integer(first_next_month - first_of_month)
 
 month_numbers <- month_nums   # alias used inside variance_aware_spei
 month_names   <- c("Jan","Feb","Mar","Apr","May","Jun",
                    "Jul","Aug","Sep","Oct","Nov","Dec")
+
+# ==============================================================================
+#   UNIT DETECTION & CONVERSION  (m/day → mm/day, applied before any WB calc)
+#
+#   ERA5-Land CDS "monthly averaged reanalysis" stores both tp and pev as
+#   mean daily rates in m/day.  This block detects the actual unit and applies
+#   the correct × 1000 factor so that the subsequent × days_in_month step
+#   produces mm/month.  Missing this step was the root cause of the WB_PM
+#   range bug (max ~+0.08 instead of the expected +20 to +45 mm/month in DJF).
+# ==============================================================================
+cat("\n===== UNIT DETECTION (precip + PET) =====\n")
+precip_unit <- detect_precip_unit(precip, dates_vec = dates, var_label = "Precip")
+pet_unit    <- detect_precip_unit(pet,    dates_vec = dates, var_label = "PET_PM")
+pet_thw_unit <- detect_precip_unit(pet_thw, dates_vec = dates, var_label = "PET_Thw")
+
+# Apply m/day → mm/day conversion where needed (factor = 1000 or 1)
+if (!is.na(precip_unit$factor) && precip_unit$factor != 1) {
+  cat(sprintf("  Applying precip × %.0f (%s → mm/day)\n",
+              precip_unit$factor, precip_unit$unit_in))
+  precip <- precip * precip_unit$factor
+}
+if (!is.na(pet_unit$factor) && pet_unit$factor != 1) {
+  cat(sprintf("  Applying PET_PM × %.0f (%s → mm/day)\n",
+              pet_unit$factor, pet_unit$unit_in))
+  pet <- pet * pet_unit$factor
+}
+if (!is.na(pet_thw_unit$factor) && pet_thw_unit$factor != 1) {
+  cat(sprintf("  Applying PET_Thw × %.0f (%s → mm/day)\n",
+              pet_thw_unit$factor, pet_thw_unit$unit_in))
+  pet_thw <- pet_thw * pet_thw_unit$factor
+}
+cat("  ✓ All inputs now in mm/day — ready for × days_in_month scaling\n")
+cat("=========================================\n\n")
 
 # ==============================================================================
 #   WATER BALANCE — PENMAN-MONTEITH  (WB_pm = P - PET_PM)
@@ -396,6 +434,14 @@ cat("=================================================\n\n")
 #   WATER BALANCE — DETRENDED PET  (counterfactual branch)  [NEW]
 # ==============================================================================
 if (RUN_DETRENDED_BRANCH) {
+  
+  # Detect and apply unit conversion for detrended PET inputs
+  pet_det_unit     <- detect_precip_unit(pet_det,     dates_vec = dates, var_label = "PET_PM_det")
+  pet_thw_det_unit <- detect_precip_unit(pet_thw_det, dates_vec = dates, var_label = "PET_Thw_det")
+  if (!is.na(pet_det_unit$factor) && pet_det_unit$factor != 1)
+    pet_det <- pet_det * pet_det_unit$factor
+  if (!is.na(pet_thw_det_unit$factor) && pet_thw_det_unit$factor != 1)
+    pet_thw_det <- pet_thw_det * pet_thw_det_unit$factor
   
   cat("\n===== WATER BALANCE (PM detrended) =====\n")
   wb_det <- precip - pet_det

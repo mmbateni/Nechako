@@ -1,5 +1,5 @@
 # ==============================================================================
-# w10b_PET_bias_nonstationarity.R
+# 10b_PET_bias_nonstationarity.R
 # ==============================================================================
 # THORNTHWAITE vs. PENMAN-MONTEITH PET BIAS NON-STATIONARITY ANALYSIS
 # Nechako River Basin, BC — 2022-2025 Drought Study
@@ -93,7 +93,7 @@ season_of <- function(m) dplyr::case_when(
 days_in_month_lut <- c(31,28.25,31,30,31,30,31,31,30,31,30,31)  # avg; leap-year aware below
 
 cat("==============================================================\n")
-cat("  w11b: PET BIAS NON-STATIONARITY ANALYSIS (P1 vs P3)\n")
+cat("  11b: PET BIAS NON-STATIONARITY ANALYSIS (P1 vs P3)\n")
 cat("==============================================================\n\n")
 
 # ==============================================================================
@@ -132,23 +132,26 @@ cat("\n--- SECTION 2: Building monthly base table ---\n")
 
 # Merge WB and PET CSVs on date/year/month
 base <- inner_join(
-  wb_raw  %>% select(date, year, month, days_in_month, wb_pm_mm_month),
-  pm_raw  %>% select(date, year, month, mean_pet) %>% rename(pet_pm_mm_day  = mean_pet),
-  by = c("date", "year", "month")
+  wb_raw  %>% dplyr::select(year, month, days_in_month, wb_pm_mm_month),
+  pm_raw  %>% dplyr::select(year, month, mean_pet) %>% rename(pet_pm_mm_day  = mean_pet),
+  by = c("year", "month")
 ) %>%
   inner_join(
-    thw_raw %>% select(date, year, month, mean_pet) %>% rename(pet_thw_mm_day = mean_pet),
-    by = c("date", "year", "month")
+    thw_raw %>% dplyr::select(year, month, mean_pet) %>% rename(pet_thw_mm_day = mean_pet),
+    by = c("year", "month")
   ) %>%
   arrange(year, month) %>%
   mutate(
-    bias_mm_day   = pet_thw_mm_day - pet_pm_mm_day,          # mm/day
-    bias_mm_month = bias_mm_day * days_in_month,              # mm/month (same units as WB)
+    date          = sprintf("%04d-%02d", year, month),   # canonical YYYY-MM
+    bias_mm_day   = pet_thw_mm_day - pet_pm_mm_day,
+    bias_mm_month = bias_mm_day * days_in_month,
     season        = season_of(month),
     in_P1         = year >= P1_START & year <= P1_END,
     in_P3         = year >= P3_START & year <= P3_END
   )
-
+cat("  wb_raw$date[1]:  ", wb_raw$date[1], "\n")
+cat("  pm_raw$date[1]:  ", pm_raw$date[1], "\n")
+cat("  thw_raw$date[1]: ", thw_raw$date[1], "\n")
 cat(sprintf("  Merged: %d months\n", nrow(base)))
 cat(sprintf("  WB_PM:        %.2f to %.2f mm/month\n",
             min(base$wb_pm_mm_month,  na.rm = TRUE),
@@ -160,7 +163,7 @@ cat(sprintf("  bias (mm/month): %.3f to %.3f\n",
             min(base$bias_mm_month,   na.rm = TRUE),
             max(base$bias_mm_month,   na.rm = TRUE)))
 
-write.csv(base %>% select(date, year, month, season, days_in_month,
+write.csv(base %>% dplyr::select(date, year, month, season, days_in_month,
                           wb_pm_mm_month, pet_pm_mm_day, pet_thw_mm_day,
                           bias_mm_day, bias_mm_month, in_P1, in_P3),
           file.path(OUT_DIR, "bias_monthly_timeseries.csv"), row.names = FALSE)
@@ -230,7 +233,7 @@ for (k in SCALES) {
       # Both numerator and denominator in same units (mm/month accumulated)
       delta_SPEI_k     = delta_bias_k / sd_wb_k_P1
     ) %>%
-    select(scale, month, month_name, season,
+    dplyr::select(scale, month, month_name, season,
            n_P1, n_P3,
            mean_bias_k_P1, mean_bias_k_P3, delta_bias_k,
            sd_wb_k_P1, mean_wb_k_P1,
@@ -327,7 +330,7 @@ ann_summary <- correction_df %>%
   ) %>% mutate(season = "Annual")
 
 cat("\n  Annual delta_SPEI per scale:\n")
-print(ann_summary %>% select(scale, mean_delta_bias_k, mean_sd_wb_k_P1, mean_delta_SPEI_k))
+print(ann_summary %>% dplyr::select(scale, mean_delta_bias_k, mean_sd_wb_k_P1, mean_delta_SPEI_k))
 
 write.csv(bind_rows(ann_summary, seas_summary),
           file.path(OUT_DIR, "bias_period_seasonal_summary.csv"),
@@ -388,7 +391,7 @@ for (s in c("DJF","MAM","JJA","SON")) {
 }
 
 sig_df <- bind_rows(sig_list)
-cat("\n  Results:\n"); print(sig_df %>% select(-note))
+cat("\n  Results:\n"); print(sig_df %>% dplyr::select(-note))
 write.csv(sig_df, file.path(OUT_DIR, "significance_tests.csv"), row.names = FALSE)
 cat("  Saved: significance_tests.csv\n")
 
@@ -428,7 +431,7 @@ for (k in SCALES) {
       delta_f_pp     = 100 * (f_thm_corr - f_thm_orig),
       season         = season_of(month)
     ) %>%
-    select(date, year, month, season, scale,
+    dplyr::select(date, year, month, season, scale,
            SPEI_PM, SPEI_Thw, delta_SPEI_k, delta_SPEI_k_lo, delta_SPEI_k_hi,
            SPEI_Thw_corr, SPEI_Thw_corr_lo, SPEI_Thw_corr_hi,
            f_thm_orig, f_thm_corr, delta_f_pp)
@@ -595,7 +598,7 @@ write_xlsx(
     "Significance_tests"         = sig_df,
     "SPEI_Thw_corrected_P3"      = corrected_all_df,
     "Base_monthly_timeseries"    = base %>%
-      select(date, year, month, season, days_in_month,
+      dplyr::select(date, year, month, season, days_in_month,
              wb_pm_mm_month, bias_mm_day, bias_mm_month, in_P1, in_P3)
   ),
   path = file.path(OUT_DIR, "bias_manuscript_tables.xlsx")
@@ -640,5 +643,5 @@ cat(sprintf("
                          thermodynamic fraction at that time scale.\n"))
 
 cat("==============================================================\n")
-cat("  w11b COMPLETE. Outputs: decomp_results/bias_nonstationarity/\n")
+cat("  10b COMPLETE. Outputs: decomp_results/bias_nonstationarity/\n")
 cat("==============================================================\n")

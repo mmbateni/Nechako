@@ -37,6 +37,8 @@
 ####################################################################################
 
 source("DROUGHT_ANALYSIS_utils.R")
+DROUGHT_THRESHOLD <- DROUGHT_ONSET
+
 utils_load_packages(c("terra", "ggplot2", "lubridate", "dplyr",
                       "data.table", "patchwork", "openxlsx", "zoo",
                       "RColorBrewer", "scales", "sf"))
@@ -57,7 +59,6 @@ cat(sprintf("✓ Basin: %.1f km²\n", sum(terra::expanse(basin_proj, unit = "km"
 
 ## ── MSPI / MSPEI single scale (mirror of 8 constant) ───────────────────────────
 MSPI_MSPEI_SCALE <- 1L
-
 ################################################################################
 # HELPERS
 ################################################################################
@@ -249,11 +250,13 @@ make_basin_ts_plot <- function(df, idx, sc) {
     error = function(e) NA_integer_)
   
   ## Dynamic y-axis: expand 10% beyond the observed min/max,
-  ## but never narrower than ±3.5 (the standard SPI display range).
+  ## never narrow the original SPI range.
   y_min  <- min(df$value, na.rm = TRUE)
   y_max  <- max(df$value, na.rm = TRUE)
-  y_lo   <- min(-3.5, floor(y_min * 1.10))   # at least -3.5; expand below if needed
-  y_hi   <- max( 3.5, ceiling(y_max * 1.10)) # at least +3.5; expand above if needed
+  y_range <- max(df$value, na.rm = TRUE) - min(df$value, na.rm = TRUE)
+  y_pad   <- y_range * 0.10
+  y_lo    <- min(-3.5, min(df$value, na.rm = TRUE) - y_pad)
+  y_hi    <- max( 3.5, max(df$value, na.rm = TRUE) + y_pad)
   
   ggplot2::ggplot(df, ggplot2::aes(date, value)) +
     drought_band_layers() +
@@ -269,7 +272,7 @@ make_basin_ts_plot <- function(df, idx, sc) {
     ggplot2::geom_line(color = idx_color, linewidth = 0.6) +
     shared_ts_theme(14) +
     ggplot2::scale_x_date(breaks = seq(as.Date("1950-01-01"), as.Date("2025-12-31"), by = "5 years"), date_labels = "%Y") +
-    ggplot2::coord_cartesian(ylim = c(y_lo, y_hi)) +
+    ggplot2::scale_y_continuous(limits = c(y_lo, y_hi)) +
     ggplot2::labs(
       title    = sprintf("%s-%02d  Basin-Averaged Time Series (Area-Weighted)",
                          toupper(idx), sc),
@@ -469,8 +472,10 @@ make_spei_panel_v2 <- function(sc, panel_lab, pet_type = "PM",
                "Severe drought","Extreme drought"))
   df_fill$date_end <- pmin(df_fill$date + 31, max(df_fill$date) + 31)
   
-  ylo <- min(-2.8, min(df$value, na.rm = TRUE) * 1.05)
-  yhi <- max( 2.2, max(df$value, na.rm = TRUE) * 1.05)
+  y_range <- max(df$value, na.rm = TRUE) - min(df$value, na.rm = TRUE)
+  y_pad   <- y_range * 0.05
+  ylo     <- min(-2.8, min(df$value, na.rm = TRUE) - y_pad)
+  yhi     <- max( 2.2, max(df$value, na.rm = TRUE) + y_pad)
   
   p <- ggplot2::ggplot() +
     ggplot2::annotate("rect",
@@ -512,9 +517,8 @@ make_spei_panel_v2 <- function(sc, panel_lab, pet_type = "PM",
       date_breaks = "10 years", date_labels = "%Y",
       expand = ggplot2::expansion(add = c(0, 0))) +
     ggplot2::scale_y_continuous(
-      limits = c(ylo, yhi),
       breaks = c(-2, -1.5, -1, -0.5, 0, 1, 2),
-      expand = ggplot2::expansion(mult = c(0, 0))) +
+      expand = ggplot2::expansion(mult = c(0.05, 0.05))) +
     ggplot2::labs(
       title = sprintf("SPEI-%d  (%s,  area-weighted basin mean)", sc, pet_label),
       x     = if (show_xlab) "Year" else NULL,
@@ -596,8 +600,10 @@ make_spei_overlay_panel <- function(sc, panel_lab, show_xlab = FALSE,
   
   all_vals <- c(if (!is.null(df_pm))  df_pm$value,
                 if (!is.null(df_thw)) df_thw$value)
-  ylo <- min(-2.8, min(all_vals, na.rm = TRUE) * 1.05)
-  yhi <- max( 2.2, max(all_vals, na.rm = TRUE) * 1.05)
+  y_range <- max(all_vals, na.rm = TRUE) - min(all_vals, na.rm = TRUE)
+  y_pad   <- y_range * 0.05
+  ylo     <- min(-2.8, min(all_vals, na.rm = TRUE) - y_pad)
+  yhi     <- max( 2.2, max(all_vals, na.rm = TRUE) + y_pad)
   
   p <- ggplot2::ggplot() +
     ggplot2::annotate("rect",

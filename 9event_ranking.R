@@ -1,5 +1,5 @@
 ####################################################################################
-# w5_event_ranking.R  ·  DROUGHT EVENT RANKING & 2022-2025 CONTEXTUALIZATION
+# 9event_ranking.R  ·  DROUGHT EVENT RANKING & 2022-2025 CONTEXTUALIZATION
 #
 # EVENT DEFINITION — Sheffield & Wood (2008) [SW08], applied to SPEI/SPI:
 #   Onset       : index < DROUGHT_ONSET  (= -0.5)
@@ -2730,7 +2730,7 @@ if (file.exists(ts_rds_file)) {
     }
   }
 } else {
-  cat(sprintf("  ⚠ Time-series RDS not found: %s\n  → Run w1_trend_test.R first, then re-run w5.\n",
+  cat(sprintf("  ⚠ Time-series RDS not found: %s\n  → Run w1_trend_test.R first, then re-run 9.\n",
               basename(ts_rds_file)))
 }
 
@@ -2978,7 +2978,7 @@ tryCatch({
   
   if (length(thw_present) == 0L) {
     cat("  \u26a0 Table 1c: no SPEI-Thw events in catalog — skipping\n")
-    cat("    (Run w5 after confirming spei_thw is in INDICES_TO_ANALYZE)\n")
+    cat("    (Run 9 after confirming spei_thw is in INDICES_TO_ANALYZE)\n")
   } else {
     tbl_1c <- make_ms_table(ranked_catalog, thw_present, n_top = 10L)
     
@@ -3048,13 +3048,12 @@ tryCatch({
 # FINAL SUMMARY
 ####################################################################################
 ####################################################################################
-# w5_EXPORT_ADDON.R
 #
 # PURPOSE: Export data structures needed by w12_bayesian_ene_analysis.R (MS2).
-#          Append this block to the END of w5_event_ranking.R, after all
+#          Append this block to the END of 9event_ranking.R, after all
 #          existing parts (1–4d) have run.
 #
-# REQUIRES (already in environment from w5 main body):
+# REQUIRES (already in environment from main body):
 #   ranked_catalog       — full SW08 event catalog with severity/duration
 #   kendall_rp_result    — output of the Part 4c copula analysis (list)
 #   n_years_record       — integer, length of the record in years
@@ -3171,11 +3170,11 @@ if (exists("kendall_rp_result") && !is.null(kendall_rp_result)) {
   
 } else {
   cat("  ⚠ kendall_rp_result not found — ms2_copula_fit.rds not written.\n")
-  cat("    Run Part 4c of w5_event_ranking.R first.\n")
+  cat("    Run Part 4c of 9event_ranking.R first.\n")
 }
 
 cat("\n╔══════════════════════════════════════╗\n")
-cat("║  w5_event_ranking.R  COMPLETE        ║\n")
+cat("║  9event_ranking.R  COMPLETE        ║\n")
 cat("╚══════════════════════════════════════╝\n\n")
 
 cat("KEY FINDINGS FOR PRESENTATION:\n")

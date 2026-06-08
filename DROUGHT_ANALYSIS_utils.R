@@ -102,6 +102,98 @@ TIMESCALES_SPATIAL  <- SPI_SCALES          # used by spme codes for spatial figu
 MONTH_NAMES    <- c("Jan", "Feb", "Mar", "Apr", "May", "Jun",
                     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
+## A2. PRECIPITATION UNIT DETECTION ──────────────────────────────────
+#' Detect the unit of a precipitation (or PET) raster by sampling a summer
+#' layer and comparing the basin-mean value against known physical ranges.
+#'
+#' ERA5-Land CDS "monthly averaged reanalysis" stores both total_precipitation
+#' and potential_evapotranspiration as mean DAILY RATES in metres/day (m/day).
+#' Standard pre-processing multiplies by 1000 to get mm/day, then by
+#' days_in_month to get mm/month.  When the × 1000 step is accidentally
+#' skipped the values are 1000× too small, which is the root cause of the
+#' WB_PM range bug (Issue 1).
+#'
+#' The function performs a fast, non-destructive test on one summer layer
+#' (July preferred; falls back to the first available layer) and returns the
+#' scalar conversion factor needed to bring the raster to mm/day:
+#'   • 1000  — raw m/day   (ERA5-Land straight from CDS, no prior scaling)
+#'   •    1  — already mm/day  (standard pre-processed input)
+#'   •   NA  — ambiguous; value printed with a warning so the caller can decide
+#'
+#' The thresholds are calibrated for a cool boreal/montane basin (Nechako):
+#'   < 0.02  m/day  → m/day   (summer mean ~0.001–0.005 m/day → need × 1000)
+#'   0.02–20 mm/day → mm/day  (summer mean ~0.5–5 mm/day for Nechako July)
+#'   > 20           → mm/month already (do NOT multiply by days_in_month again)
+#'
+#' @param raster_obj  SpatRaster loaded with terra::rast().
+#' @param dates_vec   Date vector of length nlyr(raster_obj) giving each layer
+#'                    date.  If NULL the function falls back to layer 1.
+#' @param var_label   Character label printed in diagnostic messages
+#'                    (e.g. "Precip", "PET").
+#' @param july_only   Logical.  If TRUE (default) sample the first July layer;
+#'                    otherwise sample the first available layer.
+#'
+#' @return Named list:
+#'   $factor   numeric — multiply raster by this to get mm/day
+#'             (1000, 1, or NA if ambiguous)
+#'   $unit_in  character — detected input unit label
+#'   $mean_val numeric — basin-mean of the sampled layer (original units)
+detect_precip_unit <- function(raster_obj,
+                               dates_vec  = NULL,
+                               var_label  = "variable",
+                               july_only  = TRUE) {
+  
+  ## ── Pick a representative layer ────────────────────────────────────────────
+  layer_idx <- NA_integer_
+  if (!is.null(dates_vec) && length(dates_vec) == terra::nlyr(raster_obj)) {
+    mon_nums <- as.integer(format(dates_vec, "%m"))
+    if (july_only) {
+      july_hits <- which(mon_nums == 7L)
+      layer_idx <- if (length(july_hits)) july_hits[1L] else which(!is.na(mon_nums))[1L]
+    } else {
+      layer_idx <- which(!is.na(mon_nums))[1L]
+    }
+  }
+  if (is.na(layer_idx) || layer_idx < 1L) layer_idx <- 1L
+  
+  ## ── Sample basin-mean of that layer ────────────────────────────────────────
+  vals <- terra::values(raster_obj[[layer_idx]], mat = FALSE)
+  vals <- vals[is.finite(vals)]
+  if (!length(vals)) {
+    warning(sprintf(
+      "detect_precip_unit [%s]: all values NA in layer %d — cannot detect unit.",
+      var_label, layer_idx))
+    return(list(factor = NA_real_, unit_in = "unknown", mean_val = NA_real_))
+  }
+  mean_val <- mean(vals, na.rm = TRUE)
+  
+  ## ── Classify ───────────────────────────────────────────────────────────────
+  # Boundary 0.02: highest plausible m/day daily rate for a wet boreal basin
+  # in summer is ~0.01 m/day; lowest plausible mm/day daily rate is ~0.2 mm/day.
+  # Boundary 20: max plausible mm/day for any month; above that it must be mm/month.
+  if (mean_val < 0.02) {
+    factor  <- 1000
+    unit_in <- "m/day"
+  } else if (mean_val <= 20) {
+    factor  <- 1
+    unit_in <- "mm/day"
+  } else {
+    factor  <- NA_real_   # already mm/month — caller must not re-scale by days
+    unit_in <- "mm/month"
+    warning(sprintf(
+      "detect_precip_unit [%s]: mean = %.2f looks like mm/month already. ",
+      var_label, mean_val),
+      "Do NOT multiply by days_in_month again.")
+  }
+  
+  cat(sprintf(
+    "  [detect_precip_unit] %s layer %d: mean = %.5f → detected '%s' → factor = %s\n",
+    var_label, layer_idx, mean_val, unit_in,
+    if (is.na(factor)) "NA (mm/month — skip scaling)" else as.character(factor)))
+  
+  list(factor = factor, unit_in = unit_in, mean_val = mean_val)
+}
+
 ## B. BASIN-AVERAGED CSV LOADER ─────────────────────────────────────
 #' Load a pre-computed basin-averaged drought index CSV and return a tidy
 #' long-format data.frame(date, value).
