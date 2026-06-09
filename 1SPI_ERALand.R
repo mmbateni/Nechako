@@ -215,8 +215,8 @@ variance_aware_spi <- function(v, scale, dates_vec, eps = 1e-6) {
   }
   
   finite_idx <- is.finite(z)
-  z[finite_idx & z < -4.75] <- -4.75
-  z[finite_idx & z >  4.75] <-  4.75
+  z[finite_idx & z < -4.8] <- -4.8
+  z[finite_idx & z >  4.8] <-  4.8
   
   list(spi = z, method = method_used)
 }
