@@ -655,7 +655,7 @@ identify_droughts <- function(data, thresholds,
     return(list(daily_data = data, drought_events = NULL, message = "Insufficient data"))
   }
   
-  data$doy <- ifelse(leap_year(data$year) & data$doy > 366, 365, data$doy)
+  data$doy <- ifelse(leap_year(data$year) & data$doy > 365, 365, data$doy)
   data     <- merge(data, thresholds[, c("doy", "threshold_smooth")],
                     by = "doy", all.x = TRUE)
   data     <- data[order(data$date), ]
@@ -1133,7 +1133,38 @@ write.csv(summary_table,
           file.path(MAIN_OUTPUT_DIR, "reports", "station_summary_dual_pipeline.csv"),
           row.names = FALSE)
 print(summary_table, row.names = FALSE)
+#
+ssi_stations <- names(all_ssi_results)
+ssi_combined <- dplyr::bind_rows(lapply(ssi_stations, function(sid) {
+  all_ssi_results[[sid]]$monthly_data %>% dplyr::select(date, ssi) %>% dplyr::mutate(station = sid)
+}))
 
+ssi_basin_avg <- ssi_combined %>%
+  dplyr::group_by(date) %>%
+  dplyr::summarise(value = mean(ssi, na.rm = TRUE), .groups = "drop") %>%
+  dplyr::filter(!is.na(value))
+
+df_wide <- ssi_basin_avg %>%
+  dplyr::mutate(Year = year(date), Month = month(date, label = TRUE, abbr = TRUE)) %>%
+  dplyr::select(Year, Month, value) %>%
+  pivot_wider(names_from = Month, values_from = value) %>%
+  dplyr::arrange(Year)
+
+write_csv(df_wide, file.path(MAIN_OUTPUT_DIR, "ssi_wsc_01_basin_averaged_by_month.csv"))
+
+p <- ggplot(ssi_basin_avg, aes(x = date, y = value)) +
+  geom_ribbon(aes(ymin = pmin(value, 0), ymax = 0), fill = "#d73027", alpha = 0.3) +
+  geom_ribbon(aes(ymin = 0, ymax = pmax(value, 0)), fill = "#4575b4", alpha = 0.3) +
+  geom_line(linewidth = 0.7, colour = "grey20") +
+  geom_hline(yintercept = c(0, -0.84), linetype = c("solid", "dashed"),
+             colour = c("black", "#d73027"), linewidth = 0.4) +
+  scale_x_date(date_breaks = "5 years", date_labels = "%Y") +
+  labs(title = "Standardized Streamflow Index (SSI) Basin-Averaged Time Series",
+       subtitle = paste("Stations averaged:", paste(ssi_stations, collapse = ", ")), x = NULL, y = "SSI") +
+  theme_bw(base_size = 11) + theme(plot.title = element_text(face = "bold"), panel.grid.minor = element_blank())
+
+ggsave(file.path(MAIN_OUTPUT_DIR, "ssi_wsc_basin_timeseries.png"), p, width = 12, height = 5, dpi = 300)
+#
 cat("\nOutputs written to: ", MAIN_OUTPUT_DIR, "/\n")
 cat("  shared/processed_data/            — gap-filled daily data (both pipelines)\n")
 cat("  daily/thresholds/                 — Pipeline A: Q20 variable thresholds\n")

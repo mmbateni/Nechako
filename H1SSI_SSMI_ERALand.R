@@ -203,7 +203,7 @@ compute_ssi <- function(v, scale, dates_vec, eps = 1e-6) {
   for (m in 1:12) {
 
     idx  <- which(mon == m & is.finite(x_agg))
-    if (length(idx) < 5L) next
+    if (length(idx) < 15L) next
 
     samp   <- x_agg[idx]
     samp_v <- var(samp, na.rm = TRUE)
@@ -247,7 +247,7 @@ compute_ssi <- function(v, scale, dates_vec, eps = 1e-6) {
 
   }
 
-  # Clamp to ±4.75 (matches SPI script)
+  # Clamp to ±4.8 (matches SPI script)
   fin <- is.finite(z)
   z[fin & z < -4.8] <- -4.8
   z[fin & z >  4.8] <-  4.8
@@ -278,7 +278,7 @@ compute_ssmi <- function(v, scale, dates_vec, eps = 1e-6) {
   for (m in 1:12) {
 
     idx  <- which(mon == m & is.finite(x_agg))
-    if (length(idx) < 5L) next
+    if (length(idx) < 15L) next
 
     samp   <- x_agg[idx]
     samp_c <- pmax(pmin(samp, 1 - eps), eps)   # clamp to (0,1)
@@ -301,17 +301,17 @@ compute_ssmi <- function(v, scale, dates_vec, eps = 1e-6) {
 
     }, error = function(e) {
       # Fallback : simple empirical Blom quantile
-      p        <- (rank(samp, ties.method = "average") - 0.375) /
+      p        <- (rank(samp_c, ties.method = "average") - 0.375) /
                   (length(samp) + 0.25)
       p        <- clip_prob(p, eps)
       z[idx]  <- qnorm(p)
     })
   }
 
-  # Clamp to ±4.75
+  # Clamp to ±4.8
   fin <- is.finite(z)
-  z[fin & z < -4.75] <- -4.75
-  z[fin & z >  4.75] <-  4.75
+  z[fin & z < -4.8] <- -4.8
+  z[fin & z >  4.8] <-  4.8
 
   z
 }
@@ -637,7 +637,7 @@ write_summary <- function(summaries, index_name, out_dir) {
     hdr(sprintf("Time period      : %s  to  %s  (%d months)\n",
                 min(dates), max(dates), length(dates)))
     hdr(sprintf("NA rate (basin)  : %.3f%%\n", s$na_rate))
-    hdr(sprintf("MSPEI compat.    : %s\n",
+    hdr(sprintf("Index compat.    : %s\n",
                 ifelse(s$na_rate < 0.5, "✓ READY (<0.5% NAs)", "⚠ CAUTION (>0.5% NAs)")))
 
     if (index_name == "SSI") {
@@ -676,6 +676,53 @@ if (!is.null(s[[idx_field]])) {
 
 write_summary(all_summaries_ssi,  "SSI",  out_dir_ssi)
 write_summary(all_summaries_ssmi, "SSMI", out_dir_ssmi)
+#
+plot_basin_avg <- function(idx_matrix, dates_vec, index_name, layer_label, scale, template_rast, basin_mask) {
+  cell_areas <- terra::cellSize(template_rast, unit = "m")
+  areas_vec <- as.vector(cell_areas)
+  areas_vec[!basin_mask] <- 0
+  
+  basin_avg <- apply(idx_matrix, 2, function(col) {
+    ok <- !is.na(col) & is.finite(col) & areas_vec > 0
+    if (!any(ok)) return(NA_real_)
+    # FIXED: Changed 'OK' to 'ok'
+    sum(col[ok] * areas_vec[ok]) / sum(areas_vec[ok]) 
+  })
+  
+  df_long <- data.frame(date = as.Date(dates_vec), value = basin_avg) %>% dplyr::filter(!is.na(value))
+  df_wide <- df_long %>%
+    dplyr::mutate(Year = lubridate::year(date), Month = lubridate::month(date, label = TRUE, abbr = TRUE)) %>%
+    dplyr::select(Year, Month, value) %>%
+    tidyr::pivot_wider(names_from = Month, values_from = value) %>%
+    dplyr::arrange(Year)
+  
+  out_dir <- if (index_name == "SSI") out_dir_ssi else out_dir_ssmi
+  readr::write_csv(df_wide, file.path(out_dir, sprintf("%s_%s_%02d_basin_averaged_by_month.csv", tolower(index_name), layer_label, scale)))
+  
+  p <- ggplot2::ggplot(df_long, ggplot2::aes(x = date, y = value)) +
+    ggplot2::geom_ribbon(ggplot2::aes(ymin = pmin(value, 0), ymax = 0), fill = "#d73027", alpha = 0.3) +
+    ggplot2::geom_ribbon(ggplot2::aes(ymin = 0, ymax = pmax(value, 0)), fill = "#4575b4", alpha = 0.3) +
+    ggplot2::geom_line(linewidth = 0.7, colour = "grey20") +
+    ggplot2::geom_hline(yintercept = c(0, -1, -1.5, -2), linetype = c("solid", "dashed", "dashed", "dashed"),
+                        colour = c("black", "#fc8d59", "#d73027", "#a50026"), linewidth = 0.4) +
+    ggplot2::scale_x_date(date_breaks = "5 years", date_labels = "%Y") +
+    ggplot2::labs(title = sprintf("%s-%s-%02d Basin-Averaged Time Series", index_name, layer_label, scale), x = NULL, y = sprintf("%s Index Value", index_name)) +
+    ggplot2::theme_bw(base_size = 11) + ggplot2::theme(plot.title = ggplot2::element_text(face = "bold"), panel.grid.minor = ggplot2::element_blank())
+  
+  ggplot2::ggsave(file.path(out_dir, sprintf("%s_%s_%02d_basin_timeseries.png", tolower(index_name), layer_label, scale)), p, width = 12, height = 5, dpi = 300)
+}
+
+for (cfg in layer_configs) {
+  for (sc in timescales) {
+    key <- paste0(cfg$label, "_sc", sc)
+    if (!is.null(all_summaries_ssi[[key]])) {
+      plot_basin_avg(all_summaries_ssi[[key]]$ssi_indices, dates, "SSI", cfg$label, sc, cfg$sm[[1]], basin_mask)
+    }
+    if (!is.null(all_summaries_ssmi[[key]])) {
+      plot_basin_avg(all_summaries_ssmi[[key]]$ssmi_indices, dates, "SSMI", cfg$label, sc, cfg$sm[[1]], basin_mask)
+    }
+  }
+}
 
 # ==============================================================================
 # DONE
@@ -694,4 +741,4 @@ cat("\nNaming convention:\n")
 cat("  {index}_{L1_3|L1_4}_{scale:02d}_month{m:02d}_{Mon}.{ext}\n")
 cat("  e.g.  ssi_L1_3_03_month07_Jul.nc\n")
 cat("        ssmi_L1_4_01_all_months.xlsx\n")
-cat("\n✓✓✓ READY FOR MSDI / MSPEI CALCULATION ✓✓✓\n")
+cat("\n✓✓✓ SSI-SSMI CALCULATION DONE ✓✓✓\n")

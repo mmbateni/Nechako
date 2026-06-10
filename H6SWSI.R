@@ -164,7 +164,7 @@ load_reservoir_storage <- function() {
            caption = "Source: GloLakes v2 (Hou et al. 2024)") +
       theme_bw() + theme(legend.position = "bottom")
     ggsave(file.path(MAIN_OUTPUT_DIR, "diagnostics", "plot_reservoir_storage.png"),
-           p, width = 12, height = 5, dpi = 150)
+           p, width = 12, height = 5, dpi = 300)
   }
   
   return(reservoir)
@@ -223,7 +223,11 @@ load_era5_basin_mean <- function(nc_path, var_name, basin_vect = NULL) {
 
   # ── 1. Read as SpatRaster ────────────────────────────────────────────────
   r <- terra::rast(nc_path)
-
+  if (terra::ext(r)$xmax > 180) {
+    r <- terra::rotate(r)
+    cat(sprintf("    Longitude rotated 0-360 → -180/180 | new ext: %s\n",
+                paste(round(as.vector(terra::ext(r)), 2), collapse = " ")))
+  }
   # ── 2. Decode & snap time dimension ─────────────────────────────────────
   dates <- .era5_decode_dates(r, nc_path)
 
@@ -876,6 +880,7 @@ cat("\n", strrep("=",70), "\n",
 # Must succeed before ERA5 loading; the KMZ polygon is the authoritative
 # spatial filter for all ERA5-Land variables.
 basin_vect <- load_basin_boundary(BASIN_KMZ_PATH)
+terra::crs(basin_vect, describe = TRUE)   # sanity check
 
 # ── B: Load Reservoir Storage (GloLakes) ─────────────────────────────────────
 reservoir_data <- load_reservoir_storage()
@@ -980,6 +985,95 @@ all_results <- list(
 )
 
 saveRDS(all_results, file.path(MAIN_OUTPUT_DIR, "all_results_swsi.rds"))
+# ============================================================================
+# BASIN-AVERAGED OUTPUT 
+# ============================================================================
+swsi_primary <- all_swsi[[PRIMARY_STATION]]
+
+# 1. Full Time Series (Long and Wide formats)
+df_long <- swsi_primary %>% 
+  dplyr::select(date, value = swsi) %>% 
+  dplyr::filter(!is.na(value))
+
+df_wide <- df_long %>%
+  dplyr::mutate(Year = lubridate::year(date), 
+                Month = lubridate::month(date, label = TRUE, abbr = TRUE)) %>%
+  dplyr::select(Year, Month, value) %>%
+  tidyr::pivot_wider(names_from = Month, values_from = value) %>%
+  dplyr::arrange(Year)
+
+readr::write_csv(df_wide, file.path(MAIN_OUTPUT_DIR, "swsi_01_basin_averaged_by_month.csv"))
+cat(sprintf("✓ Saved full basin-averaged SWSI (wide format): swsi_01_basin_averaged_by_month.csv\n"))
+
+# 2. Full Time Series Plot (with 2022-2025 highlighted)
+p_swsi_full <- ggplot2::ggplot(df_long, ggplot2::aes(x = date, y = value)) +
+  # Highlight 2022-2025 drought period
+  ggplot2::annotate("rect", 
+                    xmin = as.Date("2022-01-01"), xmax = as.Date("2025-12-31"), 
+                    ymin = -Inf, ymax = Inf, 
+                    fill = "grey80", alpha = 0.5) +
+  ggplot2::geom_ribbon(ggplot2::aes(ymin = pmin(value, 0), ymax = 0), fill = "#d73027", alpha = 0.3) +
+  ggplot2::geom_ribbon(ggplot2::aes(ymin = 0, ymax = pmax(value, 0)), fill = "#4575b4", alpha = 0.3) +
+  ggplot2::geom_line(linewidth = 0.7, colour = "grey20") +
+  ggplot2::geom_hline(yintercept = c(0, -1, -1.5, -2, -3, -4), linetype = "dashed",
+                      colour = c("black", "#fc8d59", "#d73027", "#a50026", "#7b0000", "#4c0000"), linewidth = 0.4) +
+  ggplot2::scale_x_date(date_breaks = "5 years", date_labels = "%Y") +
+  ggplot2::labs(
+    title = "Surface-Water Supply Index (SWSI) — Nechako Basin",
+    subtitle = paste0("Primary Station: ", PRIMARY_STATION, " | ", 
+                      format(min(df_long$date), "%b %Y"), " – ", format(max(df_long$date), "%b %Y"),
+                      " | Grey band: 2022–2025 drought"),
+    x = NULL, y = "SWSI"
+  ) +
+  ggplot2::theme_bw(base_size = 11) + 
+  ggplot2::theme(plot.title = ggplot2::element_text(face = "bold"), panel.grid.minor = ggplot2::element_blank())
+
+ggplot2::ggsave(file.path(MAIN_OUTPUT_DIR, "swsi_basin_timeseries.png"), 
+                p_swsi_full, width = 12, height = 5, dpi = 300)
+cat("✓ Saved full basin time series plot (with 2022-2025 highlight): swsi_basin_timeseries.png\n")
+
+# ============================================================================
+FOCUS_START <- as.Date("2022-01-01")
+FOCUS_END   <- as.Date("2025-12-31")
+
+swsi_focus <- swsi_primary %>%
+  dplyr::filter(date >= FOCUS_START & date <= FOCUS_END)
+
+# Save focused time series CSV
+focus_csv <- file.path(MAIN_OUTPUT_DIR, "swsi_timeseries", paste0(PRIMARY_STATION, "_swsi_2022_2025.csv"))
+readr::write_csv(swsi_focus, focus_csv)
+cat(sprintf("✓ Saved focused SWSI time series (2022-2025): %s\n", basename(focus_csv)))
+
+# Generate zoomed-in plot for 2022-2025
+df_focus_long <- swsi_focus %>% 
+  dplyr::select(date, value = swsi) %>% 
+  dplyr::filter(!is.na(value))
+
+if (nrow(df_focus_long) > 0) {
+  p_focus <- ggplot2::ggplot(df_focus_long, ggplot2::aes(x = date, y = value)) +
+    ggplot2::geom_ribbon(ggplot2::aes(ymin = pmin(value, 0), ymax = 0), fill = "#d73027", alpha = 0.4) +
+    ggplot2::geom_ribbon(ggplot2::aes(ymin = 0, ymax = pmax(value, 0)), fill = "#4575b4", alpha = 0.4) +
+    ggplot2::geom_line(linewidth = 0.8, colour = "grey20") +
+    ggplot2::geom_hline(yintercept = c(0, -1, -1.5, -2, -3, -4), linetype = "dashed",
+                        colour = c("black", "#fc8d59", "#d73027", "#a50026", "#7b0000", "#4c0000"), linewidth = 0.5) +
+    ggplot2::scale_x_date(date_breaks = "3 months", date_labels = "%b %Y") +
+    ggplot2::labs(
+      title = "Surface-Water Supply Index (SWSI) — 2022–2025 Drought Focus",
+      subtitle = paste0("Primary Station: ", PRIMARY_STATION, " | Garen (1993)"),
+      x = NULL, y = "SWSI"
+    ) +
+    ggplot2::theme_bw(base_size = 12) + 
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(face = "bold"), 
+      panel.grid.minor = ggplot2::element_blank(),
+      axis.text.x = ggplot2::element_text(angle = 45, hjust = 1)
+    )
+  
+  focus_plot_file <- file.path(MAIN_OUTPUT_DIR, "swsi_2022_2025_focus.png")
+  ggplot2::ggsave(focus_plot_file, p_focus, width = 12, height = 6, dpi = 300)
+  cat("✓ Saved zoomed-in focus plot: swsi_2022_2025_focus.png\n")
+}
+
 
 # ── G: Summary Report ────────────────────────────────────────────────────────
 cat(sprintf("\n%s\n", strrep("=",70)))

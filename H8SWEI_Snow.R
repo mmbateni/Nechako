@@ -30,7 +30,70 @@ library(zoo)
 library(writexl)
 library(parallel)
 library(lmomco)   # required for option 3 (SSPI-1 zero-inflated gamma)
+library(ggplot2)
+library(dplyr)
 
+plot_standard_basin_ts <- function(df, index_name, color = "steelblue", drought_threshold = -0.5) {
+  if (!all(c("date", "value") %in% names(df))) stop("df must have 'date' and 'value' columns.")
+  df <- df[order(df$date), ]
+  df <- df[!is.na(df$value), ]
+  
+  # Handle empty dataframe gracefully
+  if (nrow(df) == 0) {
+    warning(sprintf("No valid data to plot for %s. Returning empty plot. Check input raster and basin overlap.", index_name))
+    return(ggplot2::ggplot() + 
+             ggplot2::annotate("text", x = 0.5, y = 0.5, 
+                               label = sprintf("No valid data for %s\n(Check input raster and basin overlap)", toupper(index_name)),
+                               size = 5, color = "red") +
+             ggplot2::theme_void())
+  }
+  
+  # Drought event count
+  in_drought <- df$value < drought_threshold
+  rle_res <- rle(in_drought)
+  n_ev <- sum(rle_res$values & rle_res$lengths >= 1)
+  
+  # Dynamic y-axis
+  y_range <- max(df$value, na.rm = TRUE) - min(df$value, na.rm = TRUE)
+  y_pad   <- y_range * 0.10
+  y_lo    <- min(-3.5, min(df$value, na.rm = TRUE) - y_pad)
+  y_hi    <- max( 3.5, max(df$value, na.rm = TRUE) + y_pad)
+  
+  # Drought bands
+  drought_bands <- list(
+    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = -2.0, fill = "#7B0025", alpha = 0.15),
+    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin = -2.0, ymax = -1.5, fill = "#D73027", alpha = 0.15),
+    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin = -1.5, ymax = -1.0, fill = "#F46D43", alpha = 0.15),
+    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin = -1.0, ymax =  1.0, fill = "#2E7D32", alpha = 0.15),
+    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin =  1.0, ymax =  1.5, fill = "#90EE90", alpha = 0.15),
+    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin =  1.5, ymax =  2.0, fill = "#66BB6A", alpha = 0.15),
+    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin =  2.0, ymax =  Inf, fill = "#4575B4", alpha = 0.15)
+  )
+  
+  ggplot2::ggplot(df, ggplot2::aes(x = date, y = value)) +
+    drought_bands +
+    ggplot2::geom_hline(yintercept = 0, color = "black", linewidth = 0.4) +
+    ggplot2::geom_hline(yintercept = c(-1, 1), linetype = "dashed", color = "gray50", linewidth = 0.3) +
+    ggplot2::geom_ribbon(ggplot2::aes(ymin = ifelse(value < drought_threshold, value, 0), ymax = 0), 
+                         fill = "#c0392b", alpha = 0.35) +
+    ggplot2::geom_line(color = color, linewidth = 0.6) +
+    ggplot2::scale_x_date(date_breaks = "5 years", date_labels = "%Y") +
+    ggplot2::scale_y_continuous(limits = c(y_lo, y_hi)) +
+    ggplot2::labs(
+      title    = sprintf("%s Basin-Averaged Time Series", toupper(index_name)),
+      subtitle = sprintf("%d drought events detected (onset < %.1f)", n_ev, drought_threshold),
+      x = "Year", y = sprintf("%s Index Value", toupper(index_name))
+    ) +
+    ggplot2::theme_bw(base_size = 14) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = ggplot2::element_text(hjust = 0.5, color = "gray30"),
+      axis.title = ggplot2::element_text(face = "bold"),
+      axis.text.x = ggplot2::element_text(angle = 45, hjust = 1),
+      panel.grid.minor = ggplot2::element_blank(),
+      legend.position = "bottom"
+    )
+}
 # ---- USER SELECTION: SCF DOMAIN METHOD ----
 cat("\n============================================================\n")
 cat("SCF DOMAIN DEFINITION: SELECT METHOD\n")
@@ -40,7 +103,7 @@ cat("                          (optimal threshold selected per basin/timescale)\
 cat("  2 = Huning & AghaKouchak (2020) — fixed 5% SCF threshold\n")
 cat("                          (standard approach from the original global paper)\n")
 cat("  3 = SSPI-1 (Standardized SnowPack Index, monthly)\n")
-cat("                          (zero-inflated gamma, 1981-2020 reference, no SCF mask)\n\n")
+cat("                          (zero-inflated gamma, no SCF mask)\n\n")
 
 # ---- To use in batch/scheduled jobs, set DEFAULT_SCF_METHOD to "1", "2", or "3"
 DEFAULT_SCF_METHOD <- "2"
@@ -106,11 +169,10 @@ if (scf_method == "1") {
 } else if (scf_method == "2") {
   cat("\n→ Method selected: Huning & AghaKouchak (2020) fixed 5% SCF threshold\n")
 } else {
-  cat("\n→ Method selected: SSPI-1 (zero-inflated gamma, monthly, 1981-2020 reference)\n")
+  cat("\n→ Method selected: SSPI-1 (zero-inflated gamma, monthly)\n")
 }
 
-# ---- FIX: define scf_method_label immediately after method selection ----
-# (Previously it was defined after the echo line that referenced it, causing an error)
+# --------
 scf_method_label <- if (scf_method == "1") "Self-calibration" else if (scf_method == "2") "Huning & AghaKouchak (2020)" else "SSPI-1 (zero-inflated gamma, no SCF mask)"
 
 # ---- Paths ----
@@ -153,7 +215,19 @@ if (scf_method %in% c("1", "2")) {
 } else {
   scf_stack <- NULL  # not needed for SSPI-1
 }
+# ---- Fix 0-360 Longitude System ----
+# Global NetCDFs often use 0 to 360 longitudes (e.g., 232°E = 128°W). 
+# Shift them to the standard -180 to 180 system to match the basin shapefile.
+if (terra::ext(swe)[2] > 180) {
+  cat("✓ Shifting SWE longitudes from 0–360 to -180–180...\n")
+  swe <- terra::shift(swe, dx = -360)
+}
+if (!is.null(scf_stack) && terra::ext(scf_stack)[2] > 180) {
+  cat("✓ Shifting SCF longitudes from 0–360 to -180–180...\n")
+  scf_stack <- terra::shift(scf_stack, dx = -360)
+}
 
+# ---- Time extraction ----
 # ---- Time extraction ----
 extract_time_dimension <- function(raster_obj, file_path) {
   t <- time(raster_obj)
@@ -201,7 +275,14 @@ basin_pixels <- global(swe[[1]], "notNA")$notNA
 total_pixels <- ncell(swe)
 cat(sprintf("✓ Basin masking complete: %d pixels (%.1f%% of raster)\n",
             basin_pixels, 100 * basin_pixels / total_pixels))
-
+if (basin_pixels == 0) {
+  stop("CRITICAL ERROR: Basin masking resulted in 0 valid pixels.\n",
+       "This means the SWE raster and basin boundary do not overlap, or the raster is entirely NA.\n",
+       "Please check:\n",
+       "1. The CRS of the SWE raster and the basin boundary.\n",
+       "2. That the SWE raster actually contains data for the Nechako basin.\n",
+       "3. The extent of the SWE raster (e.g., run `plot(swe[[1]])` to visualize).")
+}
 # ---- Convert SWE to mm if needed ----
 swe_mean_sample <- global(swe[[1]], "mean", na.rm = TRUE)$mean
 if (!is.na(swe_mean_sample) && swe_mean_sample < 10) {
@@ -227,7 +308,7 @@ n_pixels <- nrow(swe_matrix)
 cat(sprintf("Processing %d basin pixels...\n", n_pixels))
 
 # ==============================================================================
-#   STEP 1: Apply 3-month moving average to RAW SWE values (PREPROCESSING)
+#   STEP 1: Apply 3-month moving sum to RAW SWE values (PREPROCESSING)
 #   NOTE: used only by methods 1 & 2 (SWEI). Method 3 (SSPI-1) operates on
 #   raw monthly SWE values directly — no temporal smoothing is applied.
 # ==============================================================================
@@ -265,7 +346,6 @@ if (scf_method == "3") {
   # ============================================================================
   #   BRANCH 3 — SSPI-1 (Zero-inflated Gamma, Monthly, No SCF Mask)
   #   Skips SCF masking entirely; uses calendar-month gamma fitting.
-  #   Reference period: 1981-2020 (per Stagge et al., 2015 / SSPI convention).
   # ============================================================================
   cat("\n→ SSPI-1 selected: skipping SCF mask build (not applicable).\n")
   cat("  Zero-inflated gamma fitting will be applied per calendar month.\n")
@@ -273,8 +353,8 @@ if (scf_method == "3") {
   basin_scf_mask <- NULL
   
   # Reference period for SSPI-1
-  sspi_ref_start <- min(dates) #as.Date("1981-01-01")
-  sspi_ref_end   <- max(dates) #as.Date("2020-12-31")
+  sspi_ref_start <- min(dates) #
+  sspi_ref_end   <- max(dates) #
   ref_idx        <- which(dates >= sspi_ref_start & dates <= sspi_ref_end)
   if (length(ref_idx) < 400) {
     warning(sprintf("SSPI-1 reference period has only %d months (recommended: >=480)", length(ref_idx)))
@@ -449,10 +529,7 @@ if (scf_method %in% c("1", "2")) {
 #   BASIN-AVERAGED SWE SETUP
 #   Correct order (matches SPI/SPEI approach):
 #     1. Average RAW SWE across basin pixels   → basin time series
-#     2. Apply 3-month rolling average          → smoothed basin series
-#   (The old approach averaged the already-smoothed per-pixel matrix, which
-#    gives the same numbers but couples the spatial and temporal smoothing
-#    steps and makes the basin series dependent on per-pixel NA patterns.)
+#     2. Apply 3-month rolling sum          → smoothed basin series
 # ==============================================================================
 cat("\n===== COMPUTING BASIN-AVERAGED SWE (raw -> average -> smooth) =====\n")
 if (scf_method %in% c("1", "2")) {
@@ -1002,6 +1079,17 @@ if (scf_method != "3") {
                           sprintf("swei_%02d_basin_averaged_by_month.csv", sc))
     write.csv(df_out, csv_file, row.names = FALSE, na = "")
     cat(sprintf("✓ Saved basin-averaged SWEI-%d (12 monthly series) to: %s\n", sc, csv_file))
+    # Pivot wide CSV to long format and plot
+    df_wide <- read.csv(csv_file)
+    df_long <- df_wide %>%
+      tidyr::pivot_longer(cols = -Year, names_to = "Month", values_to = "value") %>%
+      dplyr::mutate(date = as.Date(paste(Year, Month, "01", sep = "-"), format = "%Y-%b-%d")) %>%
+      dplyr::filter(!is.na(value)) %>%
+      dplyr::select(date, value)
+    
+    p_swei <- plot_standard_basin_ts(df_long, index_name = "SWEI", color = "#1E90FF")
+    ggplot2::ggsave(file.path(out_dir, sprintf("swei_%02d_basin_timeseries.png", sc)), 
+                    p_swei, width = 12, height = 6, dpi = 300)
   }
 }
 
@@ -1016,7 +1104,7 @@ if (scf_method == "3") {
     "============================================================\n",
     "MONTHLY SSPI-1 SUMMARY - NECHAKO BASIN\n",
     "ERA5-Land Snow Water Equivalent\n",
-    "Method 3: Zero-Inflated Gamma (1981-2020 reference, no SCF mask)\n",
+    "Method 3: Zero-Inflated Gamma (no SCF mask)\n",
     "============================================================\n\n",
     file = summary_combined_file, sep = ""
   )
@@ -1117,7 +1205,7 @@ if (scf_method == "3") {
         file = summary_combined_file, append = TRUE)
     cat("\nMethodology:\n",
         file = summary_combined_file, append = TRUE)
-    cat("  - 3-month centered moving average applied to RAW SWE\n",
+    cat("  - 3-month right moving average applied to RAW SWE\n",
         file = summary_combined_file, append = TRUE)
     cat(sprintf("  - SCF domain method: %s\n", scf_method_label),
         file = summary_combined_file, append = TRUE)
@@ -1175,4 +1263,4 @@ cat(if (scf_method == "3") "SSPI-1 CALCULATION COMPLETE!\n" else "SWEI CALCULATI
 cat("============================================================\n")
 cat(sprintf("\nOutput directory: %s\n", normalizePath(out_dir)))
 cat(sprintf("Summary file: %s\n", summary_combined_file))
-cat("\n--- READY FOR ANALYSIS ---\n")
+cat("\n--- READY FOR FURTHER ANALYSIS ---\n")

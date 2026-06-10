@@ -70,6 +70,7 @@ rm(list = ls())
 # 1.  PACKAGES
 # ==============================================================================
 required_pkgs <- c(
+  "ggplot2","dplyr",
   "tidyverse", "lubridate",
   "rvinecopulib",   # vine fitting, CDF, simulation
   "VineCopula"      # GOF, Rosenblatt transform
@@ -91,8 +92,11 @@ cfg <- list(
   # SWEI  — wide CSV:  Year column + 3-letter month columns (Jan…Dec)
   swei_file     = "swei_results_seasonal/swei_01_basin_averaged_by_month.csv",
   
-  # SSI soil  — wide CSV same format as SWEI (L1-3 = 0–100 cm, timescale 1)
-  ssi_soil_file = "ssi_results_seasonal/ssi_L1_3_01_basin_averaged_by_month.csv",
+  # SSI soil  — per-month CSVs assembled by assemble_ssi_from_monthly_csvs().
+  # Set folder and prefix to match 3SSI_SSMI_ERALand.R output naming exactly
+  # (prefix is case-sensitive on Linux/macOS — verify against actual filenames).
+  ssi_soil_folder = "ssi_results_seasonal",
+  ssi_soil_prefix = "ssi_L1_3_01",
   
   # SGI  — long CSV:  columns 'month_label' (YYYY-MM), 'sgi_median', 'date'
   sgi_file = "sgi_nechako_multisource.csv",
@@ -156,7 +160,7 @@ cfg <- list(
   
   # Monte-Carlo samples for vine CDF integration (pvinecop) and Kendall dist.
   n_mc          = 2e4L,           # increase to 1e5 for publication
-  n_kc_sim      = 5e4L,           # MC draws to estimate Kendall distribution
+  n_kc_sim      = 1e5L,           # MC draws for Kendall distribution (1e5 publication; 5e4 for speed)
   
   # ── Bootstrap CI (set to TRUE for publication-grade output) ────────────────
   run_bootstrap = FALSE,
@@ -171,7 +175,57 @@ dir.create(cfg$out_dir, showWarnings = FALSE, recursive = TRUE)
 # ==============================================================================
 # 3.  HELPER FUNCTIONS
 # ==============================================================================
-
+plot_standard_basin_ts <- function(df, index_name, color = "steelblue", drought_threshold = -0.5) {
+  if (!all(c("date", "value") %in% names(df))) stop("df must have 'date' and 'value' columns.")
+  df <- df[order(df$date), ]
+  df <- df[!is.na(df$value), ]
+  
+  # Drought event count
+  in_drought <- df$value < drought_threshold
+  rle_res <- rle(in_drought)
+  n_ev <- sum(rle_res$values & rle_res$lengths >= 1)
+  
+  # Dynamic y-axis
+  y_range <- max(df$value, na.rm = TRUE) - min(df$value, na.rm = TRUE)
+  y_pad   <- y_range * 0.10
+  y_lo    <- min(-3.5, min(df$value, na.rm = TRUE) - y_pad)
+  y_hi    <- max( 3.5, max(df$value, na.rm = TRUE) + y_pad)
+  
+  # Drought bands (matching 7basin_timeseries.R)
+  drought_bands <- list(
+    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = -2.0, fill = "#7B0025", alpha = 0.15),
+    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin = -2.0, ymax = -1.5, fill = "#D73027", alpha = 0.15),
+    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin = -1.5, ymax = -1.0, fill = "#F46D43", alpha = 0.15),
+    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin = -1.0, ymax =  1.0, fill = "#2E7D32", alpha = 0.15),
+    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin =  1.0, ymax =  1.5, fill = "#90EE90", alpha = 0.15),
+    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin =  1.5, ymax =  2.0, fill = "#66BB6A", alpha = 0.15),
+    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin =  2.0, ymax =  Inf, fill = "#4575B4", alpha = 0.15)
+  )
+  
+  ggplot2::ggplot(df, ggplot2::aes(x = date, y = value)) +
+    drought_bands +
+    ggplot2::geom_hline(yintercept = 0, color = "black", linewidth = 0.4) +
+    ggplot2::geom_hline(yintercept = c(-1, 1), linetype = "dashed", color = "gray50", linewidth = 0.3) +
+    ggplot2::geom_ribbon(ggplot2::aes(ymin = ifelse(value < drought_threshold, value, 0), ymax = 0), 
+                         fill = "#c0392b", alpha = 0.35) +
+    ggplot2::geom_line(color = color, linewidth = 0.6) +
+    ggplot2::scale_x_date(date_breaks = "5 years", date_labels = "%Y") +
+    ggplot2::scale_y_continuous(limits = c(y_lo, y_hi)) +
+    ggplot2::labs(
+      title    = sprintf("%s Basin-Averaged Time Series", toupper(index_name)),
+      subtitle = sprintf("%d drought events detected (onset < %.1f)", n_ev, drought_threshold),
+      x = "Year", y = sprintf("%s Index Value", toupper(index_name))
+    ) +
+    ggplot2::theme_bw(base_size = 14) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = ggplot2::element_text(hjust = 0.5, color = "gray30"),
+      axis.title = ggplot2::element_text(face = "bold"),
+      axis.text.x = ggplot2::element_text(angle = 45, hjust = 1),
+      panel.grid.minor = ggplot2::element_blank(),
+      legend.position = "bottom"
+    )
+}
 ## 3a. Pivot wide month-CSV (Year + 3-letter month cols) → long data frame ----
 pivot_wide_monthly <- function(path, value_name) {
   df <- read_csv(path, show_col_types = FALSE)
@@ -345,6 +399,22 @@ assemble_ssi_from_monthly_csvs <- function(folder, prefix, value_name,
       else . } %>%
     arrange(date)
 }
+## 3i. drop_na with row-count diagnostics ─────────────────────────────────
+# Wraps drop_na() and emits a warning whenever rows are silently removed,
+# so date-alignment gaps from the full_join merge are never invisible.
+drop_na_logged <- function(df, label) {
+  n_in  <- nrow(df)
+  out   <- tidyr::drop_na(df)
+  n_out <- nrow(out)
+  if (n_out < n_in)
+    message(sprintf(
+      "  \u26A0 %s: %d of %d rows retained after drop_na (%d removed — check date alignment).",
+      label, n_out, n_in, n_in - n_out))
+  else
+    message(sprintf("  \u2714 %s: all %d rows complete (no NAs dropped).", label, n_out))
+  out
+}
+
 # ==============================================================================
 # 4.  LOAD & MERGE INDICES
 # ==============================================================================
@@ -368,8 +438,8 @@ if (cfg$snow_index == "sspi1" && file.exists(cfg$sspi1_file)) {
 
 # ── 4b. SSI soil moisture ─────────────────────────────────────────────────
 ssi_soil_long <- assemble_ssi_from_monthly_csvs(
-  folder     = "ssi_results_seasonal",
-  prefix     = "ssi_L1_3_01",          # timescale-1, layers 1-3, basin 01
+  folder     = cfg$ssi_soil_folder,
+  prefix     = cfg$ssi_soil_prefix,
   value_name = "SSI_soil"
 )
 cat(sprintf("  SSI soil:       %d records (%s – %s)\n",                      
@@ -447,8 +517,20 @@ all_raw <- snow_long |>
   full_join(ntsdi_long,    by = "date") |>
   arrange(date)
 
-cat(sprintf("\n  ➤ Combined record: %d months (%s – %s)\n\n",
+cat(sprintf("\n  ➤ Combined record: %d months (%s – %s)\n",
             nrow(all_raw), min(all_raw$date), max(all_raw$date)))
+
+# ── Date-alignment diagnostic: flag any column with unexpected NAs ─────────
+na_counts <- colSums(is.na(all_raw[, c("Snow", "SSI_soil", "SGI", "SSI_wsc", "NTSDI")]))
+if (any(na_counts > 0)) {
+  message("  \u26A0 NA counts in merged table (may indicate date-format misalignment):")
+  for (nm in names(na_counts)[na_counts > 0])
+    message(sprintf("      %-12s  %d NAs  (%.1f%% of %d months)",
+                    nm, na_counts[nm], 100 * na_counts[nm] / nrow(all_raw), nrow(all_raw)))
+} else {
+  message("  \u2714 All five index columns fully populated — no date-alignment gaps detected.")
+}
+cat("\n")
 
 # ==============================================================================
 # 5.  REFERENCE-PERIOD CALIBRATED PSEUDO-OBSERVATIONS
@@ -488,7 +570,7 @@ u_cols <- paste0("u_", var_list)
 ref_u <- all_raw |>
   filter(date >= cfg$ref_start, date <= cfg$ref_end) |>
   select(all_of(u_cols)) |>
-  drop_na()
+  drop_na_logged("Tail-dependence reference matrix (all months)")
 
 td_df <- purrr::map_dfr(
   seq_along(var_list),
@@ -628,7 +710,7 @@ snow5_ref <- all_raw |>
   filter(date >= cfg$ref_start, date <= cfg$ref_end,
          month(date) %in% cfg$snow_months) |>
   select(all_of(u_cols)) |>
-  drop_na()
+  drop_na_logged("Snow-season reference period (5-var)")
 
 if (nrow(snow5_ref) < 40L)
   warning("Fewer than 40 complete snow-season months — estimates unreliable.")
@@ -652,7 +734,7 @@ warm4_ref <- all_raw |>
   filter(date >= cfg$ref_start, date <= cfg$ref_end,
          month(date) %in% cfg$warm_months) |>
   select(all_of(u_cols_warm)) |>
-  drop_na()
+  drop_na_logged("Warm-season reference period (4-var)")
 
 if (nrow(warm4_ref) < 30L)
   warning("Fewer than 30 complete warm-season months — estimates unreliable.")
@@ -674,12 +756,12 @@ cat("\n", strrep("=", 60), "\n  EVALUATING VINE CDF (full record)\n",
 all_snow <- all_raw |>
   filter(month(date) %in% cfg$snow_months) |>
   select(date, all_of(u_cols)) |>
-  drop_na()
+  drop_na_logged("Snow-season full record (CDF evaluation)")
 
 all_warm <- all_raw |>
   filter(month(date) %in% cfg$warm_months) |>
   select(date, all_of(u_cols_warm)) |>
-  drop_na()
+  drop_na_logged("Warm-season full record (CDF evaluation)")
 
 # for snow season
 p_snow_best <- pvinecop(
@@ -743,7 +825,7 @@ compute_contributions <- function(u_full_mat, vine_obj, var_names, n_mc) {
     u_neu      <- u_full_mat
     u_neu[, k] <- 0.50       # replace with neutral (50th percentile)
     p_neu      <- pvinecop(u_neu, vine_obj, n_mc = n_mc)
-    contrib[, k] <- p_base - p_neu   # >0 if variable k deepens drought
+    contrib[, k] <- p_neu - p_base   # >0 if variable k deepens drought
   }
   
   # Normalise to proportion of total deviation from 0.5
@@ -957,30 +1039,11 @@ drought_pal <- c(
 )
 
 # ── Plot 1: Seasonal MSDI time series (primary output) ───────────────────
-p1 <- ggplot(seasonal_out, aes(date, MSDI_seasonal)) +
-  geom_ribbon(aes(ymin = pmin(MSDI_seasonal, 0), ymax = 0),
-              fill = "#d73027", alpha = 0.30) +
-  geom_ribbon(aes(ymin = 0, ymax = pmax(MSDI_seasonal, 0)),
-              fill = "#4575b4", alpha = 0.25) +
-  geom_line(linewidth = 0.7, colour = "grey20") +
-  geom_hline(yintercept = -2, linetype = "dotted", colour = "#a50026", linewidth = 0.5) +
-  geom_hline(yintercept = -1.5, linetype = "dashed", colour = "#d73027", linewidth = 0.5) +
-  geom_hline(yintercept = -1, linetype = "dashed", colour = "#fc8d59", linewidth = 0.5) +
-  geom_hline(yintercept = 0, linetype = "solid", colour = "grey40", linewidth = 0.5) +
-  { if (!is.null(msdi_boot_ci))
-    list(
-      geom_ribbon(data = msdi_boot_ci |>
-                    inner_join(seasonal_out |> select(date), by = "date"),
-                  aes(ymin = MSDI_lo, ymax = MSDI_hi),
-                  alpha = 0.20, fill = "grey50", inherit.aes = FALSE)
-    )
-  } +
-  facet_wrap(~season, ncol = 1, scales = "free_x") +
-  labs(title    = "Nechako Basin — Seasonal Vine Copula MSDI",
-       subtitle = "Snow season: 5-var D/R-vine  |  Warm season: 4-var D/R-vine (SWEI excluded)",
-       x = NULL, y = "MSDI [standard normal units]") +
-  theme_bw(base_size = 11) +
-  theme(plot.title = element_text(face = "bold"), panel.grid.minor = element_blank())
+df_msdi <- seasonal_out %>% dplyr::select(date, value = MSDI_seasonal, season)
+
+# Plot with seasonal facets and save
+p1 <- plot_standard_basin_ts(df_msdi, index_name = "MSDI", color = "#d73027") +
+  ggplot2::facet_wrap(~season, ncol = 1, scales = "free_x")
 
 ggsave(file.path(cfg$out_dir, "plot1_MSDI_seasonal.png"),
        p1, width = 13, height = 7, dpi = 300)
@@ -1054,9 +1117,9 @@ if (any(grepl("^contrib_", names(contrib_df)))) {
 snow5_dates <- all_raw |>
   filter(date >= cfg$ref_start, date <= cfg$ref_end,
          month(date) %in% cfg$snow_months) |>
-  select(date, all_of(u_cols)) |>  # Added 'date' here
-  drop_na() |>
-  pull(date)  # Now pull() works correctly
+  select(date, all_of(u_cols)) |>
+  drop_na_logged("Plot 5 snow-season date index") |>
+  pull(date)
 
 # Subset MSDI_snow to match the same dates
 MSDI_snow_plot <- seasonal_out |>

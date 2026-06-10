@@ -15,7 +15,7 @@
 
 #---- 0. Packages ------------------------------------------------------------
 pkgs <- c("httr", "sf", "tidyverse", "lubridate", "jsonlite",
-          "ckanr", "tidyhydat", "geosphere")
+          "ckanr", "tidyhydat", "geosphere", "geojsonsf" ,"ggplot2","dplyr")
 new <- pkgs[!pkgs %in% installed.packages()[, "Package"]]
 if (length(new)) install.packages(new)
 invisible(lapply(pkgs, library, character.only = TRUE, warn.conflicts = FALSE))
@@ -80,6 +80,58 @@ dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 if (!dir.exists(cfg$cache_dir)) dir.create(cfg$cache_dir, recursive = TRUE)
 
 #---- 2. Helpers -------------------------------------------------------------
+plot_standard_basin_ts <- function(df, index_name, color = "steelblue", drought_threshold = -0.5) {
+  if (!all(c("date", "value") %in% names(df))) stop("df must have 'date' and 'value' columns.")
+  df <- df[order(df$date), ]
+  df <- df[!is.na(df$value), ]
+  
+  # Drought event count
+  in_drought <- df$value < drought_threshold
+  rle_res <- rle(in_drought)
+  n_ev <- sum(rle_res$values & rle_res$lengths >= 1)
+  
+  # Dynamic y-axis
+  y_range <- max(df$value, na.rm = TRUE) - min(df$value, na.rm = TRUE)
+  y_pad   <- y_range * 0.10
+  y_lo    <- min(-3.5, min(df$value, na.rm = TRUE) - y_pad)
+  y_hi    <- max( 3.5, max(df$value, na.rm = TRUE) + y_pad)
+  
+  # Drought bands (matching 7basin_timeseries.R)
+  drought_bands <- list(
+    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = -2.0, fill = "#7B0025", alpha = 0.15),
+    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin = -2.0, ymax = -1.5, fill = "#D73027", alpha = 0.15),
+    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin = -1.5, ymax = -1.0, fill = "#F46D43", alpha = 0.15),
+    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin = -1.0, ymax =  1.0, fill = "#2E7D32", alpha = 0.15),
+    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin =  1.0, ymax =  1.5, fill = "#90EE90", alpha = 0.15),
+    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin =  1.5, ymax =  2.0, fill = "#66BB6A", alpha = 0.15),
+    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin =  2.0, ymax =  Inf, fill = "#4575B4", alpha = 0.15)
+  )
+  
+  ggplot2::ggplot(df, ggplot2::aes(x = date, y = value)) +
+    drought_bands +
+    ggplot2::geom_hline(yintercept = 0, color = "black", linewidth = 0.4) +
+    ggplot2::geom_hline(yintercept = c(-1, 1), linetype = "dashed", color = "gray50", linewidth = 0.3) +
+    ggplot2::geom_ribbon(ggplot2::aes(ymin = ifelse(value < drought_threshold, value, 0), ymax = 0), 
+                         fill = "#c0392b", alpha = 0.35) +
+    ggplot2::geom_line(color = color, linewidth = 0.6) +
+    ggplot2::scale_x_date(date_breaks = "5 years", date_labels = "%Y") +
+    ggplot2::scale_y_continuous(limits = c(y_lo, y_hi)) +
+    ggplot2::labs(
+      title    = sprintf("%s Basin-Averaged Time Series", toupper(index_name)),
+      subtitle = sprintf("%d drought events detected (onset < %.1f)", n_ev, drought_threshold),
+      x = "Year", y = sprintf("%s Index Value", toupper(index_name))
+    ) +
+    ggplot2::theme_bw(base_size = 14) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = ggplot2::element_text(hjust = 0.5, color = "gray30"),
+      axis.title = ggplot2::element_text(face = "bold"),
+      axis.text.x = ggplot2::element_text(angle = 45, hjust = 1),
+      panel.grid.minor = ggplot2::element_blank(),
+      legend.position = "bottom"
+    )
+}
+#
 read_kmz <- function(kmz_path) {
   tmp_dir  <- tempdir()
   utils::unzip(kmz_path, exdir = tmp_dir)
@@ -109,7 +161,7 @@ normal_scores <- function(x) {
   n <- sum(!is.na(x))
   if (n < 4) return(rep(NA_real_, length(x)))
   r <- rank(x, na.last = "keep", ties.method = "average")
-  qnorm((2 * r - 1) / (2 * n))
+  qnorm((r - 0.44) / (n + 0.12))
 }
 
 detect_col <- function(df, patterns, label) {
@@ -445,14 +497,98 @@ load_gin <- function() {
 
 load_wsc <- function() {
   if (!cfg$src_wsc) return(NULL)
-  message("Loading WSC groundwater (tidyhydat) … [STUB]")
-  NULL
+  message("Loading WSC groundwater (tidyhydat) …")
+  
+  # 1. Get all BC groundwater stations
+  stations <- tidyhydat::hy_stations(prov_territory = "BC", station_type = "GROUNDWATER")
+  
+  # 2. Spatially filter to Nechako basin
+  stations_sf <- sf::st_as_sf(stations, coords = c("LONGITUDE", "LATITUDE"), crs = 4326)
+  in_basin <- sf::st_intersects(stations_sf, basin, sparse = FALSE)[, 1]
+  basin_stations <- stations[in_basin, ]
+  
+  if (nrow(basin_stations) == 0) {
+    message("  No WSC groundwater stations found in basin.")
+    return(NULL)
+  }
+  
+  message(sprintf("  Found %d WSC groundwater stations in basin. Fetching data...", nrow(basin_stations)))
+  
+  # 3. Fetch daily groundwater data and aggregate to monthly medians
+  gw_data <- tidyhydat::hy_daily_groundwater(station_number = basin_stations$STATION_NUMBER)
+  
+  ts <- gw_data %>%
+    mutate(
+      date = as.Date(Date),
+      gw = -as.numeric(Water_Level), # Invert so higher = wetter
+      month_label = format(date, "%Y-%m"),
+      source_id = "WSC"
+    ) %>%
+    filter(!is.na(date), !is.na(gw)) %>%
+    group_by(STATION_NUMBER, month_label) %>%
+    summarise(
+      gw = median(gw, na.rm = TRUE),
+      date = min(date),
+      .groups = "drop"
+    ) %>%
+    rename(well_num = STATION_NUMBER) %>%
+    dplyr::select(well_num, date, gw, month_label, source_id)
+  
+  message(sprintf("  WSC: %d wells, %d monthly records", n_distinct(ts$well_num), nrow(ts)))
+  return(ts)
 }
 
 load_bc_realtime <- function() {
   if (!cfg$src_bc_realtime) return(NULL)
-  message("Loading BC Real-Time (ArcGIS) … [STUB]")
-  NULL
+  message("Loading BC Real-Time (ArcGIS) …")
+  
+  # BC ArcGIS REST endpoint for water levels
+  url <- "https://maps.gov.bc.ca/arcgis/rest/services/pub/Water/BC_Water_Levels/MapServer/1/query"
+  
+  # Convert basin to WGS84 GeoJSON for the spatial query
+  basin_wgs84 <- sf::st_transform(basin, 4326)
+  basin_geojson <- geojsonsf::sf_geojson(basin_wgs84)
+  
+  # Build query parameters
+  params <- list(
+    where = "1=1",
+    outFields = "STATION_NAME,STATION_NUMBER,LATITUDE,LONGITUDE,DATE,WATER_LEVEL",
+    geometry = basin_geojson,
+    geometryType = "esriGeometryPolygon",
+    inSR = "4326",
+    spatialRel = "esriSpatialRelIntersects",
+    outSR = "4326",
+    f = "json"
+  )
+  
+  resp <- httr::GET(url, query = params, httr::timeout(120))
+  httr::stop_for_status(resp, task = "fetch BC Real-Time ArcGIS data")
+  
+  result <- jsonlite::fromJSON(httr::content(resp, as = "text", encoding = "UTF-8"), flatten = TRUE)
+  
+  if (is.null(result$features) || nrow(result$features) == 0) {
+    message("  No BC Real-Time records found in basin.")
+    return(NULL)
+  }
+  
+  ts <- result$features %>%
+    mutate(
+      date = as.Date(attributes$DATE),
+      gw = -as.numeric(attributes$WATER_LEVEL),
+      month_label = format(date, "%Y-%m"),
+      source_id = "BC_RT"
+    ) %>%
+    filter(!is.na(date), !is.na(gw)) %>%
+    group_by(well_num = attributes$STATION_NUMBER, month_label) %>%
+    summarise(
+      gw = median(gw, na.rm = TRUE),
+      date = min(date),
+      .groups = "drop"
+    ) %>%
+    dplyr::select(well_num, date, gw, month_label, source_id)
+  
+  message(sprintf("  BC Real-Time: %d wells, %d monthly records", n_distinct(ts$well_num), nrow(ts)))
+  return(ts)
 }
 
 #---- 8. Aggregate Sources ---------------------------------------------------
@@ -714,34 +850,13 @@ if (!is.null(sgi_by_aquifer)) {
 
 #---- 13. Plots --------------------------------------------------------------
 #-- 13a. Basin-wide SGI ------------------------------------------------------
-p_basin <- ggplot(sgi_basin, aes(x = date, y = sgi_median)) +
-  geom_ribbon(aes(ymin = pmin(sgi_median, 0), ymax = 0),
-              fill = "#d73027", alpha = 0.3) +
-  geom_ribbon(aes(ymin = 0, ymax = pmax(sgi_median, 0)),
-              fill = "#4575b4", alpha = 0.3) +
-  geom_line(linewidth = 0.5, colour = "grey20") +
-  geom_hline(yintercept = c(0, -1, -1.5, -2),
-             linetype = c("solid", "dashed", "dashed", "dashed"),
-             colour   = c("black", "#fc8d59", "#d73027", "#a50026"),
-             linewidth = 0.3) +
-  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
-  scale_y_continuous(
-    breaks = c(-2, -1.5, -1, 0, 1, 2),
-    labels = c("-2\n(Extreme)", "-1.5\n(Severe)", "-1\n(Moderate)", "0", "1", "2")
-  ) +
-  labs(
-    title    = "Standardised Groundwater Index (SGI) – Nechako Basin",
-    subtitle = paste0("Multi-source | ", n_distinct(sgi_long$well_num), " wells | ",
-                      paste(names(purrr::compact(sources)), collapse = "+")),
-    x = NULL, y = "SGI",
-    caption  = "Method: Bloomfield & Marchant (2013) | Data: PGOWN+GWELLS"
-  ) +
-  theme_bw(base_size = 10) +
-  theme(plot.title = element_text(face = "bold"),
-        panel.grid.minor = element_blank())
+# Prepare data
+df_sgi <- sgi_basin %>% dplyr::select(date, value = sgi_median)
 
-ggsave(file.path("sgi_results", paste0(cfg$output_prefix, "_basin.png")), p_basin, width = 10, height = 4, dpi = 150)
-message("Plot saved: ", cfg$output_prefix, "_basin.png")
+# Plot and save
+p_basin <- plot_standard_basin_ts(df_sgi, index_name = "SGI", color = "#1f77b4")
+ggsave(file.path("sgi_results", paste0(cfg$output_prefix, "_basin.png")), 
+       p_basin, width = 12, height = 6, dpi = 300)
 
 #-- 13b. Per-aquifer SGI facet plot (NEW) ------------------------------------
 if (!is.null(sgi_by_aquifer) && nrow(sgi_by_aquifer) > 0) {
