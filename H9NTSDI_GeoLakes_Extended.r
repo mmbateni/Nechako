@@ -1,40 +1,38 @@
-============================================================================
-NECHAKO BASIN — TOTAL STORAGE DEFICIT INDEX  (Extended Dual-Pipeline)
-PIPELINE 1  (BASIN)
-Original approach: basin-wide total storage aggregated across all GeoLakes
-lakes in the Nechako watershed.
-Input:  BEST_ESTIMATE_basin_total_Mm3.csv
-Required columns:  date, total_storage_Mm3
-PIPELINE 2  (NECHAKO_RESERVOIR)
-Single-lake NTSDI computed for the Nechako Reservoir only.
-(Nechako Reservoir / Ootsa Lake Reservoir — created by Kenney Dam, 1952;
-surface elevation ~850–854 m ASL; area ~890 km²; BC, Canada)
-Two data-source options (set NECHAKO_DATA_SOURCE below):
-"GEOLAKES"   — filter the GeoLakes / HydroLAKES dataset to the
-Nechako Reservoir entry using its HydroLAKES_ID.
-Expects same format as Pipeline 1 but for a single lake:
-columns  date, storage_Mm3  (or similar, see GEOLAKES_*
-settings).
-"LOCAL_CSV"  — import a CSV exported from a local water authority
-(e.g. BC Hydro reservoir operations data, BC River
-Forecast Centre BCWIS gauge exports).
-Two sub-options (LOCAL_DATA_TYPE):
-"STORAGE" — CSV already contains storage in Mm³
-"LEVEL"   — CSV contains water-surface elevation (m ASL);
-storage derived via a piecewise-linear
-hypsometric (stage–volume) look-up table
-(edit HYPSO_TABLE below with real BC Hydro
-stage–volume data).
-Based on:
-Awange et al. (2016) Adv. Water Resources 94, 45–59
-Yirdaw et al. (2008) J. Hydrology 356, 84–92
-Farahmand & AghaKouchak (2015) Adv. Water Resources 76, 140–145
-OUTPUT (per pipeline that is run):
-Nechako_TSDI_Pipeline1_Output.csv
-Nechako_NTSDI_Pipeline2_Output.csv
-Diagnostic plots for each active pipeline
-Comparison plot (if both pipelines run)
-============================================================================
+# ============================================================================
+# NECHAKO BASIN — TOTAL STORAGE DEFICIT INDEX  (Extended Dual-Pipeline)
+# PIPELINE 1  (BASIN)
+# Original approach: basin-wide total storage aggregated across all GeoLakes
+# lakes in the Nechako watershed.
+# Input:  BEST_ESTIMATE_basin_total_Mm3.csv
+# Required columns:  date, total_storage_Mm3
+# PIPELINE 2  (NECHAKO_RESERVOIR)
+# Single-lake NTSDI computed for the Nechako Reservoir only.
+# (Nechako Reservoir / Ootsa Lake Reservoir — created by Kenney Dam, 1952;
+# surface elevation ~850–854 m ASL; area ~890 km²; BC, Canada)
+# Two data-source options (set NECHAKO_DATA_SOURCE below):
+# "GEOLAKES"   — filter the GeoLakes / HydroLAKES dataset to the
+# Nechako Reservoir entry using its HydroLAKES_ID.
+# Expects same format as Pipeline 1 but for a single lake:
+# columns  date, storage_Mm3  (or similar, see GEOLAKES_*
+# settings).
+# "LOCAL_CSV"  — import a CSV exported from a local water authority
+# Two sub-options (LOCAL_DATA_TYPE):
+# "STORAGE" — CSV already contains storage in Mm³
+# "LEVEL"   — CSV contains water-surface elevation (m ASL);
+# storage derived via a piecewise-linear
+# hypsometric (stage–volume) look-up table
+# (edit HYPSO_TABLE below with real BC Hydro
+# stage–volume data).
+# Based on:
+# Awange et al. (2016) Adv. Water Resources 94, 45–59
+# Yirdaw et al. (2008) J. Hydrology 356, 84–92
+# Farahmand & AghaKouchak (2015) Adv. Water Resources 76, 140–145
+# OUTPUT (per pipeline that is run):
+# Nechako_TSDI_Pipeline1_Output.csv
+# Nechako_NTSDI_Pipeline2_Output.csv
+# Diagnostic plots for each active pipeline
+# Comparison plot (if both pipelines run)
+# ============================================================================
 rm(list = ls())
 
 # --- OUTPUT DIRECTORY SETUP ---
@@ -42,9 +40,9 @@ OUT_DIR <- "ntsdi_results"
 dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
 sink(file.path(OUT_DIR, "console_log.txt"), append = TRUE, split = TRUE)
 
-============================================================================
-PACKAGES
-============================================================================
+# ============================================================================
+# PACKAGES
+# ============================================================================
 packages <- c("tidyverse", "lubridate", "zoo")
 for (p in packages) {
   if (!require(p, character.only = TRUE)) {
@@ -53,30 +51,30 @@ for (p in packages) {
   }
 }
 
-============================================================================
-── SECTION 1 ──  PIPELINE SELECTOR
-============================================================================
+# ============================================================================
+# ── SECTION 1 ──  PIPELINE SELECTOR
+# ============================================================================
 # Set PIPELINE_MODE to one of:
 # "BASIN"             — run Pipeline 1 only
 # "NECHAKO_RESERVOIR" — run Pipeline 2 only
 # "BOTH"              — run both and produce a comparison
 PIPELINE_MODE <- "BOTH"
 
-============================================================================
-── SECTION 2 ──  PIPELINE 1  SETTINGS  (basin-wide GeoLakes)
-============================================================================
+# ============================================================================
+# ── SECTION 2 ──  PIPELINE 1  SETTINGS  (basin-wide GeoLakes)
+# ============================================================================
 P1_INPUT_FILE <- "Lakes/Glolakes/nechako_extracted/BEST_ESTIMATE_basin_total_Mm3.csv"
 # Required columns: date, total_storage_Mm3
 
-============================================================================
-── SECTION 3 ──  PIPELINE 2  SETTINGS  (Nechako Reservoir only)
-============================================================================
---- 3a. Data source ---------------------------------------------------------
+# ============================================================================
+# ── SECTION 3 ──  PIPELINE 2  SETTINGS  (Nechako Reservoir only)
+# ============================================================================
+# --- 3a. Data source ---------------------------------------------------------
 # "GEOLAKES"   — use a GeoLakes/HydroLAKES file filtered to Nechako Reservoir
 # "LOCAL_CSV"  — use a CSV from BC Hydro / BC River Forecast Centre
 NECHAKO_DATA_SOURCE <- "GEOLAKES"
 
---- 3b. GeoLakes option -----------------------------------------------------
+# --- 3b. GeoLakes option -----------------------------------------------------
 # File that contains per-lake GeoLakes storage time series.
 # Must have columns for lake identifier, date, and storage.
 GEOLAKES_FILE <- "Lakes/Glolakes/nechako_extracted/LandsatPlusICESat2_long.csv"
@@ -98,7 +96,7 @@ NECHAKO_LAT  <- 54.2493   # confirmed from LandsatPlusICESat2_long.csv
 NECHAKO_LON  <- -125.7896
 NECHAKO_TOL  <- 0.01      # tight tolerance — exact centroid known
 
-── Find the Nechako Reservoir lake_id ────────────────────────────────────────
+# ── Find the Nechako Reservoir lake_id ────────────────────────────────────────
 # Run this snippet ONCE in the console to identify the correct ID, then set
 # NECHAKO_HYDROID (as a string) to match.
 # df_tmp <- read_csv(GEOLAKES_FILE, show_col_types = FALSE)
@@ -112,24 +110,21 @@ NECHAKO_TOL  <- 0.01      # tight tolerance — exact centroid known
 #   filter(between(lat, 53.0, 54.5), between(lon, -127.5, -124.5)) %>%
 #   dplyr::select(lake_id, lake_name, lat, lon) %>%
 #   distinct()
-─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
---- 3c. Local CSV option ----------------------------------------------------
+# --- 3c. Local CSV option ----------------------------------------------------
 # CSV exported from BC Hydro reservoir operations reports, BCWIS, or similar.
-LOCAL_CSV_FILE    <- "nechako_reservoir_levels.csv"  # adjust path as needed
-LOCAL_DATE_COL    <- "date"                          # date column name
-LOCAL_DATE_FORMAT <- "%Y-%m-%d"                      # adjust if needed
-# e.g. "%d/%m/%Y" for DD/MM/YYYY
+# Path to your daily level file
+  LOCAL_CSV_FILE    <- "D:/Nechako_Drought/Nechako/Lakes/dailylevel.csv"
 
-# What does the local CSV provide?
-# "STORAGE" — a column already in Mm³  (skip hypsometric conversion)
-# "LEVEL"   — water-surface elevation in metres ASL (convert via HYPSO_TABLE)
-LOCAL_DATA_TYPE   <- "LEVEL"
+# Choose data type: "STORAGE", "LEVEL", or "LEVEL_DAILY"
+# "LEVEL_DAILY" is for files with Year, Day-of-Year, and Level columns (no header)
+LOCAL_DATA_TYPE   <- "LEVEL_DAILY" 
 
-# Column name for storage OR level (depending on LOCAL_DATA_TYPE)
-LOCAL_VALUE_COL   <- "level_m_asl"
+# Column name for storage OR level (ignored if LEVEL_DAILY, which uses fixed names)
+LOCAL_VALUE_COL   <- "Level_m"
 
---- 3d. Hypsometric (stage–volume) look-up table ----------------------------
+# --- 3d. Hypsometric (stage–volume) look-up table ----------------------------
 # Used only when LOCAL_DATA_TYPE == "LEVEL".
 # Replace the placeholder rows below with actual BC Hydro stage–volume data.
 # Source: BC Hydro Reservoir Operations, Nechako Reservoir Rule Curves
@@ -145,9 +140,9 @@ HYPSO_TABLE <- data.frame(
   # ↑ PLACEHOLDER VALUES — replace with real BC Hydro stage–volume curve data
 )
 
-============================================================================
-── SECTION 4 ──  SHARED ALGORITHM SETTINGS
-============================================================================
+# ============================================================================
+# ── SECTION 4 ──  SHARED ALGORITHM SETTINGS
+# ============================================================================
 # Palmer drought severity class used to anchor p and q
 # –1 mild | –2 moderate | –3 severe | –4 extreme
 DROUGHT_CLASS_C <- -3
@@ -159,10 +154,10 @@ SMOOTH_WINDOW  <- 3   # months (odd integer recommended)
 # Blom plotting-position constant (standard for nonparametric SPI-style PIT)
 BLOM_A <- 0.44
 
-============================================================================
-── SECTION 5 ──  HELPER FUNCTIONS
-============================================================================
----- 5a. Level → storage conversion via piecewise linear interpolation -----
+# ============================================================================
+# ── SECTION 5 ──  HELPER FUNCTIONS
+# ============================================================================
+# ---- 5a. Level → storage conversion via piecewise linear interpolation -----
 level_to_storage <- function(level_vec, hypso = HYPSO_TABLE) {
   # Validate table
   stopifnot(
@@ -192,7 +187,7 @@ level_to_storage <- function(level_vec, hypso = HYPSO_TABLE) {
   )$y
 }
 
----- 5b. Core TSDI / NTSDI computation  (Awange et al. 2016) ---------------
+# ---- 5b. Core TSDI / NTSDI computation  (Awange et al. 2016) ---------------
 # Arguments:
 #   df_in           — data frame with columns: date, storage_Mm3
 #   drought_class_c — Palmer class (negative number)
@@ -218,7 +213,7 @@ compute_tsdi <- function(df_in,
     ) %>%
     arrange(date)
   
-  ── Optional smoothing ────────────────────────────────────────────────────
+  # ── Optional smoothing ────────────────────────────────────────────────────
   if (use_smoothing) {
     df <- df %>%
       mutate(
@@ -232,7 +227,7 @@ compute_tsdi <- function(df_in,
     cat(label, ": applied", smooth_window, "-month rolling mean smoothing.\n")
   }
   
-  ── Monthly climatology (mean / max / min per calendar month) ─────────────
+  # ── Monthly climatology (mean / max / min per calendar month) ─────────────
   # Follows Awange et al. (2016) Eq. 1
   monthly_stats <- df %>%
     group_by(month) %>%
@@ -244,18 +239,18 @@ compute_tsdi <- function(df_in,
     )
   df <- left_join(df, monthly_stats, by = "month")
   
-  ── Total Storage Deficit  (TSD %) — Eq. 1 ───────────────────────────────
+  # ── Total Storage Deficit  (TSD %) — Eq. 1 ───────────────────────────────
   df <- df %>%
     mutate(
       TSD = (storage_Mm3 - clim_mean) /
             (clim_max    - clim_min  ) * 100
     )
   
-  ── Cumulative TSD ────────────────────────────────────────────────────────
+  # ── Cumulative TSD ────────────────────────────────────────────────────────
   df <- df %>%
     mutate(cumulative_TSD = cumsum(replace_na(TSD, 0)))
   
-  ── Identify dominant drought period for calibration ─────────────────────
+  # ── Identify dominant drought period for calibration ─────────────────────
   # Strategy: find the continuously-negative TSD run whose endpoint has the
   # most negative cumulative TSD value (deepest deficit).  This is more robust
   # than picking the longest run, which can be very short when the record is
@@ -294,7 +289,7 @@ compute_tsdi <- function(df_in,
     " (", nrow(drought_df), "months )\n"
   )
   
-  ── Drought monograph linear regression ──────────────────────────────────
+  # ── Drought monograph linear regression ──────────────────────────────────
   # Compute episode-local cumulative TSD here, AFTER any fallback selection,
   # so it always applies to the final drought_df (deepest or longest run).
   drought_df <- drought_df %>%
@@ -319,7 +314,7 @@ compute_tsdi <- function(df_in,
     )
   }
   
-  ── Coefficients p and q  (Eq. 3) ────────────────────────────────────────
+  # ── Coefficients p and q  (Eq. 3) ────────────────────────────────────────
   p <- 1 - (m / denom)
   q <- -drought_class_c / denom
   
@@ -336,7 +331,7 @@ compute_tsdi <- function(df_in,
     )
   }
   
-  ── Recursive TSDI  (Eq. 2) ──────────────────────────────────────────────
+  # ── Recursive TSDI  (Eq. 2) ──────────────────────────────────────────────
   n    <- nrow(df)
   TSDI <- rep(NA_real_, n)
   
@@ -357,7 +352,7 @@ compute_tsdi <- function(df_in,
   }
   df[[label]] <- TSDI
   
-  ── PIT normalization → approximately N(0,1) ─────────────────────────────
+  # ── PIT normalization → approximately N(0,1) ─────────────────────────────
   # Nonparametric Blom plotting-position (Farahmand & AghaKouchak 2015)
   tsdi_valid <- df %>%
     filter(!is.na(.data[[label]])) %>%
@@ -383,7 +378,7 @@ compute_tsdi <- function(df_in,
   )
 }
 
----- 5c. Diagnostic plots for a single pipeline ----------------------------
+# ---- 5c. Diagnostic plots for a single pipeline ----------------------------
 plot_pipeline <- function(res, label, basin_label) {
   df         <- res$data
   index_col  <- label
@@ -398,7 +393,7 @@ plot_pipeline <- function(res, label, basin_label) {
     ymin = -Inf, ymax = Inf
   )
   
-  ── Plot 1 — Storage ───────────────────────────────────────────────────
+  # ── Plot 1 — Storage ───────────────────────────────────────────────────
   p1 <- ggplot(df, aes(date, storage_Mm3)) +
     geom_rect(
       data = dband,
@@ -415,7 +410,7 @@ plot_pipeline <- function(res, label, basin_label) {
     theme_bw(base_size = 12)
   print(p1)
   
-  ── Plot 2 — TSD (%) ───────────────────────────────────────────────────
+  # ── Plot 2 — TSD (%) ───────────────────────────────────────────────────
   p2  <- ggplot(df, aes(date, TSD)) +
     geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
     geom_ribbon(aes(ymin = pmin(TSD, 0), ymax = 0),
@@ -432,7 +427,7 @@ plot_pipeline <- function(res, label, basin_label) {
     theme_bw(base_size = 12)
   print(p2)
   
-  ── Plot 3 — Raw index ─────────────────────────────────────────────────
+  # ── Plot 3 — Raw index ─────────────────────────────────────────────────
   # Palmer-style thresholds (approximate equivalents)
   thresh <- data.frame(
     yint  = c(-1, -2, -3, -4),
@@ -463,7 +458,7 @@ plot_pipeline <- function(res, label, basin_label) {
     theme(legend.position = "bottom")
   print(p3)
   
-  ── Plot 4 — Standardised index ────────────────────────────────────────
+  # ── Plot 4 — Standardised index ────────────────────────────────────────
   spi_thresh <- data.frame(
     yint  = c(-0.5, -1.0, -1.5, -2.0),
     label = c("Near-normal (-0.5)",
@@ -496,7 +491,7 @@ plot_pipeline <- function(res, label, basin_label) {
   print(p4)
 }
 
----- 5d. Summary console output -------------------------------------------
+# ---- 5d. Summary console output -------------------------------------------
 print_summary <- function(res, label, out_file) {
   df       <- res$data
   norm_col <- paste0(label, "_norm")
@@ -520,9 +515,9 @@ print_summary <- function(res, label, out_file) {
   cat("Output CSV : ", out_file, "\n")
 }
 
-============================================================================
-── SECTION 6 ──  PIPELINE 1  —  Basin-wide GeoLakes TSDI
-============================================================================
+# ============================================================================
+# ── SECTION 6 ──  PIPELINE 1  —  Basin-wide GeoLakes TSDI
+# ============================================================================
 run_pipeline_1 <- function() {
   cat("\n\n========================================================\n")
   cat("PIPELINE 1 — Basin-wide TSDI  (GeoLakes aggregated)\n")
@@ -560,24 +555,22 @@ run_pipeline_1 <- function() {
   print_summary(res, label = "TSDI", out_file = out_file)
   invisible(res)
 }
-
-============================================================================
-── SECTION 7 ──  PIPELINE 2  —  Nechako Reservoir NTSDI
-============================================================================
+# ============================================================================
+# ── SECTION 7 ──  PIPELINE 2  —  Nechako Reservoir NTSDI
+# ============================================================================
 run_pipeline_2 <- function() {
   cat("\n\n========================================================\n")
   cat("PIPELINE 2 — Nechako Reservoir NTSDI\n")
   cat("  Data source:", NECHAKO_DATA_SOURCE, "\n")
   cat("========================================================\n")
   
-  ── 7a. Load & prepare storage time series ────────────────────────────────
+#── 7a. Load & prepare storage time series ────────────────────────────────
   if (NECHAKO_DATA_SOURCE == "GEOLAKES") {
     cat("Reading GeoLakes file: ", GEOLAKES_FILE, "\n")
     df_geo  <- read_csv(GEOLAKES_FILE, show_col_types = FALSE)
     cat("Columns found: ", paste(names(df_geo), collapse = ", "), "\n")
     
-    # Validate required columns
-    missing_cols  <- setdiff(
+    missing_cols <- setdiff(
       c(GEOLAKES_DATE_COL, GEOLAKES_STORAGE_COL, GEOLAKES_LAT_COL, GEOLAKES_LON_COL),
       names(df_geo)
     )
@@ -586,77 +579,67 @@ run_pipeline_2 <- function() {
            "\nAvailable: ", paste(names(df_geo), collapse = ", "))
     }
     
-    # Filter by centroid coordinates (lake_id / lake_name are NA in this file)
     cat(sprintf("  Filtering: lat=%.4f ± %.3f, lon=%.4f ± %.3f\n",
                 NECHAKO_LAT, NECHAKO_TOL, NECHAKO_LON, NECHAKO_TOL))
     
-    df_nechako  <- df_geo %>%
+    df_nechako <- df_geo %>%
       filter(abs(.data[[GEOLAKES_LAT_COL]] - NECHAKO_LAT) <= NECHAKO_TOL,
              abs(.data[[GEOLAKES_LON_COL]] - NECHAKO_LON) <= NECHAKO_TOL)
     
     if (nrow(df_nechako) == 0) {
-      all_coords  <- df_geo %>%
-        dplyr::select(all_of(c(GEOLAKES_LAT_COL, GEOLAKES_LON_COL))) %>%
-        distinct() %>% mutate(across(everything(), ~ round(.x, 4)))
-      stop("No rows matched. All coordinates in file:\n",
-           paste(capture.output(print(all_coords)), collapse = "\n"),
-           "\nUpdate NECHAKO_LAT / NECHAKO_LON in Section 3b.")
+      stop("No rows matched. Update NECHAKO_LAT / NECHAKO_LON in Section 3b.")
     }
     cat("  Matched ", nrow(df_nechako), " rows\n")
-    cat("Nechako Reservoir rows found: ", nrow(df_nechako), "\n")
     
-    df_input  <- df_nechako %>%
+    df_input <- df_nechako %>%
       transmute(
         date        = as.Date(.data[[GEOLAKES_DATE_COL]]),
         storage_Mm3 = .data[[GEOLAKES_STORAGE_COL]]
       )
-      
+    
   } else if (NECHAKO_DATA_SOURCE == "LOCAL_CSV") {
     cat("Reading local authority CSV: ", LOCAL_CSV_FILE, "\n")
-    df_local  <- read_csv(LOCAL_CSV_FILE, show_col_types = FALSE)
-    cat("Columns found: ", paste(names(df_local), collapse = ", "), "\n")
-    
-    stopifnot(
-      LOCAL_DATE_COL  %in% names(df_local),
-      LOCAL_VALUE_COL %in% names(df_local)
-    )
     
     if (LOCAL_DATA_TYPE == "STORAGE") {
-      cat("Using direct storage values (Mm³) from column: ", LOCAL_VALUE_COL, "\n")
-      df_input  <- df_local %>%
+      df_local <- read_csv(LOCAL_CSV_FILE, show_col_types = FALSE)
+      stopifnot(LOCAL_DATE_COL %in% names(df_local), LOCAL_VALUE_COL %in% names(df_local))
+      df_input <- df_local %>%
         transmute(
           date        = as.Date(.data[[LOCAL_DATE_COL]], format = LOCAL_DATE_FORMAT),
           storage_Mm3 = .data[[LOCAL_VALUE_COL]]
         )
-    } else if (LOCAL_DATA_TYPE == "LEVEL") {
-      cat("Converting water-level (m ASL) → storage via hypsometric table.\n")
-      cat("  Level column   : ", LOCAL_VALUE_COL, "\n")
-      cat("  Hypso. table range: ",
-          min(HYPSO_TABLE$level_m), "–", max(HYPSO_TABLE$level_m), "m ASL\n")
       
-      df_input  <- df_local %>%
+    } else if (LOCAL_DATA_TYPE == "LEVEL") {
+      df_local <- read_csv(LOCAL_CSV_FILE, show_col_types = FALSE)
+      stopifnot(LOCAL_DATE_COL %in% names(df_local), LOCAL_VALUE_COL %in% names(df_local))
+      df_input <- df_local %>%
         transmute(
           date        = as.Date(.data[[LOCAL_DATE_COL]], format = LOCAL_DATE_FORMAT),
           level_m_asl = .data[[LOCAL_VALUE_COL]]
         ) %>%
-        mutate(
-          storage_Mm3 = level_to_storage(level_m_asl)
-        )
+        mutate(storage_Mm3 = level_to_storage(level_m_asl))
       
-      n_na_storage  <- sum(is.na(df_input$storage_Mm3))
-      if (n_na_storage > 0) {
-        cat(
-          "  WARNING: ", n_na_storage,
-          "records produced NA storage (level outside hypsometric table range). ",
-          "Update HYPSO_TABLE or adjust rule= in level_to_storage().\n"
-        )
-      }
+    } else if (LOCAL_DATA_TYPE == "LEVEL_DAILY") {
+      cat("  Parsing Year + Day-of-Year format and converting to storage...\n")
+      df_input <- read_csv(LOCAL_CSV_FILE, 
+                           col_names = c("Year", "DOY", "Level_m"), 
+                           show_col_types = FALSE) %>%
+        mutate(
+          date = as.Date(paste(Year, DOY), format = "%Y %j"),
+          storage_Mm3 = level_to_storage(Level_m)
+        ) %>%
+        dplyr::select(date, storage_Mm3)
+      
     } else {
-      stop("LOCAL_DATA_TYPE must be 'STORAGE' or 'LEVEL'. Got: '", LOCAL_DATA_TYPE, "'")
+      stop("LOCAL_DATA_TYPE must be 'STORAGE', 'LEVEL', or 'LEVEL_DAILY'.")
+    }
+    
+    n_na_storage <- sum(is.na(df_input$storage_Mm3))
+    if (n_na_storage > 0) {
+      cat("  WARNING: ", n_na_storage, " records produced NA storage (level outside hypsometric table range).\n")
     }
   } else {
-    stop("NECHAKO_DATA_SOURCE must be 'GEOLAKES' or 'LOCAL_CSV'. Got: '",
-         NECHAKO_DATA_SOURCE, "'")
+    stop("NECHAKO_DATA_SOURCE must be 'GEOLAKES' or 'LOCAL_CSV'.")
   }
   
   # Filter out NA storage rows before computing index
@@ -666,7 +649,6 @@ run_pipeline_2 <- function() {
   if (n_before != n_after) {
     cat("  Removed", n_before - n_after, "rows with NA storage.\n")
   }
-  
   ── 7b. Run TSDI algorithm on single-lake storage ─────────────────────────
   res <- compute_tsdi(
     df_in           = df_input,
@@ -702,9 +684,9 @@ run_pipeline_2 <- function() {
   invisible(res)
 }
 
-============================================================================
-── SECTION 8 ──  COMPARISON PLOT  (only when PIPELINE_MODE == "BOTH")
-============================================================================
+# ============================================================================
+# ── SECTION 8 ──  COMPARISON PLOT  (only when PIPELINE_MODE == "BOTH")
+# ============================================================================
 plot_comparison <- function(res1, res2) {
   cat("\n\n== Generating comparison plot ==\n")
   comp <- inner_join(
@@ -718,7 +700,7 @@ plot_comparison <- function(res1, res2) {
   }
   cat("Overlapping records:", nrow(comp), "\n")
   
-  ── Raw index comparison ──────────────────────────────────────────────────
+  # ── Raw index comparison ──────────────────────────────────────────────────
   comp_long_raw <- comp %>%
     pivot_longer(
       cols      = c(TSDI, NTSDI),
@@ -752,7 +734,7 @@ plot_comparison <- function(res1, res2) {
     theme(legend.position = "bottom")
   print(pc1)
   
-  ── Standardised index comparison ─────────────────────────────────────────
+  # ── Standardised index comparison ─────────────────────────────────────────
   comp_long_norm <- comp %>%
     pivot_longer(
       cols      = c(TSDI_norm, NTSDI_norm),
@@ -785,7 +767,7 @@ plot_comparison <- function(res1, res2) {
     theme(legend.position = "bottom")
   print(pc2)
   
-  ── Scatter / correlation ─────────────────────────────────────────────────
+  # ── Scatter / correlation ─────────────────────────────────────────────────
   corr_val <- round(cor(comp$TSDI_norm, comp$NTSDI_norm, use = "complete.obs"), 3)
   pc3  <- ggplot(comp, aes(TSDI_norm, NTSDI_norm)) +
     geom_point(alpha = 0.4, size = 1.5, colour = "#404040") +
@@ -805,9 +787,9 @@ plot_comparison <- function(res1, res2) {
   cat("Pearson r (TSDI_norm vs NTSDI_norm):", corr_val, "\n")
 }
 
-============================================================================
-── SECTION 9 ──  MAIN EXECUTION
-============================================================================
+# ============================================================================
+# ── SECTION 9 ──  MAIN EXECUTION
+# ============================================================================
 res_p1 <- NULL
 res_p2 <- NULL
 

@@ -810,6 +810,6 @@ for (w in unique(sgi_long$well_num)) {
           panel.grid.minor = element_blank())
   
   ggsave(file.path("sgi_results", paste0(cfg$output_prefix, "_well", w, ".png")), p_well, width = 10, height = 4, dpi = 150)  
-  message("Plot saved: ", cfg$output_prefix, "_well_", w, ".png")
+  message("Plot saved: ", cfg$output_prefix, "_well", w, ".png")
 }
 #---- END --------------------------------------------------------------------

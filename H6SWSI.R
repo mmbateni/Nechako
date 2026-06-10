@@ -20,7 +20,7 @@ rm(list = ls())
 # ============================================================================
 # SECTION 1: PACKAGES
 # ============================================================================
-packages_needed <- c("tidyverse", "lubridate", "zoo", "ncdf4", "lmomco")
+packages_needed <- c("tidyverse", "lubridate", "zoo", "ncdf4", "lmomco", "terra")
 for (pkg in packages_needed) {
   if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
     install.packages(pkg, repos = "https://cran.rstudio.com/")
@@ -57,7 +57,11 @@ MIN_COMPLETENESS_PCT   <- 70
 MAX_FILL_DAYS          <- 14
 MIN_DAYS_PER_MONTH     <- 15
 
-# ── ERA5-Land Basin Bounding Box ─────────────────────────────────────────────
+# ── Basin Boundary (KMZ) ─────────────────────────────────────────────────────
+BASIN_KMZ_PATH <- "Spatial/nechakoBound_dissolve.kmz"   # used for spatial masking
+
+# ── ERA5-Land Reference Extent (informational; spatial filtering uses KMZ) ───
+#    Retained for quick sanity checks / fallback documentation only.
 BASIN_LAT_MIN  <- 52.5
 BASIN_LAT_MAX  <- 55.5
 BASIN_LON_MIN  <- -127.0
@@ -75,7 +79,47 @@ RESERVOIR_DATA_AVAILABLE <- TRUE  # ✓ GloLakes extraction provides storage
 PRIMARY_STATION <- "08JC002"  # Nechako R above Nautley R (naturalized available)
 
 # ============================================================================
-# SECTION 3: GLOLAKES RESERVOIR STORAGE LOADING
+# SECTION 3: BASIN BOUNDARY — Nechako polygon from KMZ
+# ============================================================================
+# Mirrors the pattern used in 1SPI_ERALand.R:
+#   unzip KMZ → extract embedded KML → load with terra::vect() → dissolve if
+#   needed → reproject on demand inside the ERA5 loader.
+# The resulting SpatVector is passed to load_era5_basin_mean() so every
+# ERA5 variable is cropped and masked to the exact basin outline before the
+# weighted mean is computed.
+
+load_basin_boundary <- function(kmz_path = BASIN_KMZ_PATH) {
+  cat("\n[Basin] Loading Nechako boundary from KMZ...\n")
+
+  if (!file.exists(kmz_path))
+    stop("Basin KMZ not found: ", kmz_path,
+         "\n  Expected at: Spatial/nechakoBound_dissolve.kmz\n",
+         "  Please check BASIN_KMZ_PATH in Section 2.")
+
+  tmp <- tempfile()
+  dir.create(tmp, showWarnings = FALSE)
+  utils::unzip(kmz_path, exdir = tmp)
+
+  kml_files <- list.files(tmp, pattern = "\\.kml$", full.names = TRUE,
+                          recursive = TRUE)
+  if (length(kml_files) == 0)
+    stop("No .kml found inside ", kmz_path)
+
+  v <- terra::vect(kml_files[1])
+  if (nrow(v) > 1L) v <- terra::aggregate(v)   # dissolve to single polygon
+  unlink(tmp, recursive = TRUE)
+
+  # Informational: report polygon area vs the hardcoded constant
+  area_km2 <- as.numeric(terra::expanse(
+    terra::project(v, "EPSG:3005"), unit = "km"))
+  cat(sprintf("  Basin boundary loaded  |  polygon area: %.0f km²  |  constant BASIN_AREA_KM2: %.0f km²\n",
+              area_km2, BASIN_AREA_KM2))
+
+  return(v)
+}
+
+# ============================================================================
+# SECTION 4: GLOLAKES RESERVOIR STORAGE LOADING
 # ============================================================================
 load_reservoir_storage <- function() {
   cat("\n[GloLakes] Loading reservoir storage from best-estimate extraction...\n")
@@ -97,7 +141,7 @@ load_reservoir_storage <- function() {
       month      = month(date),
       water_year = if_else(month >= WATER_YEAR_START_MONTH, year, year - 1L),
       n_lakes    = as.numeric(n_lakes_contributing),
-      products   = product                          # ← was products_used
+      products   = product                          
     ) %>%
     filter(!is.na(storage), storage >= 0, n_lakes >= 1) %>%
     dplyr::select(date, storage, year, month, water_year, n_lakes, products)
@@ -127,69 +171,104 @@ load_reservoir_storage <- function() {
 }
 
 # ============================================================================
-# SECTION 4: ERA5-LAND CLIMATE DATA LOADING
+# SECTION 5: ERA5-LAND CLIMATE DATA LOADING
 # ============================================================================
+# load_era5_basin_mean()  — reads one ERA5-Land NetCDF variable and returns a
+#   tibble of basin-mean monthly values.
+#
+# Spatial masking workflow (replaces the former bounding-box approach):
+#   1. Read the NetCDF as a terra SpatRaster.
+#   2. Decode the time dimension (handles both "seconds since 1970" and
+#      "hours since 1900" encodings used by different ERA5 downloads).
+#   3. Snap all timestamps to YYYY-MM-01 (same fix as before).
+#   4. If a basin SpatVector is supplied:
+#        a. Reproject it to match the raster CRS (ERA5 is WGS84; KMZ is too,
+#           but handled defensively).
+#        b. crop()  — trims the raster to the polygon bounding box.
+#        c. mask()  — sets cells outside the polygon to NA.
+#   5. Compute a cosine-latitude weighted mean over the remaining (in-basin)
+#      pixels for every time step.
+# ─────────────────────────────────────────────────────────────────────────────
+
 ERA5_EPOCH <- as.POSIXct("1900-01-01 00:00:00", tz = "UTC")
 
-load_era5_basin_mean <- function(nc_path, var_name,
-                                 lat_min = BASIN_LAT_MIN, lat_max = BASIN_LAT_MAX,
-                                 lon_min = BASIN_LON_MIN, lon_max = BASIN_LON_MAX) {
-  cat(sprintf("  ERA5: reading '%s' from %s\n", var_name, basename(nc_path)))
-  
-  nc <- ncdf4::nc_open(nc_path)
-  on.exit(ncdf4::nc_close(nc))
-  
-  lat      <- ncdf4::ncvar_get(nc, "latitude")
-  lon      <- ncdf4::ncvar_get(nc, "longitude")
-  time_raw <- ncdf4::ncvar_get(nc, "valid_time")
-  
+# Internal helper: decode ERA5 time from either common encoding.
+.era5_decode_dates <- function(r, nc_path) {
+  # Try terra's own time metadata first (works when the file is CF-compliant)
+  t <- terra::time(r)
+  if (!all(is.na(t))) return(as.Date(t))
+
+  # Fallback: read via ncdf4, respecting ERA5's two common time encodings
+  nc         <- ncdf4::nc_open(nc_path)
+  time_raw   <- ncdf4::ncvar_get(nc, "valid_time")
   time_units <- ncdf4::ncatt_get(nc, "valid_time", "units")$value
+  ncdf4::nc_close(nc)
+
   cat(sprintf("    time units: %s\n", time_units))
   cat(sprintf("    time_raw range: %.0f to %.0f\n", min(time_raw), max(time_raw)))
-  
+
   if (grepl("seconds since 1970", time_units, ignore.case = TRUE)) {
-    dates <- as.Date(as.POSIXct(time_raw, origin = "1970-01-01", tz = "UTC"))
+    as.Date(as.POSIXct(time_raw, origin = "1970-01-01", tz = "UTC"))
   } else if (grepl("hours since 1900", time_units, ignore.case = TRUE)) {
-    dates <- as.Date(ERA5_EPOCH + as.difftime(time_raw, units = "hours"))
+    as.Date(ERA5_EPOCH + as.difftime(time_raw, units = "hours"))
   } else {
-    dates <- as.Date(as.POSIXct(time_raw, origin = "1970-01-01", tz = "UTC"))
-    cat(sprintf("    WARNING: unrecognised time units '%s' — assuming Unix seconds\n", time_units))
+    cat(sprintf("    WARNING: unrecognised time units '%s' — assuming Unix seconds\n",
+                time_units))
+    as.Date(as.POSIXct(time_raw, origin = "1970-01-01", tz = "UTC"))
   }
-  
-  # ── CRITICAL: snap all timestamps to the 1st of their month ─────────────────
-  # ERA5-Land monthly files sometimes encode timestamps at day 2 (or at noon),
-  # so the three variables can have slightly different raw dates that share no
-  # exact match, causing inner_join to return 0 rows.  All values represent the
-  # calendar month, so flooring to YYYY-MM-01 is correct and lossless.
+}
+
+load_era5_basin_mean <- function(nc_path, var_name, basin_vect = NULL) {
+  cat(sprintf("  ERA5: reading '%s' from %s\n", var_name, basename(nc_path)))
+
+  # ── 1. Read as SpatRaster ────────────────────────────────────────────────
+  r <- terra::rast(nc_path)
+
+  # ── 2. Decode & snap time dimension ─────────────────────────────────────
+  dates <- .era5_decode_dates(r, nc_path)
+
+  # CRITICAL: snap all timestamps to 1st of month (ERA5 monthly files
+  # sometimes encode at day 2 or noon, causing inner_join mismatches).
   dates <- as.Date(format(dates, "%Y-%m-01"))
   cat(sprintf("    Dates after snap: %s to %s\n", min(dates), max(dates)))
-  
-  lat_idx <- which(lat >= lat_min & lat <= lat_max)
-  lon_idx <- which(lon >= lon_min & lon <= lon_max)
-  
-  if (length(lat_idx) == 0 | length(lon_idx) == 0)
-    stop(sprintf("No ERA5 cells found for '%s' within bounding box", var_name))
-  
-  start_vec <- c(min(lon_idx), min(lat_idx), 1)
-  count_vec <- c(length(lon_idx), length(lat_idx), length(dates))
-  data_3d   <- ncdf4::ncvar_get(nc, var_name, start = start_vec, count = count_vec)
-  data_3d[data_3d >= 9e36] <- NA
-  
-  lat_w <- cos(lat[lat_idx] * pi / 180)
-  
-  basin_mean <- vapply(seq_len(length(dates)), function(t) {
-    slice <- data_3d[, , t]
-    col_means <- apply(slice, 1, function(col_vals) {
-      valid <- !is.na(col_vals)
-      if (sum(valid) == 0) return(NA_real_)
-      weighted.mean(col_vals[valid], lat_w[valid])
-    })
-    mean(col_means, na.rm = TRUE)
-  }, numeric(1))
-  
-  # Use tibble to preserve Date class — data.frame() silently strips it to
-  # integer, and a subsequent as.Date() would then misinterpret those integers
-  # as days-since-epoch, producing corrupted dates.
+
+  # ── 3. Crop & mask to Nechako basin polygon ──────────────────────────────
+  if (!is.null(basin_vect)) {
+    # Reproject basin to the raster's native CRS (ERA5 = WGS84; defensive)
+    basin_proj <- if (!terra::same.crs(basin_vect, terra::crs(r)))
+      terra::project(basin_vect, terra::crs(r)) else basin_vect
+
+    r <- terra::crop(r, basin_proj, snap = "out")   # trim to bounding box
+    r <- terra::mask(r, basin_proj, touches = TRUE)  # zero-out outside basin
+
+    n_basin <- sum(!is.na(terra::values(r[[1]])))
+    cat(sprintf("    Basin pixels: %d (after KMZ mask)\n", n_basin))
+
+    if (n_basin == 0)
+      stop(sprintf("No ERA5 cells overlap the basin polygon for variable '%s'",
+                   var_name))
+  } else {
+    # No polygon supplied — fall back to bounding-box subsetting (legacy)
+    cat("    WARNING: no basin polygon supplied — using full raster extent\n")
+  }
+
+  # ── 4. Extract pixel matrix & compute cosine-latitude weighted mean ──────
+  # terra::values() returns ncell × nlyr; NA = outside basin or fill value
+  vals <- terra::values(r, mat = TRUE)
+  vals[vals >= 9e36] <- NA_real_   # ERA5 fill-value safety net
+
+  # Cell latitudes for cosine weighting (column 2 of xyFromCell = Y = lat)
+  cell_coords <- terra::xyFromCell(r, seq_len(terra::ncell(r)))
+  lat_w <- cos(cell_coords[, 2L] * pi / 180)
+
+  basin_mean <- vapply(seq_len(ncol(vals)), function(t) {
+    v  <- vals[, t]
+    ok <- !is.na(v)
+    if (sum(ok) == 0L) return(NA_real_)
+    weighted.mean(v[ok], lat_w[ok])
+  }, numeric(1L))
+
+  # ── 5. Assemble output tibble (same schema as before) ────────────────────
   out <- tibble::tibble(
     date       = dates,
     year       = lubridate::year(dates),
@@ -198,32 +277,33 @@ load_era5_basin_mean <- function(nc_path, var_name,
                                 lubridate::year(dates), lubridate::year(dates) - 1L)
   )
   out[[var_name]] <- basin_mean
-  
-  cat(sprintf("    Non-NA values: %d / %d\n", sum(!is.na(basin_mean)), length(basin_mean)))
+
+  cat(sprintf("    Non-NA values: %d / %d\n", sum(!is.na(basin_mean)),
+              length(basin_mean)))
   return(out)
 }
 
-load_era5_all <- function(era5_dir = INPUT_ERA5_DIR) {
+load_era5_all <- function(era5_dir = INPUT_ERA5_DIR, basin_vect = NULL) {
   cat("\n[ERA5-Land] Loading basin-averaged monthly climate data...\n")
-  
+
   # ✓ CONFIRMED FILES IN monthly_data_direct/
   f_snowc <- file.path(era5_dir, "snow_cover_monthly.nc")
   f_sd    <- file.path(era5_dir, "snow_depth_water_equivalent_monthly.nc")
   f_tp    <- file.path(era5_dir, "total_precipitation_monthly.nc")
-  
+
   for (f in c(f_snowc, f_sd, f_tp))
     if (!file.exists(f)) stop(paste("ERA5 file missing:", f))
-  
-  df_snowc <- load_era5_basin_mean(f_snowc, "snowc")
-  df_sd    <- load_era5_basin_mean(f_sd, "sd")
-  df_tp    <- load_era5_basin_mean(f_tp, "tp")
-  
+
+  df_snowc <- load_era5_basin_mean(f_snowc, "snowc", basin_vect = basin_vect)
+  df_sd    <- load_era5_basin_mean(f_sd,    "sd",    basin_vect = basin_vect)
+  df_tp    <- load_era5_basin_mean(f_tp,    "tp",    basin_vect = basin_vect)
+
   # Sanity check: confirm all three date vectors align before joining
   cat(sprintf("  Pre-join date ranges:\n"))
   cat(sprintf("    snowc: %s to %s (%d rows)\n", min(df_snowc$date), max(df_snowc$date), nrow(df_snowc)))
   cat(sprintf("    sd:    %s to %s (%d rows)\n", min(df_sd$date),    max(df_sd$date),    nrow(df_sd)))
   cat(sprintf("    tp:    %s to %s (%d rows)\n", min(df_tp$date),    max(df_tp$date),    nrow(df_tp)))
-  
+
   era5 <- df_snowc %>%
     inner_join(df_sd  %>% dplyr::select(date, sd), by = "date") %>%
     inner_join(df_tp  %>% dplyr::select(date, tp), by = "date") %>%
@@ -239,14 +319,14 @@ load_era5_all <- function(era5_dir = INPUT_ERA5_DIR) {
     mutate(precip_ytd_Mm3 = cumsum(precip_Mm3),
            precip_ytd_mm  = cumsum(precip_mm)) %>%
     ungroup()
-  
+
   cat(sprintf("  ERA5 merged: %d months (%s to %s)\n",
               nrow(era5), min(era5$date), max(era5$date)))
   return(era5)
 }
 
 # ============================================================================
-# SECTION 5: SNOW PILLOW BIAS CORRECTION
+# SECTION 6: SNOW PILLOW BIAS CORRECTION
 # ============================================================================
 load_all_snow_pillows <- function(pillow_dir = INPUT_SNOWPILLOW_DIR) {
   if (!dir.exists(pillow_dir)) {
@@ -352,7 +432,7 @@ bias_correct_era5_swe <- function(era5_data, pillow_data) {
 }
 
 # ============================================================================
-# SECTION 6: WSC DISCHARGE DATA LOADING
+# SECTION 7: WSC DISCHARGE DATA LOADING
 # ============================================================================
 load_discharge_data <- function(station_id, data_path = INPUT_WSC_DIR) {
   patterns <- c(
@@ -473,7 +553,7 @@ aggregate_to_monthly_volume <- function(daily_data) {
 }
 
 # ============================================================================
-# SECTION 7: STREAMFLOW FORECAST MODELS
+# SECTION 8: STREAMFLOW FORECAST MODELS
 # ============================================================================
 build_forecast_models <- function(era5_data, monthly_vol_primary) {
   cat("\n[Forecast] Building seasonal streamflow regression models...\n")
@@ -586,7 +666,7 @@ build_forecast_models <- function(era5_data, monthly_vol_primary) {
 }
 
 # ============================================================================
-# SECTION 8: NONEXCEEDANCE PROBABILITY & COMPONENT INDEX
+# SECTION 9: NONEXCEEDANCE PROBABILITY & COMPONENT INDEX
 # ============================================================================
 compute_weibull_prob <- function(hist_vals, x_new) {
   v <- sort(hist_vals[!is.na(hist_vals)])
@@ -663,7 +743,7 @@ compute_component_index <- function(df, value_col, label) {
 }
 
 # ============================================================================
-# SECTION 9: FULL SWSI COMPUTATION (Garen 1993)
+# SECTION 10: FULL SWSI COMPUTATION (Garen 1993)
 # ============================================================================
 compute_swsi <- function(era5_data, monthly_vol, forecast_result, 
                          reservoir_data, station_id) {
@@ -724,7 +804,7 @@ compute_swsi <- function(era5_data, monthly_vol, forecast_result,
 }
 
 # ============================================================================
-# SECTION 10: DROUGHT EVENT IDENTIFICATION
+# SECTION 11: DROUGHT EVENT IDENTIFICATION
 # ============================================================================
 identify_swsi_droughts <- function(swsi_df, station_id=NULL) {
   if (is.null(swsi_df)) return(NULL)
@@ -785,18 +865,23 @@ identify_swsi_droughts <- function(swsi_df, station_id=NULL) {
 }
 
 # ============================================================================
-# SECTION 11: MAIN PROCESSING
+# SECTION 12: MAIN PROCESSING
 # ============================================================================
 cat("\n", strrep("=",70), "\n",
     "SWSI COMPUTATION — Nechako Basin (Garen 1993)\n",
     "Data: GloLakes v2 (1984+) + ERA5-Land + WSC\n",
     strrep("=",70), "\n", sep="")
 
-# ── A: Load Reservoir Storage (GloLakes) ─────────────────────────────────────
+# ── A: Load Basin Boundary ────────────────────────────────────────────────────
+# Must succeed before ERA5 loading; the KMZ polygon is the authoritative
+# spatial filter for all ERA5-Land variables.
+basin_vect <- load_basin_boundary(BASIN_KMZ_PATH)
+
+# ── B: Load Reservoir Storage (GloLakes) ─────────────────────────────────────
 reservoir_data <- load_reservoir_storage()
 
-# ── B: Load ERA5-Land Climate ────────────────────────────────────────────────
-era5_raw  <- load_era5_all(INPUT_ERA5_DIR)
+# ── C: Load ERA5-Land Climate (masked to Nechako basin polygon) ──────────────
+era5_raw    <- load_era5_all(INPUT_ERA5_DIR, basin_vect = basin_vect)
 pillow_data <- load_all_snow_pillows(INPUT_SNOWPILLOW_DIR)
 era5_data   <- bias_correct_era5_swe(era5_raw, pillow_data)
 
@@ -804,7 +889,7 @@ write.csv(era5_data, file.path(MAIN_OUTPUT_DIR, "era5_extracted",
                                "era5_basin_monthly_corrected.csv"),
           row.names = FALSE)
 
-# ── C: Load Streamflow Data ──────────────────────────────────────────────────
+# ── D: Load Streamflow Data ──────────────────────────────────────────────────
 stations <- data.frame(
   StationID   = c("08JC001", "08JC002", "08JB002", "08JA015"),
   Name        = c("Nechako R at Vanderhoof", "Nechako R above Nautley R",
@@ -843,7 +928,7 @@ for (i in seq_len(nrow(stations))) {
 if (is.null(forecast_result))
   stop(sprintf("Primary station %s not processed", PRIMARY_STATION))
 
-# ── D: Compute SWSI ──────────────────────────────────────────────────────────
+# ── E: Compute SWSI ──────────────────────────────────────────────────────────
 all_swsi     <- list()
 all_droughts <- list()
 
@@ -868,7 +953,7 @@ for (sid in names(all_monthly_vol)) {
   }
 }
 
-# ── E: Save Master Results ───────────────────────────────────────────────────
+# ── F: Save Master Results ───────────────────────────────────────────────────
 all_results <- list(
   stations        = stations,
   era5_data       = era5_data,
@@ -890,13 +975,13 @@ all_results <- list(
     reservoir_source  = "GloLakes v2 (Hou et al. 2024)",
     era5_variables    = c("snowc", "sd (SWE)", "tp (precip)"),
     processed_date    = Sys.Date(),
-    script_version    = "3.0_complete_GloLakes_corrected_paths"
+    script_version    = "3.1_KMZ_basin_mask"
   )
 )
 
 saveRDS(all_results, file.path(MAIN_OUTPUT_DIR, "all_results_swsi.rds"))
 
-# ── F: Summary Report ────────────────────────────────────────────────────────
+# ── G: Summary Report ────────────────────────────────────────────────────────
 cat(sprintf("\n%s\n", strrep("=",70)))
 cat("SWSI ANALYSIS SUMMARY — Nechako Basin\n")
 cat(sprintf("%s\n", strrep("=",70)))

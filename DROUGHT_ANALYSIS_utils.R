@@ -102,7 +102,12 @@ TIMESCALES_SPATIAL  <- SPI_SCALES          # used by spme codes for spatial figu
 MONTH_NAMES    <- c("Jan", "Feb", "Mar", "Apr", "May", "Jun",
                     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
-## A2. PRECIPITATION UNIT DETECTION ──────────────────────────────────
+## A2. PRECIPITATION UNIT DETECTION & SAFE SCALING ───────────────────
+#' Two companion functions:
+#'   detect_precip_unit()   — inspect one layer and return the conversion factor
+#'   apply_precip_scaling() — apply that factor + days_in_month safely (use this
+#'                            in callers instead of writing the if/multiply inline)
+#'
 #' Detect the unit of a precipitation (or PET) raster by sampling a summer
 #' layer and comparing the basin-mean value against known physical ranges.
 #'
@@ -192,6 +197,53 @@ detect_precip_unit <- function(raster_obj,
     if (is.na(factor)) "NA (mm/month — skip scaling)" else as.character(factor)))
   
   list(factor = factor, unit_in = unit_in, mean_val = mean_val)
+}
+
+#' Apply the unit conversion returned by detect_precip_unit() and then scale
+#' by days_in_month — in the correct order and with a hard stop if the input
+#' is already in mm/month (factor = NA), which would otherwise cause a silent
+#' ×28–31 over-inflation if the days_in_month multiply ran unconditionally.
+#'
+#' Replace the unsafe inline pattern:
+#'   if (!is.na(precip_unit$factor) && precip_unit$factor != 1)
+#'     precip <- precip * precip_unit$factor
+#'   precip <- precip * days_in_month          # ← bug: always ran, even for NA
+#'
+#' With:
+#'   precip <- apply_precip_scaling(precip, precip_unit, days_in_month)
+#'
+#' @param raster_obj    SpatRaster to scale (modified in-place via terra copy-on-modify).
+#' @param precip_unit   List returned by detect_precip_unit() — must have $factor.
+#' @param days_in_month Integer vector of length nlyr(raster_obj) giving the number
+#'                      of days in each layer's month (used for mm/day → mm/month).
+#' @return Scaled SpatRaster in mm/month.
+apply_precip_scaling <- function(raster_obj, precip_unit, days_in_month) {
+  
+  factor <- precip_unit$factor
+  
+  ## ── Guard: mm/month input must not be re-scaled by days ────────────────────
+  if (is.na(factor)) {
+    stop(
+      "apply_precip_scaling: detect_precip_unit returned factor = NA, which means\n",
+      "  the input raster appears to be in mm/month already (mean > 20).\n",
+      "  Multiplying by days_in_month would inflate every value by ~28-31x.\n",
+      "  Review your input NetCDF: if it really is mm/month, return it as-is\n",
+      "  without any further scaling.  If it is mm/day, re-check the detection\n",
+      "  thresholds in detect_precip_unit() for your study region.")
+  }
+  
+  ## ── Step 1: m/day → mm/day (only when factor = 1000) ──────────────────────
+  if (factor != 1) {
+    cat(sprintf("  [apply_precip_scaling] Applying × %.0f (%s → mm/day)\n",
+                factor, precip_unit$unit_in))
+    raster_obj <- raster_obj * factor
+  }
+  
+  ## ── Step 2: mm/day → mm/month ─────────────────────────────────────────────
+  raster_obj <- raster_obj * days_in_month
+  cat("  [apply_precip_scaling] Days-in-month scaling applied → mm/month\n")
+  
+  raster_obj
 }
 
 ## B. BASIN-AVERAGED CSV LOADER ─────────────────────────────────────

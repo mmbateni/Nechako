@@ -655,7 +655,7 @@ identify_droughts <- function(data, thresholds,
     return(list(daily_data = data, drought_events = NULL, message = "Insufficient data"))
   }
   
-  data$doy <- ifelse(leap_year(data$year) & data$doy > 366, 366, data$doy)
+  data$doy <- ifelse(leap_year(data$year) & data$doy > 366, 365, data$doy)
   data     <- merge(data, thresholds[, c("doy", "threshold_smooth")],
                     by = "doy", all.x = TRUE)
   data     <- data[order(data$date), ]
@@ -1036,8 +1036,9 @@ all_results <- list(
     interpolation_method      = "monoH.FC (Fritsch-Carlson PCHIP)",
     # Pipeline A
     pipeline_a                = "Raut & Ganguli (2024) variable threshold",
-    threshold_exceedance_prob = 0.80,        # 80% exceedance
-    threshold_quantile_prob   = THRESHOLD_EXCEEDANCE_PROB,   # probs= = 0.20
+    threshold_quantile_prob   = THRESHOLD_EXCEEDANCE_PROB,              # 0.20 — the probs= argument passed to quantile()
+    threshold_exceedance_prob = 1 - THRESHOLD_EXCEEDANCE_PROB,          # 0.80 — derived (1 - quantile_prob); 80% of days exceed Q20
+    threshold_note            = "Q20 = quantile(probs=0.20); 80% of daily flows exceed this value (low-flow threshold)",
     threshold_window_days     = THRESHOLD_WINDOW_SIZE,
     min_drought_duration_days = MIN_DROUGHT_DURATION_DAYS,
     # Pipeline B

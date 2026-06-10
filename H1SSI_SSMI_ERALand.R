@@ -26,6 +26,12 @@
 #   • CSV    per calendar month
 #   • Excel  workbook (all calendar months as sheets)
 #   • Summary .txt file
+# Layer 4 (100–289 cm) contributes 65 % of the weight in L1_4.
+# ERA5-Land layer 4 has known
+# lower temporal variability than the shallow layers, 
+# so L1_4 will inherently produce lowervariance index values than L1_3, 
+# affecting drought frequency comparisons between the two
+# configurations
 ##############################################
 
 # ---- Libraries ----
@@ -243,8 +249,8 @@ compute_ssi <- function(v, scale, dates_vec, eps = 1e-6) {
 
   # Clamp to ±4.75 (matches SPI script)
   fin <- is.finite(z)
-  z[fin & z < -4.75] <- -4.75
-  z[fin & z >  4.75] <-  4.75
+  z[fin & z < -4.8] <- -4.8
+  z[fin & z >  4.8] <-  4.8
 
   list(ssi = z, method = method_used)
 }
@@ -653,9 +659,6 @@ write_summary <- function(summaries, index_name, out_dir) {
                       r$n_zvar, r$pct_zvar))
         }
       }
-
-      # Drought frequency from stored indices
-      idx_mat <- s$ssi_indices
   }# end if (index_name == "SSI")
 
 # Drought frequency — for both SSI and SSMI

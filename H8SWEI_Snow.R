@@ -282,18 +282,15 @@ if (scf_method == "3") {
   cat(sprintf("✓ SSPI-1 reference period: %s to %s (%d months)\n",
               dates[ref_idx[1]], dates[ref_idx[length(ref_idx)]], length(ref_idx)))
   
-  # Zero-inflation screening: exclude pixels with >50% zero SWE in reference period
-  cat("\n===== ZERO-INFLATION SCREENING (SSPI-1) =====\n")
-  ref_swe_sspi   <- swe_matrix[, ref_idx, drop = FALSE]
-  zero_prop_sspi <- rowMeans(ref_swe_sspi <= 0, na.rm = TRUE)
-  invalid_pix_sspi <- which(zero_prop_sspi > 0.50)
-  valid_pix_sspi   <- which(zero_prop_sspi <= 0.50)
-  cat(sprintf("✓ Valid pixels (<=50%% zero SWE in ref period): %d (%.1f%%)\n",
-              length(valid_pix_sspi), 100 * length(valid_pix_sspi) / n_pixels))
-  if (length(invalid_pix_sspi) > 0) {
-    cat(sprintf("  Excluded pixels (>50%% zero SWE): %d\n", length(invalid_pix_sspi)))
-    swe_matrix[invalid_pix_sspi, ] <- NA
-  }
+  # Zero-inflation pre-screen removed.
+  # The basin-global screen (rowMeans across all months) incorrectly excluded
+  # seasonal pixels that are snow-free in summer but snow-covered in winter,
+  # because their annual zero fraction can exceed 50% even though their winter
+  # months are valid.  monthly_sspi() handles zero-inflation correctly per
+  # calendar month: p0 is estimated from that month's reference sample only,
+  # and months where all reference values are zero hit the zero-variance path
+  # (method = 3, SSPI = 0) rather than being excluded entirely.
+  invalid_pix_sspi <- integer(0)   # retained so the summary writer below compiles
   
 } else if (scf_method == "1") {
   
@@ -661,7 +658,7 @@ n_cores <- max(1L, detectCores() - 1L)
 cat(sprintf("\n✓ Starting parallel cluster with %d cores\n", n_cores))
 dir.create(tempdir(), recursive = TRUE, showWarnings = FALSE)
 cl <- makeCluster(n_cores)
-
+clusterSetRNGStream(cl, iseed = 40L)   # ← random seed setting
 if (scf_method == "3") {
   clusterExport(cl, varlist = c("monthly_sspi", "clip_prob",
                                 "swe_matrix", "dates", "ref_idx"),
@@ -813,6 +810,7 @@ for (sc in timescales) {
   # ==============================================================================
   #   CALCULATE BASIN-AVERAGED SWEI
   # ==============================================================================
+  set.seed(40L)   #  seeds the runif() zero-perturbation
   avg_swei_out <- tryCatch(
     gringorten_swei_seasonal(swe_basin_avg_smoothed, dates, scf_mask_list,
                              cell_index = NULL, basin_scf_mask = basin_scf_mask,
@@ -842,7 +840,6 @@ for (sc in timescales) {
   extreme_wet  <- sum(swei_indices >  3.0, na.rm = TRUE)
   cat(sprintf("  Extreme values (|SWEI| > 3): %d dry, %d wet (retained, no clipping)\n",
               extreme_dry, extreme_wet))
-  basin_mask_swei  <- !is.na(swe_smoothed)
   na_rate_basin  <- 100 * mean(is.na(swei_indices))
   cat(sprintf("  NA rate (basin): %.3f%%\n", na_rate_basin))
   
@@ -932,7 +929,7 @@ for (sc in timescales) {
        main   = sprintf("SWEI-%d: Seasonal Method", sc),
        axes   = FALSE, box = FALSE)
   if (!is.null(basin)) plot(basin, add = TRUE, border = "darkgray", lwd = 1.5)
-  valid_pixels <- sum(!is.na(values(swe)))
+  valid_pixels <- sum(!is.na(values(swe[[24]])))
   mtext(sprintf("Valid pixels: %d | Gringorten: %.1f%%", valid_pixels, gringorten_pct),
         side = 1, line = 1, cex = 0.75, col = "gray30")
   # -- Panel 2: Legend --
@@ -1038,11 +1035,15 @@ if (scf_method == "3") {
         file = summary_combined_file, append = TRUE)
     cat(sprintf("Reference period: %s to %s\n", sspi_ref_start, sspi_ref_end),
         file = summary_combined_file, append = TRUE)
-    cat("\nZero-Inflation Screening:\n",
+    cat("\nZero-Inflation Handling:\n",
         file = summary_combined_file, append = TRUE)
-    cat(sprintf("  Excluded pixels (>50%% zero SWE in ref period): %d (%.1f%%)\n",
-                length(invalid_pix_sspi),
-                100 * length(invalid_pix_sspi) / n_pixels),
+    cat("  Basin-global pre-screen removed (was incorrectly excluding seasonal pixels).\n",
+        file = summary_combined_file, append = TRUE)
+    cat("  Zero-inflation is handled per calendar month inside monthly_sspi():\n",
+        file = summary_combined_file, append = TRUE)
+    cat("  p0 estimated from that month's reference sample; all-zero months\n",
+        file = summary_combined_file, append = TRUE)
+    cat("  use the zero-variance path (method = 3, SSPI assigned 0).\n",
         file = summary_combined_file, append = TRUE)
     cat("\nMethodology:\n",
         file = summary_combined_file, append = TRUE)

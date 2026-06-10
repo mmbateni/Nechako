@@ -664,8 +664,9 @@ vines_warm4 <- fit_vine_pair(u_warm4, cfg$dvine_order_4A, cfg$dvine_order_4B, "W
 saveRDS(vines_warm4, file.path(cfg$out_dir, "vines_warm4.rds"))
 
 # ==============================================================================
-# 9.  VINE CDF EVALUATION  (full record, using best structure per season)
+# ==== SECTION 9: VINE CDF EVALUATION ====
 # ==============================================================================
+set.seed(40L)   # ← random seeds pvinecop() MC integration
 cat("\n", strrep("=", 60), "\n  EVALUATING VINE CDF (full record)\n",
     strrep("=", 60), "\n\n", sep = "")
 
@@ -680,18 +681,22 @@ all_warm <- all_raw |>
   select(date, all_of(u_cols_warm)) |>
   drop_na()
 
+# for snow season
 p_snow_best <- pvinecop(
-  as.matrix(all_snow[, u_cols]),
+  `colnames<-`(as.matrix(all_snow[, u_cols]), var_list),
   vines_snow5$best, n_mc = cfg$n_mc
 )
+
+# for warm season
 p_warm_best <- pvinecop(
-  as.matrix(all_warm[, u_cols_warm]),
+  `colnames<-`(as.matrix(all_warm[, u_cols_warm]), var_list_warm),
   vines_warm4$best, n_mc = cfg$n_mc
 )
 
 # ==============================================================================
-# 10. KENDALL DISTRIBUTION ESTIMATION VIA MONTE-CARLO
+# ==== SECTION 10: KENDALL DISTRIBUTION ESTIMATION VIA MONTE-CARLO ====
 # ==============================================================================
+set.seed(40L)   # ← random seeds rvinecop() inside estimate_kendall_cdf()
 cat("\n  Estimating Kendall distributions (MC, n =",
     format(cfg$n_kc_sim, big.mark = ","), ") …\n")
 
@@ -716,13 +721,14 @@ seasonal_out <- bind_rows(
 ) |> arrange(date)
 
 # ==============================================================================
-# 12. COMPONENT CONTRIBUTION SCORES — SEASONAL
+# ==== SECTION 12: COMPONENT CONTRIBUTIONS - SEASONAL  ==== 
 # ==============================================================================
 # For each observation and variable, estimate how much that variable's anomaly
 # drives the joint drought.  Method: compute vine CDF with that variable's
 # pseudo-obs replaced by the neutral level (0.50) and take the difference
 # from the original CDF.  Larger positive difference = larger contribution to
 # drought (variable pulled the joint probability down).
+set.seed(40L)   # ← random seeds pvinecop() inside compute_contributions()
 
 cat(strrep("=", 60),
     "\n  COMPUTING COMPONENT CONTRIBUTIONS\n",
@@ -875,7 +881,7 @@ if (cfg$run_bootstrap) {
   cat("\n", strrep("=", 60), "\n  BOOTSTRAP (n = ", cfg$n_boot, ")\n",
       strrep("=", 60), "\n\n", sep = "")
   
-  set.seed(2024L)
+  set.seed(40L)
   # Bootstrap on seasonal data separately, then combine
   boot_msdi_snow <- matrix(NA_real_, nrow = nrow(all_snow), ncol = cfg$n_boot)
   boot_msdi_warm <- matrix(NA_real_, nrow = nrow(all_warm), ncol = cfg$n_boot)
@@ -1088,24 +1094,38 @@ if (requireNamespace("GGally", quietly = TRUE)) {
 }
 # ── Plot 6: Drought event severity vs duration scatter ───────────────────
 if (nrow(drought_minor) > 0) {
-  p6  <- ggplot(drought_minor,
-                aes(duration_months, severity, colour = drought_class,
-                    size = abs(peak_msdi), label = format(start_date, "%Y-%m"))) +
-    geom_point(alpha = 0.8) +
-    ggrepel::geom_text_repel(size = 3, max.overlaps = 15,
-                             show.legend = FALSE) +
-    scale_colour_manual(values = c(Moderate = "#fdae61", Severe = "#d73027",
-                                   Extreme  = "#a50026"),
-                        name = "Peak class") +
-    scale_size_continuous(range = c(2, 8), name = "|Peak MSDI|") +
-    labs(title    = "Nechako Drought Event Catalogue (MSDI  < −1.0)",
-         x = "Duration (months)", y = "Severity (deficit sum)") +
-    theme_bw(base_size = 11) +
-    theme(plot.title = element_text(face = "bold"))
-  # ggrepel is optional; fall back to geom_text if unavailable
   if (!requireNamespace("ggrepel", quietly = TRUE)) {
-    p6 <- p6 + geom_text(size = 3, vjust = -0.8, show.legend = FALSE)
+    # Fallback build if ggrepel is not installed
+    p6 <- ggplot(drought_minor,
+                 aes(duration_months, severity, colour = drought_class,
+                     size = abs(peak_msdi), label = format(start_date, "%Y-%m"))) +
+      geom_point(alpha = 0.8) +
+      geom_text(size = 3, vjust = -0.8, show.legend = FALSE) +
+      scale_colour_manual(values = c(Moderate = "#fdae61", Severe = "#d73027",
+                                     Extreme  = "#a50026"),
+                          name = "Peak class") +
+      scale_size_continuous(range = c(2, 8), name = "|Peak MSDI|") +
+      labs(title    = "Nechako Drought Event Catalogue (MSDI < −1.0)",
+           x = "Duration (months)", y = "Severity (deficit sum)") +
+      theme_bw(base_size = 11) +
+      theme(plot.title = element_text(face = "bold"))
+  } else {
+    # Standard build with ggrepel
+    p6 <- ggplot(drought_minor,
+                 aes(duration_months, severity, colour = drought_class,
+                     size = abs(peak_msdi), label = format(start_date, "%Y-%m"))) +
+      geom_point(alpha = 0.8) +
+      ggrepel::geom_text_repel(size = 3, max.overlaps = 15, show.legend = FALSE) +
+      scale_colour_manual(values = c(Moderate = "#fdae61", Severe = "#d73027",
+                                     Extreme  = "#a50026"),
+                          name = "Peak class") +
+      scale_size_continuous(range = c(2, 8), name = "|Peak MSDI|") +
+      labs(title    = "Nechako Drought Event Catalogue (MSDI < −1.0)",
+           x = "Duration (months)", y = "Severity (deficit sum)") +
+      theme_bw(base_size = 11) +
+      theme(plot.title = element_text(face = "bold"))
   }
+  
   ggsave(file.path(cfg$out_dir, "plot6_drought_event_scatter.png"),
          p6, width = 8, height = 6, dpi = 250)
   cat("  Plot 6: Drought event severity vs duration\n")
