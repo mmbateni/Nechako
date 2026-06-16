@@ -13,7 +13,7 @@
 # "GEOLAKES"   — filter the GeoLakes / HydroLAKES dataset to the
 # Nechako Reservoir entry using its HydroLAKES_ID.
 # Expects same format as Pipeline 1 but for a single lake:
-# columns  date, storage_Mm3  (or similar, see GEOLAKES_*
+# columns  date, storage_m3  (or similar, see GEOLAKES_*
 # settings).
 # "LOCAL_CSV"  — import a CSV exported from a local water authority
 # Two sub-options (LOCAL_DATA_TYPE):
@@ -38,11 +38,10 @@ rm(list = ls())
 OUT_DIR <- "ntsdi_results"
 dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
 sink(file.path(OUT_DIR, "console_log.txt"), append = TRUE, split = TRUE)
-
 # ============================================================================
 # PACKAGES
 # ============================================================================
-packages <- c("tidyverse", "lubridate", "zoo","ggplot2","dplyr")
+packages <- c("tidyverse", "lubridate", "zoo","ggplot2","dplyr","readxl")
 for (p in packages) {
   if (!require(p, character.only = TRUE)) {
     install.packages(p)
@@ -165,7 +164,11 @@ NECHAKO_TOL  <- 0.01      # tight tolerance — exact centroid known
 # CSV exported from reservoir operations reports, BCWIS, or similar.
 # Path to your daily level file
 LOCAL_CSV_FILE    <- "D:/Nechako_Drought/Nechako/Lakes/dailylevel.csv"
-
+Storage_curve <- read_excel("./Storage curve.xlsx")
+# ----------------------------------------------------------------------------
+# Hardcoded stage-storage curve: Elevation (ft) vs Storage (hm³)
+# Source: Storage curve.xlsx in working directory
+# ----------------------------------------------------------------------------
 # Choose data type: "STORAGE", "LEVEL", or "LEVEL_DAILY"
 # "LEVEL_DAILY" is for files with Year, Day-of-Year, and Level columns (no header)
 LOCAL_DATA_TYPE   <- "LEVEL_DAILY" 
@@ -179,14 +182,10 @@ LOCAL_DATE_FORMAT <- "%Y-%m-%d"
 # Replace the placeholder rows below with actual stage–volume data.
 # The Nechako Reservoir operating range is approximately 850–854 m ASL
 # (2790–2800 ft); max. depth 305 m; surface area ~890 km².
-# Format: data.frame with columns  level_m  and  storage_Mm3
-HYPSO_TABLE <- data.frame(
-  level_m     = c(842.0, 844.0, 846.0, 848.0, 849.0,
-                  850.0, 851.0, 852.0, 853.0, 854.0, 855.0),
-  storage_Mm3 = c(11000, 13000, 15500, 18500, 20000,
-                  21500, 22500, 23000, 23400, 23700, 24000)
-  # ↑ PLACEHOLDER VALUES — replace with real Rio-Tinto  stage–volume curve data
-)
+# Format: data.frame with columns  level_m  and  storage_m3
+level_m <- Storage_curve$`Elevation (ft)`*0.3048
+storage_m3 <- Storage_curve$`Storage (hm³)`*1000000
+HYPSO_TABLE <- data.frame(level_m,storage_m3) %>%  arrange(level_m)
 
 # ============================================================================
 # ── SECTION 4 ──  SHARED ALGORITHM SETTINGS
@@ -211,7 +210,7 @@ level_to_storage <- function(level_vec, hypso = HYPSO_TABLE) {
   stopifnot(
     is.data.frame(hypso),
     "level_m"     %in% names(hypso),
-    "storage_Mm3" %in% names(hypso)
+    "storage_m3" %in% names(hypso)
   )
   hypso <- hypso[order(hypso$level_m), ]   # ensure ascending order
   
@@ -228,7 +227,7 @@ level_to_storage <- function(level_vec, hypso = HYPSO_TABLE) {
   # approx() performs piecewise-linear interpolation; rule = 1 → NA outside range
   approx(
     x      = hypso$level_m,
-    y      = hypso$storage_Mm3,
+    y      = hypso$storage_m3,
     xout   = level_vec,
     method = "linear",
     rule   = 1       # NA outside table range; change to 2 to extrapolate
@@ -237,7 +236,7 @@ level_to_storage <- function(level_vec, hypso = HYPSO_TABLE) {
 
 # ---- 5b. Core TSDI / NTSDI computation  (Awange et al. 2016) ---------------
 # Arguments:
-#   df_in           — data frame with columns: date, storage_Mm3
+#   df_in           — data frame with columns: date, storage_m3
 #   drought_class_c — Palmer class (negative number)
 #   use_smoothing   — logical
 #   smooth_window   — integer (months)
@@ -251,7 +250,7 @@ compute_tsdi <- function(df_in,
                          label           = "TSDI") {
   stopifnot(
     "date"        %in% names(df_in),
-    "storage_Mm3" %in% names(df_in)
+    "storage_m3" %in% names(df_in)
   )
   df <- df_in %>%
     mutate(
@@ -265,8 +264,8 @@ compute_tsdi <- function(df_in,
   if (use_smoothing) {
     df <- df %>%
       mutate(
-        storage_Mm3 = zoo::rollmean(
-          storage_Mm3,
+        storage_m3 = zoo::rollmean(
+          storage_m3,
           k     = smooth_window,
           fill  = NA,
           align = "center"
@@ -280,9 +279,9 @@ compute_tsdi <- function(df_in,
   monthly_stats <- df %>%
     group_by(month) %>%
     summarise(
-      clim_mean = mean(storage_Mm3, na.rm = TRUE),
-      clim_max  = max( storage_Mm3, na.rm = TRUE),
-      clim_min  = min( storage_Mm3, na.rm = TRUE),
+      clim_mean = mean(storage_m3, na.rm = TRUE),
+      clim_max  = max( storage_m3, na.rm = TRUE),
+      clim_min  = min( storage_m3, na.rm = TRUE),
       .groups   = "drop"
     )
   df <- left_join(df, monthly_stats, by = "month")
@@ -290,7 +289,7 @@ compute_tsdi <- function(df_in,
   # ── Total Storage Deficit  (TSD %) — Eq. 1 ───────────────────────────────
   df <- df %>%
     mutate(
-      TSD = (storage_Mm3 - clim_mean) /
+      TSD = (storage_m3 - clim_mean) /
         (clim_max    - clim_min  ) * 100
     )
   
@@ -303,7 +302,10 @@ compute_tsdi <- function(df_in,
   # most negative cumulative TSD value (deepest deficit).  This is more robust
   # than picking the longest run, which can be very short when the record is
   # dominated by a single wet or dry phase and produces p outside (0,1).
-  is_dry <- df$TSD < 0
+  # Filter to valid TSD rows before RLE to prevent NA gaps from breaking dry runs.
+  df_valid <- df[!is.na(df$TSD), ]
+  
+  is_dry <- df_valid$TSD < 0
   r      <- rle(is_dry)
   ends   <- cumsum(r$lengths)
   starts <- ends - r$lengths + 1
@@ -314,11 +316,11 @@ compute_tsdi <- function(df_in,
   }
   
   # Score each dry run by the cumulative TSD at its endpoint (most negative = worst)
-  run_scores <- sapply(dry_runs, function(ri) df$cumulative_TSD[ends[ri]])
+  run_scores <- sapply(dry_runs, function(ri) df_valid$cumulative_TSD[ends[ri]])
   deepest_run <- dry_runs[which.min(run_scores)]
   dry_start   <- starts[deepest_run]
   dry_end     <- ends[deepest_run]
-  drought_df <- df[dry_start:dry_end, ] %>%
+  drought_df <- df_valid[dry_start:dry_end, ] %>%
     mutate(drought_time = seq_len(n()))
   
   if (nrow(drought_df) < 6) {
@@ -326,7 +328,7 @@ compute_tsdi <- function(df_in,
     longest_run <- dry_runs[which.max(r$lengths[dry_runs])]
     dry_start   <- starts[longest_run]
     dry_end     <- ends[longest_run]
-    drought_df  <- df[dry_start:dry_end, ] %>%
+    drought_df  <- df_valid[dry_start:dry_end, ] %>%
       mutate(drought_time = seq_len(n()))
     message(label, ": deepest-deficit episode < 6 months; falling back to longest dry run.")
   }
@@ -427,7 +429,7 @@ compute_tsdi <- function(df_in,
 }
 
 # ---- 5c. Diagnostic plots for a single pipeline ----------------------------
-plot_pipeline <- function(res, label, basin_label) {
+plot_pipeline <- function(res, label, basin_label, storage_units_label = "Mm³") {
   df         <- res$data
   index_col  <- label
   norm_col   <- paste0(label, "_norm")
@@ -442,7 +444,7 @@ plot_pipeline <- function(res, label, basin_label) {
   )
   
   # ── Plot 1 — Storage ───────────────────────────────────────────────────
-  p1 <- ggplot(df, aes(date, storage_Mm3)) +
+  p1 <- ggplot(df, aes(date, storage_m3)) +
     geom_rect(
       data = dband,
       aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
@@ -453,7 +455,7 @@ plot_pipeline <- function(res, label, basin_label) {
       title    = paste(basin_label, "— Lake Storage"),
       subtitle = "Shaded band = dominant drought episode used for calibration",
       x        = NULL,
-      y        = "Storage (Mm³)"
+      y        = paste0("Storage (", storage_units_label, ")")
     ) +
     theme_bw(base_size = 12)
   print(p1)
@@ -546,7 +548,7 @@ print_summary <- function(res, label, out_file) {
 assess_annual_coverage <- function(df, min_coverage = 0.70,
                                    require_consecutive = 5L,
                                    expected_obs_per_year = NULL) {
-  # df must have columns: year, storage_Mm3
+  # df must have columns: year, storage_m3
   # Returns a list: $table (year-by-year) and $first_stable_year
   #
   # expected_obs_per_year: the number of valid observations per year that
@@ -560,7 +562,7 @@ assess_annual_coverage <- function(df, min_coverage = 0.70,
     group_by(year) %>%
     summarise(
       n_months_present = n(),
-      n_valid          = sum(!is.na(storage_Mm3)),
+      n_valid          = sum(!is.na(storage_m3)),
       .groups          = "drop"
     ) %>%
     filter(year < year(Sys.Date()))   # drop current partial year
@@ -634,15 +636,127 @@ assess_annual_coverage <- function(df, min_coverage = 0.70,
   
   list(table = cov_tbl, first_stable_year = first_stable)
 }
+
+# ============================================================================
+# ── HELPER — Diagnose a coverage-count jump (e.g. 6 -> 12 obs/year)
+# ============================================================================
+# Run this manually from the console, e.g.:
+#   diagnose_coverage_jump(split_year = 2021)
+# It checks whether a jump in valid monthly observations reflects a genuine
+# improvement in data coverage (new sensor/product filling previously-empty
+# months) or an artifact: duplicated date rows, a relaxed quality filter, a
+# change in which lakes feed the basin total, or forward-filled placeholder
+# values masquerading as new independent observations.
+diagnose_coverage_jump <- function(split_year, input_file = P1_INPUT_FILE) {
+  df_raw <- read_csv(input_file, show_col_types = FALSE) %>%
+    mutate(
+      date   = as.Date(date),
+      period = if_else(year(date) < split_year, "pre", "post")
+    )
+  
+  cat("\n==================== Coverage-jump diagnostic ====================\n")
+  cat("Split year:", split_year, "\n")
+  
+  # 1. Duplicate dates ---------------------------------------------------
+  # If the same calendar month appears as >1 row (e.g. one row per
+  # product/sensor instead of one merged "best estimate" row), that alone
+  # would manufacture extra "valid" months without any new information.
+  dup_dates <- df_raw %>% count(date) %>% filter(n > 1)
+  cat(sprintf("\n1. Duplicate 'date' rows in file: %d\n", nrow(dup_dates)))
+  if (nrow(dup_dates) > 0) {
+    cat("   Sample duplicated dates:\n")
+    print(head(dup_dates, 10))
+  }
+  
+  # 2. Lake participation -------------------------------------------------
+  # A jump driven by more lakes reporting (n_lakes_contributing rising
+  # toward n_lakes_total) is consistent with genuinely improved coverage.
+  # A jump in n_lakes_total itself means the lake inventory changed, which
+  # makes pre/post basin totals not directly comparable.
+  if (all(c("n_lakes_contributing", "n_lakes_total", "all_lakes_present") %in% names(df_raw))) {
+    cat("\n2. Lake participation, pre vs post:\n")
+    print(
+      df_raw %>%
+        group_by(period) %>%
+        summarise(
+          mean_n_lakes_contributing = mean(n_lakes_contributing, na.rm = TRUE),
+          mean_n_lakes_total        = mean(n_lakes_total, na.rm = TRUE),
+          pct_all_lakes_present     = mean(all_lakes_present, na.rm = TRUE) * 100,
+          .groups = "drop"
+        )
+    )
+  }
+  
+  # 3. Product / methodology shift -----------------------------------------
+  # A change in the dominant "product" label (e.g. Landsat-only -> blended
+  # Landsat+ICESat-2) is a plausible, documented explanation for more
+  # months suddenly having valid retrievals.
+  if ("product" %in% names(df_raw)) {
+    cat("\n3. 'product' field, pre vs post:\n")
+    print(df_raw %>% count(period, product))
+  }
+  
+  # 4. Quality flag shift ----------------------------------------------------
+  # If "quality" shows a sudden shift toward a lower-quality tier post-split,
+  # the extra months may be lower-confidence fills rather than equivalent
+  # observations to the pre-split record.
+  if ("quality" %in% names(df_raw)) {
+    cat("\n4. 'quality' field, pre vs post:\n")
+    print(df_raw %>% count(period, quality))
+  }
+  
+  # 5. Magnitude sanity check -------------------------------------------------
+  # If two products got summed instead of merged, post-split storage would
+  # look anomalously large relative to the pre-split record.
+  cat("\n5. total_storage_Mm3 magnitude, pre vs post:\n")
+  print(
+    df_raw %>%
+      group_by(period) %>%
+      summarise(
+        mean_storage   = mean(total_storage_Mm3, na.rm = TRUE),
+        median_storage = median(total_storage_Mm3, na.rm = TRUE),
+        sd_storage     = sd(total_storage_Mm3, na.rm = TRUE),
+        .groups = "drop"
+      )
+  )
+  
+  # 6. Forward-fill / duplication check ---------------------------------------
+  # A high share of near-zero month-to-month change post-split is a common
+  # symptom of gap-filling (e.g. repeating the last known value) rather than
+  # genuinely new independent monthly estimates.
+  cat("\n6. Share of post-split months with near-zero change from the previous month:\n")
+  df_diff <- df_raw %>%
+    arrange(date) %>%
+    mutate(diff_from_prev = total_storage_Mm3 - lag(total_storage_Mm3))
+  print(
+    df_diff %>%
+      filter(period == "post") %>%
+      summarise(pct_near_zero_diff = mean(abs(diff_from_prev) < 0.01, na.rm = TRUE) * 100)
+  )
+  
+  cat("\n==================== End diagnostic ====================\n")
+  invisible(df_raw)
+}
+
 # ============================================================================
 # ── SECTION 6 ──  PIPELINE 1  —  Basin-wide GeoLakes TSDI
 # ============================================================================
 run_pipeline_1 <- function(min_annual_coverage    = 0.70,
                            require_consecutive    = 5L,
                            calibration_start_year = NULL,
+                           quality_max            = 1L,
                            expected_obs_per_year  = NULL) {
   # calibration_start_year: override the auto-detected start year if desired
   #   e.g. calibration_start_year = 1992 to force calibration from 1992 onward
+  #
+  # quality_max: integer.  Rows with quality > quality_max are dropped before
+  #   any TSDI computation.  Default 1L retains only the consistent pre-2021
+  #   quality=1 record and excludes the post-2020 under-counted regime (where
+  #   n_lakes_contributing drops from ~5.7 to ~3.0 and total_storage_Mm3 falls
+  #   ~3× due to a shifting subset sum, not genuine drought).
+  #   Set to NULL to disable the filter and pass all rows (not recommended
+  #   until lake-participation normalisation is applied to correct for the
+  #   variable contributing-lake count).
   #
   # expected_obs_per_year: denominator for the coverage fraction.
   #   NULL = auto-detect (recommended).
@@ -651,21 +765,61 @@ run_pipeline_1 <- function(min_annual_coverage    = 0.70,
   
   cat("\n\n========================================================\n")
   cat("PIPELINE 1 — Basin-wide TSDI  (GeoLakes aggregated)\n")
+  qual_label <- if (!is.null(quality_max)) {
+    sprintf("quality <= %d only", quality_max)
+  } else {
+    "all quality levels (filter disabled)"
+  }
+  cat(sprintf("  Input filter: %s\n", qual_label))
   cat("========================================================\n")
   
   df_raw <- read_csv(P1_INPUT_FILE, show_col_types = FALSE)
   cat("Columns found:", paste(names(df_raw), collapse = ", "), "\n")
   stopifnot(
-    "date"              %in% names(df_raw),
+    "date"               %in% names(df_raw),
     "total_storage_Mm3" %in% names(df_raw)
   )
+  
+  # ── Quality filter ────────────────────────────────────────────────────────
+  # Applied to df_raw BEFORE transmute so the quality column is accessible.
+  # With quality_max = 1L (default), this removes every row flagged quality=2
+  # (the post-2020 under-counted regime where total_storage_Mm3 is a 3-lake
+  # subset sum rather than the consistent ~6-lake basin total).  The result is
+  # a 1984–2020 record whose climatology and drought-episode detection are not
+  # contaminated by the coverage artifact.
+  if (!is.null(quality_max)) {
+    if (!"quality" %in% names(df_raw)) {
+      warning("quality_max is set but no 'quality' column found in ",
+              P1_INPUT_FILE, "; filter skipped.")
+    } else {
+      n_raw     <- nrow(df_raw)
+      df_raw    <- df_raw %>% filter(quality <= quality_max)
+      n_kept    <- nrow(df_raw)
+      n_dropped <- n_raw - n_kept
+      date_range <- if (n_kept > 0) {
+        sprintf("%s – %s",
+                format(min(as.Date(df_raw$date))),
+                format(max(as.Date(df_raw$date))))
+      } else "no rows remain"
+      cat(sprintf(
+        "  Quality filter (quality <= %d): kept %d of %d rows, dropped %d  [%s]\n",
+        quality_max, n_kept, n_raw, n_dropped, date_range
+      ))
+      if (n_kept == 0)
+        stop("All rows removed by quality filter. ",
+             "Check quality_max or inspect the 'quality' column in your CSV.")
+    }
+  } else {
+    cat("  Quality filter: DISABLED (quality_max = NULL) — all rows passed through.\n",
+        "  WARNING: post-2020 rows with quality=2 (under-counted lake sum) are included.\n")
+  }
   
   df_input <- df_raw %>%
     transmute(
       date        = as.Date(date),
       year        = year(as.Date(date)),
       month       = month(as.Date(date)),
-      storage_Mm3 = total_storage_Mm3
+      storage_m3 = total_storage_Mm3
     )
   
   # ── Coverage filter ───────────────────────────────────────────────────────
@@ -684,7 +838,7 @@ run_pipeline_1 <- function(min_annual_coverage    = 0.70,
   
   df_calib <- df_input %>%
     filter(year >= start_yr) %>%
-    dplyr::select(date, storage_Mm3)
+    dplyr::select(date, storage_m3)
   
   n_full  <- nrow(df_input)
   n_calib <- nrow(df_calib)
@@ -719,7 +873,8 @@ run_pipeline_1 <- function(min_annual_coverage    = 0.70,
             file.path(OUT_DIR, "processed_data", "Pipeline1_annual_coverage.csv"))
   
   pdf(file.path(OUT_DIR, "Pipeline1_Diagnostics.pdf"), width = 10, height = 6)
-  plot_pipeline(res, label = "TSDI", basin_label = "Nechako Basin (all lakes)")
+  plot_pipeline(res, label = "TSDI", basin_label = "Nechako Basin (all lakes)",
+                storage_units_label = "Mm³")
   dev.off()
   
   print_summary(res, label = "TSDI", out_file = out_file)
@@ -765,7 +920,7 @@ run_pipeline_2 <- function() {
     df_input <- df_nechako %>%
       transmute(
         date        = as.Date(.data[[GEOLAKES_DATE_COL]]),
-        storage_Mm3 = .data[[GEOLAKES_STORAGE_COL]]
+        storage_m3 = .data[[GEOLAKES_STORAGE_COL]]
       )
     
   } else if (NECHAKO_DATA_SOURCE == "LOCAL_CSV") {
@@ -777,7 +932,7 @@ run_pipeline_2 <- function() {
       df_input <- df_local %>%
         transmute(
           date        = as.Date(.data[[LOCAL_DATE_COL]], format = LOCAL_DATE_FORMAT),
-          storage_Mm3 = .data[[LOCAL_VALUE_COL]]
+          storage_m3 = .data[[LOCAL_VALUE_COL]]
         )
       
     } else if (LOCAL_DATA_TYPE == "LEVEL") {
@@ -788,7 +943,7 @@ run_pipeline_2 <- function() {
           date        = as.Date(.data[[LOCAL_DATE_COL]], format = LOCAL_DATE_FORMAT),
           level_m_asl = .data[[LOCAL_VALUE_COL]]
         ) %>%
-        mutate(storage_Mm3 = level_to_storage(level_m_asl))
+        mutate(storage_m3 = level_to_storage(level_m_asl))
       
     } else if (LOCAL_DATA_TYPE == "LEVEL_DAILY") {
       cat("  Parsing Year + Day-of-Year format and converting to storage...\n")
@@ -797,15 +952,15 @@ run_pipeline_2 <- function() {
                            show_col_types = FALSE) %>%
         mutate(
           date = as.Date(paste(Year, DOY), format = "%Y %j"),
-          storage_Mm3 = level_to_storage(Level_m)
+          storage_m3 = level_to_storage(Level_m)
         ) %>%
-        dplyr::select(date, storage_Mm3)
+        dplyr::select(date, storage_m3)
       
     } else {
       stop("LOCAL_DATA_TYPE must be 'STORAGE', 'LEVEL', or 'LEVEL_DAILY'.")
     }
     
-    n_na_storage <- sum(is.na(df_input$storage_Mm3))
+    n_na_storage <- sum(is.na(df_input$storage_m3))
     if (n_na_storage > 0) {
       cat("  WARNING: ", n_na_storage, " records produced NA storage (level outside hypsometric table range).\n")
     }
@@ -815,7 +970,7 @@ run_pipeline_2 <- function() {
   
   # Filter out NA storage rows before computing index
   n_before <- nrow(df_input)
-  df_input <- df_input %>% filter(!is.na(storage_Mm3))
+  df_input <- df_input %>% filter(!is.na(storage_m3))
   n_after  <- nrow(df_input)
   if (n_before != n_after) {
     cat("  Removed", n_before - n_after, "rows with NA storage.\n")
@@ -837,6 +992,17 @@ run_pipeline_2 <- function() {
   out_file <- file.path(OUT_DIR, "Nechako_NTSDI_Pipeline2_Output.csv")
   write_csv(res$data, out_file)
   
+  # ── Resolve actual storage units for this run ─────────────────────────────
+  # GEOLAKES and LOCAL_CSV/STORAGE are documented as already being in Mm³.
+  # LOCAL_CSV/LEVEL and LOCAL_CSV/LEVEL_DAILY go through level_to_storage(),
+  # which converts the HYPSO_TABLE (hm³ -> m³) and therefore yields real m³.
+  p2_storage_units <- if (NECHAKO_DATA_SOURCE == "LOCAL_CSV" &&
+                          LOCAL_DATA_TYPE %in% c("LEVEL", "LEVEL_DAILY")) {
+    "m³"
+  } else {
+    "Mm³"
+  }
+  
   pdf(file.path(OUT_DIR, "Pipeline2_Diagnostics.pdf"), width = 10, height = 6)
   plot_pipeline(
     res, 
@@ -847,7 +1013,8 @@ run_pipeline_2 <- function() {
              paste0("Local CSV (", LOCAL_DATA_TYPE, ")"), 
              "GeoLakes"), 
       "]"
-    )
+    ),
+    storage_units_label = p2_storage_units
   )
   dev.off()
   
@@ -965,7 +1132,9 @@ res_p1 <- NULL
 res_p2 <- NULL
 
 if (PIPELINE_MODE %in% c("BASIN", "BOTH")) {
-  res_p1 <- run_pipeline_1()
+  # quality_max = 1L: exclude post-2020 quality=2 rows (under-counted basin sum).
+  # Change to NULL only after lake-participation normalisation is in place.
+  res_p1 <- run_pipeline_1(quality_max = 1L)
 }
 
 if (PIPELINE_MODE %in% c("NECHAKO_RESERVOIR", "BOTH")) {
