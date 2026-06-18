@@ -52,7 +52,7 @@ lakes_in_nechako <- st_intersection(glws_lakes, nechako_basin)
 cat("Number of lakes in Nechako River basin:", nrow(lakes_in_nechako), "\n")
 
 # =============================================================================
-# STEP 4: Extract Lake Attributes
+# STEP 4a: Extract Lake Attributes
 # =============================================================================
 
 nechako_lake_data <- lakes_in_nechako %>%
@@ -84,7 +84,24 @@ nechako_lake_data <- lakes_in_nechako %>%
   )
 
 print(nechako_lake_data)
+# =============================================================================
+# STEP 4b: Lakes with missing names in GLWS
+# =============================================================================
 
+lakes_missing_names <- nechako_lake_data %>%
+  filter(is.na(LakeName) | LakeName == "") %>%
+  select(LakeID, LakeName, TypeName, LakeArea)
+
+if (nrow(lakes_missing_names) > 0) {
+  cat("\n--- Lakes with no name recorded in GLWS ---\n")
+  print(lakes_missing_names)
+  
+  write_csv(lakes_missing_names,
+            file.path(output_dir, "nechako_lakes_missing_names.csv"))
+  cat("\nMissing‑name list saved to nechako_lakes_missing_names.csv\n")
+} else {
+  cat("\nAll lakes in the Nechako basin have names in GLWS.\n")
+}
 # =============================================================================
 # STEP 5: Save Shapefile
 # Note: the attributes CSV is saved later in Step 6b, after time series
@@ -229,35 +246,142 @@ write_csv(nechako_lake_data,
 cat("\nOutputs saved to:", output_dir, "\n")
 
 # =============================================================================
-# STEP 7: Alternative - Using Lake Coordinates CSV (If No Shapefile Access)
+# STEP 7: Fetch Missing Lake Names from HydroLAKES (Efficient Spatial Join)
 # =============================================================================
+hydrolakes_path <- "D:/Nechako_Drought/Nechako/Spatial/HydroLAKES_NorthAmerica.shp" 
 
-coords_path <- file.path(glws_root, "GLWS lake coordinates v1.1.csv")
-lake_coords <- read_csv(coords_path, show_col_types = FALSE)
-
-# Column names are lowercase: latitude / longitude
-lake_coords_sf <- st_as_sf(lake_coords,
-                           coords = c("longitude", "latitude"),
-                           crs = 4326)
-
-lake_coords_sf <- st_transform(lake_coords_sf, st_crs(nechako_basin))
-
-lakes_in_nechako_coords <- st_join(lake_coords_sf, nechako_basin,
-                                   join = st_within)
-
-lakes_in_nechako_coords <- lakes_in_nechako_coords %>%
-  filter(!is.na(LakeID))
-
+if (nrow(lakes_missing_names) > 0) {
+  cat("\n--- Fetching missing names from HydroLAKES ---\n")
+  
+  # 1. Temporarily disable s2 to prevent errors with invalid geometries
+  sf_use_s2(FALSE)
+  
+  # 2. Load HydroLAKES North America (removed unsupported SPATIAL_FILTER)
+  hydrolakes_na <- st_read(hydrolakes_path, quiet = TRUE)
+  
+  # 3. Filter by Nechako bounding box (extremely fast)
+  nechako_bbox_sfc <- st_as_sfc(st_bbox(nechako_basin))
+  hydrolakes_nechako <- st_filter(hydrolakes_na, nechako_bbox_sfc)
+  
+  # Re-enable s2 for subsequent spatial operations
+  sf_use_s2(TRUE)
+  
+  cat("Polygons after bounding box filter:", nrow(hydrolakes_nechako), "\n")
+  
+  # 4. Validate ONLY the small subset (takes seconds instead of minutes)
+  hydrolakes_nechako <- st_make_valid(hydrolakes_nechako)
+  
+  # 5. Transform CRS
+  hydrolakes_nechako <- st_transform(hydrolakes_nechako, st_crs(lakes_in_nechako))
+  
+  # 6. Spatial Join for missing lakes only
+  missing_lakes_sf <- lakes_in_nechako %>%
+    filter(LakeID %in% lakes_missing_names$LakeID)
+  
+  # Detect name column
+  if ("Lake_name" %in% names(hydrolakes_nechako)) {
+    name_col <- "Lake_name"
+  } else if ("LAKE_NAME" %in% names(hydrolakes_nechako)) {
+    name_col <- "LAKE_NAME"
+  } else {
+    stop("Cannot find lake name column")
+  }
+  
+  joined_names <- st_join(missing_lakes_sf, 
+                          hydrolakes_nechako %>% select(Hylak_id, !!sym(name_col)),
+                          join = st_nearest_feature) %>%
+    st_drop_geometry() %>%
+    select(LakeID, LakeName_HydroLAKES = !!sym(name_col)) %>%
+    group_by(LakeID) %>%
+    slice(1) %>%
+    ungroup()
+  
+  # Update nechako_lake_data
+  nechako_lake_data <- nechako_lake_data %>%
+    left_join(joined_names, by = "LakeID") %>%
+    mutate(LakeName = if_else(is.na(LakeName) | LakeName == "", 
+                              LakeName_HydroLAKES, 
+                              LakeName)) %>%
+    select(-LakeName_HydroLAKES)
+  
+  still_missing <- nechako_lake_data %>%
+    filter(is.na(LakeName) | LakeName == "")
+  
+  if (nrow(still_missing) > 0) {
+    cat("WARNING: Still missing after HydroLAKES join — applying manual override:\n")
+    print(still_missing %>% select(LakeID, LakeArea))
+    
+    # Manual fallback for lakes whose HydroLAKES polygon has a blank name field.
+    # Sources:
+    #   François  (694)  — confirmed via Nominatim reverse geocoding
+    #   Tezzeron (1449)  — geographic inference: 115 km², Stuart Lake/Omineca
+    #                      Valley sub-basin, only lake of that size at those coords
+    manual_names <- tibble(
+      LakeID     = c(1449L,       694L),
+      ManualName = c("Tezzeron",  "François")
+    )
+    
+    nechako_lake_data <- nechako_lake_data %>%
+      left_join(manual_names, by = "LakeID") %>%
+      mutate(LakeName = if_else(is.na(LakeName) | LakeName == "",
+                                ManualName, LakeName)) %>%
+      select(-ManualName)
+    
+    # Re-save CSV now that names are resolved
+    write_csv(nechako_lake_data,
+              file.path(output_dir, "nechako_lakes_glws_v1.1.csv"))
+    
+    cat("Final lake names after manual override:\n")
+    print(nechako_lake_data %>% select(LakeID, LakeName, LakeArea, TypeName))
+    
+  } else {
+    cat("SUCCESS: All lake names resolved.\n")
+  }
+} else {
+  cat("\nNo missing lake names to resolve.\n")
+}
 # =============================================================================
 # STEP 8: Basin Map
 # =============================================================================
 
+# Build spatial layer with resolved labels from nechako_lake_data
+lakes_for_map <- lakes_in_nechako %>%
+  select(LakeID, geometry) %>%
+  left_join(
+    nechako_lake_data %>% select(LakeID, LakeName, TypeName),
+    by = "LakeID"
+  ) %>%
+  mutate(Label = ifelse(is.na(LakeName) | LakeName == "",
+                        paste0("ID", LakeID),
+                        LakeName))
+
 ggplot() +
-  geom_sf(data = nechako_basin, fill = "lightblue", alpha = 0.5) +
-  geom_sf(data = lakes_in_nechako, color = "darkblue", size = 2) +
-  labs(title = "GLWS Lakes in Nechako River Basin",
-       subtitle = paste("Number of lakes:", nrow(lakes_in_nechako))) +
-  theme_minimal()
+  geom_sf(data = nechako_basin,
+          fill = "#d4e8f5", colour = "steelblue", linewidth = 0.6) +
+  geom_sf(data = lakes_for_map,
+          aes(colour = TypeName, shape = TypeName), size = 3.5) +
+  geom_sf_text(data = lakes_for_map,
+               aes(label = Label),
+               size = 3, nudge_y = 0.05,
+               fontface = "bold", colour = "black") +
+  scale_colour_manual(
+    name   = "Lake type",
+    values = c("Natural lake" = "#1f78b4", "Reservoir" = "#e31a1c")
+  ) +
+  scale_shape_manual(
+    name   = "Lake type",
+    values = c("Natural lake" = 16, "Reservoir" = 17)
+  ) +
+  labs(
+    title    = "GLWS Lakes in Nechako River Basin",
+    subtitle = paste("Number of lakes:", nrow(lakes_in_nechako)),
+    caption  = "Source: GLWS v1.1 (Yao et al., 2023)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title      = element_text(face = "bold"),
+    legend.position = "bottom"
+  )
 
 ggsave(file.path(output_dir, "nechako_lakes_map.png"),
        width = 10, height = 8, dpi = 300)
