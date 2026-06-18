@@ -99,7 +99,7 @@ cfg <- list(
   ssi_soil_prefix = "ssi_L1_3_01",
   
   # SGI  — long CSV:  columns 'month_label' (YYYY-MM), 'sgi_median', 'date'
-  sgi_file = "sgi_nechako_multisource.csv",
+  sgi_file =  path.expand("./sgi_results/sgi_nechako_multisource_basin.csv"),
   
   # WSC streamflow SSI — RDS files saved by 7WSC_StreamFlow.R
   # Each RDS is a data frame with columns: date (YYYY-MM-15), ssi, ...
@@ -109,7 +109,7 @@ cfg <- list(
   ),
   # NTSDI — long CSV from 9NTSDI_GeoLakes_Extended.r Pipeline 2
   # Columns: date, NTSDI_norm  (Blom-standardised reservoir index)
-  ntsdi_file    = "Nechako_NTSDI_Pipeline2_Output.csv",
+  ntsdi_file    =  "ntsdi_results/Nechako_NTSDI_Pipeline2_Output.csv",
   
   # ── Reference period (calibrate pseudo-obs marginals here only) ────────────
   ref_start     = as.Date("1981-01-01"),
