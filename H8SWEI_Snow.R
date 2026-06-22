@@ -458,7 +458,6 @@ if (scf_method %in% c("1", "2")) {
   cat(sprintf("✓ Basin SCF mask: months included = %s\n",
               paste(month.abb[which(basin_scf_mask)], collapse = ", ")))
 }
-}
 # ==============================================================================
 #   BASIN-AVERAGED SWE SETUP
 #   Correct order (matches SPI/SPEI approach):
