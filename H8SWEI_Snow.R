@@ -30,70 +30,7 @@ library(zoo)
 library(writexl)
 library(parallel)
 library(lmomco)   # required for option 3 (SSPI-1 zero-inflated gamma)
-library(ggplot2)
-library(dplyr)
 
-plot_standard_basin_ts <- function(df, index_name, color = "steelblue", drought_threshold = -0.5) {
-  if (!all(c("date", "value") %in% names(df))) stop("df must have 'date' and 'value' columns.")
-  df <- df[order(df$date), ]
-  df <- df[!is.na(df$value), ]
-  
-  # Handle empty dataframe gracefully
-  if (nrow(df) == 0) {
-    warning(sprintf("No valid data to plot for %s. Returning empty plot. Check input raster and basin overlap.", index_name))
-    return(ggplot2::ggplot() + 
-             ggplot2::annotate("text", x = 0.5, y = 0.5, 
-                               label = sprintf("No valid data for %s\n(Check input raster and basin overlap)", toupper(index_name)),
-                               size = 5, color = "red") +
-             ggplot2::theme_void())
-  }
-  
-  # Drought event count
-  in_drought <- df$value < drought_threshold
-  rle_res <- rle(in_drought)
-  n_ev <- sum(rle_res$values & rle_res$lengths >= 1)
-  
-  # Dynamic y-axis
-  y_range <- max(df$value, na.rm = TRUE) - min(df$value, na.rm = TRUE)
-  y_pad   <- y_range * 0.10
-  y_lo    <- min(-3.5, min(df$value, na.rm = TRUE) - y_pad)
-  y_hi    <- max( 3.5, max(df$value, na.rm = TRUE) + y_pad)
-  
-  # Drought bands
-  drought_bands <- list(
-    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = -2.0, fill = "#7B0025", alpha = 0.15),
-    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin = -2.0, ymax = -1.5, fill = "#D73027", alpha = 0.15),
-    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin = -1.5, ymax = -1.0, fill = "#F46D43", alpha = 0.15),
-    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin = -1.0, ymax =  1.0, fill = "#2E7D32", alpha = 0.15),
-    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin =  1.0, ymax =  1.5, fill = "#90EE90", alpha = 0.15),
-    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin =  1.5, ymax =  2.0, fill = "#66BB6A", alpha = 0.15),
-    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin =  2.0, ymax =  Inf, fill = "#4575B4", alpha = 0.15)
-  )
-  
-  ggplot2::ggplot(df, ggplot2::aes(x = date, y = value)) +
-    drought_bands +
-    ggplot2::geom_hline(yintercept = 0, color = "black", linewidth = 0.4) +
-    ggplot2::geom_hline(yintercept = c(-1, 1), linetype = "dashed", color = "gray50", linewidth = 0.3) +
-    ggplot2::geom_ribbon(ggplot2::aes(ymin = ifelse(value < drought_threshold, value, 0), ymax = 0), 
-                         fill = "#c0392b", alpha = 0.35) +
-    ggplot2::geom_line(color = color, linewidth = 0.6) +
-    ggplot2::scale_x_date(date_breaks = "5 years", date_labels = "%Y") +
-    ggplot2::scale_y_continuous(limits = c(y_lo, y_hi)) +
-    ggplot2::labs(
-      title    = sprintf("%s Basin-Averaged Time Series", toupper(index_name)),
-      subtitle = sprintf("%d drought events detected (onset < %.1f)", n_ev, drought_threshold),
-      x = "Year", y = sprintf("%s Index Value", toupper(index_name))
-    ) +
-    ggplot2::theme_bw(base_size = 14) +
-    ggplot2::theme(
-      plot.title = ggplot2::element_text(face = "bold", hjust = 0.5),
-      plot.subtitle = ggplot2::element_text(hjust = 0.5, color = "gray30"),
-      axis.title = ggplot2::element_text(face = "bold"),
-      axis.text.x = ggplot2::element_text(angle = 45, hjust = 1),
-      panel.grid.minor = ggplot2::element_blank(),
-      legend.position = "bottom"
-    )
-}
 # ---- USER SELECTION: SCF DOMAIN METHOD ----
 cat("\n============================================================\n")
 cat("SCF DOMAIN DEFINITION: SELECT METHOD\n")
@@ -103,7 +40,7 @@ cat("                          (optimal threshold selected per basin/timescale)\
 cat("  2 = Huning & AghaKouchak (2020) — fixed 5% SCF threshold\n")
 cat("                          (standard approach from the original global paper)\n")
 cat("  3 = SSPI-1 (Standardized SnowPack Index, monthly)\n")
-cat("                          (zero-inflated gamma, no SCF mask)\n\n")
+cat("                          (zero-inflated gamma, 1981-2020 reference, no SCF mask)\n\n")
 
 # ---- To use in batch/scheduled jobs, set DEFAULT_SCF_METHOD to "1", "2", or "3"
 DEFAULT_SCF_METHOD <- "2"
@@ -169,10 +106,11 @@ if (scf_method == "1") {
 } else if (scf_method == "2") {
   cat("\n→ Method selected: Huning & AghaKouchak (2020) fixed 5% SCF threshold\n")
 } else {
-  cat("\n→ Method selected: SSPI-1 (zero-inflated gamma, monthly)\n")
+  cat("\n→ Method selected: SSPI-1 (zero-inflated gamma, monthly, 1981-2020 reference)\n")
 }
 
-# --------
+# ---- FIX: define scf_method_label immediately after method selection ----
+# (Previously it was defined after the echo line that referenced it, causing an error)
 scf_method_label <- if (scf_method == "1") "Self-calibration" else if (scf_method == "2") "Huning & AghaKouchak (2020)" else "SSPI-1 (zero-inflated gamma, no SCF mask)"
 
 # ---- Paths ----
@@ -215,19 +153,7 @@ if (scf_method %in% c("1", "2")) {
 } else {
   scf_stack <- NULL  # not needed for SSPI-1
 }
-# ---- Fix 0-360 Longitude System ----
-# Global NetCDFs often use 0 to 360 longitudes (e.g., 232°E = 128°W). 
-# Shift them to the standard -180 to 180 system to match the basin shapefile.
-if (terra::ext(swe)[2] > 180) {
-  cat("✓ Shifting SWE longitudes from 0–360 to -180–180...\n")
-  swe <- terra::shift(swe, dx = -360)
-}
-if (!is.null(scf_stack) && terra::ext(scf_stack)[2] > 180) {
-  cat("✓ Shifting SCF longitudes from 0–360 to -180–180...\n")
-  scf_stack <- terra::shift(scf_stack, dx = -360)
-}
 
-# ---- Time extraction ----
 # ---- Time extraction ----
 extract_time_dimension <- function(raster_obj, file_path) {
   t <- time(raster_obj)
@@ -275,14 +201,7 @@ basin_pixels <- global(swe[[1]], "notNA")$notNA
 total_pixels <- ncell(swe)
 cat(sprintf("✓ Basin masking complete: %d pixels (%.1f%% of raster)\n",
             basin_pixels, 100 * basin_pixels / total_pixels))
-if (basin_pixels == 0) {
-  stop("CRITICAL ERROR: Basin masking resulted in 0 valid pixels.\n",
-       "This means the SWE raster and basin boundary do not overlap, or the raster is entirely NA.\n",
-       "Please check:\n",
-       "1. The CRS of the SWE raster and the basin boundary.\n",
-       "2. That the SWE raster actually contains data for the Nechako basin.\n",
-       "3. The extent of the SWE raster (e.g., run `plot(swe[[1]])` to visualize).")
-}
+
 # ---- Convert SWE to mm if needed ----
 swe_mean_sample <- global(swe[[1]], "mean", na.rm = TRUE)$mean
 if (!is.na(swe_mean_sample) && swe_mean_sample < 10) {
@@ -305,28 +224,8 @@ dates <- dates_swe
 months_all <- as.integer(format(dates, "%m"))
 years_all <- as.integer(format(dates, "%Y"))
 n_pixels <- nrow(swe_matrix)
-cat(sprintf("Processing %d basin pixels...\n", n_pixels))
+cat(sprintf("Processing %d pixels of the rectangle covering basin ...\n", n_pixels))
 
-# ==============================================================================
-#   STEP 1: Apply 3-month moving sum to RAW SWE values (PREPROCESSING)
-#   NOTE: used only by methods 1 & 2 (SWEI). Method 3 (SSPI-1) operates on
-#   raw monthly SWE values directly — no temporal smoothing is applied.
-# ==============================================================================
-if (scf_method %in% c("1", "2")) {
-  swe_smoothed <- matrix(NA, nrow = nrow(swe_matrix), ncol = ncol(swe_matrix))
-  for (i in 1:nrow(swe_matrix)) {
-    swe_smoothed[i, ] <- zoo::rollapply(swe_matrix[i, ],
-                                        width = 3,
-                                        FUN = sum,
-                                        align = "right",
-                                        fill = NA,
-                                        na.rm = FALSE)   # NA if any of the three months is NA
-  }
-  cat("✓ 3-month rolling sum applied to SWE (SWEI preprocessing)\n")
-} else {
-  swe_smoothed <- NULL  # not used by SSPI-1
-  cat("✓ No temporal smoothing applied (SSPI-1 uses raw monthly SWE)\n")
-}
 
 # ==============================================================================
 #   USER CHOICE: SCF DOMAIN DEFINITION METHOD (confirmed above — echoing selection)
@@ -339,6 +238,11 @@ cat(sprintf("\n→ Proceeding with Method %s: %s\n", scf_method, scf_method_labe
 #   STEP 2: BUILD SCF MASK  (branched by user choice)
 # ==============================================================================
 cat("\n===== STEP 2: Building SCF mask =====\n")
+# NOTE (Option B — decoupled windows): target_k is intentionally fixed at 3
+# per Huning & AghaKouchak (2020), regardless of the SWE accumulation window
+# (sc). The SCF climatology mask always uses a 3-month right-aligned window
+# because that is what the original H&A methodology specifies. This is a
+# deliberate methodological choice, not an accidental mismatch.
 target_k    <- 3
 
 if (scf_method == "3") {
@@ -346,6 +250,7 @@ if (scf_method == "3") {
   # ============================================================================
   #   BRANCH 3 — SSPI-1 (Zero-inflated Gamma, Monthly, No SCF Mask)
   #   Skips SCF masking entirely; uses calendar-month gamma fitting.
+  #   Reference period: 1981-2020 (per Stagge et al., 2015 / SSPI convention).
   # ============================================================================
   cat("\n→ SSPI-1 selected: skipping SCF mask build (not applicable).\n")
   cat("  Zero-inflated gamma fitting will be applied per calendar month.\n")
@@ -353,8 +258,8 @@ if (scf_method == "3") {
   basin_scf_mask <- NULL
   
   # Reference period for SSPI-1
-  sspi_ref_start <- min(dates) #
-  sspi_ref_end   <- max(dates) #
+  sspi_ref_start <- min(dates) #as.Date("1981-01-01")
+  sspi_ref_end   <- max(dates) #as.Date("2020-12-31")
   ref_idx        <- which(dates >= sspi_ref_start & dates <= sspi_ref_end)
   if (length(ref_idx) < 400) {
     warning(sprintf("SSPI-1 reference period has only %d months (recommended: >=480)", length(ref_idx)))
@@ -362,119 +267,146 @@ if (scf_method == "3") {
   cat(sprintf("✓ SSPI-1 reference period: %s to %s (%d months)\n",
               dates[ref_idx[1]], dates[ref_idx[length(ref_idx)]], length(ref_idx)))
   
-  # Zero-inflation pre-screen removed.
-  # The basin-global screen (rowMeans across all months) incorrectly excluded
-  # seasonal pixels that are snow-free in summer but snow-covered in winter,
-  # because their annual zero fraction can exceed 50% even though their winter
-  # months are valid.  monthly_sspi() handles zero-inflation correctly per
-  # calendar month: p0 is estimated from that month's reference sample only,
-  # and months where all reference values are zero hit the zero-variance path
-  # (method = 3, SSPI = 0) rather than being excluded entirely.
-  invalid_pix_sspi <- integer(0)   # retained so the summary writer below compiles
+  # Zero-inflation screening: exclude pixels with >50% zero SWE in reference period
+  cat("\n===== ZERO-INFLATION SCREENING (SSPI-1) =====\n")
+  ref_swe_sspi   <- swe_matrix[, ref_idx, drop = FALSE]
+  zero_prop_sspi <- rowMeans(ref_swe_sspi <= 0, na.rm = TRUE)
+  invalid_pix_sspi <- which(zero_prop_sspi > 0.50)
+  valid_pix_sspi   <- which(zero_prop_sspi <= 0.50)
+  cat(sprintf("✓ Valid pixels (<=50%% zero SWE in ref period): %d (%.1f%%)\n",
+              length(valid_pix_sspi), 100 * length(valid_pix_sspi) / n_pixels))
+  if (length(invalid_pix_sspi) > 0) {
+    cat(sprintf("  Excluded pixels (>50%% zero SWE): %d\n", length(invalid_pix_sspi)))
+    swe_matrix[invalid_pix_sspi, ] <- NA
+  }
   
 } else if (scf_method == "1") {
   
   # ============================================================================
-  #   BRANCH 1 — SELF-CALIBRATION  (6preq_diag_SCF.R)
+  #   BRANCH 1 — SELF-CALIBRATION  (H8preq_diag_SCF.R)
   # ============================================================================
   scf_diag_dir    <- "scf_timescale_diagnostics"
   scf_diag_csv    <- file.path(scf_diag_dir, "scf_timescale_final_recommendations.csv")
-  scf_diag_script <- "6preq_diag_SCF.R"   # must exist in the working directory
+  H8preq_diag_SCF <- "H8preq_diag_SCF.R"   # must exist in the working directory
   
   # Run the diagnostic script automatically if its outputs are missing
-  if (!file.exists(scf_diag_csv)) {
-    cat("\n  SCF diagnostic outputs not found in '", scf_diag_dir, "'\n", sep = "")
-    if (file.exists(scf_diag_script)) {
-      if (interactive() && requireNamespace("rstudioapi", quietly = TRUE) &&
-          rstudioapi::isAvailable()) {
-        # RStudio GUI: use a Yes/No dialog
-        run_diag <- if (rstudioapi::showQuestion(
-          title   = "Run diagnostic script?",
-          message = paste0("SCF diagnostic outputs not found.\n\n",
-                           "Run 6preq_diag_SCF.R now to generate them?"),
-          ok = "Yes", cancel = "No"
-        )) "y" else "n"
-      } else if (interactive()) {
-        run_diag <- ""
-        while (!run_diag %in% c("y", "n")) {
-          run_diag <- tolower(trimws(readline(
-            prompt = "  Run 6preq_diag_SCF.R now to generate them? (y/n): ")))
-        }
-      } else {
-        # Non-interactive: auto-source the diagnostic script
-        run_diag <- "y"
-        cat("  Non-interactive session: auto-sourcing 6preq_diag_SCF.R\n")
-      }
-      if (run_diag == "y") {
-        cat("  Sourcing 6preq_diag_SCF.R ...\n")
-        source(scf_diag_script, local = FALSE)
-        cat("  ✓ 6preq_diag_SCF.R complete\n")
-      } else {
-        stop("Self-calibration outputs are required. ",
-             "Run 6preq_diag_SCF.R first, or re-run and choose method 2.")
+  if (!file.exists(H8preq_diag_SCF)) {
+    cat("\n  SCF diagnostic outputs not found in '", scf_diag_dir, "'\n", sep = "")} 
+  if (file.exists(H8preq_diag_SCF)) {
+    if (interactive() && requireNamespace("rstudioapi", quietly = TRUE) &&
+        rstudioapi::isAvailable()) {
+      # RStudio GUI: use a Yes/No dialog
+      run_diag <- if (rstudioapi::showQuestion(
+        title   = "Run diagnostic script?",
+        message = paste0("SCF diagnostic outputs not found.\n\n",
+                         "Run 6preq_diag_SCF.R now to generate them?"),
+        ok = "Yes", cancel = "No"
+      )) "y" else "n"
+    } else if (interactive()) {
+      run_diag <- ""
+      while (!run_diag %in% c("y", "n")) {
+        run_diag <- tolower(trimws(readline(
+          prompt = "  Run 6preq_diag_SCF.R now to generate them? (y/n): ")))
       }
     } else {
-      stop("'", scf_diag_script, "' not found in working directory and diagnostic ",
-           "outputs are missing.\n",
-           "  Place 6preq_diag_SCF.R in '", getwd(), "' and re-run, or choose method 2.")
+      # Non-interactive: auto-source the diagnostic script
+      run_diag <- "y"
+      cat("  Non-interactive session: auto-sourcing H8preq_diag_SCF.R\n")
     }
-  }
-  
-  # Read data-driven threshold chosen for k=3
-  scf_threshold <- 0.10   # fallback default
-  diag_df <- read.csv(scf_diag_csv, stringsAsFactors = FALSE)
-  if ("timescale" %in% names(diag_df) && "chosen_threshold" %in% names(diag_df)) {
-    k3_row <- diag_df[as.character(diag_df$timescale) == as.character(target_k), ]
-    if (nrow(k3_row) > 0) scf_threshold <- as.numeric(k3_row$chosen_threshold[1])
-  }
-  
-  # Find the closest-matching mask NetCDF for that threshold
-  mask_file_pattern <- sprintf("scf_mask_k%d_*.nc", target_k)
-  mask_candidates   <- list.files(scf_diag_dir, pattern = glob2rx(mask_file_pattern),
-                                  full.names = TRUE)
-  if (length(mask_candidates) == 0)
-    stop(sprintf("No SCF mask NetCDF found for k=%d in '%s'", target_k, scf_diag_dir))
-  
-  best_mask <- mask_candidates[[1]]
-  if (length(mask_candidates) > 1) {
-    min_diff <- Inf
-    for (f in mask_candidates) {
-      m_match <- regexec("threshold_([0-9.]+)\\.nc$", basename(f))
-      if (length(m_match[[1]]) > 1) {
-        th_in_file <- as.numeric(regmatches(basename(f), m_match)[[1]][2])
-        d <- abs(th_in_file - scf_threshold)
-        if (d < min_diff) { min_diff <- d; best_mask <- f }
-      }
-    }
-  }
-  cat(sprintf("✓ Self-calibration mask loaded: '%s' (threshold = %.3f)\n",
-              basename(best_mask), scf_threshold))
-  
-  scf_mask_stack <- rast(best_mask)
-  scf_mask_list  <- vector("list", 12)
-  for (m in 1:12) {
-    if (m <= nlyr(scf_mask_stack)) {
-      mask_vals      <- values(scf_mask_stack[[m]])
-      scf_mask_list[[m]] <- !is.na(mask_vals) & (mask_vals == 1)
+    if (run_diag == "y") {
+      cat("  Sourcing H8preq_diag_SCF ...\n")
+      
+      # ---- ISOLATION FIX ----
+      # H8preq_diag_SCF defines its own `out_dir`, `scf_stack`, `swe_stack`,
+      # `total_pixels`, `dates_scf`, etc. Sourcing with local = FALSE would
+      # dump all of those into THIS script's global environment and silently
+      # overwrite our own `out_dir` (and anything else with a matching name),
+      # misdirecting every output file written for the rest of this script.
+      #
+      # We only need the FILES it writes to disk (the final recommendations
+      # CSV and the mask .nc files) -- nothing it returns as an R object --
+      # so it's safe and correct to run it in a throwaway environment.
+      #
+      # Belt-and-suspenders: also snapshot/restore out_dir and the working
+      # directory in case something other than this sourced script ever
+      # changes them unexpectedly.
+      .out_dir_before <- out_dir
+      .wd_before       <- getwd()
+      
+      diag_env <- new.env(parent = globalenv())
+      source(H8preq_diag_SCF, local = diag_env)
+      
+      out_dir <- .out_dir_before
+      if (getwd() != .wd_before) setwd(.wd_before)
+      rm(.out_dir_before, .wd_before)
+      # ---- END ISOLATION FIX ----
+      
+      cat("  ✓ H8preq_diag_SCF.R complete\n")
     } else {
-      scf_mask_list[[m]] <- rep(FALSE, ncell(swe))
+      stop("Self-calibration outputs are required. ",
+           "Run H8preq_diag_SCF first, or re-run and choose method 2.")
+    }
+  } else {
+    stop("'", H8preq_diag_SCF, "' not found in working directory and diagnostic ",
+         "outputs are missing.\n",
+         "  Place H8preq_diag_SCF in '", getwd(), "' and re-run, or choose method 2.")
+  }
+
+
+# Read data-driven threshold chosen for k=3
+scf_threshold <- 0.10   # fallback default
+diag_df <- read.csv(scf_diag_csv, stringsAsFactors = FALSE)
+if ("timescale" %in% names(diag_df) && "chosen_threshold" %in% names(diag_df)) {
+  k3_row <- diag_df[as.character(diag_df$timescale) == as.character(target_k), ]
+  if (nrow(k3_row) > 0) scf_threshold <- as.numeric(k3_row$chosen_threshold[1])
+}
+
+# Find the closest-matching mask NetCDF for that threshold
+mask_file_pattern <- sprintf("scf_mask_k%d_*.nc", target_k)
+mask_candidates   <- list.files(scf_diag_dir, pattern = glob2rx(mask_file_pattern),
+                                full.names = TRUE)
+if (length(mask_candidates) == 0)
+  stop(sprintf("No SCF mask NetCDF found for k=%d in '%s'", target_k, scf_diag_dir))
+
+best_mask <- mask_candidates[[1]]
+if (length(mask_candidates) > 1) {
+  min_diff <- Inf
+  for (f in mask_candidates) {
+    m_match <- regexec("threshold_([0-9.]+)\\.nc$", basename(f))
+    if (length(m_match[[1]]) > 1) {
+      th_in_file <- as.numeric(regmatches(basename(f), m_match)[[1]][2])
+      d <- abs(th_in_file - scf_threshold)
+      if (d < min_diff) { min_diff <- d; best_mask <- f }
     }
   }
-  
-  # Basin-level SCF mask: month included when >=50% of BASIN pixels are flagged.
-  # Restrict to basin pixels only (same fix as H&A branch).
-  cat("\n===== COMPUTING BASIN-LEVEL SCF MASK (self-calibration) =====\n")
-  basin_pixel_idx <- which(!is.na(swe_matrix[, 1]))
-  basin_scf_mask  <- logical(12)
-  for (m in 1:12) {
-    if (m <= nlyr(scf_mask_stack)) {
-      mv_basin          <- scf_mask_list[[m]][basin_pixel_idx]
-      basin_scf_mask[m] <- length(mv_basin) > 0 && mean(mv_basin, na.rm = TRUE) >= 0.5
-    }
+}
+cat(sprintf("✓ Self-calibration mask loaded: '%s' (threshold = %.3f)\n",
+            basename(best_mask), scf_threshold))
+
+scf_mask_stack <- rast(best_mask)
+scf_mask_list  <- vector("list", 12)
+for (m in 1:12) {
+  if (m <= nlyr(scf_mask_stack)) {
+    mask_vals      <- values(scf_mask_stack[[m]])
+    scf_mask_list[[m]] <- !is.na(mask_vals) & (mask_vals == 1)
+  } else {
+    scf_mask_list[[m]] <- rep(FALSE, ncell(swe))
   }
-  
-} else {
-  
+}
+
+# Basin-level SCF mask: month included when >=50% of BASIN pixels are flagged.
+# Restrict to basin pixels only (same fix as H&A branch).
+cat("\n===== COMPUTING BASIN-LEVEL SCF MASK (self-calibration) =====\n")
+basin_pixel_idx <- which(!is.na(swe_matrix[, 1]))
+basin_scf_mask  <- logical(12)
+ for (m in 1:12) {
+   if (m <= nlyr(scf_mask_stack)) {
+     mv_basin          <- scf_mask_list[[m]][basin_pixel_idx]
+     basin_scf_mask[m] <- length(mv_basin) > 0 && mean(mv_basin, na.rm = TRUE) >= 0.5
+   }
+ }
+ } else if (scf_method == "2") {
+
   # ============================================================================
   #   BRANCH 2 — HUNING & AGHAKOUCHAK (2020)  fixed 5% SCF threshold
   # ============================================================================
@@ -487,8 +419,10 @@ if (scf_method == "3") {
   scf_matrix_ha  <- values(scf_basin, mat = TRUE)   # ncell(swe) x nlyr
   months_scf_ha  <- as.integer(format(dates_scf, "%m"))
   
-  # Right-aligned 3-month mean SCF climatology per calendar month
-  # For month m the window is (m-2, m-1, m) — mirrors the SWE aggregation window.
+  # Right-aligned 3-month mean SCF climatology per calendar month.
+  # For month m the window is (m-2, m-1, m).
+  # NOTE (Option B): This window is intentionally fixed at 3 per H&A (2020) and
+  # does NOT change with the SWE accumulation window (sc). See target_k comment above.
   # Modular arithmetic wraps correctly: e.g. m=1 → window months 11, 12, 1
   scf_mask_list <- vector("list", 12)
   for (m in 1:12) {
@@ -524,30 +458,28 @@ if (scf_method %in% c("1", "2")) {
   cat(sprintf("✓ Basin SCF mask: months included = %s\n",
               paste(month.abb[which(basin_scf_mask)], collapse = ", ")))
 }
-
+}
 # ==============================================================================
 #   BASIN-AVERAGED SWE SETUP
 #   Correct order (matches SPI/SPEI approach):
 #     1. Average RAW SWE across basin pixels   → basin time series
-#     2. Apply 3-month rolling sum          → smoothed basin series
+#     2. Apply 3-month rolling average          → smoothed basin series
+#   (The old approach averaged the already-smoothed per-pixel matrix, which
+#    gives the same numbers but couples the spatial and temporal smoothing
+#    steps and makes the basin series dependent on per-pixel NA patterns.)
 # ==============================================================================
-cat("\n===== COMPUTING BASIN-AVERAGED SWE (raw -> average -> smooth) =====\n")
+cat("\n===== COMPUTING BASIN-AVERAGED SWE (raw; per-timescale smoothing inside loop) =====\n")
 if (scf_method %in% c("1", "2")) {
-  swe_basin_avg_raw      <- colMeans(swe_matrix, na.rm = TRUE)
-  swe_basin_avg_smoothed  <- zoo::rollapply(swe_basin_avg_raw,
-                                            width = 3,
-                                            FUN   = sum,
-                                            align = "right",
-                                            fill  = NA,
-                                            na.rm = FALSE)
-  cat(sprintf("✓ Basin-averaged smoothed SWE: %d time steps, %.1f%% non-NA\n",
-              length(swe_basin_avg_smoothed),
-              100 * mean(!is.na(swe_basin_avg_smoothed))))
+  # Raw basin mean only — smoothing is applied inside for(sc) with width = sc
+  # so each timescale gets its own correctly-sized rolling sum (Option B).
+  swe_basin_avg_raw <- colMeans(swe_matrix, na.rm = TRUE)
+  cat(sprintf("✓ Basin-averaged raw SWE: %d time steps\n", length(swe_basin_avg_raw)))
 } else {
-  swe_basin_avg_raw      <- NULL
-  swe_basin_avg_smoothed <- NULL
-  cat("✓ Basin-averaged smoothed SWE: skipped (not used by SSPI-1)\n")
+  swe_basin_avg_raw <- NULL
+  cat("✓ Basin-averaged SWE: skipped (not used by SSPI-1)\n")
 }
+# swe_basin_avg_smoothed is (re)computed inside for(sc) with width = sc
+swe_basin_avg_smoothed <- NULL
 basin_avg_swei_results <- list()
 
 # ==============================================================================
@@ -729,13 +661,20 @@ monthly_sspi <- function(v, dates_vec, ref_idx, eps = 1e-6) {
 # ==============================================================================
 #   MAIN CALCULATION LOOP - PARALLEL (Matches SPI Structure)
 # ==============================================================================
-timescales <- c(1) # SWEI typically 1-month output, but structured like SPI/SPEI/...
+# SWEI timescales: each value defines BOTH the output label (swei_03_*) AND the
+# rolling-sum window width (width = sc) — Option B decoupling ensures these are
+# always mathematically tied together.
+# Currently c(3) → 3-month seasonal SWEI matching Huning & AghaKouchak (2020).
+# To run multiple windows in one pass, extend to e.g. c(1, 3, 6); filenames,
+# smoothing windows, and summaries all update automatically.
+# SSPI-1 always operates on raw monthly SWE (window = 1, no rolling sum).
+timescales <- if (scf_method == "3") c(1) else c(3)
 # ---- Set up parallel cluster ----
 n_cores <- max(1L, detectCores() - 1L)
 cat(sprintf("\n✓ Starting parallel cluster with %d cores\n", n_cores))
 dir.create(tempdir(), recursive = TRUE, showWarnings = FALSE)
 cl <- makeCluster(n_cores)
-clusterSetRNGStream(cl, iseed = 40L)   # ← random seed setting
+clusterSetRNGStream(cl, iseed = 40)  
 if (scf_method == "3") {
   clusterExport(cl, varlist = c("monthly_sspi", "clip_prob",
                                 "swe_matrix", "dates", "ref_idx"),
@@ -743,9 +682,11 @@ if (scf_method == "3") {
   clusterEvalQ(cl, { library(zoo); library(lmomco) })
 } else {
   clusterExport(cl, varlist = c("gringorten_swei_seasonal", "clip_prob",
-                                "swe_smoothed", "dates", "scf_mask_list",
+                                "dates", "scf_mask_list",
                                 "basin_scf_mask"),
                 envir = environment())
+  # NOTE: swe_smoothed is NOT exported here — it is built inside for(sc) with
+  # width = sc and re-exported to workers immediately after each build (Option B).
   clusterEvalQ(cl, { library(zoo) })
 }
 
@@ -883,11 +824,48 @@ for (sc in timescales) {
   # ============================================================================
   #   OPTIONS 1 & 2: SWEI CALCULATION (Gringorten, SCF-masked)
   # ============================================================================
-  cat(sprintf("\n===== SWEI-%d (Sequential Calculation) =====\n", sc))
+  cat(sprintf("\n===== SWEI-%d (%d-month window, Sequential Calculation) =====\n", sc, sc))
+  # ==============================================================================
+  #   STEP 1: Apply sc-month rolling sum to RAW SWE values (PREPROCESSING)
+  #   Option B decoupling: width = sc means the smoothing window, the output label
+  #   (swei_%02d_*), and the longname all derive from the same loop variable.
+  #   NOTE: used only by methods 1 & 2 (SWEI). Method 3 (SSPI-1) operates on
+  #   raw monthly SWE values directly — no temporal smoothing is applied.
+  #   NOTE: SCF mask uses a fixed k=3 window (H&A 2020) regardless of sc — see
+  #   target_k comment above for the rationale.
+  # ==============================================================================
+  
+  # Basin average: apply sc-month rolling sum (width = sc, not hard-coded 3)
+  swe_basin_avg_smoothed <- zoo::rollapply(swe_basin_avg_raw,
+                                           width = sc,
+                                           FUN   = sum,
+                                           align = "right",
+                                           fill  = NA,
+                                           na.rm = FALSE)
+  cat(sprintf("✓ Basin-averaged %d-month smoothed SWE: %d steps, %.1f%% non-NA\n",
+              sc, length(swe_basin_avg_smoothed),
+              100 * mean(!is.na(swe_basin_avg_smoothed))))
+  
+  # Per-pixel rolling sum with the same width
+  swe_smoothed <- matrix(NA, nrow = nrow(swe_matrix), ncol = ncol(swe_matrix))
+  for (i in 1:nrow(swe_matrix)) {
+    swe_smoothed[i, ] <- zoo::rollapply(swe_matrix[i, ],
+                                        width = sc,
+                                        FUN = sum,
+                                        align = "right",
+                                        fill = NA,
+                                        na.rm = FALSE)   # NA if any month in the window is NA
+  }
+  cat(sprintf("✓ %d-month rolling sum applied to SWE (SWEI preprocessing)\n", sc))
+  
+  # Re-export swe_smoothed to workers now that it has been built for sc = %d.
+  # (It cannot be pre-exported before the loop because it doesn't exist yet —
+  #  this per-iteration export is the correct fix for the latent bug.)
+  clusterExport(cl, varlist = c("swe_smoothed"), envir = environment())
+  
   # ==============================================================================
   #   CALCULATE BASIN-AVERAGED SWEI
   # ==============================================================================
-  set.seed(40L)   #  seeds the runif() zero-perturbation
   avg_swei_out <- tryCatch(
     gringorten_swei_seasonal(swe_basin_avg_smoothed, dates, scf_mask_list,
                              cell_index = NULL, basin_scf_mask = basin_scf_mask,
@@ -917,8 +895,34 @@ for (sc in timescales) {
   extreme_wet  <- sum(swei_indices >  3.0, na.rm = TRUE)
   cat(sprintf("  Extreme values (|SWEI| > 3): %d dry, %d wet (retained, no clipping)\n",
               extreme_dry, extreme_wet))
-  na_rate_basin  <- 100 * mean(is.na(swei_indices))
-  cat(sprintf("  NA rate (basin): %.3f%%\n", na_rate_basin))
+  
+  # ── NA diagnostics: explicitly separate the two very different completeness
+  #    numbers so the discrepancy is visible before anyone uses the gridded files.
+  #
+  #    basin mean series  — spatial averaging masks individual pixel gaps; nearly
+  #                         always complete even when most pixels are masked.
+  #    per-pixel gridded  — 75%-nonzero-years criterion + per-pixel SCF mask are
+  #                         applied cell-by-cell, so NA rates are far higher.
+  #    Restricting to basin pixels only avoids dilution by all-NA out-of-basin cells.
+  basin_pix_rows      <- which(!is.na(swe_matrix[, 1]))   # within-basin pixel rows
+  na_rate_grid        <- 100 * mean(is.na(swei_indices[basin_pix_rows, , drop = FALSE]))
+  na_rate_basin       <- na_rate_grid   # kept for backward-compat with summary code
+  basin_mean_complete <- 100 * mean(!is.na(basin_avg_swei_results[[as.character(sc)]]))
+  
+  cat(sprintf("  Basin mean series:  %.1f%% complete (%.1f%% NA)\n",
+              basin_mean_complete, 100 - basin_mean_complete))
+  cat(sprintf("  Per-pixel gridded:  %.3f%% NA  (basin pixels only)\n", na_rate_grid))
+  grid_status <- ifelse(na_rate_grid < 0.5,
+                        "READY  (<0.5% NAs)",
+                        "CAUTION (>0.5% NAs)")
+  cat(sprintf("  Gridded compatibility: %s\n", grid_status))
+  if (na_rate_grid >= 0.5) {
+    cat("  ⚠  High per-pixel NA is expected: the 75%%-nonzero-years criterion\n")
+    cat("     and SCF mask are applied pixel-by-pixel, which is much stricter\n")
+    cat("     than the basin-mean aggregate implies. The basin mean series is\n")
+    cat("     suitable for time-series analysis; use gridded files for spatial\n")
+    cat("     analysis with awareness of actual spatial coverage.\n")
+  }
   
   # Method distribution
   gringorten_pct  <- 100 * sum(method_matrix == 1, na.rm = TRUE) / sum(!is.na(method_matrix))
@@ -932,6 +936,7 @@ for (sc in timescales) {
     sc = sc,
     date = Sys.time(),
     na_rate = na_rate_basin,
+    basin_mean_complete = basin_mean_complete,
     gringorten_pct = gringorten_pct,
     masked_pct = masked_pct,
     swei_indices = swei_indices,
@@ -1006,7 +1011,7 @@ for (sc in timescales) {
        main   = sprintf("SWEI-%d: Seasonal Method", sc),
        axes   = FALSE, box = FALSE)
   if (!is.null(basin)) plot(basin, add = TRUE, border = "darkgray", lwd = 1.5)
-  valid_pixels <- sum(!is.na(values(swe[[24]])))
+  valid_pixels <- sum(!is.na(values(swe[[1]])))
   mtext(sprintf("Valid pixels: %d | Gringorten: %.1f%%", valid_pixels, gringorten_pct),
         side = 1, line = 1, cex = 0.75, col = "gray30")
   # -- Panel 2: Legend --
@@ -1079,17 +1084,6 @@ if (scf_method != "3") {
                           sprintf("swei_%02d_basin_averaged_by_month.csv", sc))
     write.csv(df_out, csv_file, row.names = FALSE, na = "")
     cat(sprintf("✓ Saved basin-averaged SWEI-%d (12 monthly series) to: %s\n", sc, csv_file))
-    # Pivot wide CSV to long format and plot
-    df_wide <- read.csv(csv_file)
-    df_long <- df_wide %>%
-      tidyr::pivot_longer(cols = -Year, names_to = "Month", values_to = "value") %>%
-      dplyr::mutate(date = as.Date(paste(Year, Month, "01", sep = "-"), format = "%Y-%b-%d")) %>%
-      dplyr::filter(!is.na(value)) %>%
-      dplyr::select(date, value)
-    
-    p_swei <- plot_standard_basin_ts(df_long, index_name = "SWEI", color = "#1E90FF")
-    ggplot2::ggsave(file.path(out_dir, sprintf("swei_%02d_basin_timeseries.png", sc)), 
-                    p_swei, width = 12, height = 6, dpi = 300)
   }
 }
 
@@ -1104,7 +1098,7 @@ if (scf_method == "3") {
     "============================================================\n",
     "MONTHLY SSPI-1 SUMMARY - NECHAKO BASIN\n",
     "ERA5-Land Snow Water Equivalent\n",
-    "Method 3: Zero-Inflated Gamma (no SCF mask)\n",
+    "Method 3: Zero-Inflated Gamma (1981-2020 reference, no SCF mask)\n",
     "============================================================\n\n",
     file = summary_combined_file, sep = ""
   )
@@ -1123,15 +1117,11 @@ if (scf_method == "3") {
         file = summary_combined_file, append = TRUE)
     cat(sprintf("Reference period: %s to %s\n", sspi_ref_start, sspi_ref_end),
         file = summary_combined_file, append = TRUE)
-    cat("\nZero-Inflation Handling:\n",
+    cat("\nZero-Inflation Screening:\n",
         file = summary_combined_file, append = TRUE)
-    cat("  Basin-global pre-screen removed (was incorrectly excluding seasonal pixels).\n",
-        file = summary_combined_file, append = TRUE)
-    cat("  Zero-inflation is handled per calendar month inside monthly_sspi():\n",
-        file = summary_combined_file, append = TRUE)
-    cat("  p0 estimated from that month's reference sample; all-zero months\n",
-        file = summary_combined_file, append = TRUE)
-    cat("  use the zero-variance path (method = 3, SSPI assigned 0).\n",
+    cat(sprintf("  Excluded pixels (>50%% zero SWE in ref period): %d (%.1f%%)\n",
+                length(invalid_pix_sspi),
+                100 * length(invalid_pix_sspi) / n_pixels),
         file = summary_combined_file, append = TRUE)
     cat("\nMethodology:\n",
         file = summary_combined_file, append = TRUE)
@@ -1186,7 +1176,8 @@ if (scf_method == "3") {
   cat(
     "============================================================\n",
     "COMBINED SWEI SUMMARY FOR ALL TIMESCALES\n",
-    "Seasonal Approach (3-month Smoothed SWE + k=3 SCF Mask)\n",
+    "Seasonal Approach: SWE rolling sum = timescale months (Option B)\n",
+    "SCF mask window fixed at k=3 per Huning & AghaKouchak (2020)\n",
     "============================================================\n\n",
     file = summary_combined_file, sep = ""
   )
@@ -1205,12 +1196,16 @@ if (scf_method == "3") {
         file = summary_combined_file, append = TRUE)
     cat("\nMethodology:\n",
         file = summary_combined_file, append = TRUE)
-    cat("  - 3-month right moving average applied to RAW SWE\n",
+    cat(sprintf("  - %d-month rolling sum applied to RAW SWE (window = sc = %d)\n", sc, sc),
+        file = summary_combined_file, append = TRUE)
+    cat("  - SCF mask window fixed at k=3 (intentionally independent of SWE window,\n",
+        file = summary_combined_file, append = TRUE)
+    cat("    per Huning & AghaKouchak 2020 — see target_k comment in script)\n",
         file = summary_combined_file, append = TRUE)
     cat(sprintf("  - SCF domain method: %s\n", scf_method_label),
         file = summary_combined_file, append = TRUE)
     if (scf_method == "1") {
-      cat(sprintf("    -> Data-driven threshold from 6preq_diag_SCF.R (k=3, threshold = %.3f)\n",
+      cat(sprintf("    -> Data-driven threshold from H8preq_diag_SCF.R (k=3, threshold = %.3f)\n",
                   scf_threshold),
           file = summary_combined_file, append = TRUE)
     } else {
@@ -1234,11 +1229,26 @@ if (scf_method == "3") {
         file = summary_combined_file, append = TRUE)
     cat("\nNA Analysis:\n",
         file = summary_combined_file, append = TRUE)
-    cat(sprintf("  Total NA values in basin: %.3f%%\n", s$na_rate),
+    cat(sprintf("  Basin mean series:     %.1f%% complete (%.1f%% NA)\n",
+                s$basin_mean_complete, 100 - s$basin_mean_complete),
         file = summary_combined_file, append = TRUE)
-    cat(sprintf("  Compatibility: %s\n",
-                ifelse(s$na_rate < 0.5, "READY (<0.5% NAs)", "CAUTION (>0.5% NAs)")),
+    cat(sprintf("  Per-pixel gridded:     %.3f%% NA  (basin pixels only)\n", s$na_rate),
         file = summary_combined_file, append = TRUE)
+    cat(sprintf("  Gridded compatibility: %s\n",
+                ifelse(s$na_rate < 0.5, "READY  (<0.5% NAs)", "CAUTION (>0.5% NAs)")),
+        file = summary_combined_file, append = TRUE)
+    if (s$na_rate >= 0.5) {
+      cat("  NOTE: The large gap between basin-mean completeness and per-pixel NA\n",
+          file = summary_combined_file, append = TRUE)
+      cat("  is expected — spatial averaging masks individual pixel gaps, while the\n",
+          file = summary_combined_file, append = TRUE)
+      cat("  75%%-nonzero-years criterion and SCF mask applied pixel-by-pixel are\n",
+          file = summary_combined_file, append = TRUE)
+      cat("  much stricter. The basin mean series is suitable for time-series analysis;\n",
+          file = summary_combined_file, append = TRUE)
+      cat("  use gridded files for spatial analysis with awareness of spatial coverage.\n",
+          file = summary_combined_file, append = TRUE)
+    }
     first_idx  <- 1:min(12, ncol(s$swei_indices))
     first_swei  <- s$swei_indices[, first_idx, drop = FALSE]
     cat("\nDrought frequency (first 12 months):\n",
@@ -1263,4 +1273,4 @@ cat(if (scf_method == "3") "SSPI-1 CALCULATION COMPLETE!\n" else "SWEI CALCULATI
 cat("============================================================\n")
 cat(sprintf("\nOutput directory: %s\n", normalizePath(out_dir)))
 cat(sprintf("Summary file: %s\n", summary_combined_file))
-cat("\n--- READY FOR FURTHER ANALYSIS ---\n")
+cat("\n--- READY FOR ANALYSIS ---\n")

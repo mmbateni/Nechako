@@ -93,7 +93,7 @@ sm_l4 <- rast(sm_files[4])
 extract_time_dimension <- function(raster_obj, file_path) {
   t <- time(raster_obj)
   if (!all(is.na(t))) return(as.Date(t))
-
+  
   nc <- nc_open(file_path)
   if ("valid_time" %in% names(nc$var)) {
     tv <- ncvar_get(nc, "valid_time")
@@ -182,39 +182,39 @@ expand_to_full <- function(sub_mat, valid_idx, n_pixels_total) {
 # Method codes: 1 = Beta  |  2 = Empirical (Blom)
 # ==============================================================================
 compute_ssi <- function(v, scale, dates_vec, eps = 1e-6) {
-
+  
   v_clean <- v
   v_clean[!is.finite(v_clean)] <- NA_real_
-
+  
   # Rolling mean aggregation (scale = 1 → raw monthly value)
   x_agg <- if (scale == 1L) v_clean else roll_mean_right(v_clean, scale)
-
+  
   n           <- length(x_agg)
   z           <- rep(NA_real_, n)
   method_used <- rep(NA_integer_, n)
   mon         <- as.integer(format(dates_vec, "%m"))
-
+  
   for (m in 1:12) {
-
+    
     idx  <- which(mon == m & is.finite(x_agg))
     if (length(idx) < 5L) next
-
+    
     samp   <- x_agg[idx]
     samp_v <- var(samp, na.rm = TRUE)
-
+    
     # ---- Case 0 : zero variance ----
     if (!is.finite(samp_v) || samp_v < .Machine$double.eps) {
       z[idx]           <- 0
       method_used[idx] <- 3L   # 3 = zero-variance sentinel
       next
     }
-
+    
     # ---- Case 1 : Beta distribution (method-of-moments) ----
     # Clamp to strict (0, 1) interior before moment estimation
     samp_b <- pmax(pmin(samp, 1 - eps), eps)
     mu     <- mean(samp_b, na.rm = TRUE)
     v2     <- var(samp_b,  na.rm = TRUE)
-
+    
     ok_beta <- tryCatch({
       if (v2 <= 0 || v2 >= mu * (1 - mu)) stop("moments out of range")
       phi   <- (mu * (1 - mu) / v2) - 1
@@ -222,30 +222,30 @@ compute_ssi <- function(v, scale, dates_vec, eps = 1e-6) {
       beta  <- (1 - mu) * phi
       if (!is.finite(alpha) || !is.finite(beta) ||
           alpha <= 0         || beta  <= 0) stop("non-positive params")
-
+      
       p    <- pbeta(samp_b, shape1 = alpha, shape2 = beta)
       p    <- clip_prob(p, eps)
       z[idx]           <- qnorm(p)
       method_used[idx] <- 1L   # 1 = Beta
       TRUE
     }, error = function(e) FALSE)
-
+    
     if (ok_beta) next
-
+    
     # ---- Case 2 : Empirical Blom fallback ----
     p                <- (rank(samp, ties.method = "average") - 0.375) /
-                        (length(samp) + 0.25)
+      (length(samp) + 0.25)
     p                <- clip_prob(p, eps)
     z[idx]           <- qnorm(p)
     method_used[idx] <- 2L   # 2 = Empirical
-
+    
   }
-
+  
   # Clamp to ±4.75 (matches SPI script)
   fin <- is.finite(z)
   z[fin & z < -4.75] <- -4.75
   z[fin & z >  4.75] <-  4.75
-
+  
   list(ssi = z, method = method_used)
 }
 
@@ -259,54 +259,64 @@ compute_ssi <- function(v, scale, dates_vec, eps = 1e-6) {
 # Monthly stratification per Kao & Govindaraju (2010).
 # ==============================================================================
 compute_ssmi <- function(v, scale, dates_vec, eps = 1e-6) {
-
+  
   v_clean <- v
   v_clean[!is.finite(v_clean)] <- NA_real_
-
+  
   x_agg <- if (scale == 1L) v_clean else roll_mean_right(v_clean, scale)
-
+  
   n   <- length(x_agg)
   z   <- rep(NA_real_, n)
   mon <- as.integer(format(dates_vec, "%m"))
-
+  
   for (m in 1:12) {
-
+    
     idx  <- which(mon == m & is.finite(x_agg))
     if (length(idx) < 5L) next
-
+    
     samp   <- x_agg[idx]
     samp_c <- pmax(pmin(samp, 1 - eps), eps)   # clamp to (0,1)
-
-    tryCatch({
-
+    
+    # ---- Case 1 : KDE (logit-transform + Gaussian KDE-CDF) ----
+    # NOTE: the assignment to z[idx] happens here, in compute_ssmi's own
+    # frame, not inside the tryCatch error handler. Assigning inside a
+    # tryCatch(error = function(e) {...}) closure does NOT propagate to
+    # the enclosing function's variables (a bare `<-` there creates a
+    # throwaway local copy) -- this previously caused the Blom fallback
+    # to silently fail to update z whenever the KDE step errored.
+    ok_kde <- tryCatch({
+      
       # Step 1 — Logit transform  y = log(x / (1 - x))
       y <- log(samp_c / (1 - samp_c))
-
+      
       # Step 2 — Silverman bandwidth in transformed space
       bw <- bw.nrd0(y)
       if (!is.finite(bw) || bw <= 0) bw <- 0.5 * IQR(y) + .Machine$double.eps
-
+      
       # Step 3 — KDE-CDF at each training point
       # F̂(yᵢ) = (1/n) Σⱼ Φ((yᵢ − yⱼ) / h)
       p <- vapply(y, function(yi) mean(pnorm((yi - y) / bw)), numeric(1L))
       p <- clip_prob(p, eps)
-
+      
       z[idx] <- qnorm(p)
-
-    }, error = function(e) {
-      # Fallback : simple empirical Blom quantile
-      p        <- (rank(samp, ties.method = "average") - 0.375) /
-                  (length(samp) + 0.25)
-      p        <- clip_prob(p, eps)
-      z[idx]  <- qnorm(p)
-    })
+      TRUE
+      
+    }, error = function(e) FALSE)
+    
+    if (ok_kde) next
+    
+    # ---- Case 2 : Empirical Blom fallback ----
+    p      <- (rank(samp, ties.method = "average") - 0.375) /
+      (length(samp) + 0.25)
+    p      <- clip_prob(p, eps)
+    z[idx] <- qnorm(p)
   }
-
+  
   # Clamp to ±4.75
   fin <- is.finite(z)
   z[fin & z < -4.75] <- -4.75
   z[fin & z >  4.75] <-  4.75
-
+  
   z
 }
 
@@ -314,26 +324,26 @@ compute_ssmi <- function(v, scale, dates_vec, eps = 1e-6) {
 # OUTPUT SAVING HELPER
 # ==============================================================================
 save_index_outputs <- function(index_matrix, method_matrix,
-                                template_rast, dates_vec,
-                                scale, index_name, layer_label,
-                                out_dir, month_names) {
-
+                               template_rast, dates_vec,
+                               scale, index_name, layer_label,
+                               out_dir, month_names) {
+  
   months_all <- as.integer(format(dates_vec, "%m"))
-
+  
   # -- NetCDF per calendar month --
   for (m in 1:12) {
     idx_m <- which(months_all == m)
     if (length(idx_m) == 0L) next
-
+    
     idx_rast <- rast(template_rast)
     idx_rast <- rep(idx_rast, length(idx_m))
     values(idx_rast) <- index_matrix[, idx_m, drop = FALSE]
     terra::time(idx_rast) <- dates_vec[idx_m]
-
+    
     nc_file <- file.path(out_dir,
-      sprintf("%s_%s_%02d_month%02d_%s.nc",
-              tolower(index_name), layer_label, scale, m, month_names[m]))
-
+                         sprintf("%s_%s_%02d_month%02d_%s.nc",
+                                 tolower(index_name), layer_label, scale, m, month_names[m]))
+    
     writeCDF(idx_rast, nc_file,
              varname  = tolower(index_name),
              longname = sprintf("%s (scale=%d month, %s)", index_name, scale, layer_label),
@@ -341,41 +351,41 @@ save_index_outputs <- function(index_matrix, method_matrix,
              missval  = -9999,
              overwrite = TRUE)
   }
-
+  
   # -- Excel workbook (one sheet per calendar month) --
   excel_data <- list()
   for (m in 1:12) {
     idx_m <- which(months_all == m)
     if (length(idx_m) == 0L) next
-
+    
     df       <- as.data.frame(index_matrix[, idx_m, drop = FALSE])
     colnames(df) <- format(dates_vec[idx_m], "%Y")
     coords   <- xyFromCell(template_rast, 1:nrow(index_matrix))
     df       <- cbind(lon = coords[, 1], lat = coords[, 2], df)
     excel_data[[month_names[m]]] <- df
   }
-
+  
   xlsx_file <- file.path(out_dir,
-    sprintf("%s_%s_%02d_all_months.xlsx", tolower(index_name), layer_label, scale))
+                         sprintf("%s_%s_%02d_all_months.xlsx", tolower(index_name), layer_label, scale))
   if (file.exists(xlsx_file)) file.remove(xlsx_file)
   write_xlsx(excel_data, xlsx_file)
-
+  
   # -- CSV per calendar month --
   for (m in 1:12) {
     idx_m <- which(months_all == m)
     if (length(idx_m) == 0L) next
-
+    
     df       <- as.data.frame(index_matrix[, idx_m, drop = FALSE])
     colnames(df) <- format(dates_vec[idx_m], "%Y")
     coords   <- xyFromCell(template_rast, 1:nrow(index_matrix))
     df       <- cbind(lon = coords[, 1], lat = coords[, 2], df)
-
+    
     csv_file <- file.path(out_dir,
-      sprintf("%s_%s_%02d_month%02d_%s.csv",
-              tolower(index_name), layer_label, scale, m, month_names[m]))
+                          sprintf("%s_%s_%02d_month%02d_%s.csv",
+                                  tolower(index_name), layer_label, scale, m, month_names[m]))
     write.csv(df, csv_file, row.names = FALSE)
   }
-
+  
   cat(sprintf("    ✓ %s outputs saved (%s, scale=%d)\n",
               index_name, layer_label, scale))
 }
@@ -415,43 +425,43 @@ all_summaries_ssi  <- list()
 all_summaries_ssmi <- list()
 
 for (cfg in layer_configs) {
-
+  
   cat(sprintf("\n============================================================\n"))
   cat(sprintf("LAYER CONFIG : %s\n", cfg$desc))
   cat(sprintf("============================================================\n"))
-
-    
-    sm_rast   <- cfg$sm
-    layer_lbl <- cfg$label
-    
-    # ── rebuild sm_matrix_sub for this layer config ──
-    sm_mat_full   <- values(sm_rast, mat = TRUE)
-    sm_matrix_sub <- sm_mat_full[valid_idx, , drop = FALSE]
-    rm(sm_mat_full)
-    cat(sprintf("Basin pixels : %d | Time steps : %d\n",
-                n_valid, ncol(sm_matrix_sub)))
-    # ───────────────────────────────────────────────────────
-
+  
+  
+  sm_rast   <- cfg$sm
+  layer_lbl <- cfg$label
+  
+  # ── rebuild sm_matrix_sub for this layer config ──
+  sm_mat_full   <- values(sm_rast, mat = TRUE)
+  sm_matrix_sub <- sm_mat_full[valid_idx, , drop = FALSE]
+  rm(sm_mat_full)
+  cat(sprintf("Basin pixels : %d | Time steps : %d\n",
+              n_valid, ncol(sm_matrix_sub)))
+  # ───────────────────────────────────────────────────────
+  
   # Export to workers
   clusterExport(cl,
-    varlist = c("compute_ssi", "compute_ssmi",
-                "roll_mean_right", "clip_prob",
-                "sm_matrix_sub", "dates"),
-    envir = environment())
+                varlist = c("compute_ssi", "compute_ssmi",
+                            "roll_mean_right", "clip_prob",
+                            "sm_matrix_sub", "dates"),
+                envir = environment())
   clusterEvalQ(cl, { library(zoo); library(stats) })
-
+  
   for (sc in timescales) {
-
+    
     cat(sprintf("\n  ===== Scale %d month (%s) =====\n", sc, layer_lbl))
-
+    
     clusterExport(cl, varlist = "sc", envir = environment())
-
+    
     # ──────────────────────────────
     #  SSI
     # ──────────────────────────────
     cat(sprintf("  [SSI-%d  %s]  Computing...\n", sc, layer_lbl))
     start_t <- Sys.time()
-
+    
     ssi_results <- parLapply(cl, seq_len(n_valid), function(i) {
       tryCatch(
         compute_ssi(sm_matrix_sub[i, ], scale = sc, dates_vec = dates),
@@ -459,7 +469,7 @@ for (cfg in layer_configs) {
                                  method = rep(NA_integer_, length(dates)))
       )
     })
-
+    
     ssi_sub     <- do.call(rbind, lapply(ssi_results, `[[`, "ssi"))
     ssi_mth_sub <- do.call(rbind, lapply(ssi_results, `[[`, "method"))
     
@@ -469,23 +479,23 @@ for (cfg in layer_configs) {
     ssi_methods[valid_idx, ] <- ssi_mth_sub
     
     ssi_indices[!is.finite(ssi_indices)] <- NA_real_
-
+    
     elapsed <- round(as.numeric(difftime(Sys.time(), start_t, units = "mins")), 2)
-
+    
     # Diagnostics
     na_rate_ssi     <- 100 * mean(is.na(ssi_indices[basin_mask, ]))
     beta_pct        <- 100 * sum(ssi_methods == 1L, na.rm = TRUE) /
-                              sum(!is.na(ssi_methods))
+      sum(!is.na(ssi_methods))
     emp_pct         <- 100 * sum(ssi_methods == 2L, na.rm = TRUE) /
-                              sum(!is.na(ssi_methods))
+      sum(!is.na(ssi_methods))
     zvar_pct        <- 100 * sum(ssi_methods == 3L, na.rm = TRUE) /
-                              sum(!is.na(ssi_methods))
-
+      sum(!is.na(ssi_methods))
+    
     cat(sprintf("  Done in %.2f min\n", elapsed))
     cat(sprintf("  NA rate (basin)   : %.3f%%\n",  na_rate_ssi))
     cat(sprintf("  Methods: Beta=%.1f%%  Empirical=%.1f%%  Zero-var=%.1f%%\n",
                 beta_pct, emp_pct, zvar_pct))
-
+    
     mon_all <- as.integer(format(dates, "%m"))
     cat(sprintf("  Case counts by calendar month (SSI-%d, %s):\n", sc, layer_lbl))
     cat(sprintf("  %-5s  %8s  %6s  %8s  %6s  %8s  %6s\n",
@@ -511,7 +521,7 @@ for (cfg in layer_configs) {
       )
     }
     cbm_ssi <- do.call(rbind, Filter(Negate(is.null), cbm_rows))
-
+    
     # Store summary
     key <- paste0(layer_lbl, "_sc", sc)
     all_summaries_ssi[[key]] <- list(
@@ -525,7 +535,7 @@ for (cfg in layer_configs) {
       case_by_month = cbm_ssi,
       ssi_indices   = ssi_indices
     )
-
+    
     save_index_outputs(
       index_matrix  = ssi_indices,
       method_matrix = ssi_methods,
@@ -537,26 +547,26 @@ for (cfg in layer_configs) {
       out_dir       = out_dir_ssi,
       month_names   = month_names
     )
-
+    
     rm(ssi_results, ssi_indices, ssi_methods)
-
+    
     # ──────────────────────────────
     #  SSMI
     # ──────────────────────────────
     cat(sprintf("  [SSMI-%d %s]  Computing...\n", sc, layer_lbl))
     start_t <- Sys.time()
-
+    
     ssmi_results <- parLapply(cl, seq_len(n_valid), function(i) {
       tryCatch(
         list(ssmi = compute_ssmi(sm_matrix_sub[i, ], scale = sc, dates_vec = dates)),
         error = function(e) list(ssmi = rep(NA_real_, length(dates)))
       )
     })
-
+    
     ssmi_sub    <- do.call(rbind, lapply(ssmi_results, `[[`, "ssmi"))
     ssmi_indices <- expand_to_full(ssmi_sub, valid_idx, n_pixels)
     ssmi_indices[!is.finite(ssmi_indices)] <- NA_real_
-
+    
     elapsed <- round(as.numeric(difftime(Sys.time(), start_t, units = "mins")), 2)
     na_rate_ssmi <- 100 * mean(is.na(ssmi_indices[basin_mask, ]))
     idx_mat      <- ssmi_indices                          # ← was s$ssmi_indices
@@ -573,7 +583,7 @@ for (cfg in layer_configs) {
       na_rate     = na_rate_ssmi,
       ssmi_indices = ssmi_indices
     )
-
+    
     save_index_outputs(
       index_matrix  = ssmi_indices,
       method_matrix = NULL,
@@ -585,12 +595,12 @@ for (cfg in layer_configs) {
       out_dir       = out_dir_ssmi,
       month_names   = month_names
     )
-
+    
     rm(ssmi_results, ssmi_indices)
-
+    
   }  # end timescales loop
-
-
+  
+  
 }  # end layer_configs loop
 stopCluster(cl)
 cat("\n✓ Parallel cluster stopped\n")
@@ -602,17 +612,17 @@ cat("\n===== WRITING SUMMARY FILES =====\n")
 
 write_summary <- function(summaries, index_name, out_dir) {
   summary_file <- file.path(out_dir,
-    sprintf("%s_all_timescales_summary.txt", tolower(index_name)))
-
+                            sprintf("%s_all_timescales_summary.txt", tolower(index_name)))
+  
   hdr <- function(..., append = TRUE) {
     cat(..., file = summary_file, append = append, sep = "")
   }
-
+  
   hdr(sprintf(
     "============================================================\n%s SUMMARY (ALL TIMESCALES AND LAYER CONFIGURATIONS)\n",
     index_name), append = FALSE)
   hdr("Monthly stratification : Kao & Govindaraju (2010)\n")
-
+  
   if (index_name == "SSI") {
     hdr("Distribution           : Beta (primary) → Empirical Blom (fallback)\n")
     hdr("Reference              : Hao & AghaKouchak (2013), McKee et al. (1993)\n")
@@ -621,7 +631,7 @@ write_summary <- function(summaries, index_name, out_dir) {
     hdr("Reference              : Carrao et al. (2013), Russo et al.\n")
   }
   hdr("============================================================\n\n")
-
+  
   for (s in summaries) {
     hdr(sprintf("\n========== %s-%d  |  %s ==========\n",
                 index_name, s$scale, s$layer))
@@ -633,13 +643,13 @@ write_summary <- function(summaries, index_name, out_dir) {
     hdr(sprintf("NA rate (basin)  : %.3f%%\n", s$na_rate))
     hdr(sprintf("compat.    : %s\n",
                 ifelse(s$na_rate < 0.5, "✓ READY (<0.5% NAs)", "⚠ CAUTION (>0.5% NAs)")))
-
+    
     if (index_name == "SSI") {
       hdr("\nMethod distribution:\n")
       hdr(sprintf("  Beta fitting   : %.1f%%\n", s$beta_pct))
       hdr(sprintf("  Empirical Blom : %.1f%%\n", s$emp_pct))
       hdr(sprintf("  Zero-variance  : %.1f%%\n", s$zvar_pct))
-
+      
       if (!is.null(s$case_by_month)) {
         hdr("\nCase counts by calendar month:\n")
         hdr(sprintf("  %-5s  %8s  %6s  %8s  %6s  %8s  %6s\n",
@@ -653,21 +663,21 @@ write_summary <- function(summaries, index_name, out_dir) {
                       r$n_zvar, r$pct_zvar))
         }
       }
-
+      
       # Drought frequency from stored indices
       idx_mat <- s$ssi_indices
-  }# end if (index_name == "SSI")
-
-# Drought frequency — for both SSI and SSMI
-idx_field <- if (index_name == "SSI") "ssi_indices" else "ssmi_indices"
-if (!is.null(s[[idx_field]])) {
-  idx_mat <- s[[idx_field]]
-  hdr("\nDrought frequency (standardized index):\n")
-  hdr(sprintf("  Extreme     (< -2.0) : %.2f%%\n", 100 * mean(idx_mat < -2.0, na.rm = TRUE)))
-  hdr(sprintf("  Severe      (< -1.5) : %.2f%%\n", 100 * mean(idx_mat < -1.5, na.rm = TRUE)))
-  hdr(sprintf("  Moderate    (< -1.0) : %.2f%%\n", 100 * mean(idx_mat < -1.0, na.rm = TRUE)))
-}
-}# ← end for (s in summaries)
+    }# end if (index_name == "SSI")
+    
+    # Drought frequency — for both SSI and SSMI
+    idx_field <- if (index_name == "SSI") "ssi_indices" else "ssmi_indices"
+    if (!is.null(s[[idx_field]])) {
+      idx_mat <- s[[idx_field]]
+      hdr("\nDrought frequency (standardized index):\n")
+      hdr(sprintf("  Extreme     (< -2.0) : %.2f%%\n", 100 * mean(idx_mat < -2.0, na.rm = TRUE)))
+      hdr(sprintf("  Severe      (< -1.5) : %.2f%%\n", 100 * mean(idx_mat < -1.5, na.rm = TRUE)))
+      hdr(sprintf("  Moderate    (< -1.0) : %.2f%%\n", 100 * mean(idx_mat < -1.0, na.rm = TRUE)))
+    }
+  }# ← end for (s in summaries)
   cat(sprintf("✓ Summary saved: %s\n", summary_file))
 }
 

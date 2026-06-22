@@ -23,8 +23,8 @@
 #
 # Station Notes:
 #   08JC001  Nechako R at Vanderhoof     | regulated + naturalized  (Qnat & Qin)
-#   08JC002  Nechako R above Nautley R   | regulated + naturalized  (Qnat & Qin PRIMARY)
-#   08JB002  Nechako R at Isle Pierre    | regulated ONLY 1929-2024 [EXCLUDED from H-SWSI]
+#   08JC002  Nechako R at Isle Pierre   | regulated + naturalized  (Qnat & Qin PRIMARY)
+#   08JB002  STELLAKO RIVER AT GLENANNAN    | unaffected by regulation 1929-2024 
 #   08JA015  Stuart Lake outlet          | unregulated 1976-2023    [supplementary Qnat]
 #
 # Natural Lakes for H-SWSI LakeNat component (GloLakes v2):
@@ -1400,10 +1400,9 @@ h_long <- hswsi_result %>%
 
 p_h_comp <- ggplot(h_long, aes(x = date, y = Z, colour = component)) +
   facet_wrap(~ component, ncol = 1, scales = "free_y") +
-  geom_hline(yintercept = c(0, -1, -2),
-             linetype = "dashed",
-             colour   = c("grey50","#fc8d59","#d73027"),
-             linewidth = 0.35) +
+  geom_hline(yintercept = 0,  linetype = "dashed", colour = "grey50",  linewidth = 0.35) +
+  geom_hline(yintercept = -1, linetype = "dashed", colour = "#fc8d59", linewidth = 0.35) +
+  geom_hline(yintercept = -2, linetype = "dashed", colour = "#d73027", linewidth = 0.35) +
   geom_line(linewidth = 0.6) +
   scale_colour_brewer(palette = "Set1", guide = "none") +
   scale_x_date(date_breaks = "5 years", date_labels = "%Y") +
@@ -1434,10 +1433,9 @@ o_long <- oswsi_result %>%
 
 p_o_comp <- ggplot(o_long, aes(x = date, y = Z, colour = component)) +
   facet_wrap(~ component, ncol = 1, scales = "free_y") +
-  geom_hline(yintercept = c(0, -1, -2),
-             linetype = "dashed",
-             colour   = c("grey50","#fc8d59","#d73027"),
-             linewidth = 0.35) +
+  geom_hline(yintercept = 0,  linetype = "dashed", colour = "grey50",  linewidth = 0.35) +
+  geom_hline(yintercept = -1, linetype = "dashed", colour = "#fc8d59", linewidth = 0.35) +
+  geom_hline(yintercept = -2, linetype = "dashed", colour = "#d73027", linewidth = 0.35) +
   geom_line(linewidth = 0.6) +
   scale_colour_brewer(palette = "Dark2", guide = "none") +
   scale_x_date(date_breaks = "5 years", date_labels = "%Y") +

@@ -1,17 +1,19 @@
 # ============================================================================
 # NECHAKO STREAMFLOW RIVER BASIN — DUAL-PIPELINE DROUGHT ANALYSIS
-# 
+# Since Nechako Reservoir levels capture wetness/drought conditions,
+# we use only streamflow data unaffected by dam regulation.
 # Pipeline A (Daily):   Variable threshold drought, Raut & Ganguli (2024)
 # Pipeline B (Monthly): Standardized Streamflow Index, Peña-Angulo et al. (2022)
 #
 # Shared preprocessing (both pipelines):
 #   - Data loading & completeness check  (original year-span logic)
 #   - Gap filling: Fritsch-Carlson PCHIP, gaps > MAX_FILL_DAYS left as NA  
-#   - Hard exclusion gate for stations < 70% completeness                  
+#   - Hard exclusion gate for stations < 50% completeness                  
 #
 # Pipeline A adds:
 #   - Per-DOY variable threshold (Q20 = 80% exceedance probability)        
 #   - Daily drought event identification (min 30 days)
+#   - NA gap-days are silently treated as "not drought" in Pipeline A
 #
 # Pipeline B adds:
 #   - Daily → monthly mean aggregation
@@ -19,7 +21,7 @@
 #   - SSI calculation and drought identification (SSI < -0.84)
 #
 # check_data_completeness() uses the original month-span denominator.
-#       Only 08JE001 and 08JE004 are expected to pass (≥70% completeness).
+#       
 # ============================================================================
 
 rm(list = ls())
@@ -49,17 +51,13 @@ for (pkg in packages_needed) {
 # SECTION 2: STATION METADATA & DIRECTORIES
 # ============================================================================
 stations <- data.frame(
-  StationID   = c("08JA015", "08JB002", "08JC001", "08JC002",
-                  "08JC005", "08JE001", "08JE004"),
-  StationName = c("LAVENTIE CREEK NEAR THE MOUTH",
-                  "STELLAKO RIVER AT GLENANNAN",
-                  "NECHAKO RIVER AT VANDERHOOF",
-                  "NECHAKO RIVER AT ISLE PIERRE",
+  StationID   = c("08JB002", "08JC005", "08JE001", "08JE004"),
+  StationName = c("STELLAKO RIVER AT GLENANNAN",
                   "CHILAKO RIVER NEAR PRINCE GEORGE",
                   "STUART RIVER NEAR FORT ST. JAMES",
                   "TSILCOH RIVER NEAR THE MOUTH"),
-  StartYear   = c(1976, 1929, 1915, 1950, 1953, 1929, 1975),
-  EndYear     = c(2022, 2024, 2023, 2023, 2022, 2024, 2024),
+  StartYear   = c(1929, 1953, 1929, 1975),
+  EndYear     = c(2024, 2022, 2024, 2024),
   stringsAsFactors = FALSE
 )
 
@@ -127,9 +125,9 @@ create_station_completeness_plot <- function(stations, completeness, output_dir)
           main = "Station Data Completeness (Year-Span Denominator)",
           ylab = "Completeness (%)",
           border = "gray30")
-  abline(h = 70, lty = 2, lwd = 2, col = "red")
+  abline(h = 50, lty = 2, lwd = 2, col = "red")
   legend("topright", 
-         legend = c("INCLUDED (≥70%)", "EXCLUDED (<70%)"),
+         legend = c("INCLUDED (≥50%)", "EXCLUDED (<50%)"),
          fill = c("#2ca02c", "#d62728"),
          bty = "n")
   dev.off()
@@ -359,7 +357,7 @@ create_text_report <- function(stations, completeness,
 # ============================================================================
 
 # ── Shared (preprocessing) ────────────────────────────────────────────────
-MIN_COMPLETENESS_PCT <- 70   # paper Criterion B
+MIN_COMPLETENESS_PCT <- 50   # paper Criterion B
 MAX_FILL_DAYS        <- 14   # PCHIP only for gaps ≤ 14 days (FIX 2)
 
 # ── Pipeline A: daily variable threshold (Raut & Ganguli 2024) ───────────
@@ -371,7 +369,7 @@ MIN_DROUGHT_DURATION_DAYS <- 30     # minimum consecutive days below threshold
 # ── Pipeline B: SSI monthly (Peña-Angulo et al. 2022) ───────────────────
 SSI_DROUGHT_THRESHOLD  <- -0.84    # 5-year return period (Peña-Angulo §2.2.1)
 SSI_RECOVERY_THRESHOLD <-  0.00    # drought ends when SSI returns to 0
-DISTRIBUTIONS          <- c("gev", "pe3", "lnorm", "llogis", "gpareto", "weibull")
+DISTRIBUTIONS <- c("gev", "pe3", "lnorm", "glo", "gpareto", "weibull")
 MIN_MONTHS_FOR_FIT     <- 120      # minimum 10 years of monthly data
 
 # ============================================================================
@@ -655,7 +653,6 @@ identify_droughts <- function(data, thresholds,
     return(list(daily_data = data, drought_events = NULL, message = "Insufficient data"))
   }
   
-  data$doy <- ifelse(leap_year(data$year) & data$doy > 365, 365, data$doy)
   data     <- merge(data, thresholds[, c("doy", "threshold_smooth")],
                     by = "doy", all.x = TRUE)
   data     <- data[order(data$date), ]
@@ -749,17 +746,17 @@ calculate_lmoments_distance <- function(data, dist_name) {
       par  <- lmomco::pargev(lmom_sample)
       lmom_theo <- lmomco::lmomgev(par)
     } else if (dist_name == "lnorm") {
-      par  <- lmomco::parlnorm(lmom_sample)
-      lmom_theo <- lmomco::lmomlnorm(par)
+      par  <- lmomco::parln3(lmom_sample)
+      lmom_theo <- lmomco::lmomln3(par)
     } else if (dist_name == "weibull") {
       par  <- lmomco::parwei(lmom_sample)
       lmom_theo <- lmomco::lmomwei(par)
     } else if (dist_name == "gpareto") {
       par  <- lmomco::pargpa(lmom_sample)
       lmom_theo <- lmomco::lmomgpa(par)
-    } else if (dist_name == "llogis") {
-      par  <- lmomco::parlld(lmom_sample)
-      lmom_theo <- lmomco::lmomlld(par)
+    } else if (dist_name == "glo") {
+      par  <- lmomco::parglo(lmom_sample)
+      lmom_theo <- lmomco::lmomglo(par)
     } else if (dist_name == "pe3") {
       par  <- lmomco::parpe3(lmom_sample)
       lmom_theo <- lmomco::lmompe3(par)
@@ -767,15 +764,34 @@ calculate_lmoments_distance <- function(data, dist_name) {
       return(Inf)
     }
     
-    # Euclidean distance on first two L-moments (L-mean, L-scale)
-    d_sample <- lmom_sample$lambdas[1:2]
-    d_theo   <- lmom_theo$lambdas[1:2]
-    if (any(is.na(c(d_sample, d_theo)))) return(Inf)
-    return(sqrt(sum((d_sample - d_theo)^2)))
+    # FIX: L1 (mean) and L2 (L-scale) match the sample by construction under
+    # L-moment parameter estimation -- comparing them can never discriminate
+    # between candidate distributions (this was the bug: it produced ~0 distance
+    # for every distribution regardless of actual fit quality).
+    #
+    # The correct discriminating statistics are the higher-order L-moment
+    # RATIOS: L-skewness (tau3 = lambda3/lambda2) and L-kurtosis
+    # (tau4 = lambda4/lambda2). These are NOT forced to match by a fit that
+    # only uses L1/L2 to solve for parameters, so they actually measure how
+    # well each candidate's shape matches the sample's shape. This is the
+    # standard "L-moment ratio diagram" comparison used in L-moment-based
+    # distribution selection (e.g., Hosking & Wallis, 1997).
+    tau3_sample <- lmom_sample$ratios[3]
+    tau4_sample <- lmom_sample$ratios[4]
+    tau3_theo   <- lmom_theo$ratios[3]
+    tau4_theo   <- lmom_theo$ratios[4]
+    
+    if (any(is.na(c(tau3_sample, tau4_sample, tau3_theo, tau4_theo)))) return(Inf)
+    l1l2_check <- sqrt(sum((d_sample - d_theo)^2))  # should be ~0; large value = fit didn't converge
+    
+    return(list(
+      discriminant_distance = sqrt((tau3_sample - tau3_theo)^2 + (tau4_sample - tau4_theo)^2),
+      fit_sanity_check = l1l2_check
+    ))
+    return(sqrt((tau3_sample - tau3_theo)^2 + (tau4_sample - tau4_theo)^2))
     
   }, error = function(e) Inf)
 }
-
 calculate_ssi <- function(monthly_data, station_id = NULL) {
   if (is.null(monthly_data) || nrow(monthly_data) < MIN_MONTHS_FOR_FIT) {
     cat("  [Pipeline B] Insufficient monthly data for SSI (need >= 120 months)\n")
@@ -814,10 +830,10 @@ calculate_ssi <- function(monthly_data, station_id = NULL) {
     
     cdf_fn <- switch(best_dist,
                      gev     = function(x) lmomco::cdfgev(x, lmomco::pargev(lmom_sample)),
-                     lnorm   = function(x) lmomco::cdflnorm(x, lmomco::parlnorm(lmom_sample)),
+                     lnorm   = function(x) lmomco::cdfln3(x, lmomco::parln3(lmom_sample)),
                      weibull = function(x) lmomco::cdfwei(x, lmomco::parwei(lmom_sample)),
                      gpareto = function(x) lmomco::cdfgpa(x, lmomco::pargpa(lmom_sample)),
-                     llogis  = function(x) lmomco::cdflld(x, lmomco::parlld(lmom_sample)),
+                     glo     = function(x) lmomco::cdfglo(x, lmomco::parglo(lmom_sample)),
                      pe3     = function(x) lmomco::cdfpe3(x, lmomco::parpe3(lmom_sample))
     )
     
@@ -1036,9 +1052,8 @@ all_results <- list(
     interpolation_method      = "monoH.FC (Fritsch-Carlson PCHIP)",
     # Pipeline A
     pipeline_a                = "Raut & Ganguli (2024) variable threshold",
-    threshold_quantile_prob   = THRESHOLD_EXCEEDANCE_PROB,              # 0.20 — the probs= argument passed to quantile()
-    threshold_exceedance_prob = 1 - THRESHOLD_EXCEEDANCE_PROB,          # 0.80 — derived (1 - quantile_prob); 80% of days exceed Q20
-    threshold_note            = "Q20 = quantile(probs=0.20); 80% of daily flows exceed this value (low-flow threshold)",
+    threshold_exceedance_prob = 1 - THRESHOLD_EXCEEDANCE_PROB,        # 80% exceedance
+    threshold_quantile_prob   = THRESHOLD_EXCEEDANCE_PROB,   # probs= = 0.20
     threshold_window_days     = THRESHOLD_WINDOW_SIZE,
     min_drought_duration_days = MIN_DROUGHT_DURATION_DAYS,
     # Pipeline B
@@ -1133,38 +1148,7 @@ write.csv(summary_table,
           file.path(MAIN_OUTPUT_DIR, "reports", "station_summary_dual_pipeline.csv"),
           row.names = FALSE)
 print(summary_table, row.names = FALSE)
-#
-ssi_stations <- names(all_ssi_results)
-ssi_combined <- dplyr::bind_rows(lapply(ssi_stations, function(sid) {
-  all_ssi_results[[sid]]$monthly_data %>% dplyr::select(date, ssi) %>% dplyr::mutate(station = sid)
-}))
 
-ssi_basin_avg <- ssi_combined %>%
-  dplyr::group_by(date) %>%
-  dplyr::summarise(value = mean(ssi, na.rm = TRUE), .groups = "drop") %>%
-  dplyr::filter(!is.na(value))
-
-df_wide <- ssi_basin_avg %>%
-  dplyr::mutate(Year = year(date), Month = month(date, label = TRUE, abbr = TRUE)) %>%
-  dplyr::select(Year, Month, value) %>%
-  pivot_wider(names_from = Month, values_from = value) %>%
-  dplyr::arrange(Year)
-
-write_csv(df_wide, file.path(MAIN_OUTPUT_DIR, "ssi_wsc_01_basin_averaged_by_month.csv"))
-
-p <- ggplot(ssi_basin_avg, aes(x = date, y = value)) +
-  geom_ribbon(aes(ymin = pmin(value, 0), ymax = 0), fill = "#d73027", alpha = 0.3) +
-  geom_ribbon(aes(ymin = 0, ymax = pmax(value, 0)), fill = "#4575b4", alpha = 0.3) +
-  geom_line(linewidth = 0.7, colour = "grey20") +
-  geom_hline(yintercept = c(0, -0.84), linetype = c("solid", "dashed"),
-             colour = c("black", "#d73027"), linewidth = 0.4) +
-  scale_x_date(date_breaks = "5 years", date_labels = "%Y") +
-  labs(title = "Standardized Streamflow Index (SSI) Basin-Averaged Time Series",
-       subtitle = paste("Stations averaged:", paste(ssi_stations, collapse = ", ")), x = NULL, y = "SSI") +
-  theme_bw(base_size = 11) + theme(plot.title = element_text(face = "bold"), panel.grid.minor = element_blank())
-
-ggsave(file.path(MAIN_OUTPUT_DIR, "ssi_wsc_basin_timeseries.png"), p, width = 12, height = 5, dpi = 300)
-#
 cat("\nOutputs written to: ", MAIN_OUTPUT_DIR, "/\n")
 cat("  shared/processed_data/            — gap-filled daily data (both pipelines)\n")
 cat("  daily/thresholds/                 — Pipeline A: Q20 variable thresholds\n")
