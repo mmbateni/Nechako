@@ -1,36 +1,32 @@
 # ============================================================================
-# NECHAKO BASIN — TOTAL STORAGE DEFICIT INDEX  (Extended Dual-Pipeline)
-# PIPELINE 1  (BASIN)
-# Original approach: basin-wide total storage aggregated across all GeoLakes
-# lakes in the Nechako watershed.
-# Input:  BEST_ESTIMATE_basin_total_Mm3.csv
-# Required columns:  date, total_storage_Mm3
-# PIPELINE 2  (NECHAKO_RESERVOIR)
-# Single-lake NTSDI computed for the Nechako Reservoir only.
-# (Nechako Reservoir / Ootsa Lake Reservoir — created by Kenney Dam, 1952;
-# surface elevation ~850–854 m ASL; area ~890 km²; BC, Canada)
-# Two data-source options (set NECHAKO_DATA_SOURCE below):
-# "GEOLAKES"   — filter the GeoLakes / HydroLAKES dataset to the
-# Nechako Reservoir entry using its HydroLAKES_ID.
-# Expects same format as Pipeline 1 but for a single lake:
-# columns  date, storage_m3  (or similar, see GEOLAKES_*
-# settings).
-# "LOCAL_CSV"  — import a CSV exported from a local water authority
-# Two sub-options (LOCAL_DATA_TYPE):
-# "STORAGE" — CSV already contains storage in Mm³
-# "LEVEL"   — CSV contains water-surface elevation (m ASL);
-# storage derived via a piecewise-linear
-# hypsometric (stage–volume) look-up table
-# (edit HYPSO_TABLE below with real stage–volume data).
+# NECHAKO BASIN ??? TOTAL STORAGE DEFICIT INDEX  (Extended Dual-Pipeline)
+# VERSION 2 ??? Changes from original (H9NTSDI_GeoLakes_Extended.r):
+#
+#   1. Pipeline 2 now supports LOCAL_DATA ONLY.
+#      The GEOLAKES branch has been removed; NECHAKO_DATA_SOURCE is fixed to
+#      "LOCAL_DATA" and its sub-options (STORAGE / LEVEL / LEVEL_DAILY) remain.
+#
+#   2. compute_tsdi() ??? p-validity retry loop added.
+#      When the primary calibration episode yields p ??? (0,1) (which causes the
+#      recursive formula to diverge), the function now iterates over all dry
+#      runs in descending order of deficit severity until one produces a valid
+#      p.  This fixes the Pipeline 1 numerical explosion seen in the original
+#      run (p = ???7.07 ??? raw TSDI ??? ??1e182).
+#
+#   3. New Section 3.5  ??? Kenney Dam / Nechako Reservoir regulation settings.
+#
+#   4. New function check_regulated_lakes() (Section 5e).
+#      Reads the GeoLakes long file, filters to the Nechako watershed bounding
+#      box, flags each lake as IMPOUNDED / LIKELY IMPOUNDED / DOWNSTREAM /
+#      NATURAL, and produces a summary CSV + diagnostic PDF.
+#
+#   5. Section 9 now calls check_regulated_lakes() when pipeline mode includes
+#      BASIN or BOTH.
+#
 # Based on:
-# Awange et al. (2016) Adv. Water Resources 94, 45–59
-# Yirdaw et al. (2008) J. Hydrology 356, 84–92
-# Farahmand & AghaKouchak (2015) Adv. Water Resources 76, 140–145
-# OUTPUT (per pipeline that is run):
-# Nechako_TSDI_Pipeline1_Output.csv
-# Nechako_NTSDI_Pipeline2_Output.csv
-# Diagnostic plots for each active pipeline
-# Comparison plot (if both pipelines run)
+#   Awange et al. (2016) Adv. Water Resources 94, 45???59
+#   Yirdaw et al. (2008) J. Hydrology 356, 84???92
+#   Farahmand & AghaKouchak (2015) Adv. Water Resources 76, 140???145
 # ============================================================================
 rm(list = ls())
 
@@ -38,49 +34,55 @@ rm(list = ls())
 OUT_DIR <- "ntsdi_results"
 dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
 sink(file.path(OUT_DIR, "console_log.txt"), append = TRUE, split = TRUE)
+
 # ============================================================================
 # PACKAGES
 # ============================================================================
-packages <- c("tidyverse", "lubridate", "zoo","ggplot2","dplyr","readxl")
+packages <- c("tidyverse", "lubridate", "zoo", "ggplot2", "dplyr", "readxl")
 for (p in packages) {
   if (!require(p, character.only = TRUE)) {
     install.packages(p)
     library(p, character.only = TRUE)
   }
 }
-plot_standard_basin_ts <- function(df, index_name, color = "steelblue", drought_threshold = -0.5) {
-  if (!all(c("date", "value") %in% names(df))) stop("df must have 'date' and 'value' columns.")
+
+# ============================================================================
+# HELPER ??? standard time-series plot (shared across both pipelines)
+# ============================================================================
+plot_standard_basin_ts <- function(df, index_name, color = "steelblue",
+                                   drought_threshold = -0.5) {
+  if (!all(c("date", "value") %in% names(df)))
+    stop("df must have 'date' and 'value' columns.")
   df <- df[order(df$date), ]
   df <- df[!is.na(df$value), ]
   
-  # Drought event count
   in_drought <- df$value < drought_threshold
-  rle_res <- rle(in_drought)
-  n_ev <- sum(rle_res$values & rle_res$lengths >= 1)
+  rle_res    <- rle(in_drought)
+  n_ev       <- sum(rle_res$values & rle_res$lengths >= 1)
   
-  # Dynamic y-axis
   y_range <- max(df$value, na.rm = TRUE) - min(df$value, na.rm = TRUE)
   y_pad   <- y_range * 0.10
   y_lo    <- min(-3.5, min(df$value, na.rm = TRUE) - y_pad)
   y_hi    <- max( 3.5, max(df$value, na.rm = TRUE) + y_pad)
   
-  # Drought bands (matching 7basin_timeseries.R)
   drought_bands <- list(
-    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = -2.0, fill = "#7B0025", alpha = 0.15),
-    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin = -2.0, ymax = -1.5, fill = "#D73027", alpha = 0.15),
-    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin = -1.5, ymax = -1.0, fill = "#F46D43", alpha = 0.15),
-    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin = -1.0, ymax =  1.0, fill = "#2E7D32", alpha = 0.15),
-    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin =  1.0, ymax =  1.5, fill = "#90EE90", alpha = 0.15),
-    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin =  1.5, ymax =  2.0, fill = "#66BB6A", alpha = 0.15),
-    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin =  2.0, ymax =  Inf, fill = "#4575B4", alpha = 0.15)
+    ggplot2::annotate("rect", xmin=-Inf, xmax=Inf, ymin=-Inf,  ymax=-2.0, fill="#7B0025", alpha=0.15),
+    ggplot2::annotate("rect", xmin=-Inf, xmax=Inf, ymin=-2.0,  ymax=-1.5, fill="#D73027", alpha=0.15),
+    ggplot2::annotate("rect", xmin=-Inf, xmax=Inf, ymin=-1.5,  ymax=-1.0, fill="#F46D43", alpha=0.15),
+    ggplot2::annotate("rect", xmin=-Inf, xmax=Inf, ymin=-1.0,  ymax= 1.0, fill="#2E7D32", alpha=0.15),
+    ggplot2::annotate("rect", xmin=-Inf, xmax=Inf, ymin= 1.0,  ymax= 1.5, fill="#90EE90", alpha=0.15),
+    ggplot2::annotate("rect", xmin=-Inf, xmax=Inf, ymin= 1.5,  ymax= 2.0, fill="#66BB6A", alpha=0.15),
+    ggplot2::annotate("rect", xmin=-Inf, xmax=Inf, ymin= 2.0,  ymax= Inf, fill="#4575B4", alpha=0.15)
   )
   
   ggplot2::ggplot(df, ggplot2::aes(x = date, y = value)) +
     drought_bands +
     ggplot2::geom_hline(yintercept = 0, color = "black", linewidth = 0.4) +
-    ggplot2::geom_hline(yintercept = c(-1, 1), linetype = "dashed", color = "gray50", linewidth = 0.3) +
-    ggplot2::geom_ribbon(ggplot2::aes(ymin = ifelse(value < drought_threshold, value, 0), ymax = 0), 
-                         fill = "#c0392b", alpha = 0.35) +
+    ggplot2::geom_hline(yintercept = c(-1, 1), linetype = "dashed",
+                        color = "gray50", linewidth = 0.3) +
+    ggplot2::geom_ribbon(
+      ggplot2::aes(ymin = ifelse(value < drought_threshold, value, 0), ymax = 0),
+      fill = "#c0392b", alpha = 0.35) +
     ggplot2::geom_line(color = color, linewidth = 0.6) +
     ggplot2::scale_x_date(date_breaks = "5 years", date_labels = "%Y") +
     ggplot2::scale_y_continuous(limits = c(y_lo, y_hi)) +
@@ -91,429 +93,395 @@ plot_standard_basin_ts <- function(df, index_name, color = "steelblue", drought_
     ) +
     ggplot2::theme_bw(base_size = 14) +
     ggplot2::theme(
-      plot.title = ggplot2::element_text(face = "bold", hjust = 0.5),
+      plot.title    = ggplot2::element_text(face = "bold", hjust = 0.5),
       plot.subtitle = ggplot2::element_text(hjust = 0.5, color = "gray30"),
-      axis.title = ggplot2::element_text(face = "bold"),
-      axis.text.x = ggplot2::element_text(angle = 45, hjust = 1),
+      axis.title    = ggplot2::element_text(face = "bold"),
+      axis.text.x   = ggplot2::element_text(angle = 45, hjust = 1),
       panel.grid.minor = ggplot2::element_blank(),
-      legend.position = "bottom"
+      legend.position  = "bottom"
     )
 }
-# ============================================================================
-# ── SECTION 1 ──  PIPELINE SELECTOR
-# ============================================================================
-# Set PIPELINE_MODE to one of:
-# "BASIN"             — run Pipeline 1 only
-# "NECHAKO_RESERVOIR" — run Pipeline 2 only
-# "BOTH"              — run both and produce a comparison
-PIPELINE_MODE <- "BOTH"
 
 # ============================================================================
-# ── SECTION 2 ──  PIPELINE 1  SETTINGS  (basin-wide GeoLakes)
+# ?????? SECTION 1 ??????  PIPELINE SELECTOR
+# ============================================================================
+PIPELINE_MODE <- "BOTH"   # "BASIN" | "NECHAKO_RESERVOIR" | "BOTH"
+
+# ============================================================================
+# ?????? SECTION 2 ??????  PIPELINE 1  SETTINGS  (basin-wide GeoLakes)
 # ============================================================================
 P1_INPUT_FILE <- "Lakes/Glolakes/nechako_extracted/BEST_ESTIMATE_basin_total_Mm3.csv"
 # Required columns: date, total_storage_Mm3
 
 # ============================================================================
-# ── SECTION 3 ──  PIPELINE 2  SETTINGS  (Nechako Reservoir only)
+# ?????? SECTION 3 ??????  PIPELINE 2  SETTINGS  (Nechako Reservoir ??? LOCAL CSV ONLY)
 # ============================================================================
-# --- 3a. Data source ---------------------------------------------------------
-# "GEOLAKES"   — use a GeoLakes/HydroLAKES file filtered to Nechako Reservoir
-# "LOCAL_CSV"  — use a CSV from Rio-Tinto
-NECHAKO_DATA_SOURCE <- "GEOLAKES"
+# NOTE (v2): Pipeline 2 now uses LOCAL CSV exclusively.
+#   The GEOLAKES branch has been removed.  Set LOCAL_DATA_TYPE and the
+#   relevant column / file settings below.
 
-# --- 3b. GeoLakes option -----------------------------------------------------
-# File that contains per-lake GeoLakes storage time series.
-# Must have columns for lake identifier, date, and storage.
-GEOLAKES_FILE <- "Lakes/Glolakes/nechako_extracted/LandsatPlusICESat2_long.csv"
+NECHAKO_DATA_SOURCE <- "LOCAL_DATA"   # FIXED ??? do not change
 
-# HydroLAKES ID for the Nechako Reservoir.
-# To find it: open your GeoLakes shapefile / CSV and look for the Nechako
-# Reservoir polygon (centroid near 53.75°N, 126.0°W).
-# Replace the placeholder value below with the real ID.
+# Path to your daily level / storage file (BC Hydro, BCWIS, RFC, etc.)
+# NOTE: despite the .csv extension, this file is whitespace-delimited
+# (Year, DOY, Level_m — 3 fields, no header), NOT comma-separated.
+# read_table() is used deliberately in run_pipeline_2(); do not switch to read_csv().
+LOCAL_DATA_FILE    <- "D:/Nechako_Drought/Nechako/Lakes/dailylevel.csv"
 
-# Column names in the GeoLakes long-format file
-GEOLAKES_DATE_COL    <- "date"            # date column
-GEOLAKES_STORAGE_COL <- "storage_Mm3"    # storage column (Mm³)
-GEOLAKES_LAT_COL     <- "lat"            # latitude column
-GEOLAKES_LON_COL     <- "lon"            # longitude column
+# Choose data type:
+#   "STORAGE"      ??? CSV already contains storage in Mm??
+#   "LEVEL"        ??? CSV has a WSE column (m ASL); storage via hypsometric LUT
+#   "LEVEL_DAILY"  ??? CSV has Year, Day-of-Year, Level_m (no header row)
+LOCAL_DATA_TYPE   <- "LEVEL_DAILY"
 
-# Nechako Reservoir identified as file_idx=2437 (highest storage ~208 Mm³ mean)
-# lake_id and lake_name are NA in this file; filter by centroid coordinates instead.
-NECHAKO_LAT  <- 54.2493   # confirmed from LandsatPlusICESat2_long.csv
-NECHAKO_LON  <- -125.7896
-NECHAKO_TOL  <- 0.01      # tight tolerance — exact centroid known
-
-# ── Find the Nechako Reservoir lake_id ────────────────────────────────────────
-# Run this snippet ONCE in the console to identify the correct ID, then set
-# NECHAKO_HYDROID (as a string) to match.
-# df_tmp <- read_csv(GEOLAKES_FILE, show_col_types = FALSE)
-# df_tmp %>%
-#   filter(!is.na(lake_name)) %>%
-#   filter(grepl("nechako|ootsa|kenney", lake_name, ignore.case = TRUE)) %>%
-#   dplyr::select(lake_id, lake_name, lat, lon) %>%
-#   distinct()
-# If the above returns nothing, try searching by coordinates:
-# df_tmp %>%
-#   filter(between(lat, 53.0, 54.5), between(lon, -127.5, -124.5)) %>%
-#   dplyr::select(lake_id, lake_name, lat, lon) %>%
-#   distinct()
-# ─────────────────────────────────────────────────────────────────────────────
-
-# --- 3c. Local CSV option ----------------------------------------------------
-# CSV exported from reservoir operations reports, BCWIS, or similar.
-# Path to your daily level file
-LOCAL_CSV_FILE    <- "D:/Nechako_Drought/Nechako/Lakes/dailylevel.csv"
-Storage_curve <- read_excel("./Storage curve.xlsx")
-# ----------------------------------------------------------------------------
-# Hardcoded stage-storage curve: Elevation (ft) vs Storage (hm³)
-# Source: Storage curve.xlsx in working directory
-# ----------------------------------------------------------------------------
-# Choose data type: "STORAGE", "LEVEL", or "LEVEL_DAILY"
-# "LEVEL_DAILY" is for files with Year, Day-of-Year, and Level columns (no header)
-LOCAL_DATA_TYPE   <- "LEVEL_DAILY" 
-
-# Column name for storage OR level (ignored if LEVEL_DAILY, which uses fixed names)
+# Column names (ignored when LOCAL_DATA_TYPE == "LEVEL_DAILY")
 LOCAL_VALUE_COL   <- "Level_m"
-LOCAL_DATE_COL    <- "Date"         
-LOCAL_DATE_FORMAT <- "%Y-%m-%d" 
-# --- 3d. Hypsometric (stage–volume) look-up table ----------------------------
-# Used only when LOCAL_DATA_TYPE == "LEVEL_DAILY".
-# Replace the placeholder rows below with actual stage–volume data.
-# The Nechako Reservoir operating range is approximately 850–854 m ASL
-# (2790–2800 ft); max. depth 305 m; surface area ~890 km².
-# Format: data.frame with columns  level_m  and  storage_m3
-level_m <- Storage_curve$`Elevation (ft)`*0.3048
-storage_m3 <- Storage_curve$`Storage (hm³)`*1000000
-HYPSO_TABLE <- data.frame(level_m,storage_m3) %>%  arrange(level_m)
+LOCAL_DATE_COL    <- "Date"
+LOCAL_DATE_FORMAT <- "%Y-%m-%d"
+
+# GeoLakes long-format file (used only for the lake regulation diagnostic;
+# Pipeline 2 no longer reads this file at all).
+GEOLAKES_FILE        <- "Lakes/Glolakes/nechako_extracted/LandsatPlusICESat2_long.csv"
+GEOLAKES_DATE_COL    <- "date"
+GEOLAKES_STORAGE_COL <- "storage_Mm3"
+GEOLAKES_LAT_COL     <- "lat"
+GEOLAKES_LON_COL     <- "lon"
+
+# Nechako Reservoir GeoLakes centroid (used for regulation diagnostic only)
+NECHAKO_LAT  <- 54.2493
+NECHAKO_LON  <- -125.7896
+NECHAKO_TOL  <- 0.01
+
+# Storage curve (stage???volume look-up table for LEVEL / LEVEL_DAILY)
+Storage_curve <- read_excel("./Lakes/Storage curve.xlsx")
+col_elev <- grep("Elevation", names(Storage_curve), value = TRUE)[1]
+col_stor <- grep("Storage",   names(Storage_curve), value = TRUE)[1]
+
+if (is.na(col_elev) || is.na(col_stor))
+  stop("Could not find Elevation/Storage columns. Found names: ",
+       paste(names(Storage_curve), collapse = ", "))
+
+level_m    <- Storage_curve[[col_elev]] * 0.3048
+storage_m3 <- Storage_curve[[col_stor]] * 1000000
+
+HYPSO_TABLE <- data.frame(level_m, storage_m3) %>% arrange(level_m)
 
 # ============================================================================
-# ── SECTION 4 ──  SHARED ALGORITHM SETTINGS
+# ?????? SECTION 3.5 ??????  KENNEY DAM / REGULATION CHECK SETTINGS  (NEW in v2)
 # ============================================================================
-# Palmer drought severity class used to anchor p and q
-# –1 mild | –2 moderate | –3 severe | –4 extreme
-DROUGHT_CLASS_C <- -3
+# Kenney Dam approximate coordinates (BC, Canada)
+KENNEY_DAM_LAT <- 53.733    # ~53??44'N
+KENNEY_DAM_LON <- -127.217  # ~127??13'W
 
-# Optional rolling smoothing of storage before computing TSD
-USE_SMOOTHING  <- FALSE
-SMOOTH_WINDOW  <- 3   # months (odd integer recommended)
+# Nechako watershed coarse bounding box for the lake regulation scan
+NECHAKO_WS_LAT  <- c(52.5, 55.5)
+NECHAKO_WS_LON  <- c(-128.5, -122.0)
 
-# Blom plotting-position constant (standard for nonparametric SPI-style PIT)
-BLOM_A <- 0.44
+# Nechako Reservoir impoundment zone
+# The reservoir (Ootsa / Whitesail / Eutsuk / Knewstubb / Natalkuz) lies WEST
+# of the dam between approximately 53.1???54.6??N, 125.0???127.8??W at ???840 m ASL.
+RESERVOIR_ZONE <- list(
+  lat = c(53.1, 54.6),
+  lon = c(-127.8, -125.0),
+  elev_min_m = 840          # reservoir operating range ??? ~840 m
+)
+
+# Known sub-basins of the Nechako Reservoir system (for annotation)
+RESERVOIR_COMPONENTS <- data.frame(
+  name = c("Ootsa Lake / Nechako Res.", "Whitesail Lake",
+           "Eutsuk Lake", "Knewstubb Lake", "Natalkuz Lake"),
+  lat  = c(53.60, 53.55, 53.35, 53.68, 53.78),
+  lon  = c(-126.00, -126.95, -127.25, -126.30, -126.55)
+)
 
 # ============================================================================
-# ── SECTION 5 ──  HELPER FUNCTIONS
+# ?????? SECTION 4 ??????  SHARED ALGORITHM SETTINGS
 # ============================================================================
-# ---- 5a. Level → storage conversion via piecewise linear interpolation -----
+DROUGHT_CLASS_C <- -3      # Palmer class: ???1 mild | ???2 moderate | ???3 severe | ???4 extreme
+USE_SMOOTHING   <- FALSE
+SMOOTH_WINDOW   <- 3       # months
+BLOM_A          <- 0.44    # Blom plotting-position constant
+
+# ============================================================================
+# ?????? SECTION 5 ??????  HELPER FUNCTIONS
+# ============================================================================
+
+# ---- 5a. Level ??? storage (piecewise linear) ---------------------------------
 level_to_storage <- function(level_vec, hypso = HYPSO_TABLE) {
-  # Validate table
   stopifnot(
     is.data.frame(hypso),
-    "level_m"     %in% names(hypso),
+    "level_m"    %in% names(hypso),
     "storage_m3" %in% names(hypso)
   )
-  hypso <- hypso[order(hypso$level_m), ]   # ensure ascending order
-  
+  hypso <- hypso[order(hypso$level_m), ]
   out_of_range <- level_vec < min(hypso$level_m) |
     level_vec > max(hypso$level_m)
   if (any(out_of_range, na.rm = TRUE)) {
-    n_oob <- sum(out_of_range, na.rm = TRUE)
-    warning(
-      n_oob, " level value(s) fall outside the hypsometric table range [",
-      min(hypso$level_m), ", ", max(hypso$level_m), " m]. ",
-      "Storage will be extrapolated (use with caution) or will return NA."
-    )
+    warning(sum(out_of_range, na.rm = TRUE),
+            " level value(s) outside hypsometric table range [",
+            min(hypso$level_m), ", ", max(hypso$level_m), " m].")
   }
-  # approx() performs piecewise-linear interpolation; rule = 1 → NA outside range
-  approx(
-    x      = hypso$level_m,
-    y      = hypso$storage_m3,
-    xout   = level_vec,
-    method = "linear",
-    rule   = 1       # NA outside table range; change to 2 to extrapolate
-  )$y
+  approx(x = hypso$level_m, y = hypso$storage_m3,
+         xout = level_vec, method = "linear", rule = 1)$y
 }
 
 # ---- 5b. Core TSDI / NTSDI computation  (Awange et al. 2016) ---------------
-# Arguments:
-#   df_in           — data frame with columns: date, storage_m3
-#   drought_class_c — Palmer class (negative number)
-#   use_smoothing   — logical
-#   smooth_window   — integer (months)
-#   blom_a          — Blom constant
-#   label           — character string used in console messages and plots
+# CHANGE v2: added p-validity retry loop.
+#   When the primary drought episode yields p ??? (0,1), the function now
+#   iterates over all dry runs sorted by deficit severity, trying each until
+#   one gives 0 < p < 1.  This prevents the recursive formula from diverging.
+#
+# Root cause of the original Pipeline 1 failure
+# -----------------------------------------------
+# Dominant episode (fallback to longest run): 1991-07 to 1992-06 (6 months)
+#   slope  m = ???34.054  intercept b = +29.833
+#   denom  m + b = ???4.221  (barely negative; intercept nearly cancels slope)
+#   p = 1 ??? m/(m+b) = 1 ??? (???34.054/???4.221) = 1 ??? 8.069 = ???7.069
+# With p = ???7.07 the recursion TSDI[i] = p??TSDI[i-1] + q??TSD[i] diverges
+# exponentially ??? raw TSDI ??? ??1e182.  The standardised range looks reasonable
+# only because the rank-based (Blom) normalisation still works on any finite
+# ordering of values, masking the underlying explosion.
 compute_tsdi <- function(df_in,
                          drought_class_c = DROUGHT_CLASS_C,
                          use_smoothing   = USE_SMOOTHING,
                          smooth_window   = SMOOTH_WINDOW,
                          blom_a          = BLOM_A,
                          label           = "TSDI") {
-  stopifnot(
-    "date"        %in% names(df_in),
-    "storage_m3" %in% names(df_in)
-  )
+  stopifnot("date"       %in% names(df_in),
+            "storage_m3" %in% names(df_in))
+  
   df <- df_in %>%
-    mutate(
-      date  = as.Date(date),
-      year  = year(date),
-      month = month(date)
-    ) %>%
+    mutate(date  = as.Date(date),
+           year  = year(date),
+           month = month(date)) %>%
     arrange(date)
   
-  # ── Optional smoothing ────────────────────────────────────────────────────
+  # Optional smoothing
   if (use_smoothing) {
     df <- df %>%
-      mutate(
-        storage_m3 = zoo::rollmean(
-          storage_m3,
-          k     = smooth_window,
-          fill  = NA,
-          align = "center"
-        )
-      )
-    cat(label, ": applied", smooth_window, "-month rolling mean smoothing.\n")
+      mutate(storage_m3 = zoo::rollmean(storage_m3, k = smooth_window,
+                                        fill = NA, align = "center"))
+    cat(label, ": applied", smooth_window, "-month rolling mean.\n")
   }
   
-  # ── Monthly climatology (mean / max / min per calendar month) ─────────────
-  # Follows Awange et al. (2016) Eq. 1
+  # Monthly climatology (Awange et al. 2016, Eq. 1)
+  # NOTE: bimonthly GeoLakes data has ~6 obs/year, so some calendar months
+  # have ALL NA storage.  suppressWarnings() silences max/min on empty groups;
+  # the subsequent mutate replaces -Inf / Inf / NaN with NA so those months
+  # produce NA TSD rather than exploding the calculation.
   monthly_stats <- df %>%
     group_by(month) %>%
     summarise(
-      clim_mean = mean(storage_m3, na.rm = TRUE),
-      clim_max  = max( storage_m3, na.rm = TRUE),
-      clim_min  = min( storage_m3, na.rm = TRUE),
+      clim_mean = suppressWarnings(mean(storage_m3, na.rm = TRUE)),
+      clim_max  = suppressWarnings(max( storage_m3, na.rm = TRUE)),
+      clim_min  = suppressWarnings(min( storage_m3, na.rm = TRUE)),
       .groups   = "drop"
+    ) %>%
+    mutate(
+      clim_mean = ifelse(is.nan(clim_mean)       | is.infinite(clim_mean), NA_real_, clim_mean),
+      clim_max  = ifelse(is.infinite(clim_max),  NA_real_, clim_max),
+      clim_min  = ifelse(is.infinite(clim_min),  NA_real_, clim_min)
     )
   df <- left_join(df, monthly_stats, by = "month")
   
-  # ── Total Storage Deficit  (TSD %) — Eq. 1 ───────────────────────────────
+  # TSD (%)
   df <- df %>%
-    mutate(
-      TSD = (storage_m3 - clim_mean) /
-        (clim_max    - clim_min  ) * 100
-    )
+    mutate(TSD = (storage_m3 - clim_mean) / (clim_max - clim_min) * 100)
   
-  # ── Cumulative TSD ────────────────────────────────────────────────────────
+  # Cumulative TSD
   df <- df %>%
     mutate(cumulative_TSD = cumsum(replace_na(TSD, 0)))
   
-  # ── Identify dominant drought period for calibration ─────────────────────
-  # Strategy: find the continuously-negative TSD run whose endpoint has the
-  # most negative cumulative TSD value (deepest deficit).  This is more robust
-  # than picking the longest run, which can be very short when the record is
-  # dominated by a single wet or dry phase and produces p outside (0,1).
-  # Filter to valid TSD rows before RLE to prevent NA gaps from breaking dry runs.
+  # Identify all dry runs
   df_valid <- df[!is.na(df$TSD), ]
-  
-  is_dry <- df_valid$TSD < 0
-  r      <- rle(is_dry)
-  ends   <- cumsum(r$lengths)
-  starts <- ends - r$lengths + 1
+  is_dry   <- df_valid$TSD < 0
+  r        <- rle(is_dry)
+  ends     <- cumsum(r$lengths)
+  starts   <- ends - r$lengths + 1
   dry_runs <- which(r$values == TRUE)
   
-  if (length(dry_runs) == 0) {
-    stop(label, ": no drought periods detected (no consecutive negative TSD months).")
+  if (length(dry_runs) == 0)
+    stop(label, ": no drought periods detected (no negative TSD months).")
+  
+  # ?????? Internal helper: attempt calibration on one dry run ?????????????????????????????????????????????????????????
+  try_calibrate <- function(run_idx) {
+    ds <- starts[run_idx]; de <- ends[run_idx]
+    if ((de - ds + 1) < 6) return(NULL)   # need ???3 points for regression
+    d <- df_valid[ds:de, ] %>%
+      mutate(drought_time = as.numeric(date - min(date)) / 30.44,  # months, real elapsed time
+             local_cum_TSD = cumsum(TSD))
+    fit <- lm(local_cum_TSD ~ drought_time, data = d)
+    m_val  <- coef(fit)[2]; b_val <- coef(fit)[1]
+    denom  <- m_val + b_val
+    if (abs(denom) < 1e-6) return(NULL)
+    p_val  <- 1 - (m_val / denom)
+    q_val  <- -drought_class_c / denom
+    list(drought_df = d, m = m_val, b = b_val, denom = denom,
+         p = p_val, q = q_val,
+         date_start = df_valid$date[ds], date_end = df_valid$date[de])
   }
   
-  # Score each dry run by the cumulative TSD at its endpoint (most negative = worst)
-  run_scores <- sapply(dry_runs, function(ri) df_valid$cumulative_TSD[ends[ri]])
-  deepest_run <- dry_runs[which.min(run_scores)]
-  dry_start   <- starts[deepest_run]
-  dry_end     <- ends[deepest_run]
-  drought_df <- df_valid[dry_start:dry_end, ] %>%
-    mutate(drought_time = seq_len(n()))
+  # ?????? Step 1: primary selection ??? deepest deficit endpoint ??????????????????????????????????????????????????????
+  run_scores  <- sapply(dry_runs, function(ri) df_valid$cumulative_TSD[ends[ri]])
+  primary_run <- dry_runs[which.min(run_scores)]
+  cal         <- try_calibrate(primary_run)
   
-  if (nrow(drought_df) < 6) {
-    # Fallback: use the longest dry run if the deepest is implausibly short
+  # Fallback A: longest run (original behaviour)
+  if (is.null(cal) || nrow(cal$drought_df) < 6) {
     longest_run <- dry_runs[which.max(r$lengths[dry_runs])]
-    dry_start   <- starts[longest_run]
-    dry_end     <- ends[longest_run]
-    drought_df  <- df_valid[dry_start:dry_end, ] %>%
-      mutate(drought_time = seq_len(n()))
-    message(label, ": deepest-deficit episode < 6 months; falling back to longest dry run.")
+    cal_fb      <- try_calibrate(longest_run)
+    if (!is.null(cal_fb) && nrow(cal_fb$drought_df) >= 3) {
+      cal <- cal_fb
+      message(label, ": deepest episode < 6 months; fell back to longest dry run.")
+    }
   }
   
-  cat(
-    "\n", label, " — dominant drought episode:\n",
-    "  ", format(min(drought_df$date)), "to", format(max(drought_df$date)),
-    " (", nrow(drought_df), "months )\n"
-  )
+  # ?????? Step 2 (NEW): p-validity retry ?????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  # If p ??? (0,1) the recursion diverges.  Try remaining dry runs in order of
+  # decreasing deficit severity until a valid p is found.
+  found <- !is.null(cal) && cal$p > 0 && cal$p < 1   # TRUE if initial cal already valid
   
-  # ── Drought monograph linear regression ──────────────────────────────────
-  # Compute episode-local cumulative TSD here, AFTER any fallback selection,
-  # so it always applies to the final drought_df (deepest or longest run).
-  drought_df <- drought_df %>%
-    mutate(local_cum_TSD = cumsum(TSD))
-  
-  fit <- lm(local_cum_TSD ~ drought_time, data = drought_df)
-  m   <- coef(fit)[2]
-  b   <- coef(fit)[1]
-  
-  cat(
-    label, " — drought monograph regression:\n",
-    "   slope (m) =", round(m, 4), "\n",
-    "   intercept (b) =", round(b, 4), "\n"
-  )
-  
-  denom <- m + b
-  if (abs(denom) < 1e-6) {
-    stop(
-      label, ": m + b is near zero (", round(denom, 6), "). ",
-      "Cannot compute p and q. ",
-      "Ensure the dominant dry period has a clearly negative cumulative trend."
-    )
+  if (!found) {
+    invalid_p <- if (!is.null(cal)) round(cal$p, 4) else "NA"
+    message(label, ": initial calibration p = ", invalid_p,
+            " is outside (0,1).  Searching alternative dry periods...")
+    
+    sorted_runs <- dry_runs[order(run_scores)]   # most-negative deficit first
+    for (ri in sorted_runs) {
+      cal_try <- try_calibrate(ri)
+      if (!is.null(cal_try) && cal_try$p > 0 && cal_try$p < 1) {
+        cal   <- cal_try
+        found <- TRUE
+        message(label, ": valid calibration found using episode ",
+                format(cal$date_start), " ??? ", format(cal$date_end),
+                "  (p = ", round(cal$p, 4), ")")
+        break
+      }
+    }
+    if (!found) {
+      warning(label, ": no dry period yields p ??? (0,1).  ",
+              "TSDI values will be numerically unstable.  ",
+              "Consider adjusting DROUGHT_CLASS_C or inspecting data quality.")
+    }
   }
   
-  # ── Coefficients p and q  (Eq. 3) ────────────────────────────────────────
-  p <- 1 - (m / denom)
-  q <- -drought_class_c / denom
-  
-  cat(
-    label, " — derived coefficients:\n",
-    "   p =", round(p, 6), "\n",
-    "   q =", round(q, 6), "\n"
-  )
-  
-  if (p <= 0 || p >= 1) {
-    warning(
-      label, ": p = ", round(p, 4), " is outside (0, 1). ",
-      "Check the regression period and drought-class setting."
-    )
+  if (!found) {
+    sorted_runs <- dry_runs[order(run_scores)]   # needed here too if not already defined
+    best_ri  <- sorted_runs[which.min(abs(sapply(sorted_runs, function(ri) {
+      ct <- try_calibrate(ri); if (is.null(ct)) Inf else abs(ct$p - 0.5)
+    })))]
+    best_cal <- try_calibrate(best_ri)
+    stop(label, ": no dry period ??? 6 months yields p ??? (0,1). ",
+         "Best available: p = ", if (!is.null(best_cal)) round(best_cal$p,4) else "NA",
+         ". Reduce minimum episode length or inspect data.")
   }
+  drought_df  <- cal$drought_df
+  m <- cal$m; b <- cal$b; p <- cal$p; q <- cal$q
   
-  # ── Recursive TSDI  (Eq. 2) ──────────────────────────────────────────────
+  cat("\n", label, " ??? dominant drought episode:\n",
+      "   ", format(cal$date_start), " to ", format(cal$date_end),
+      " (", nrow(drought_df), " months )\n")
+  cat(label, " ??? drought monograph regression:\n",
+      "   slope (m) =",     round(m, 4), "\n",
+      "   intercept (b) =", round(b, 4), "\n")
+  cat(label, " ??? derived coefficients:\n",
+      "   p =", round(p, 6), "\n",
+      "   q =", round(q, 6), "\n")
+  
+  if (p <= 0 || p >= 1)
+    warning(label, ": p = ", round(p, 4), " is still outside (0,1).")
+  
+  # ?????? Recursive TSDI  (Eq. 2) ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
   n    <- nrow(df)
   TSDI <- rep(NA_real_, n)
-  
-  # Seed: use first non-NA TSD value (Yirdaw et al. 2008 initial condition)
   first_valid <- which(!is.na(df$TSD))[1]
-  if (!is.na(first_valid)) {
+  if (!is.na(first_valid))
     TSDI[first_valid] <- 0.02 * df$TSD[first_valid]
-  }
   
   for (i in seq_len(n)[-seq_len(max(1L, first_valid - 1L))][-1L]) {
     if (!is.na(df$TSD[i])) {
-      prev <- if (!is.na(TSDI[i - 1])) TSDI[i - 1] else 0
+      prev    <- if (!is.na(TSDI[i - 1])) TSDI[i - 1] else 0
       TSDI[i] <- p * prev + q * df$TSD[i]
     } else {
-      # Gap: carry forward the last valid index value unchanged
       TSDI[i] <- TSDI[i - 1]
     }
   }
   df[[label]] <- TSDI
   
-  # ── PIT normalization → approximately N(0,1) ─────────────────────────────
-  # Nonparametric Blom plotting-position (Farahmand & AghaKouchak 2015)
+  # ?????? PIT normalisation ??? N(0,1)  (Farahmand & AghaKouchak 2015) ?????????????????????????????????
   tsdi_valid <- df %>%
     filter(!is.na(.data[[label]])) %>%
-    mutate(
-      rank_tsdi      = rank(.data[[label]], ties.method = "average"),
-      n_valid        = n(),
-      u_blom         = (rank_tsdi - blom_a) / (n_valid + 1 - 2 * blom_a),
-      norm_col_value = qnorm(u_blom)
-    ) %>%
+    mutate(rank_tsdi      = rank(.data[[label]], ties.method = "average"),
+           n_valid        = n(),
+           u_blom         = (rank_tsdi - blom_a) / (n_valid + 1 - 2 * blom_a),
+           norm_col_value = qnorm(u_blom)) %>%
     rename(!!paste0(label, "_norm") := norm_col_value) %>%
     dplyr::select(date, rank_tsdi, n_valid, u_blom, !!paste0(label, "_norm"))
   df <- left_join(df, tsdi_valid, by = "date")
   
-  # Return results and calibrated coefficients as a named list
-  list(
-    data      = df,
-    p         = p,
-    q         = q,
-    m         = m,
-    b         = b,
-    drought_start = min(drought_df$date),
-    drought_end   = max(drought_df$date)
-  )
+  list(data          = df,
+       p             = p, q = q, m = m, b = b,
+       drought_start = cal$date_start,
+       drought_end   = cal$date_end)
 }
 
 # ---- 5c. Diagnostic plots for a single pipeline ----------------------------
-plot_pipeline <- function(res, label, basin_label, storage_units_label = "Mm³") {
-  df         <- res$data
-  index_col  <- label
-  norm_col   <- paste0(label, "_norm")
-  p_val      <- res$p
-  q_val      <- res$q
+plot_pipeline <- function(res, label, basin_label,
+                          storage_units_label = "Mm??") {
+  df        <- res$data
+  norm_col  <- paste0(label, "_norm")
+  p_val     <- res$p
+  q_val     <- res$q
   
-  # Drought band for annotation
-  dband <- data.frame(
-    xmin = res$drought_start,
-    xmax = res$drought_end,
-    ymin = -Inf, ymax = Inf
-  )
+  dband <- data.frame(xmin = res$drought_start, xmax = res$drought_end,
+                      ymin = -Inf, ymax = Inf)
   
-  # ── Plot 1 — Storage ───────────────────────────────────────────────────
   p1 <- ggplot(df, aes(date, storage_m3)) +
-    geom_rect(
-      data = dband,
-      aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
-      fill = "lightblue", alpha = 0.3, inherit.aes = FALSE
-    ) +
+    geom_rect(data = dband,
+              aes(xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax),
+              fill = "lightblue", alpha = 0.3, inherit.aes = FALSE) +
     geom_line(linewidth = 0.8, colour = "#2c7bb6") +
-    labs(
-      title    = paste(basin_label, "— Lake Storage"),
-      subtitle = "Shaded band = dominant drought episode used for calibration",
-      x        = NULL,
-      y        = paste0("Storage (", storage_units_label, ")")
-    ) +
+    labs(title    = paste(basin_label, "??? Lake Storage"),
+         subtitle = "Shaded band = dominant drought episode used for calibration",
+         x = NULL, y = paste0("Storage (", storage_units_label, ")")) +
     theme_bw(base_size = 12)
   print(p1)
   
-  # ── Plot 2 — TSD (%) ───────────────────────────────────────────────────
-  p2  <- ggplot(df, aes(date, TSD)) +
+  p2 <- ggplot(df, aes(date, TSD)) +
     geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
     geom_ribbon(aes(ymin = pmin(TSD, 0), ymax = 0),
                 fill = "#d7191c", alpha = 0.3) +
     geom_ribbon(aes(ymin = 0, ymax = pmax(TSD, 0)),
                 fill = "#1a9641", alpha = 0.3) +
     geom_line(linewidth = 0.6) +
-    labs(
-      title    = paste(basin_label, "— Total Storage Deficit (TSD %)"),
-      subtitle = "Red shading = deficit  |  Green shading = surplus",
-      x        = NULL,
-      y        = "TSD (%)"
-    ) +
+    labs(title    = paste(basin_label, "??? Total Storage Deficit (TSD %)"),
+         subtitle = "Red = deficit | Green = surplus",
+         x = NULL, y = "TSD (%)") +
     theme_bw(base_size = 12)
   print(p2)
   
-  # ── Plot 3 — Raw index ─────────────────────────────────────────────────
-  # Palmer-style thresholds (approximate equivalents)
   thresh <- data.frame(
     yint  = c(-1, -2, -3, -4),
     label = c("Mild (-1)", "Moderate (-2)", "Severe (-3)", "Extreme (-4)")
   )
-  p3  <- ggplot(df, aes(date, .data[[index_col]])) +
+  p3 <- ggplot(df, aes(date, .data[[label]])) +
     geom_hline(yintercept = 0, linetype = "dashed") +
     geom_hline(data = thresh,
                aes(yintercept = yint, colour = label),
                linetype = "dotted", linewidth = 0.7) +
     geom_line(linewidth = 0.8) +
     scale_colour_manual(
-      values = c("Mild (-1)"     = "#fee08b",
-                 "Moderate (-2)" = "#fc8d59",
-                 "Severe (-3)"   = "#d73027",
-                 "Extreme (-4)"  = "#7b0000"),
-      name = "Palmer class"
-    ) +
-    labs(
-      title    = paste(basin_label, "— ", label, "(Palmer-style thresholds)"),
-      subtitle = paste0("p = ", round(p_val, 4),
-                        "  |  q = ", round(q_val, 4),
-                        "  |  C = ", DROUGHT_CLASS_C),
-      x        = NULL,
-      y        = label
-    ) +
-    theme_bw(base_size = 12) +
-    theme(legend.position = "bottom")
+      values = c("Mild (-1)"="#fee08b","Moderate (-2)"="#fc8d59",
+                 "Severe (-3)"="#d73027","Extreme (-4)"="#7b0000"),
+      name = "Palmer class") +
+    labs(title    = paste(basin_label, "???", label, "(Palmer-style)"),
+         subtitle = paste0("p = ", round(p_val, 4), "  |  q = ",
+                           round(q_val, 4), "  |  C = ", DROUGHT_CLASS_C),
+         x = NULL, y = label) +
+    theme_bw(base_size = 12) + theme(legend.position = "bottom")
   print(p3)
   
-  # ── Plot 4 — Standardised index ────────────────────────────────────────
-  # Build the two-column data frame expected by plot_standard_basin_ts.
-  # (spi_thresh was defined here previously but is unused by that helper;
-  #  the helper draws its own colour bands internally.)
-  df_std <- data.frame(date  = df$date,
-                       value = df[[norm_col]])
+  df_std <- data.frame(date = df$date, value = df[[norm_col]])
   p4 <- plot_standard_basin_ts(df_std, index_name = label, color = "#2c7bb6")
   print(p4)
 }
@@ -522,7 +490,6 @@ plot_pipeline <- function(res, label, basin_label, storage_units_label = "Mm³")
 print_summary <- function(res, label, out_file) {
   df       <- res$data
   norm_col <- paste0(label, "_norm")
-  
   cat("\n============================================================\n")
   cat(label, " ANALYSIS COMPLETE\n")
   cat("============================================================\n")
@@ -534,67 +501,314 @@ print_summary <- function(res, label, out_file) {
   cat("  Drought period : ", format(res$drought_start),
       " to ", format(res$drought_end), "\n")
   cat("\nRaw ", label, " range    : ",
-      round(min(df[[label]],   na.rm = TRUE), 3), " to ",
-      round(max(df[[label]],   na.rm = TRUE), 3), "\n")
+      round(min(df[[label]],    na.rm = TRUE), 4), " to ",
+      round(max(df[[label]],    na.rm = TRUE), 4), "\n")
   cat("Standardised range : ",
-      round(min(df[[norm_col]], na.rm = TRUE), 3), " to ",
-      round(max(df[[norm_col]], na.rm = TRUE), 3), "\n")
+      round(min(df[[norm_col]], na.rm = TRUE), 4), " to ",
+      round(max(df[[norm_col]], na.rm = TRUE), 4), "\n")
   cat("Output CSV : ", out_file, "\n")
 }
 
-# ============================================================================
-# ── HELPER — Annual coverage assessment for Pipeline 1 data
-# ============================================================================
-assess_annual_coverage <- function(df, min_coverage = 0.70,
-                                   require_consecutive = 5L,
-                                   expected_obs_per_year = NULL) {
-  # df must have columns: year, storage_m3
-  # Returns a list: $table (year-by-year) and $first_stable_year
-  #
-  # expected_obs_per_year: the number of valid observations per year that
-  #   represents "full" coverage for this dataset.  NULL = auto-detect as the
-  #   median valid-month count across all complete years.
-  #   Set explicitly to 6 for bimonthly Landsat / GeoLakes products,
-  #   or to 12 for monthly time series.
+# ---- 5e. Lake regulation diagnostic  (NEW in v2) ---------------------------
+# Reads the GeoLakes long file, filters to the Nechako watershed bounding box,
+# assigns a regulation status to every lake, and produces:
+#   ??? console table of per-lake statistics
+#   ??? processed_data/Pipeline1_lake_regulation_check.csv
+#   ??? Pipeline1_LakeRegulation_Diagnostics.pdf  (spatial map + time series)
+#
+# Regulation classification logic
+# ???????????????????????????????????????????????????????????????????????????????????????????????????
+# IMPOUNDED (direct)    : exact coordinate match to the known Nechako Reservoir
+#                         GeoLakes entry (lat ??? 54.25??N, lon ??? 125.79??W).
+# LIKELY IMPOUNDED      : centroid falls within the reservoir zone polygon
+#                         (53.1???54.6??N, 127.8???125.0??W, elevation ??? 840 m).
+#                         These are likely Ootsa / Whitesail / Eutsuk /
+#                         Knewstubb / Natalkuz sub-basins that form the
+#                         Nechako Reservoir system.
+# DOWNSTREAM-REGULATED  : east of Kenney Dam on the Nechako mainstem corridor;
+#                         not impounded but subject to regulated releases.
+# NATURAL               : remainder of the watershed bounding box.
+#
+# NOTE: If the 'basin' column in the GeoLakes file contains a Nechako basin
+#   label (e.g. "Nechako", "Fraser-Nechako"), the function will also print a
+#   basin-filtered subset so you can cross-check the coordinate-based flags.
+check_regulated_lakes <- function(
+    lat_range  = NECHAKO_WS_LAT,
+    lon_range  = NECHAKO_WS_LON,
+    dam_lat    = KENNEY_DAM_LAT,
+    dam_lon    = KENNEY_DAM_LON
+) {
+  cat("\n\n========================================================\n")
+  cat("PIPELINE 1 ??? LAKE REGULATION DIAGNOSTIC\n")
+  cat("  Checking which GeoLakes in the Nechako watershed are\n")
+  cat("  affected by Kenney Dam (Nechako Reservoir, 1952)\n")
+  cat("========================================================\n\n")
   
-  # ── Step 1: count valid obs per year ──────────────────────────────────────
+  if (!file.exists(GEOLAKES_FILE)) {
+    warning("GEOLAKES_FILE not found: ", GEOLAKES_FILE,
+            "\nSkipping regulation diagnostic.")
+    return(invisible(NULL))
+  }
+  
+  df_geo <- read_csv(GEOLAKES_FILE, show_col_types = FALSE)
+  cat("GeoLakes file: ", nrow(df_geo), " rows |",
+      n_distinct(df_geo$file_idx), " unique lakes (file_idx)\n\n")
+  
+  # ?????? Print unique basin / state labels to help manual cross-checking ?????????????????????
+  if ("basin" %in% names(df_geo)) {
+    cat("Unique 'basin' values (full file):\n")
+    print(sort(unique(df_geo$basin)))
+    cat("\n")
+  }
+  if ("state" %in% names(df_geo)) {
+    cat("Unique 'state' values (full file):\n")
+    print(sort(unique(df_geo$state)))
+    cat("\n")
+  }
+  
+  # ?????? Filter to watershed bounding box ???????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  df_ws <- df_geo %>%
+    filter(between(.data[[GEOLAKES_LAT_COL]], lat_range[1], lat_range[2]),
+           between(.data[[GEOLAKES_LON_COL]], lon_range[1], lon_range[2]))
+  
+  cat(sprintf("Lakes within bounding box [%.1f???%.1f??N, %.1f???%.1f??W]: %d rows, %d unique lakes\n\n",
+              lat_range[1], lat_range[2], abs(lon_range[2]), abs(lon_range[1]),
+              nrow(df_ws), n_distinct(df_ws$file_idx)))
+  
+  if (nrow(df_ws) == 0) {
+    warning("No lakes found within the bounding box.  ",
+            "Check NECHAKO_WS_LAT / NECHAKO_WS_LON settings.")
+    return(invisible(NULL))
+  }
+  
+  # ?????? Per-lake summary statistics ?????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  lake_summary <- df_ws %>%
+    group_by(file_idx, lake_name, lake_id,
+             lat  = .data[[GEOLAKES_LAT_COL]],
+             lon  = .data[[GEOLAKES_LON_COL]],
+             lake_area_km2, elevation_m) %>%
+    summarise(
+      n_obs             = n(),
+      n_valid_storage   = sum(!is.na(.data[[GEOLAKES_STORAGE_COL]])),
+      pct_valid         = round(n_valid_storage / n_obs * 100, 1),
+      date_start        = min(as.Date(date), na.rm = TRUE),
+      date_end          = max(as.Date(date), na.rm = TRUE),
+      mean_storage_Mm3  = mean(.data[[GEOLAKES_STORAGE_COL]], na.rm = TRUE),
+      sd_storage_Mm3    = sd(  .data[[GEOLAKES_STORAGE_COL]], na.rm = TRUE),
+      cv_pct            = round(
+        sd(.data[[GEOLAKES_STORAGE_COL]], na.rm = TRUE) /
+          mean(.data[[GEOLAKES_STORAGE_COL]], na.rm = TRUE) * 100, 1),
+      range_storage_Mm3 = max(.data[[GEOLAKES_STORAGE_COL]], na.rm = TRUE) -
+        min(.data[[GEOLAKES_STORAGE_COL]], na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(mean_storage_Mm3))
+  
+  # ?????? Regulation flag ?????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  lake_summary <- lake_summary %>%
+    mutate(
+      # 1. Direct match: known Nechako Reservoir GeoLakes centroid
+      is_nechako_reservoir = abs(lat - NECHAKO_LAT) <= NECHAKO_TOL * 3 &
+        abs(lon - NECHAKO_LON) <= NECHAKO_TOL * 3,
+      
+      # 2. Reservoir zone: west of dam, within impoundment footprint
+      in_reservoir_zone = between(lat, RESERVOIR_ZONE$lat[1], RESERVOIR_ZONE$lat[2]) &
+        between(lon, RESERVOIR_ZONE$lon[1], RESERVOIR_ZONE$lon[2]) &
+        (is.na(elevation_m) | elevation_m >= RESERVOIR_ZONE$elev_min_m),
+      
+      # 3. Downstream regulated: east of dam in Nechako River corridor
+      downstream_of_dam = between(lat, 53.0, 54.5) &
+        between(lon, -127.3, -122.5) &
+        !(between(lat, RESERVOIR_ZONE$lat[1], RESERVOIR_ZONE$lat[2]) &
+            between(lon, RESERVOIR_ZONE$lon[1], RESERVOIR_ZONE$lon[2])),
+      
+      regulation_status = case_when(
+        is_nechako_reservoir             ~ "IMPOUNDED ??? Nechako Reservoir (direct match)",
+        in_reservoir_zone & !is_nechako_reservoir ~ "LIKELY IMPOUNDED ??? within reservoir zone",
+        downstream_of_dam                ~ "DOWNSTREAM ??? regulated releases from dam",
+        TRUE                             ~ "NATURAL ??? likely unaffected"
+      )
+    )
+  
+  # ?????? Console table ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  cat("?????? Per-lake summary (sorted by mean storage) ??????????????????????????????????????????????????????????????????\n")
+  print(
+    lake_summary %>%
+      dplyr::select(file_idx, lake_name, lat, lon, lake_area_km2, elevation_m,
+                    n_valid_storage, pct_valid,
+                    mean_storage_Mm3, sd_storage_Mm3, cv_pct,
+                    regulation_status) %>%
+      mutate(across(c(lat, lon, lake_area_km2, elevation_m,
+                      mean_storage_Mm3, sd_storage_Mm3), ~round(., 3))),
+    n = Inf
+  )
+  
+  # ?????? Optional basin-column cross-check ???????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  if ("basin" %in% names(df_ws)) {
+    nechako_basins <- df_ws %>%
+      filter(grepl("nechako|fraser.*nechako|nechako.*fraser",
+                   basin, ignore.case = TRUE)) %>%
+      dplyr::select(file_idx, lake_name, lat = .data[[GEOLAKES_LAT_COL]],
+                    lon = .data[[GEOLAKES_LON_COL]], basin) %>%
+      distinct()
+    cat("\n?????? Lakes matched by 'basin' column (Nechako keyword) ???????????????????????????????????????\n")
+    if (nrow(nechako_basins) > 0) print(nechako_basins, n = Inf) else
+      cat("  No matches ??? check unique 'basin' values printed above.\n")
+  }
+  
+  # ?????? Save CSV ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  out_dir_proc <- file.path(OUT_DIR, "processed_data")
+  dir.create(out_dir_proc, showWarnings = FALSE, recursive = TRUE)
+  reg_csv <- file.path(out_dir_proc, "Pipeline1_lake_regulation_check.csv")
+  write_csv(lake_summary, reg_csv)
+  cat("\nRegulation table saved to:", reg_csv, "\n")
+  
+  # ?????? Plots ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  reg_colours <- c(
+    "IMPOUNDED ??? Nechako Reservoir (direct match)"  = "#d73027",
+    "LIKELY IMPOUNDED ??? within reservoir zone"      = "#fc8d59",
+    "DOWNSTREAM ??? regulated releases from dam"      = "#fee090",
+    "NATURAL ??? likely unaffected"                   = "#4575b4"
+  )
+  
+  pdf(file.path(OUT_DIR, "Pipeline1_LakeRegulation_Diagnostics.pdf"),
+      width = 12, height = 8)
+  
+  # Plot A ??? spatial map
+  p_map <- ggplot(lake_summary %>% filter(!is.na(mean_storage_Mm3)),
+                  aes(x = lon, y = lat,
+                      colour = regulation_status,
+                      size   = log1p(pmax(mean_storage_Mm3, 0)))) +
+    geom_point(alpha = 0.80) +
+    # Kenney Dam marker
+    geom_point(data = data.frame(lon = dam_lon, lat = dam_lat),
+               aes(x = lon, y = lat), inherit.aes = FALSE,
+               shape = 17, size = 5, colour = "black") +
+    annotate("text", x = dam_lon + 0.05, y = dam_lat + 0.08,
+             label = "Kenney Dam (1952)", hjust = 0, size = 3.5,
+             fontface = "bold") +
+    # Reservoir sub-basin labels
+    geom_text(data = RESERVOIR_COMPONENTS,
+              aes(x = lon, y = lat, label = name),
+              inherit.aes = FALSE, size = 2.8, colour = "darkred",
+              nudge_y = 0.06, hjust = 0.5) +
+    scale_colour_manual(values = reg_colours) +
+    scale_size_continuous(name = "log(mean storage + 1 Mm??)", range = c(2, 10)) +
+    labs(
+      title    = "GeoLakes in Nechako Watershed ??? Regulation Status",
+      subtitle = paste0("Bounding box: ", lat_range[1], "???", lat_range[2],
+                        "??N, ", abs(lon_range[2]), "???", abs(lon_range[1]),
+                        "??W  |  ??? = Kenney Dam (~53.73??N, 127.22??W)"),
+      x = "Longitude (??W)",  y = "Latitude (??N)",
+      colour = "Regulation status"
+    ) +
+    coord_fixed(ratio = 1.4) +
+    theme_bw(base_size = 12) +
+    theme(legend.position = "bottom",
+          legend.text = element_text(size = 9))
+  print(p_map)
+  
+  # Plot B ??? storage time series faceted by lake
+  lakes_with_data <- lake_summary %>%
+    filter(n_valid_storage >= 5) %>% pull(file_idx)
+  
+  df_ts <- df_ws %>%
+    filter(file_idx %in% lakes_with_data) %>%
+    left_join(lake_summary %>%
+                dplyr::select(file_idx, regulation_status),
+              by = "file_idx") %>%
+    mutate(
+      lake_label = case_when(
+        !is.na(lake_name) & lake_name != "" ~
+          paste0(file_idx, ": ", lake_name),
+        TRUE ~
+          paste0("idx_", file_idx, "\n(",
+                 round(.data[[GEOLAKES_LAT_COL]], 2), "??N, ",
+                 round(.data[[GEOLAKES_LON_COL]], 2), "??W)")
+      )
+    )
+  
+  if (nrow(df_ts) > 0) {
+    p_ts <- ggplot(df_ts,
+                   aes(x = as.Date(date),
+                       y = .data[[GEOLAKES_STORAGE_COL]],
+                       colour = regulation_status)) +
+      geom_line(linewidth = 0.5, na.rm = TRUE) +
+      geom_point(size = 0.8, na.rm = TRUE) +
+      facet_wrap(~ lake_label, scales = "free_y", ncol = 2) +
+      scale_colour_manual(values = reg_colours) +
+      scale_x_date(date_breaks = "10 years", date_labels = "%Y") +
+      labs(title    = "Storage Time Series ??? GeoLakes in Nechako Watershed",
+           subtitle = "Coloured by regulation status (free y-axis per lake)",
+           x = NULL, y = "Storage (Mm??)", colour = NULL) +
+      theme_bw(base_size = 9) +
+      theme(legend.position  = "bottom",
+            strip.text       = element_text(size = 7),
+            axis.text.x      = element_text(angle = 45, hjust = 1))
+    print(p_ts)
+  }
+  
+  # Plot C ??? mean storage bar chart coloured by regulation status
+  p_bar <- ggplot(
+    lake_summary %>%
+      filter(!is.na(mean_storage_Mm3)) %>%
+      mutate(lake_label = paste0(
+        file_idx, ": ",
+        ifelse(is.na(lake_name) | lake_name == "", "(unnamed)", lake_name)
+      )),
+    aes(x = reorder(lake_label, mean_storage_Mm3),
+        y = mean_storage_Mm3,
+        fill = regulation_status)
+  ) +
+    geom_col() +
+    coord_flip() +
+    scale_fill_manual(values = reg_colours) +
+    labs(title = "Mean GeoLakes Storage ??? Nechako Watershed Lakes",
+         x     = "Lake (file_idx: name)",
+         y     = "Mean storage (Mm??)",
+         fill  = "Regulation status") +
+    theme_bw(base_size = 11) +
+    theme(legend.position = "bottom",
+          legend.text = element_text(size = 9))
+  print(p_bar)
+  
+  dev.off()
+  cat("Regulation diagnostic PDF saved to:",
+      file.path(OUT_DIR, "Pipeline1_LakeRegulation_Diagnostics.pdf"), "\n")
+  
+  invisible(lake_summary)
+}
+
+# ============================================================================
+# ?????? HELPER ??? Annual coverage assessment (Pipeline 1)
+# ============================================================================
+assess_annual_coverage <- function(df,
+                                   min_coverage          = 0.70,
+                                   require_consecutive   = 5L,
+                                   expected_obs_per_year = NULL) {
   raw_counts <- df %>%
     group_by(year) %>%
-    summarise(
-      n_months_present = n(),
-      n_valid          = sum(!is.na(storage_m3)),
-      .groups          = "drop"
-    ) %>%
-    filter(year < year(Sys.Date()))   # drop current partial year
+    summarise(n_months_present = n(),
+              n_valid          = sum(!is.na(storage_m3)),
+              .groups          = "drop") %>%
+    filter(year < year(Sys.Date()))
   
-  # ── Step 2: resolve denominator ───────────────────────────────────────────
   if (is.null(expected_obs_per_year)) {
-    expected_obs_per_year <- round(median(raw_counts$n_valid))
-    expected_obs_per_year <- max(expected_obs_per_year, 1L)   # guard vs. 0
-    cat(sprintf(
-      "   expected_obs_per_year auto-detected from data median: %d\n",
-      expected_obs_per_year
-    ))
+    expected_obs_per_year <- max(round(median(raw_counts$n_valid)), 1L)
+    cat(sprintf("   expected_obs_per_year auto-detected: %d\n",
+                expected_obs_per_year))
   } else {
-    cat(sprintf(
-      "   expected_obs_per_year (user-supplied): %d\n",
-      expected_obs_per_year
-    ))
+    cat(sprintf("   expected_obs_per_year (user-supplied): %d\n",
+                expected_obs_per_year))
   }
   
   cov_tbl <- raw_counts %>%
-    mutate(
-      # Coverage = fraction of the dataset's natural observation frequency
-      coverage         = n_valid / expected_obs_per_year,
-      meets_threshold  = coverage >= min_coverage
-    )
+    mutate(coverage        = n_valid / expected_obs_per_year,
+           meets_threshold = coverage >= min_coverage)
   
-  cat("\n── Annual storage coverage (Pipeline 1) ──────────────────────────\n")
+  cat("\n?????? Annual storage coverage (Pipeline 1) ??????????????????????????????????????????????????????????????????????????????\n")
   cat(sprintf("   Threshold: %.0f%%  |  Require %.0f consecutive qualifying years\n",
               min_coverage * 100, require_consecutive))
-  cat(sprintf("   Coverage denominator (expected obs/year): %d\n",
-              expected_obs_per_year))
-  cat("\n")
   print(
     cov_tbl %>%
       mutate(coverage_pct = sprintf("%4.0f%%", coverage * 100),
@@ -603,278 +817,145 @@ assess_annual_coverage <- function(df, min_coverage = 0.70,
     n = Inf
   )
   
-  # ── Find first year that starts a run of ≥ require_consecutive good years ──
-  years       <- cov_tbl$year
-  meets       <- cov_tbl$meets_threshold
+  years  <- cov_tbl$year
+  meets  <- cov_tbl$meets_threshold
   first_stable <- NA_integer_
-  
   for (i in seq_along(years)) {
     end_idx <- i + require_consecutive - 1L
     if (end_idx > length(years)) break
-    if (all(meets[i:end_idx])) {
-      first_stable <- years[i]
-      break
-    }
+    if (all(meets[i:end_idx])) { first_stable <- years[i]; break }
   }
-  
   if (is.na(first_stable)) {
-    # Fallback: just use the first qualifying year
     if (any(meets)) {
       first_stable <- years[which(meets)[1]]
-      cat(sprintf(
-        "\n  NOTE: could not find %d consecutive qualifying years.\n",
-        require_consecutive))
-      cat(sprintf("  Falling back to first qualifying year: %d\n", first_stable))
+      cat(sprintf("\n  NOTE: could not find %d consecutive qualifying years; ",
+                  require_consecutive))
+      cat(sprintf("falling back to first qualifying year: %d\n", first_stable))
     } else {
-      stop("No years meet the coverage threshold. Lower min_coverage or check data.")
+      stop("No years meet the coverage threshold.")
     }
   } else {
-    cat(sprintf(
-      "\n  First year starting ≥%d consecutive qualifying years: %d\n",
-      require_consecutive, first_stable))
+    cat(sprintf("\n  First year starting ???%d consecutive qualifying years: %d\n",
+                require_consecutive, first_stable))
   }
-  
   list(table = cov_tbl, first_stable_year = first_stable)
 }
 
 # ============================================================================
-# ── HELPER — Diagnose a coverage-count jump (e.g. 6 -> 12 obs/year)
+# ?????? HELPER ??? Coverage-jump diagnostic (run manually from console)
 # ============================================================================
-# Run this manually from the console, e.g.:
-#   diagnose_coverage_jump(split_year = 2021)
-# It checks whether a jump in valid monthly observations reflects a genuine
-# improvement in data coverage (new sensor/product filling previously-empty
-# months) or an artifact: duplicated date rows, a relaxed quality filter, a
-# change in which lakes feed the basin total, or forward-filled placeholder
-# values masquerading as new independent observations.
 diagnose_coverage_jump <- function(split_year, input_file = P1_INPUT_FILE) {
   df_raw <- read_csv(input_file, show_col_types = FALSE) %>%
-    mutate(
-      date   = as.Date(date),
-      period = if_else(year(date) < split_year, "pre", "post")
-    )
+    mutate(date   = as.Date(date),
+           period = if_else(year(date) < split_year, "pre", "post"))
   
-  cat("\n==================== Coverage-jump diagnostic ====================\n")
+  cat("\n========== Coverage-jump diagnostic ==========\n")
   cat("Split year:", split_year, "\n")
   
-  # 1. Duplicate dates ---------------------------------------------------
-  # If the same calendar month appears as >1 row (e.g. one row per
-  # product/sensor instead of one merged "best estimate" row), that alone
-  # would manufacture extra "valid" months without any new information.
   dup_dates <- df_raw %>% count(date) %>% filter(n > 1)
-  cat(sprintf("\n1. Duplicate 'date' rows in file: %d\n", nrow(dup_dates)))
-  if (nrow(dup_dates) > 0) {
-    cat("   Sample duplicated dates:\n")
-    print(head(dup_dates, 10))
-  }
+  cat(sprintf("\n1. Duplicate 'date' rows: %d\n", nrow(dup_dates)))
+  if (nrow(dup_dates) > 0) print(head(dup_dates, 10))
   
-  # 2. Lake participation -------------------------------------------------
-  # A jump driven by more lakes reporting (n_lakes_contributing rising
-  # toward n_lakes_total) is consistent with genuinely improved coverage.
-  # A jump in n_lakes_total itself means the lake inventory changed, which
-  # makes pre/post basin totals not directly comparable.
-  if (all(c("n_lakes_contributing", "n_lakes_total", "all_lakes_present") %in% names(df_raw))) {
+  if (all(c("n_lakes_contributing", "n_lakes_total") %in% names(df_raw))) {
     cat("\n2. Lake participation, pre vs post:\n")
-    print(
-      df_raw %>%
-        group_by(period) %>%
-        summarise(
-          mean_n_lakes_contributing = mean(n_lakes_contributing, na.rm = TRUE),
-          mean_n_lakes_total        = mean(n_lakes_total, na.rm = TRUE),
-          pct_all_lakes_present     = mean(all_lakes_present, na.rm = TRUE) * 100,
-          .groups = "drop"
-        )
-    )
+    print(df_raw %>% group_by(period) %>%
+            summarise(mean_n_contributing = mean(n_lakes_contributing, na.rm=TRUE),
+                      mean_n_total        = mean(n_lakes_total, na.rm=TRUE),
+                      .groups = "drop"))
   }
-  
-  # 3. Product / methodology shift -----------------------------------------
-  # A change in the dominant "product" label (e.g. Landsat-only -> blended
-  # Landsat+ICESat-2) is a plausible, documented explanation for more
-  # months suddenly having valid retrievals.
   if ("product" %in% names(df_raw)) {
     cat("\n3. 'product' field, pre vs post:\n")
     print(df_raw %>% count(period, product))
   }
+  cat("\n4. total_storage_Mm3 magnitude, pre vs post:\n")
+  print(df_raw %>% group_by(period) %>%
+          summarise(mean_storage = mean(total_storage_Mm3, na.rm=TRUE),
+                    sd_storage   = sd(total_storage_Mm3, na.rm=TRUE),
+                    .groups = "drop"))
   
-  # 4. Quality flag shift ----------------------------------------------------
-  # If "quality" shows a sudden shift toward a lower-quality tier post-split,
-  # the extra months may be lower-confidence fills rather than equivalent
-  # observations to the pre-split record.
-  if ("quality" %in% names(df_raw)) {
-    cat("\n4. 'quality' field, pre vs post:\n")
-    print(df_raw %>% count(period, quality))
-  }
-  
-  # 5. Magnitude sanity check -------------------------------------------------
-  # If two products got summed instead of merged, post-split storage would
-  # look anomalously large relative to the pre-split record.
-  cat("\n5. total_storage_Mm3 magnitude, pre vs post:\n")
-  print(
-    df_raw %>%
-      group_by(period) %>%
-      summarise(
-        mean_storage   = mean(total_storage_Mm3, na.rm = TRUE),
-        median_storage = median(total_storage_Mm3, na.rm = TRUE),
-        sd_storage     = sd(total_storage_Mm3, na.rm = TRUE),
-        .groups = "drop"
-      )
-  )
-  
-  # 6. Forward-fill / duplication check ---------------------------------------
-  # A high share of near-zero month-to-month change post-split is a common
-  # symptom of gap-filling (e.g. repeating the last known value) rather than
-  # genuinely new independent monthly estimates.
-  cat("\n6. Share of post-split months with near-zero change from the previous month:\n")
-  df_diff <- df_raw %>%
-    arrange(date) %>%
-    mutate(diff_from_prev = total_storage_Mm3 - lag(total_storage_Mm3))
-  print(
-    df_diff %>%
-      filter(period == "post") %>%
-      summarise(pct_near_zero_diff = mean(abs(diff_from_prev) < 0.01, na.rm = TRUE) * 100)
-  )
-  
-  cat("\n==================== End diagnostic ====================\n")
   invisible(df_raw)
 }
 
 # ============================================================================
-# ── SECTION 6 ──  PIPELINE 1  —  Basin-wide GeoLakes TSDI
+# ?????? SECTION 6 ??????  PIPELINE 1  ???  Basin-wide GeoLakes TSDI
 # ============================================================================
 run_pipeline_1 <- function(min_annual_coverage    = 0.70,
-                           require_consecutive    = 5L,
+                           require_consecutive   = 5L,
                            calibration_start_year = NULL,
                            quality_max            = 1L,
                            expected_obs_per_year  = NULL) {
-  # calibration_start_year: override the auto-detected start year if desired
-  #   e.g. calibration_start_year = 1992 to force calibration from 1992 onward
-  #
-  # quality_max: integer.  Rows with quality > quality_max are dropped before
-  #   any TSDI computation.  Default 1L retains only the consistent pre-2021
-  #   quality=1 record and excludes the post-2020 under-counted regime (where
-  #   n_lakes_contributing drops from ~5.7 to ~3.0 and total_storage_Mm3 falls
-  #   ~3× due to a shifting subset sum, not genuine drought).
-  #   Set to NULL to disable the filter and pass all rows (not recommended
-  #   until lake-participation normalisation is applied to correct for the
-  #   variable contributing-lake count).
-  #
-  # expected_obs_per_year: denominator for the coverage fraction.
-  #   NULL = auto-detect (recommended).
-  #   Set to 6 for bimonthly Landsat / GeoLakes products,
-  #   or to 12 for monthly records (e.g. gauge data).
-  
   cat("\n\n========================================================\n")
-  cat("PIPELINE 1 — Basin-wide TSDI  (GeoLakes aggregated)\n")
-  qual_label <- if (!is.null(quality_max)) {
-    sprintf("quality <= %d only", quality_max)
-  } else {
-    "all quality levels (filter disabled)"
-  }
+  cat("PIPELINE 1 ??? Basin-wide TSDI  (GeoLakes aggregated)\n")
+  qual_label <- if (!is.null(quality_max))
+    sprintf("quality <= %d only", quality_max) else "all quality levels"
   cat(sprintf("  Input filter: %s\n", qual_label))
   cat("========================================================\n")
   
   df_raw <- read_csv(P1_INPUT_FILE, show_col_types = FALSE)
   cat("Columns found:", paste(names(df_raw), collapse = ", "), "\n")
-  stopifnot(
-    "date"               %in% names(df_raw),
-    "total_storage_Mm3" %in% names(df_raw)
-  )
+  stopifnot("date" %in% names(df_raw), "total_storage_Mm3" %in% names(df_raw))
   
-  # ── Quality filter ────────────────────────────────────────────────────────
-  # Applied to df_raw BEFORE transmute so the quality column is accessible.
-  # With quality_max = 1L (default), this removes every row flagged quality=2
-  # (the post-2020 under-counted regime where total_storage_Mm3 is a 3-lake
-  # subset sum rather than the consistent ~6-lake basin total).  The result is
-  # a 1984–2020 record whose climatology and drought-episode detection are not
-  # contaminated by the coverage artifact.
   if (!is.null(quality_max)) {
     if (!"quality" %in% names(df_raw)) {
-      warning("quality_max is set but no 'quality' column found in ",
-              P1_INPUT_FILE, "; filter skipped.")
+      warning("quality_max set but no 'quality' column found; filter skipped.")
     } else {
-      n_raw     <- nrow(df_raw)
-      df_raw    <- df_raw %>% filter(quality <= quality_max)
-      n_kept    <- nrow(df_raw)
-      n_dropped <- n_raw - n_kept
-      date_range <- if (n_kept > 0) {
-        sprintf("%s – %s",
-                format(min(as.Date(df_raw$date))),
-                format(max(as.Date(df_raw$date))))
-      } else "no rows remain"
-      cat(sprintf(
-        "  Quality filter (quality <= %d): kept %d of %d rows, dropped %d  [%s]\n",
-        quality_max, n_kept, n_raw, n_dropped, date_range
-      ))
-      if (n_kept == 0)
-        stop("All rows removed by quality filter. ",
-             "Check quality_max or inspect the 'quality' column in your CSV.")
+      n_raw  <- nrow(df_raw)
+      df_raw <- df_raw %>% filter(quality <= quality_max)
+      n_kept <- nrow(df_raw)
+      cat(sprintf("  Quality filter (???%d): kept %d / %d rows, dropped %d\n",
+                  quality_max, n_kept, n_raw, n_raw - n_kept))
+      if (n_kept == 0) stop("All rows removed by quality filter.")
     }
-  } else {
-    cat("  Quality filter: DISABLED (quality_max = NULL) — all rows passed through.\n",
-        "  WARNING: post-2020 rows with quality=2 (under-counted lake sum) are included.\n")
   }
   
   df_input <- df_raw %>%
-    transmute(
-      date        = as.Date(date),
-      year        = year(as.Date(date)),
-      month       = month(as.Date(date)),
-      storage_m3 = total_storage_Mm3
-    )
+    transmute(date       = as.Date(date),
+              year       = year(as.Date(date)),
+              month      = month(as.Date(date)),
+              storage_m3 = total_storage_Mm3)
   
-  # ── Coverage filter ───────────────────────────────────────────────────────
   cov <- assess_annual_coverage(df_input,
                                 min_coverage          = min_annual_coverage,
                                 require_consecutive   = require_consecutive,
                                 expected_obs_per_year = expected_obs_per_year)
   
   start_yr <- if (!is.null(calibration_start_year)) {
-    cat(sprintf("  Using manually-set calibration start year: %d\n",
-                calibration_start_year))
+    cat(sprintf("  Manually-set calibration start year: %d\n", calibration_start_year))
     calibration_start_year
   } else {
     cov$first_stable_year
   }
   
-  df_calib <- df_input %>%
-    filter(year >= start_yr) %>%
+  df_calib <- df_input %>% filter(year >= start_yr) %>%
     dplyr::select(date, storage_m3)
   
-  n_full  <- nrow(df_input)
-  n_calib <- nrow(df_calib)
-  cat(sprintf(
-    "\n  Full record  : %s to %s (%d months)\n",
-    min(df_input$date), max(df_input$date), n_full))
-  cat(sprintf(
-    "  Calibration  : %s to %s (%d months, %.0f%% of full record)\n\n",
-    min(df_calib$date), max(df_calib$date), n_calib,
-    n_calib / n_full * 100))
+  cat(sprintf("\n  Full record : %s to %s (%d months)\n",
+              min(df_input$date), max(df_input$date), nrow(df_input)))
+  cat(sprintf("  Calibration : %s to %s (%d months, %.0f%%)\n\n",
+              min(df_calib$date), max(df_calib$date), nrow(df_calib),
+              nrow(df_calib) / nrow(df_input) * 100))
   
-  # ── TSDI on the coverage-filtered record ─────────────────────────────────
-  res <- compute_tsdi(
-    df_in           = df_calib,
-    drought_class_c = DROUGHT_CLASS_C,
-    use_smoothing   = USE_SMOOTHING,
-    smooth_window   = SMOOTH_WINDOW,
-    blom_a          = BLOM_A,
-    label           = "TSDI"
-  )
+  res <- compute_tsdi(df_in           = df_calib,
+                      drought_class_c = DROUGHT_CLASS_C,
+                      use_smoothing   = USE_SMOOTHING,
+                      smooth_window   = SMOOTH_WINDOW,
+                      blom_a          = BLOM_A,
+                      label           = "TSDI")
   
-  # Attach the coverage table and start year to the result for audit trail
-  res$coverage_table      <- cov$table
-  res$calibration_start   <- start_yr
+  res$coverage_table    <- cov$table
+  res$calibration_start <- start_yr
   
   out_file <- file.path(OUT_DIR, "Nechako_TSDI_Pipeline1_Output.csv")
   write_csv(res$data, out_file)
   
-  # Save coverage table separately (create sub-folder first)
   dir.create(file.path(OUT_DIR, "processed_data"), showWarnings = FALSE, recursive = TRUE)
   write_csv(cov$table,
             file.path(OUT_DIR, "processed_data", "Pipeline1_annual_coverage.csv"))
   
   pdf(file.path(OUT_DIR, "Pipeline1_Diagnostics.pdf"), width = 10, height = 6)
-  plot_pipeline(res, label = "TSDI", basin_label = "Nechako Basin (all lakes)",
-                storage_units_label = "Mm³")
+  plot_pipeline(res, label = "TSDI",
+                basin_label = "Nechako Basin (all lakes)",
+                storage_units_label = "Mm??")
   dev.off()
   
   print_summary(res, label = "TSDI", out_file = out_file)
@@ -882,139 +963,107 @@ run_pipeline_1 <- function(min_annual_coverage    = 0.70,
 }
 
 # ============================================================================
-# ── SECTION 7 ──  PIPELINE 2  —  Nechako Reservoir NTSDI
+# ?????? SECTION 7 ??????  PIPELINE 2  ???  Nechako Reservoir NTSDI  (LOCAL CSV ONLY)
 # ============================================================================
+# CHANGE v2: GEOLAKES branch removed.  Pipeline 2 now reads only from the
+# local authority CSV file.  NECHAKO_DATA_SOURCE is fixed to "LOCAL_DATA" in
+# Section 3 above; the run_pipeline_2() function below no longer checks or
+# branches on the data-source setting.
 run_pipeline_2 <- function() {
   cat("\n\n========================================================\n")
-  cat("PIPELINE 2 — Nechako Reservoir NTSDI\n")
-  cat("  Data source:", NECHAKO_DATA_SOURCE, "\n")
+  cat("PIPELINE 2 ??? Nechako Reservoir NTSDI\n")
+  cat("  Data source: LOCAL_DATA (", LOCAL_DATA_TYPE, ")\n")
   cat("========================================================\n")
   
-  #── 7a. Load & prepare storage time series ────────────────────────────────
-  if (NECHAKO_DATA_SOURCE == "GEOLAKES") {
-    cat("Reading GeoLakes file: ", GEOLAKES_FILE, "\n")
-    df_geo  <- read_csv(GEOLAKES_FILE, show_col_types = FALSE)
-    cat("Columns found: ", paste(names(df_geo), collapse = ", "), "\n")
+  cat("Reading local authority CSV: ", LOCAL_DATA_FILE, "\n")
+  
+  if (LOCAL_DATA_TYPE == "STORAGE") {
+    df_local <- read_csv(LOCAL_DATA_FILE, show_col_types = FALSE)
+    stopifnot(LOCAL_DATE_COL %in% names(df_local),
+              LOCAL_VALUE_COL %in% names(df_local))
+    df_input <- df_local %>%
+      transmute(date       = as.Date(.data[[LOCAL_DATE_COL]],
+                                     format = LOCAL_DATE_FORMAT),
+                storage_m3 = .data[[LOCAL_VALUE_COL]])
     
-    missing_cols <- setdiff(
-      c(GEOLAKES_DATE_COL, GEOLAKES_STORAGE_COL, GEOLAKES_LAT_COL, GEOLAKES_LON_COL),
-      names(df_geo)
-    )
-    if (length(missing_cols) > 0) {
-      stop("Missing columns: ", paste(missing_cols, collapse = ", "),
-           "\nAvailable: ", paste(names(df_geo), collapse = ", "))
-    }
+  } else if (LOCAL_DATA_TYPE == "LEVEL") {
+    df_local <- read_csv(LOCAL_DATA_FILE, show_col_types = FALSE)
+    stopifnot(LOCAL_DATE_COL %in% names(df_local),
+              LOCAL_VALUE_COL %in% names(df_local))
+    df_input <- df_local %>%
+      transmute(date        = as.Date(.data[[LOCAL_DATE_COL]],
+                                      format = LOCAL_DATE_FORMAT),
+                level_m_asl = .data[[LOCAL_VALUE_COL]]) %>%
+      mutate(storage_m3 = level_to_storage(level_m_asl))
     
-    cat(sprintf("  Filtering: lat=%.4f ± %.3f, lon=%.4f ± %.3f\n",
-                NECHAKO_LAT, NECHAKO_TOL, NECHAKO_LON, NECHAKO_TOL))
-    
-    df_nechako <- df_geo %>%
-      filter(abs(.data[[GEOLAKES_LAT_COL]] - NECHAKO_LAT) <= NECHAKO_TOL,
-             abs(.data[[GEOLAKES_LON_COL]] - NECHAKO_LON) <= NECHAKO_TOL)
-    
-    if (nrow(df_nechako) == 0) {
-      stop("No rows matched. Update NECHAKO_LAT / NECHAKO_LON in Section 3b.")
-    }
-    cat("  Matched ", nrow(df_nechako), " rows\n")
-    
-    df_input <- df_nechako %>%
-      transmute(
-        date        = as.Date(.data[[GEOLAKES_DATE_COL]]),
-        storage_m3 = .data[[GEOLAKES_STORAGE_COL]]
-      )
-    
-  } else if (NECHAKO_DATA_SOURCE == "LOCAL_CSV") {
-    cat("Reading local authority CSV: ", LOCAL_CSV_FILE, "\n")
-    
-    if (LOCAL_DATA_TYPE == "STORAGE") {
-      df_local <- read_csv(LOCAL_CSV_FILE, show_col_types = FALSE)
-      stopifnot(LOCAL_DATE_COL %in% names(df_local), LOCAL_VALUE_COL %in% names(df_local))
-      df_input <- df_local %>%
-        transmute(
-          date        = as.Date(.data[[LOCAL_DATE_COL]], format = LOCAL_DATE_FORMAT),
-          storage_m3 = .data[[LOCAL_VALUE_COL]]
-        )
-      
-    } else if (LOCAL_DATA_TYPE == "LEVEL") {
-      df_local <- read_csv(LOCAL_CSV_FILE, show_col_types = FALSE)
-      stopifnot(LOCAL_DATE_COL %in% names(df_local), LOCAL_VALUE_COL %in% names(df_local))
-      df_input <- df_local %>%
-        transmute(
-          date        = as.Date(.data[[LOCAL_DATE_COL]], format = LOCAL_DATE_FORMAT),
-          level_m_asl = .data[[LOCAL_VALUE_COL]]
-        ) %>%
-        mutate(storage_m3 = level_to_storage(level_m_asl))
-      
-    } else if (LOCAL_DATA_TYPE == "LEVEL_DAILY") {
-      cat("  Parsing Year + Day-of-Year format and converting to storage...\n")
-      df_input <- read_csv(LOCAL_CSV_FILE, 
-                           col_names = c("Year", "DOY", "Level_m"), 
+  } else if (LOCAL_DATA_TYPE == "LEVEL_DAILY") {
+    cat("  Parsing Year + Day-of-Year format and converting to storage...\n")
+    # File is whitespace-delimited with exactly 3 fields per row:
+    #   Year, DOY, Level_m  (no header, no trailing column).
+    # Verified against dailylevel.csv: 25,933 rows, all 3-field, no parse
+    # failures, years 1955-2025, DOY 1-366, levels 842.8-853.7 m ASL.
+    df_input <- read_table(LOCAL_DATA_FILE,
+                           col_names = c("Year", "DOY", "Level_m"),
+                           col_types     = "iid",
                            show_col_types = FALSE) %>%
-        mutate(
-          date = as.Date(paste(Year, DOY), format = "%Y %j"),
-          storage_m3 = level_to_storage(Level_m)
-        ) %>%
-        dplyr::select(date, storage_m3)
-      
-    } else {
-      stop("LOCAL_DATA_TYPE must be 'STORAGE', 'LEVEL', or 'LEVEL_DAILY'.")
-    }
+      filter(Year <= year(Sys.Date())) %>%
+      mutate(date       = as.Date(paste(Year, DOY), format = "%Y %j"),
+             storage_m3 = level_to_storage(Level_m)) %>%
+      dplyr::select(date, storage_m3)
     
-    n_na_storage <- sum(is.na(df_input$storage_m3))
-    if (n_na_storage > 0) {
-      cat("  WARNING: ", n_na_storage, " records produced NA storage (level outside hypsometric table range).\n")
-    }
   } else {
-    stop("NECHAKO_DATA_SOURCE must be 'GEOLAKES' or 'LOCAL_CSV'.")
+    stop("LOCAL_DATA_TYPE must be 'STORAGE', 'LEVEL', or 'LEVEL_DAILY'.")
   }
   
-  # Filter out NA storage rows before computing index
+  n_na <- sum(is.na(df_input$storage_m3))
+  if (n_na > 0)
+    cat("  WARNING:", n_na,
+        "records produced NA storage (level outside hypsometric table).\n")
+  
   n_before <- nrow(df_input)
   df_input <- df_input %>% filter(!is.na(storage_m3))
   n_after  <- nrow(df_input)
-  if (n_before != n_after) {
+  if (n_before != n_after)
     cat("  Removed", n_before - n_after, "rows with NA storage.\n")
-  }
-  # ── 7b. Run TSDI algorithm on single-lake storage ─────────────────────────
-  res <- compute_tsdi(
-    df_in           = df_input,
-    drought_class_c = DROUGHT_CLASS_C,
-    use_smoothing   = USE_SMOOTHING,
-    smooth_window   = SMOOTH_WINDOW,
-    blom_a          = BLOM_A,
-    label           = "NTSDI"      # Nechako Total Storage Deficit Index
-  )
   
-  # Append data source metadata to output
+  cat(sprintf("  Valid storage records: %d  (%s to %s)\n",
+              n_after, min(df_input$date), max(df_input$date)))
+  df_input <- df_input %>% filter(date <= as_date("2025-01-01"))
+  # Aggregate daily ??? monthly (TSDI algorithm expects monthly input)
+  df_in <- df_input %>%
+    mutate(year  = year(date), month = month(date)) %>%
+    group_by(year, month) %>%
+    summarise(
+      storage_m3 = mean(storage_m3, na.rm = TRUE),
+      date       = as.Date(paste(year[1], month[1], "01"), "%Y %m %d"),
+      .groups    = "drop"
+    ) %>%
+    arrange(date) %>%
+    dplyr::select(date, storage_m3)
+  # ====== Run TSDI algorithm ==============================
+  res <- compute_tsdi(df_in           = df_in, # <-- FIXED
+                      drought_class_c = DROUGHT_CLASS_C,
+                      use_smoothing   = USE_SMOOTHING,
+                      smooth_window   = SMOOTH_WINDOW,
+                      blom_a          = BLOM_A,
+                      label           = "NTSDI")
+  
   res$data <- res$data %>%
-    mutate(data_source = NECHAKO_DATA_SOURCE)
+    mutate(data_source    = "LOCAL_DATA",
+           local_data_type = LOCAL_DATA_TYPE)
   
   out_file <- file.path(OUT_DIR, "Nechako_NTSDI_Pipeline2_Output.csv")
   write_csv(res$data, out_file)
   
-  # ── Resolve actual storage units for this run ─────────────────────────────
-  # GEOLAKES and LOCAL_CSV/STORAGE are documented as already being in Mm³.
-  # LOCAL_CSV/LEVEL and LOCAL_CSV/LEVEL_DAILY go through level_to_storage(),
-  # which converts the HYPSO_TABLE (hm³ -> m³) and therefore yields real m³.
-  p2_storage_units <- if (NECHAKO_DATA_SOURCE == "LOCAL_CSV" &&
-                          LOCAL_DATA_TYPE %in% c("LEVEL", "LEVEL_DAILY")) {
-    "m³"
-  } else {
-    "Mm³"
-  }
+  # Storage units depend on the conversion path
+  p2_units <- if (LOCAL_DATA_TYPE %in% c("LEVEL", "LEVEL_DAILY")) "m??" else "Mm??"
   
   pdf(file.path(OUT_DIR, "Pipeline2_Diagnostics.pdf"), width = 10, height = 6)
   plot_pipeline(
-    res, 
-    label       = "NTSDI", 
-    basin_label = paste0(
-      "Nechako Reservoir [source: ", 
-      ifelse(NECHAKO_DATA_SOURCE == "LOCAL_CSV", 
-             paste0("Local CSV (", LOCAL_DATA_TYPE, ")"), 
-             "GeoLakes"), 
-      "]"
-    ),
-    storage_units_label = p2_storage_units
+    res,
+    label       = "NTSDI",
+    basin_label = paste0("Nechako Reservoir [Local CSV: ", LOCAL_DATA_TYPE, "]"),
+    storage_units_label = p2_units
   )
   dev.off()
   
@@ -1023,7 +1072,7 @@ run_pipeline_2 <- function() {
 }
 
 # ============================================================================
-# ── SECTION 8 ──  COMPARISON PLOT  (only when PIPELINE_MODE == "BOTH")
+# ?????? SECTION 8 ??????  COMPARISON PLOT  (only when PIPELINE_MODE == "BOTH")
 # ============================================================================
 plot_comparison <- function(res1, res2) {
   cat("\n\n== Generating comparison plot ==\n")
@@ -1033,92 +1082,63 @@ plot_comparison <- function(res1, res2) {
     by = "date"
   )
   if (nrow(comp) == 0) {
-    warning("No overlapping dates between Pipeline 1 and Pipeline 2. Skipping comparison plot.")
+    warning("No overlapping dates between pipelines.  Skipping comparison plot.")
     return(invisible(NULL))
   }
   cat("Overlapping records:", nrow(comp), "\n")
   
-  # ── Raw index comparison ──────────────────────────────────────────────────
   comp_long_raw <- comp %>%
-    pivot_longer(
-      cols      = c(TSDI, NTSDI),
-      names_to  = "Index",
-      values_to = "value"
-    ) %>%
-    mutate(
-      Index = recode(Index,
-                     TSDI  = "Pipeline 1: Basin-wide TSDI",
-                     NTSDI = "Pipeline 2: Nechako Reservoir NTSDI"
-      )
-    )
-  pc1  <- ggplot(comp_long_raw, aes(date, value, colour = Index)) +
+    pivot_longer(c(TSDI, NTSDI), names_to = "Index", values_to = "value") %>%
+    mutate(Index = recode(Index,
+                          TSDI  = "Pipeline 1: Basin-wide TSDI",
+                          NTSDI = "Pipeline 2: Nechako Reservoir NTSDI"))
+  
+  pc1 <- ggplot(comp_long_raw, aes(date, value, colour = Index)) +
     geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
     geom_line(linewidth = 0.8, alpha = 0.85) +
     scale_colour_manual(
-      values = c("Pipeline 1: Basin-wide TSDI"           = "#2c7bb6",
-                 "Pipeline 2: Nechako Reservoir NTSDI"   = "#d7191c")
-    ) +
-    labs(
-      title    = "Comparison — Basin TSDI vs. Nechako Reservoir NTSDI",
-      subtitle = paste0(
-        "Overlap: ", format(min(comp$date)), " – ", format(max(comp$date)),
-        "  |  Data source (P2): ", NECHAKO_DATA_SOURCE
-      ),
-      x      = NULL,
-      y      = "Index value",
-      colour = NULL
-    ) +
-    theme_bw(base_size = 12) +
-    theme(legend.position = "bottom")
+      values = c("Pipeline 1: Basin-wide TSDI"         = "#2c7bb6",
+                 "Pipeline 2: Nechako Reservoir NTSDI" = "#d7191c")) +
+    labs(title    = "Comparison ??? Basin TSDI vs. Nechako Reservoir NTSDI",
+         subtitle = paste0("Overlap: ", format(min(comp$date)), " ??? ",
+                           format(max(comp$date)),
+                           "  |  P2 data: LOCAL_DATA (", LOCAL_DATA_TYPE, ")"),
+         x = NULL, y = "Index value", colour = NULL) +
+    theme_bw(base_size = 12) + theme(legend.position = "bottom")
   print(pc1)
   
-  # ── Standardised index comparison ─────────────────────────────────────────
   comp_long_norm <- comp %>%
-    pivot_longer(
-      cols      = c(TSDI_norm, NTSDI_norm),
-      names_to  = "Index",
-      values_to = "value"
-    ) %>%
-    mutate(
-      Index = recode(Index,
-                     TSDI_norm  = "Pipeline 1: Basin-wide TSDI_norm",
-                     NTSDI_norm = "Pipeline 2: Nechako Reservoir NTSDI_norm"
-      )
-    )
-  pc2  <- ggplot(comp_long_norm, aes(date, value, colour = Index)) +
-    geom_hline(yintercept = 0,    linetype = "dashed", colour = "grey50") +
-    geom_hline(yintercept = -1.0, linetype = "dotted", colour = "#fc8d59") +
-    geom_hline(yintercept = -1.5, linetype = "dotted", colour = "#d73027") +
+    pivot_longer(c(TSDI_norm, NTSDI_norm),
+                 names_to = "Index", values_to = "value") %>%
+    mutate(Index = recode(Index,
+                          TSDI_norm  = "Pipeline 1: Basin TSDI_norm",
+                          NTSDI_norm = "Pipeline 2: Nechako Res. NTSDI_norm"))
+  
+  pc2 <- ggplot(comp_long_norm, aes(date, value, colour = Index)) +
+    geom_hline(yintercept =  0,    linetype = "dashed",  colour = "grey50") +
+    geom_hline(yintercept = -1.0,  linetype = "dotted",  colour = "#fc8d59") +
+    geom_hline(yintercept = -1.5,  linetype = "dotted",  colour = "#d73027") +
     geom_line(linewidth = 0.8, alpha = 0.85) +
     scale_colour_manual(
-      values = c("Pipeline 1: Basin-wide TSDI_norm"            = "#2c7bb6",
-                 "Pipeline 2: Nechako Reservoir NTSDI_norm"    = "#d7191c")
-    ) +
-    labs(
-      title    = "Comparison — Standardised Basin TSDI_norm vs. NTSDI_norm",
-      subtitle = "Dotted lines: SPI-style moderate (–1.0) and severe (–1.5) thresholds",
-      x        = NULL,
-      y        = "Standardised index [N(0,1)]",
-      colour   = NULL
-    ) +
-    theme_bw(base_size = 12) +
-    theme(legend.position = "bottom")
+      values = c("Pipeline 1: Basin TSDI_norm"          = "#2c7bb6",
+                 "Pipeline 2: Nechako Res. NTSDI_norm"  = "#d7191c")) +
+    labs(title    = "Comparison ??? Standardised TSDI_norm vs. NTSDI_norm",
+         subtitle = "Dotted lines: moderate (???1.0) and severe (???1.5) thresholds",
+         x = NULL, y = "Standardised index [N(0,1)]", colour = NULL) +
+    theme_bw(base_size = 12) + theme(legend.position = "bottom")
   print(pc2)
   
-  # ── Scatter / correlation ─────────────────────────────────────────────────
   corr_val <- round(cor(comp$TSDI_norm, comp$NTSDI_norm, use = "complete.obs"), 3)
-  pc3  <- ggplot(comp, aes(TSDI_norm, NTSDI_norm)) +
+  pc3 <- ggplot(comp, aes(TSDI_norm, NTSDI_norm)) +
     geom_point(alpha = 0.4, size = 1.5, colour = "#404040") +
     geom_smooth(method = "lm", se = TRUE, colour = "#2c7bb6", linewidth = 0.9) +
     geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey60") +
     annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 1.4, size = 4,
              label = paste0("r = ", corr_val)) +
-    labs(
-      title    = "Scatter — Basin TSDI_norm vs. Nechako Reservoir NTSDI_norm",
-      subtitle = "Dashed line = 1:1; blue line = OLS fit",
-      x        = "Basin TSDI_norm (Pipeline 1)",
-      y        = "Nechako Reservoir NTSDI_norm (Pipeline 2)"
-    ) +
+    labs(title    = "Scatter ??? Basin TSDI_norm vs. Nechako Reservoir NTSDI_norm",
+         subtitle = "Dashed = 1:1 line; blue = OLS fit",
+         x = "Basin TSDI_norm (Pipeline 1)",
+         y = "Nechako Reservoir NTSDI_norm (Pipeline 2)") +
     theme_bw(base_size = 12)
   print(pc3)
   
@@ -1126,15 +1146,18 @@ plot_comparison <- function(res1, res2) {
 }
 
 # ============================================================================
-# ── SECTION 9 ──  MAIN EXECUTION
+# ?????? SECTION 9 ??????  MAIN EXECUTION
 # ============================================================================
 res_p1 <- NULL
 res_p2 <- NULL
 
 if (PIPELINE_MODE %in% c("BASIN", "BOTH")) {
-  # quality_max = 1L: exclude post-2020 quality=2 rows (under-counted basin sum).
-  # Change to NULL only after lake-participation normalisation is in place.
   res_p1 <- run_pipeline_1(quality_max = 1L)
+  
+  # ?????? NEW in v2: run lake regulation diagnostic after Pipeline 1 ???????????????????????????????????????
+  # This checks which GeoLakes lakes in the Nechako watershed may be affected
+  # by regulation from Kenney Dam (Nechako Reservoir, 1952).
+  res_reg <- check_regulated_lakes()
 }
 
 if (PIPELINE_MODE %in% c("NECHAKO_RESERVOIR", "BOTH")) {
@@ -1147,7 +1170,5 @@ if (PIPELINE_MODE == "BOTH" && !is.null(res_p1) && !is.null(res_p2)) {
   dev.off()
 }
 
-# Close console log sink
 sink()
-
 cat("\n\nDone. All outputs saved to:", normalizePath(OUT_DIR), "\n")
