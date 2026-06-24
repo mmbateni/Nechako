@@ -1,16 +1,16 @@
 # ============================================================================
-# NECHAKO STREAMFLOW RIVER BASIN — DUAL-PIPELINE DROUGHT ANALYSIS
+# NECHAKO STREAMFLOW RIVER BASIN — SSI DROUGHT ANALYSIS (PIPELINE B ONLY)
 # Since Nechako Reservoir levels capture wetness/drought conditions,
 # we use only streamflow data unaffected by dam regulation.
-# Pipeline A (Daily):   Variable threshold drought, Raut & Ganguli (2024)
+# Pipeline A (Daily):   DISABLED — Variable threshold drought, Raut & Ganguli (2024)
 # Pipeline B (Monthly): Standardized Streamflow Index, Peña-Angulo et al. (2022)
 #
-# Shared preprocessing (both pipelines):
+# Shared preprocessing:
 #   - Data loading & completeness check  (original year-span logic)
 #   - Gap filling: Fritsch-Carlson PCHIP, gaps > MAX_FILL_DAYS left as NA  
 #   - Hard exclusion gate for stations < 50% completeness                  
 #
-# Pipeline A adds:
+# Pipeline A (COMMENTED OUT):
 #   - Per-DOY variable threshold (Q20 = 80% exceedance probability)        
 #   - Daily drought event identification (min 30 days)
 #   - NA gap-days are silently treated as "not drought" in Pipeline A
@@ -18,22 +18,26 @@
 # Pipeline B adds:
 #   - Daily → monthly mean aggregation
 #   - Best-fit distribution selection via L-moments (lmomco)
-#   - SSI calculation and drought identification (SSI < -0.84)
+#   - SSI calculation and drought identification (SSI < -0.50)
 #
 # check_data_completeness() uses the original month-span denominator.
 #       
 # ============================================================================
 
 rm(list = ls())
-
+if (file.exists("DROUGHT_ANALYSIS_utils.R")) {
+  source("DROUGHT_ANALYSIS_utils.R")
+} else {
+  warning("DROUGHT_ANALYSIS_utils.R not found. Falling back to local thresholds.")
+}
 # ============================================================================
 # SECTION 1: PACKAGES
 # ============================================================================
 packages_needed <- c(
   # Shared / general
   "tidyverse", "lubridate", "zoo",
-  # Pipeline A (daily threshold)
-  "circular", "MASS", "trend", "Kendall", "boot", "copula", "kde1d",
+  # Pipeline A (daily threshold) — DISABLED
+  # "circular", "MASS", "trend", "Kendall", "boot", "copula", "kde1d",
   # Pipeline B (SSI)
   "lmomco", "fitdistrplus",
   # Additional outputs (from SWEI code)
@@ -51,13 +55,13 @@ for (pkg in packages_needed) {
 # SECTION 2: STATION METADATA & DIRECTORIES
 # ============================================================================
 stations <- data.frame(
-  StationID   = c("08JB002", "08JC005", "08JE001", "08JE004"),
+  StationID   = c("08JB002", "08JB003", "08JE001", "08JE004"),
   StationName = c("STELLAKO RIVER AT GLENANNAN",
-                  "CHILAKO RIVER NEAR PRINCE GEORGE",
+                  "NAUTLEY RIVER NEAR FORT FRASER",
                   "STUART RIVER NEAR FORT ST. JAMES",
                   "TSILCOH RIVER NEAR THE MOUTH"),
-  StartYear   = c(1929, 1953, 1929, 1975),
-  EndYear     = c(2024, 2022, 2024, 2024),
+  StartYear   = c(1929,1950,  1929, 1975),
+  EndYear     = c(2024, 2024,  2024, 2024),
   stringsAsFactors = FALSE
 )
 
@@ -78,10 +82,10 @@ get_station_display <- function(station_id, stations_df = stations) {
 
 for (sub in c(
   "",
-  "shared/processed_data",          # daily gap-filled data (used by both)
+  "shared/processed_data",          # daily gap-filled data
   "shared/completeness",
-  "daily/thresholds",               # Pipeline A
-  "daily/drought_events",
+  # "daily/thresholds",             # Pipeline A — DISABLED
+  # "daily/drought_events",         # Pipeline A — DISABLED
   "ssi/monthly_data",               # Pipeline B
   "ssi/drought_events",
   "figures",
@@ -166,17 +170,17 @@ create_excel_summary <- function(stations, completeness,
       stringsAsFactors = FALSE
     )
     
-    # Pipeline A stats - ALWAYS add these columns (NA if excluded)
-    if (comp$meets_threshold && !is.null(daily_droughts[[sid]]$drought_events)) {
-      ev_a <- daily_droughts[[sid]]$drought_events
-      base$A_Drought_Events      <- nrow(ev_a)
-      base$A_Total_Days          <- sum(ev_a$duration)
-      base$A_Avg_Duration_Days   <- if (nrow(ev_a) > 0) round(mean(ev_a$duration), 1) else NA_real_
-    } else {
-      base$A_Drought_Events      <- NA_integer_
-      base$A_Total_Days          <- NA_integer_
-      base$A_Avg_Duration_Days   <- NA_real_
-    }
+    # Pipeline A stats — DISABLED
+    # if (comp$meets_threshold && !is.null(daily_droughts[[sid]]$drought_events)) {
+    #   ev_a <- daily_droughts[[sid]]$drought_events
+    #   base$A_Drought_Events      <- nrow(ev_a)
+    #   base$A_Total_Days          <- sum(ev_a$duration)
+    #   base$A_Avg_Duration_Days   <- if (nrow(ev_a) > 0) round(mean(ev_a$duration), 1) else NA_real_
+    # } else {
+    #   base$A_Drought_Events      <- NA_integer_
+    #   base$A_Total_Days          <- NA_integer_
+    #   base$A_Avg_Duration_Days   <- NA_real_
+    # }
     
     # Pipeline B stats - ALWAYS add these columns (NA if excluded)
     if (comp$meets_threshold && !is.null(ssi_results[[sid]])) {
@@ -202,15 +206,15 @@ create_excel_summary <- function(stations, completeness,
   }
   excel_data[["01_Station_Summary"]] <- do.call(rbind, summary_rows)
   
-  # Sheets for Pipeline A Drought Events (one per included station)
-  for (sid in names(daily_droughts)) {
-    if (!is.null(daily_droughts[[sid]]$drought_events)) {
-      ev <- daily_droughts[[sid]]$drought_events
-      if (nrow(ev) > 0) {
-        excel_data[[paste0("A_", sid, "_Daily_Droughts")]] <- as.data.frame(ev)
-      }
-    }
-  }
+  # Sheets for Pipeline A Drought Events — DISABLED
+  # for (sid in names(daily_droughts)) {
+  #   if (!is.null(daily_droughts[[sid]]$drought_events)) {
+  #     ev <- daily_droughts[[sid]]$drought_events
+  #     if (nrow(ev) > 0) {
+  #       excel_data[[paste0("A_", sid, "_Daily_Droughts")]] <- as.data.frame(ev)
+  #     }
+  #   }
+  # }
   
   # Sheets for Pipeline B Drought Events (one per included station)
   for (sid in names(ssi_droughts)) {
@@ -298,17 +302,18 @@ create_text_report <- function(stations, completeness,
         file = report_file, append = TRUE)
     
     if (comp$meets_threshold) {
-      if (!is.null(daily_droughts[[sid]]$drought_events)) {
-        ev_a <- daily_droughts[[sid]]$drought_events
-        cat(sprintf("\nPipeline A (Daily Threshold):\n"),
-            file = report_file, append = TRUE)
-        cat(sprintf("  Drought events: %d\n", nrow(ev_a)),
-            file = report_file, append = TRUE)
-        cat(sprintf("  Total drought days: %d\n", sum(ev_a$duration)),
-            file = report_file, append = TRUE)
-        cat(sprintf("  Average duration: %.1f days\n", mean(ev_a$duration)),
-            file = report_file, append = TRUE)
-      }
+      # Pipeline A (Daily Threshold) — DISABLED
+      # if (!is.null(daily_droughts[[sid]]$drought_events)) {
+      #   ev_a <- daily_droughts[[sid]]$drought_events
+      #   cat(sprintf("\nPipeline A (Daily Threshold):\n"),
+      #       file = report_file, append = TRUE)
+      #   cat(sprintf("  Drought events: %d\n", nrow(ev_a)),
+      #       file = report_file, append = TRUE)
+      #   cat(sprintf("  Total drought days: %d\n", sum(ev_a$duration)),
+      #       file = report_file, append = TRUE)
+      #   cat(sprintf("  Average duration: %.1f days\n", mean(ev_a$duration)),
+      #       file = report_file, append = TRUE)
+      # }
       
       if (!is.null(ssi_droughts[[sid]]$drought_events)) {
         ev_b <- ssi_droughts[[sid]]$drought_events
@@ -330,16 +335,17 @@ create_text_report <- function(stations, completeness,
   # Methodology
   cat("\n\n========== METHODOLOGY ==========\n",
       file = report_file, append = TRUE)
-  cat("Pipeline A (Daily):\n",
-      "  • Variable threshold (Q20 = 80% exceedance probability)\n",
-      "  • 31-day centered moving average smoothing\n",
-      "  • Minimum drought duration: 30 days\n",
-      "  • Reference: Raut & Ganguli (2024)\n\n",
-      file = report_file, append = TRUE)
+  # Pipeline A (Daily) — DISABLED
+  # cat("Pipeline A (Daily):\n",
+  #     "  • Variable threshold (Q20 = 80% exceedance probability)\n",
+  #     "  • 31-day centered moving average smoothing\n",
+  #     "  • Minimum drought duration: 30 days\n",
+  #     "  • Reference: Raut & Ganguli (2024)\n\n",
+  #     file = report_file, append = TRUE)
   cat("Pipeline B (Monthly):\n",
       "  • Standardized Streamflow Index (SSI)\n",
       "  • Best-fit distribution via L-moments (lmomco)\n",
-      "  • Drought threshold: SSI < -0.84 (5-year return period)\n",
+      "  • Drought threshold: SSI < -0.50 (moderate drought)\n",
       "  • Reference: Peña-Angulo et al. (2022)\n\n",
       file = report_file, append = TRUE)
   
@@ -360,15 +366,15 @@ create_text_report <- function(stations, completeness,
 MIN_COMPLETENESS_PCT <- 50   # paper Criterion B
 MAX_FILL_DAYS        <- 14   # PCHIP only for gaps ≤ 14 days (FIX 2)
 
-# ── Pipeline A: daily variable threshold (Raut & Ganguli 2024) ───────────
-THRESHOLD_EXCEEDANCE_PROB <- 0.20   # Q20 = 80% exceedance (low-flow threshold)
-# Original code wrongly used 0.80 (high-flow)
-THRESHOLD_WINDOW_SIZE     <- 31     # 31-day centred moving average smoothing
-MIN_DROUGHT_DURATION_DAYS <- 30     # minimum consecutive days below threshold
+# ── Pipeline A: daily variable threshold — DISABLED ──────────────────────
+# THRESHOLD_EXCEEDANCE_PROB <- 0.20   # Q20 = 80% exceedance (low-flow threshold)
+# # Original code wrongly used 0.80 (high-flow)
+# THRESHOLD_WINDOW_SIZE     <- 31     # 31-day centred moving average smoothing
+# MIN_DROUGHT_DURATION_DAYS <- 30     # minimum consecutive days below threshold
 
 # ── Pipeline B: SSI monthly (Peña-Angulo et al. 2022) ───────────────────
-SSI_DROUGHT_THRESHOLD  <- -0.84    # 5-year return period (Peña-Angulo §2.2.1)
-SSI_RECOVERY_THRESHOLD <-  0.00    # drought ends when SSI returns to 0
+SSI_DROUGHT_THRESHOLD   <- if (exists("DROUGHT_ONSET")) DROUGHT_ONSET else -0.50
+SSI_RECOVERY_THRESHOLD  <- if (exists("DROUGHT_END")) DROUGHT_END else -0.50  
 DISTRIBUTIONS <- c("gev", "pe3", "lnorm", "glo", "gpareto", "weibull")
 MIN_MONTHS_FOR_FIT     <- 120      # minimum 10 years of monthly data
 
@@ -590,122 +596,117 @@ fill_missing_data <- function(data, max_fill = MAX_FILL_DAYS) {
 }
 
 # ============================================================================
-# SECTION 7: PIPELINE A — VARIABLE THRESHOLD CALCULATION
-#
-# Computes the Q20 (20th percentile = 80% exceedance probability) for each
-# day-of-year across all years, then smooths with a 31-day centred moving
-# average.  Original code used probs=0.80 (80th percentile, a high-flow value)
-# which caused ~80% of all days to be classified as drought.
+# SECTION 7: PIPELINE A — VARIABLE THRESHOLD CALCULATION — DISABLED
 # ============================================================================
-calculate_variable_threshold <- function(data,
-                                         window_size    = THRESHOLD_WINDOW_SIZE,
-                                         exceedance_prob = THRESHOLD_EXCEEDANCE_PROB,
-                                         station_id     = NULL) {
-  if (is.null(data) || nrow(data) == 0) return(NULL)
-  
-  thresholds <- data.frame(doy = 1:366,
-                           threshold        = NA_real_,
-                           threshold_smooth = NA_real_)
-  
-  for (d in 1:366) {
-    doy_vals <- data$discharge[data$doy == d]
-    doy_vals <- doy_vals[!is.na(doy_vals)]
-    
-    if (length(doy_vals) >= 10) {
-      thresholds$threshold[d] <- quantile(doy_vals, probs = exceedance_prob, na.rm = TRUE)
-    } else {
-      neighbors <- numeric(0)
-      for (offset in 1:15) {
-        d_prev    <- ((d - offset - 1) %% 366) + 1
-        d_next    <- ((d + offset - 1) %% 366) + 1
-        neighbors <- c(neighbors,
-                       data$discharge[data$doy == d_prev & !is.na(data$discharge)],
-                       data$discharge[data$doy == d_next & !is.na(data$discharge)])
-        if (length(neighbors) >= 10) break
-      }
-      if (length(neighbors) >= 2)
-        thresholds$threshold[d] <- quantile(neighbors, probs = exceedance_prob, na.rm = TRUE)
-    }
-  }
-  
-  thresholds$threshold_smooth <- zoo::rollapply(
-    thresholds$threshold,
-    width = window_size, FUN = mean,
-    fill = NA, align = "center", partial = TRUE
-  )
-  thresholds$threshold_smooth[366] <- thresholds$threshold_smooth[365]
-  thresholds$station_id      <- station_id
-  thresholds$window_size     <- window_size
-  thresholds$exceedance_prob <- exceedance_prob
-  
-  cat(sprintf("  [Pipeline A] Q%.0f threshold (80%%-exceedance), %d-day smoothing\n",
-              exceedance_prob * 100, window_size))
-  return(thresholds)
-}
+# calculate_variable_threshold <- function(data,
+#                                          window_size    = THRESHOLD_WINDOW_SIZE,
+#                                          exceedance_prob = THRESHOLD_EXCEEDANCE_PROB,
+#                                          station_id     = NULL) {
+#   if (is.null(data) || nrow(data) == 0) return(NULL)
+#
+#   thresholds <- data.frame(doy = 1:366,
+#                            threshold        = NA_real_,
+#                            threshold_smooth = NA_real_)
+#
+#   for (d in 1:366) {
+#     doy_vals <- data$discharge[data$doy == d]
+#     doy_vals <- doy_vals[!is.na(doy_vals)]
+#
+#     if (length(doy_vals) >= 10) {
+#       thresholds$threshold[d] <- quantile(doy_vals, probs = exceedance_prob, na.rm = TRUE)
+#     } else {
+#       neighbors <- numeric(0)
+#       for (offset in 1:15) {
+#         d_prev    <- ((d - offset - 1) %% 366) + 1
+#         d_next    <- ((d + offset - 1) %% 366) + 1
+#         neighbors <- c(neighbors,
+#                        data$discharge[data$doy == d_prev & !is.na(data$discharge)],
+#                        data$discharge[data$doy == d_next & !is.na(data$discharge)])
+#         if (length(neighbors) >= 10) break
+#       }
+#       if (length(neighbors) >= 2)
+#         thresholds$threshold[d] <- quantile(neighbors, probs = exceedance_prob, na.rm = TRUE)
+#     }
+#   }
+#
+#   thresholds$threshold_smooth <- zoo::rollapply(
+#     thresholds$threshold,
+#     width = window_size, FUN = mean,
+#     fill = NA, align = "center", partial = TRUE
+#   )
+#   thresholds$threshold_smooth[366] <- thresholds$threshold_smooth[365]
+#   thresholds$station_id      <- station_id
+#   thresholds$window_size     <- window_size
+#   thresholds$exceedance_prob <- exceedance_prob
+#
+#   cat(sprintf("  [Pipeline A] Q%.0f threshold (80%%-exceedance), %d-day smoothing\n",
+#               exceedance_prob * 100, window_size))
+#   return(thresholds)
+# }
 
 # ============================================================================
-# SECTION 8: PIPELINE A — DAILY DROUGHT EVENT IDENTIFICATION
+# SECTION 8: PIPELINE A — DAILY DROUGHT EVENT IDENTIFICATION — DISABLED
 # ============================================================================
-identify_droughts <- function(data, thresholds,
-                              min_duration = MIN_DROUGHT_DURATION_DAYS,
-                              station_id   = NULL) {
-  if (is.null(data) || nrow(data) == 0 || is.null(thresholds)) {
-    return(list(daily_data = data, drought_events = NULL, message = "Insufficient data"))
-  }
-  
-  data     <- merge(data, thresholds[, c("doy", "threshold_smooth")],
-                    by = "doy", all.x = TRUE)
-  data     <- data[order(data$date), ]
-  
-  data$below_threshold <- data$discharge < data$threshold_smooth
-  data$below_threshold[is.na(data$below_threshold)] <- FALSE   # NA days not drought
-  
-  data$event_id <- with(rle(data$below_threshold), rep(seq_along(lengths), lengths))
-  
-  event_info <- data %>%
-    group_by(event_id) %>%
-    filter(below_threshold == TRUE) %>%
-    summarise(
-      start_date     = min(date),
-      end_date       = max(date),
-      duration       = n(),
-      start_doy      = first(doy),
-      end_doy        = last(doy),
-      discharge_min  = min(discharge,  na.rm = TRUE),
-      discharge_mean = mean(discharge, na.rm = TRUE),
-      threshold_mean = mean(threshold_smooth, na.rm = TRUE),
-      deficit_volume = sum(threshold_smooth - discharge, na.rm = TRUE),
-      deficit_mean   = mean(threshold_smooth - discharge, na.rm = TRUE),
-      .groups = "drop"
-    ) %>%
-    filter(duration >= min_duration) %>%
-    mutate(
-      event_id_new = row_number(),
-      year  = year(start_date),
-      month = month(start_date),
-      season = case_when(
-        month %in% c(12, 1, 2) ~ "Winter",
-        month %in% c(3, 4, 5)  ~ "Spring",
-        month %in% c(6, 7, 8)  ~ "Summer",
-        month %in% c(9, 10,11) ~ "Fall"
-      )
-    )
-  
-  if (!is.null(station_id)) event_info$station_id <- station_id
-  
-  data <- data %>%
-    left_join(event_info %>% dplyr::select(event_id, event_id_new), by = "event_id")
-  
-  cat(sprintf("  [Pipeline A] Drought events: %d (min %d days below Q20 threshold)\n",
-              nrow(event_info), min_duration))
-  return(list(
-    daily_data         = data,
-    drought_events     = event_info,
-    n_events           = nrow(event_info),
-    total_drought_days = sum(event_info$duration),
-    message            = "Success"
-  ))
-}
+# identify_droughts <- function(data, thresholds,
+#                               min_duration = MIN_DROUGHT_DURATION_DAYS,
+#                               station_id   = NULL) {
+#   if (is.null(data) || nrow(data) == 0 || is.null(thresholds)) {
+#     return(list(daily_data = data, drought_events = NULL, message = "Insufficient data"))
+#   }
+#
+#   data     <- merge(data, thresholds[, c("doy", "threshold_smooth")],
+#                     by = "doy", all.x = TRUE)
+#   data     <- data[order(data$date), ]
+#
+#   data$below_threshold <- data$discharge < data$threshold_smooth
+#   data$below_threshold[is.na(data$below_threshold)] <- FALSE   # NA days not drought
+#
+#   data$event_id <- with(rle(data$below_threshold), rep(seq_along(lengths), lengths))
+#
+#   event_info <- data %>%
+#     group_by(event_id) %>%
+#     filter(below_threshold == TRUE) %>%
+#     summarise(
+#       start_date     = min(date),
+#       end_date       = max(date),
+#       duration       = n(),
+#       start_doy      = first(doy),
+#       end_doy        = last(doy),
+#       discharge_min  = min(discharge,  na.rm = TRUE),
+#       discharge_mean = mean(discharge, na.rm = TRUE),
+#       threshold_mean = mean(threshold_smooth, na.rm = TRUE),
+#       deficit_volume = sum(threshold_smooth - discharge, na.rm = TRUE),
+#       deficit_mean   = mean(threshold_smooth - discharge, na.rm = TRUE),
+#       .groups = "drop"
+#     ) %>%
+#     filter(duration >= min_duration) %>%
+#     mutate(
+#       event_id_new = row_number(),
+#       year  = year(start_date),
+#       month = month(start_date),
+#       season = case_when(
+#         month %in% c(12, 1, 2) ~ "Winter",
+#         month %in% c(3, 4, 5)  ~ "Spring",
+#         month %in% c(6, 7, 8)  ~ "Summer",
+#         month %in% c(9, 10,11) ~ "Fall"
+#       )
+#     )
+#
+#   if (!is.null(station_id)) event_info$station_id <- station_id
+#
+#   data <- data %>%
+#     left_join(event_info %>% dplyr::select(event_id, event_id_new), by = "event_id")
+#
+#   cat(sprintf("  [Pipeline A] Drought events: %d (min %d days below Q20 threshold)\n",
+#               nrow(event_info), min_duration))
+#   return(list(
+#     daily_data         = data,
+#     drought_events     = event_info,
+#     n_events           = nrow(event_info),
+#     total_drought_days = sum(event_info$duration),
+#     message            = "Success"
+#   ))
+# }
 
 # ============================================================================
 # SECTION 9: PIPELINE B — DAILY TO MONTHLY AGGREGATION
@@ -782,16 +783,55 @@ calculate_lmoments_distance <- function(data, dist_name) {
     tau4_theo   <- lmom_theo$ratios[4]
     
     if (any(is.na(c(tau3_sample, tau4_sample, tau3_theo, tau4_theo)))) return(Inf)
-    l1l2_check <- sqrt(sum((d_sample - d_theo)^2))  # should be ~0; large value = fit didn't converge
     
-    return(list(
-      discriminant_distance = sqrt((tau3_sample - tau3_theo)^2 + (tau4_sample - tau4_theo)^2),
-      fit_sanity_check = l1l2_check
-    ))
     return(sqrt((tau3_sample - tau3_theo)^2 + (tau4_sample - tau4_theo)^2))
     
   }, error = function(e) Inf)
 }
+
+# ============================================================================
+# SECTION 10b: PIPELINE B — BOOTSTRAP DISTRIBUTION STABILITY (Fix 3)
+#
+# Resamples the monthly flow record B times and tallies how often each
+# candidate distribution wins the L-moment distance contest.  A single-sample
+# winner with < BOOT_MIN_WIN_PCT % of bootstrap draws is considered unstable;
+# the plurality winner is reported alongside it in the console and saved in
+# the return list so the analyst can make an informed final choice.
+# ============================================================================
+BOOT_REPS        <- 500L   # number of bootstrap replicates
+CLOSE_MARGIN_PCT <- 15     # trigger warning + bootstrap when winner margin < this %
+
+bootstrap_best_distribution <- function(flow_vals, distributions,
+                                        B    = BOOT_REPS,
+                                        seed = 42L) {
+  set.seed(seed)
+  win_counts <- setNames(integer(length(distributions)), distributions)
+  
+  for (b in seq_len(B)) {
+    boot_sample <- sample(flow_vals, size = length(flow_vals), replace = TRUE)
+    boot_dists  <- vapply(distributions,
+                          function(d) calculate_lmoments_distance(boot_sample, d),
+                          numeric(1))
+    winner <- distributions[which.min(boot_dists)]
+    if (length(winner) == 1L && !is.na(winner))
+      win_counts[winner] <- win_counts[winner] + 1L
+  }
+  
+  win_pct   <- win_counts / B * 100
+  boot_best <- names(which.max(win_counts))
+  
+  cat(sprintf("  [Pipeline B] Bootstrap stability (B = %d replicates):\n", B))
+  for (d in names(sort(win_counts, decreasing = TRUE))) {
+    cat(sprintf("    %-10s  %3.0f%%\n", d, win_pct[d]))
+  }
+  cat(sprintf("  Bootstrap plurality winner: %s (%3.0f%% of draws)\n",
+              boot_best, win_pct[boot_best]))
+  
+  return(list(win_counts = win_counts,
+              win_pct    = win_pct,
+              boot_best  = boot_best))
+}
+
 calculate_ssi <- function(monthly_data, station_id = NULL) {
   if (is.null(monthly_data) || nrow(monthly_data) < MIN_MONTHS_FOR_FIT) {
     cat("  [Pipeline B] Insufficient monthly data for SSI (need >= 120 months)\n")
@@ -824,7 +864,98 @@ calculate_ssi <- function(monthly_data, station_id = NULL) {
   cat(sprintf("  Best distribution: %s (distance = %.6f)\n",
               best_dist, min(dist_distances$distance, na.rm = TRUE)))
   
-  # Fit the best distribution using lmomco's L-moment parameter estimation
+  # ── Fix 2: GPA finite-upper-bound disqualification ──────────────────────────
+  # GPA with kappa > 0 has a hard ceiling at xi + alpha/kappa.  If that ceiling
+  # falls below the observed maximum flow, GPA assigns zero probability to flows
+  # that actually occurred — a mathematical impossibility.  Disqualify and
+  # promote the runner-up.  When kappa <= 0 the upper tail is unbounded (passes
+  # silently, as happened for 08JE001).
+  gpa_disqualified <- FALSE
+  if (best_dist == "gpareto") {
+    par_gpa <- lmomco::pargpa(lmomco::lmoms(flow_vals, nmom = 4))
+    kappa   <- par_gpa$para["kappa"]
+    if (!is.na(kappa) && kappa > 0) {
+      upper_bound <- par_gpa$para["xi"] + par_gpa$para["alpha"] / kappa
+      if (upper_bound < max(flow_vals, na.rm = TRUE)) {
+        cat(sprintf(
+          "  [Pipeline B] GPA disqualified: fitted ceiling (%.2f m\u00b3/s) < observed max (%.2f m\u00b3/s). Promoting runner-up.\n",
+          upper_bound, max(flow_vals, na.rm = TRUE)))
+        dist_distances_valid <- dist_distances[dist_distances$distribution != "gpareto", ]
+        best_dist            <- dist_distances_valid$distribution[which.min(dist_distances_valid$distance)]
+        gpa_disqualified     <- TRUE
+        cat(sprintf("  [Pipeline B] Runner-up selected: %s\n", best_dist))
+      } else {
+        cat(sprintf("  [Pipeline B] GPA kappa > 0 but ceiling (%.2f) >= observed max (%.2f) — retained.\n",
+                    upper_bound, max(flow_vals, na.rm = TRUE)))
+      }
+    } else {
+      cat(sprintf("  [Pipeline B] GPA kappa = %.4f (unbounded upper tail) — no disqualification needed.\n",
+                  ifelse(is.na(kappa), NA_real_, kappa)))
+    }
+  }
+  
+  # ── Fix 1 + Fix 3: Close-margin warning and conditional bootstrap ────────────
+  #
+  # Both checks operate on dist_eligible — the surviving candidates AFTER any
+  # GPA disqualification above.  This ensures the margin and runner-up reported
+  # always reflect the actual decision space, not the original full table.
+  #
+  # Bootstrap (Fix 3) is expensive (BOOT_REPS resamples × 6 fits each).  It is
+  # only triggered when the winning margin is below CLOSE_MARGIN_PCT, i.e. when
+  # the single-sample selection is genuinely uncertain.  When the winner is
+  # clear the check is skipped and boot_result is set to NULL.
+  # Use the filtered table when GPA was disqualified, the full table otherwise.
+  # This ensures margin and bootstrap always reflect the actual candidate pool.
+  dist_eligible <- if (gpa_disqualified) {
+    dist_distances_valid[is.finite(dist_distances_valid$distance), ]
+  } else {
+    dist_distances[is.finite(dist_distances$distance), ]
+  }
+  
+  boot_result <- NULL
+  
+  if (nrow(dist_eligible) >= 2) {
+    sorted_eligible <- dist_eligible[order(dist_eligible$distance), ]
+    margin_pct      <- (sorted_eligible$distance[2] - sorted_eligible$distance[1]) /
+      sorted_eligible$distance[1] * 100
+    runner_up       <- sorted_eligible$distribution[2]
+    
+    if (margin_pct < CLOSE_MARGIN_PCT) {
+      # ── Fix 1: warn ─────────────────────────────────────────────────────────
+      warning(sprintf(
+        "[Pipeline B] UNSTABLE SELECTION for station %s: '%s' wins by only %.1f%% over '%s' — running bootstrap.",
+        ifelse(is.null(station_id), "unknown", station_id),
+        best_dist, margin_pct, runner_up))
+      
+      # ── Fix 3: bootstrap (only when margin is narrow) ───────────────────────
+      cat(sprintf("  [Pipeline B] Close margin (%.1f%% < %.0f%%) — running bootstrap (B = %d)...\n",
+                  margin_pct, CLOSE_MARGIN_PCT, BOOT_REPS))
+      boot_result <- tryCatch(
+        bootstrap_best_distribution(flow_vals, sorted_eligible$distribution),
+        error = function(e) {
+          cat(sprintf("  [Pipeline B] Bootstrap failed: %s\n", e$message))
+          NULL
+        }
+      )
+      if (!is.null(boot_result) && boot_result$boot_best != best_dist) {
+        warning(sprintf(
+          "[Pipeline B] Bootstrap plurality ('%s', %.0f%%) DIFFERS from single-sample winner ('%s') for station %s. Consider overriding.",
+          boot_result$boot_best,
+          boot_result$win_pct[boot_result$boot_best],
+          best_dist,
+          ifelse(is.null(station_id), "unknown", station_id)))
+      } else if (!is.null(boot_result)) {
+        cat(sprintf("  [Pipeline B] Bootstrap confirms '%s' as plurality winner (%.0f%% of draws).\n",
+                    boot_result$boot_best,
+                    boot_result$win_pct[boot_result$boot_best]))
+      }
+    } else {
+      cat(sprintf("  [Pipeline B] Margin clear (%.1f%% >= %.0f%%) — bootstrap not needed.\n",
+                  margin_pct, CLOSE_MARGIN_PCT))
+    }
+  }
+  
+  # ── CDF fit and SSI transformation ──────────────────────────────────────────
   tryCatch({
     lmom_sample <- lmomco::lmoms(flow_vals, nmom = 4)
     
@@ -841,7 +972,7 @@ calculate_ssi <- function(monthly_data, station_id = NULL) {
     p_vals <- cdf_fn(monthly_data$discharge_mean)
     # Clamp to avoid Inf at exact 0 or 1
     p_vals <- pmax(1e-6, pmin(1 - 1e-6, p_vals))
-    monthly_data$ssi              <- qnorm(p_vals)
+    monthly_data$ssi               <- qnorm(p_vals)
     monthly_data$best_distribution <- best_dist
     
     cat(sprintf("  [Pipeline B] SSI calculated for %d months\n",
@@ -850,7 +981,8 @@ calculate_ssi <- function(monthly_data, station_id = NULL) {
     return(list(
       monthly_data      = monthly_data,
       best_distribution = best_dist,
-      dist_distances    = dist_distances
+      dist_distances    = dist_distances,
+      boot_result       = boot_result    # NULL if bootstrap failed
     ))
     
   }, error = function(e) {
@@ -870,45 +1002,76 @@ identify_ssi_droughts <- function(ssi_result,
     return(list(drought_events = NULL, message = "Insufficient SSI data"))
   }
   
-  data           <- ssi_result$monthly_data
-  data$in_drought <- data$ssi < drought_threshold
-  data$event_id   <- with(rle(data$in_drought), rep(seq_along(lengths), lengths))
+  data <- ssi_result$monthly_data
+  
+  # 1. Use shared detection system for exact parity with 7basin_timeseries.R
+  df_in <- data.frame(date = data$date, value = data$ssi)
+  shared_events <- tryCatch(
+    detect_drought_events(df_in, 
+                          onset_threshold = drought_threshold,
+                          termination_threshold = recovery_threshold, 
+                          min_duration = 1),
+    error = function(e) data.frame()
+  )
+  
+  if (nrow(shared_events) == 0) {
+    # Return empty structure expected by downstream Excel/Report generators
+    event_info <- data.frame(start_date=as.Date(character()), end_date=as.Date(character()),
+                             duration_months=integer(), start_year=integer(), start_month=integer(),
+                             ssi_min=numeric(), ssi_mean=numeric(), severity=numeric(),
+                             event_id_new=integer(), season=character(), stringsAsFactors=FALSE)
+    if (!is.null(station_id)) { 
+      event_info$station_id <- character()
+      event_info$distribution <- character() 
+    }
+    data$event_id <- NA_integer_
+    return(list(monthly_data=data, drought_events=event_info, n_events=0L,
+                total_drought_months=0L, best_distribution=ssi_result$best_distribution, message="Success"))
+  }
+  
+  # 2. Map events back to calculate H7WSC-specific numeric severity (deficit)
+  data$event_id <- NA_integer_
+  for (i in seq_len(nrow(shared_events))) {
+    idx <- which(data$date >= shared_events$start_date[i] & data$date <= shared_events$end_date[i])
+    data$event_id[idx] <- i
+  }
   
   event_info <- data %>%
-    group_by(event_id) %>%
-    filter(in_drought == TRUE) %>%
-    summarise(
-      start_date      = min(date),
-      end_date        = max(date),
-      duration_months = n(),
-      start_year      = first(year),
-      start_month     = first(month),
-      ssi_min         = min(ssi,  na.rm = TRUE),
-      ssi_mean        = mean(ssi, na.rm = TRUE),
-      severity        = sum(abs(ssi[ssi < drought_threshold]), na.rm = TRUE),
+    dplyr::filter(!is.na(event_id)) %>%
+    dplyr::group_by(event_id) %>%
+    dplyr::summarise(
+      start_date = min(date), 
+      end_date = max(date), 
+      duration_months = dplyr::n(),
+      start_year = lubridate::year(min(date)), 
+      start_month = lubridate::month(min(date)),
+      ssi_min = min(ssi, na.rm = TRUE), 
+      ssi_mean = mean(ssi, na.rm = TRUE),
+      severity = sum(abs(ssi[ssi < drought_threshold]), na.rm = TRUE), # Kept numeric for downstream compatibility
       .groups = "drop"
     ) %>%
-    filter(duration_months >= 1) %>%
-    mutate(
-      event_id_new = row_number(),
-      season = case_when(
-        start_month %in% c(12, 1, 2) ~ "Winter",
-        start_month %in% c(3, 4, 5)  ~ "Spring",
-        start_month %in% c(6, 7, 8)  ~ "Summer",
-        start_month %in% c(9, 10,11) ~ "Fall"
+    dplyr::mutate(
+      event_id_new = dplyr::row_number(),
+      season = dplyr::case_when(
+        start_month %in% c(12,1,2) ~ "Winter", start_month %in% c(3,4,5) ~ "Spring",
+        start_month %in% c(6,7,8) ~ "Summer", start_month %in% c(9,10,11) ~ "Fall"
       )
     )
   
   if (!is.null(station_id)) {
-    event_info$station_id    <- station_id
-    event_info$distribution  <- ssi_result$best_distribution
+    event_info$station_id <- station_id
+    event_info$distribution <- ssi_result$best_distribution
   }
   
-  data <- data %>%
-    left_join(event_info %>% dplyr::select(event_id, event_id_new), by = "event_id")
+  # Re-map event_id to sequential IDs for downstream consistency
+  data <- data %>% 
+    dplyr::left_join(data.frame(event_id=event_info$event_id, event_id_new=event_info$event_id_new), by="event_id") %>%
+    dplyr::mutate(event_id = event_id_new) %>% 
+    dplyr::select(-event_id_new)
   
-  cat(sprintf("  [Pipeline B] Drought events: %d (SSI < %.2f)\n",
-              nrow(event_info), drought_threshold))
+  cat(sprintf("  [Pipeline B] Drought events: %d (Onset < %.2f, Recovery >= %.2f)\n",
+              nrow(event_info), drought_threshold, recovery_threshold))
+  
   return(list(
     monthly_data         = data,
     drought_events       = event_info,
@@ -927,8 +1090,8 @@ identify_ssi_droughts <- function(ssi_result,
 
 all_processed_data <- list()   # gap-filled daily data (shared)
 all_completeness   <- list()   # completeness check results (shared)
-all_thresholds     <- list()   # Pipeline A
-all_daily_droughts <- list()   # Pipeline A
+all_thresholds     <- list()   # Pipeline A — DISABLED (kept as empty list for compatibility)
+all_daily_droughts <- list()   # Pipeline A — DISABLED (kept as empty list for compatibility)
 all_ssi_results    <- list()   # Pipeline B
 all_ssi_droughts   <- list()   # Pipeline B
 
@@ -966,15 +1129,15 @@ for (i in 1:nrow(stations)) {
   data_filled <- fill_missing_data(raw_data)
   all_processed_data[[station_id]] <- data_filled
   
-  # ── [4a/6] Pipeline A: variable threshold ───────────────────────────────────
-  cat("\n[4a/6] Pipeline A — calculating variable threshold (Q20, 80% exceedance)...\n")
-  thresholds <- calculate_variable_threshold(data_filled, station_id = station_id)
-  all_thresholds[[station_id]] <- thresholds
+  # ── [4a/6] Pipeline A: variable threshold — DISABLED ───────────────────────
+  # cat("\n[4a/6] Pipeline A — calculating variable threshold (Q20, 80% exceedance)...\n")
+  # thresholds <- calculate_variable_threshold(data_filled, station_id = station_id)
+  # all_thresholds[[station_id]] <- thresholds
   
-  # ── [5a/6] Pipeline A: daily drought identification ─────────────────────────
-  cat("\n[5a/6] Pipeline A — identifying daily drought events...\n")
-  daily_droughts <- identify_droughts(data_filled, thresholds, station_id = station_id)
-  all_daily_droughts[[station_id]] <- daily_droughts
+  # ── [5a/6] Pipeline A: daily drought identification — DISABLED ──────────────
+  # cat("\n[5a/6] Pipeline A — identifying daily drought events...\n")
+  # daily_droughts <- identify_droughts(data_filled, thresholds, station_id = station_id)
+  # all_daily_droughts[[station_id]] <- daily_droughts
   
   # ── [4b/6] Pipeline B: aggregate to monthly ─────────────────────────────────
   cat("\n[4b/6] Pipeline B — aggregating to monthly...\n")
@@ -987,7 +1150,7 @@ for (i in 1:nrow(stations)) {
     all_ssi_results[[station_id]] <- ssi_result
     
     # ── [6b/6] Pipeline B: SSI drought identification ─────────────────────────
-    cat("\n[6b/6] Pipeline B — identifying SSI drought events (SSI < -0.84)...\n")
+    cat("\n[6b/6] Pipeline B — identifying SSI drought events (SSI < -0.50)...\n")
     ssi_droughts <- identify_ssi_droughts(ssi_result, station_id = station_id)
     all_ssi_droughts[[station_id]] <- ssi_droughts
   } else {
@@ -1012,12 +1175,12 @@ for (sid in names(all_processed_data)) {
 }
 cat("  Shared outputs saved\n")
 
-# Pipeline A
-saveRDS(all_thresholds,
-        file.path(MAIN_OUTPUT_DIR, "daily", "thresholds", "thresholds_all.rds"))
-saveRDS(all_daily_droughts,
-        file.path(MAIN_OUTPUT_DIR, "daily", "drought_events", "daily_droughts_all.rds"))
-cat("  Pipeline A (daily threshold) outputs saved\n")
+# Pipeline A — DISABLED
+# saveRDS(all_thresholds,
+#         file.path(MAIN_OUTPUT_DIR, "daily", "thresholds", "thresholds_all.rds"))
+# saveRDS(all_daily_droughts,
+#         file.path(MAIN_OUTPUT_DIR, "daily", "drought_events", "daily_droughts_all.rds"))
+# cat("  Pipeline A (daily threshold) outputs saved\n")
 
 # Pipeline B
 for (sid in names(all_ssi_results)) {
@@ -1036,9 +1199,9 @@ all_results <- list(
   stations           = stations,
   completeness       = all_completeness,
   processed_data     = all_processed_data,
-  # Pipeline A
-  thresholds         = all_thresholds,
-  daily_droughts     = all_daily_droughts,
+  # Pipeline A — DISABLED
+  # thresholds         = all_thresholds,
+  # daily_droughts     = all_daily_droughts,
   # Pipeline B
   ssi_results        = all_ssi_results,
   ssi_droughts       = all_ssi_droughts,
@@ -1050,12 +1213,12 @@ all_results <- list(
     min_completeness_pct      = MIN_COMPLETENESS_PCT,
     max_fill_days             = MAX_FILL_DAYS,
     interpolation_method      = "monoH.FC (Fritsch-Carlson PCHIP)",
-    # Pipeline A
-    pipeline_a                = "Raut & Ganguli (2024) variable threshold",
-    threshold_exceedance_prob = 1 - THRESHOLD_EXCEEDANCE_PROB,        # 80% exceedance
-    threshold_quantile_prob   = THRESHOLD_EXCEEDANCE_PROB,   # probs= = 0.20
-    threshold_window_days     = THRESHOLD_WINDOW_SIZE,
-    min_drought_duration_days = MIN_DROUGHT_DURATION_DAYS,
+    # Pipeline A — DISABLED
+    # pipeline_a                = "Raut & Ganguli (2024) variable threshold",
+    # threshold_exceedance_prob = 1 - THRESHOLD_EXCEEDANCE_PROB,
+    # threshold_quantile_prob   = THRESHOLD_EXCEEDANCE_PROB,
+    # threshold_window_days     = THRESHOLD_WINDOW_SIZE,
+    # min_drought_duration_days = MIN_DROUGHT_DURATION_DAYS,
     # Pipeline B
     pipeline_b                = "Peña-Angulo et al. (2022) SSI monthly",
     ssi_drought_threshold     = SSI_DROUGHT_THRESHOLD,
@@ -1113,21 +1276,22 @@ for (sid in names(all_completeness)) {
     stringsAsFactors = FALSE
   )
   if (!comp$meets_threshold) {
-    base$A_Drought_Events      <- NA_integer_
-    base$A_Total_Days          <- NA_integer_
-    base$A_Avg_Duration_Days   <- NA_real_
+    # Pipeline A stats — DISABLED
+    # base$A_Drought_Events      <- NA_integer_
+    # base$A_Total_Days          <- NA_integer_
+    # base$A_Avg_Duration_Days   <- NA_real_
     base$B_Best_Distribution   <- NA_character_
     base$B_Drought_Events      <- NA_integer_
     base$B_Total_Months        <- NA_integer_
     base$B_Avg_Duration_Months <- NA_real_
     base$B_Avg_Severity        <- NA_real_
   } else {
-    # Pipeline A stats
-    ev_a <- all_daily_droughts[[sid]]$drought_events
-    base$A_Drought_Events     <- if (!is.null(ev_a)) nrow(ev_a)           else NA_integer_
-    base$A_Total_Days         <- if (!is.null(ev_a)) sum(ev_a$duration)   else NA_integer_
-    base$A_Avg_Duration_Days  <- if (!is.null(ev_a) && nrow(ev_a) > 0)
-      round(mean(ev_a$duration), 1)           else NA_real_
+    # Pipeline A stats — DISABLED
+    # ev_a <- all_daily_droughts[[sid]]$drought_events
+    # base$A_Drought_Events     <- if (!is.null(ev_a)) nrow(ev_a)           else NA_integer_
+    # base$A_Total_Days         <- if (!is.null(ev_a)) sum(ev_a$duration)   else NA_integer_
+    # base$A_Avg_Duration_Days  <- if (!is.null(ev_a) && nrow(ev_a) > 0)
+    #   round(mean(ev_a$duration), 1)           else NA_real_
     
     # Pipeline B stats
     ev_b <- all_ssi_droughts[[sid]]$drought_events
@@ -1150,9 +1314,9 @@ write.csv(summary_table,
 print(summary_table, row.names = FALSE)
 
 cat("\nOutputs written to: ", MAIN_OUTPUT_DIR, "/\n")
-cat("  shared/processed_data/            — gap-filled daily data (both pipelines)\n")
-cat("  daily/thresholds/                 — Pipeline A: Q20 variable thresholds\n")
-cat("  daily/drought_events/             — Pipeline A: daily drought events\n")
+cat("  shared/processed_data/            — gap-filled daily data\n")
+# cat("  daily/thresholds/                 — Pipeline A: Q20 variable thresholds\n")   # DISABLED
+# cat("  daily/drought_events/             — Pipeline A: daily drought events\n")       # DISABLED
 cat("  ssi/monthly_data/                 — Pipeline B: monthly SSI time series\n")
 cat("  ssi/drought_events/               — Pipeline B: SSI drought events\n")
 cat("  figures/                          — station_completeness_barplot.png\n")
