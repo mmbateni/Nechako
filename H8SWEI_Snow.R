@@ -33,7 +33,7 @@ library(lmomco)   # required for option 2 (SSPI-1 zero-inflated gamma)
 cat("\n============================================================\n")
 cat("SCF DOMAIN DEFINITION: SELECT METHOD\n")
 cat("============================================================\n")
-cat("  1 = Huning & AghaKouchak (2020) ??? fixed 5% SCF threshold\n")
+cat("  1 = Huning & AghaKouchak (2020) — fixed 5% SCF threshold\n")
 cat("                          (standard approach from the original global paper)\n")
 cat("  2 = SSPI-1 (Standardized SnowPack Index, monthly)\n")
 cat("                          (zero-inflated gamma, 1981-2020 reference, no SCF mask)\n\n")
@@ -47,7 +47,7 @@ scf_method <- ""
 args <- commandArgs(trailingOnly = TRUE)
 if (length(args) >= 1 && trimws(args[1]) %in% c("1", "2")) {
   scf_method <- trimws(args[1])
-  cat(sprintf("??? Method set from command-line argument: %s\n", scf_method))
+  cat(sprintf("→ Method set from command-line argument: %s\n", scf_method))
   
   # Priority 2: RStudio GUI dialog (works with Run button AND source())
 } else if (interactive() && requireNamespace("rstudioapi", quietly = TRUE) &&
@@ -62,15 +62,15 @@ if (length(args) >= 1 && trimws(args[1]) %in% c("1", "2")) {
     default = DEFAULT_SCF_METHOD
   )
   if (is.null(raw_input)) {
-    # User clicked Cancel ??? use the default
+    # User clicked Cancel — use the default
     scf_method <- DEFAULT_SCF_METHOD
-    cat(sprintf("??? Dialog cancelled: using default Method %s\n", scf_method))
+    cat(sprintf("→ Dialog cancelled: using default Method %s\n", scf_method))
   } else {
     scf_method <- trimws(raw_input)
   }
   while (!scf_method %in% c("1", "2")) {
     raw_input <- rstudioapi::showPrompt(
-      title   = "Invalid input ??? try again",
+      title   = "Invalid input — try again",
       message = "Please enter 1 or 2:",
       default = DEFAULT_SCF_METHOD
     )
@@ -80,7 +80,7 @@ if (length(args) >= 1 && trimws(args[1]) %in% c("1", "2")) {
     }
     scf_method <- trimws(raw_input)
   }
-  cat(sprintf("??? Method set from RStudio dialog: %s\n", scf_method))
+  cat(sprintf("→ Method set from RStudio dialog: %s\n", scf_method))
   
   # Priority 3: plain readline() fallback (R console, non-RStudio interactive)
 } else if (interactive()) {
@@ -92,14 +92,14 @@ if (length(args) >= 1 && trimws(args[1]) %in% c("1", "2")) {
   # Priority 4: non-interactive fallback default (batch / Rscript without args)
 } else {
   scf_method <- DEFAULT_SCF_METHOD
-  cat(sprintf("??? Non-interactive session detected: using default Method %s\n", scf_method))
+  cat(sprintf("→ Non-interactive session detected: using default Method %s\n", scf_method))
   cat("  (Edit DEFAULT_SCF_METHOD at the top of the script to change this.)\n")
 }
 
 if (scf_method == "1") {
-  cat("\n??? Method selected: Huning & AghaKouchak (2020) fixed 5% SCF threshold\n")
+  cat("\n→ Method selected: Huning & AghaKouchak (2020) fixed 5% SCF threshold\n")
 } else {
-  cat("\n??? Method selected: SSPI-1 (zero-inflated gamma, monthly, 1981-2020 reference)\n")
+  cat("\n→ Method selected: SSPI-1 (zero-inflated gamma, monthly, 1981-2020 reference)\n")
 }
 
 scf_method_label <- if (scf_method == "1") "Huning & AghaKouchak (2020)" else "SSPI-1 (zero-inflated gamma, no SCF mask)"
@@ -120,7 +120,7 @@ basin <- if (file.exists(basin_path)) {
   unlink(tmp, recursive = TRUE); v
 } else NULL
 if (!is.null(basin)) {
-  cat("??? Basin boundary loaded\n")
+  cat("✓ Basin boundary loaded\n")
 } else {
   stop("Basin boundary not found: ", basin_path)
 }
@@ -184,17 +184,17 @@ if (!is.null(scf_stack)) {
   scf_ext <- ext(scf_stack)
   
   if (scf_ext[2] > 180 && swe_ext[2] <= 180) {
-    cat("??? Rotating SCF from 0-360 to -180-180 to match SWE...\n")
+    cat("✓ Rotating SCF from 0-360 to -180-180 to match SWE...\n")
     scf_stack <- terra::rotate(scf_stack)
   } else if (swe_ext[2] > 180 && scf_ext[2] <= 180) {
-    cat("??? Rotating SWE from 0-360 to -180-180 to match SCF...\n")
+    cat("✓ Rotating SWE from 0-360 to -180-180 to match SCF...\n")
     swe <- terra::rotate(swe)
   }
 }
 
 # 2. Crop early to save memory and isolate the basin
 if (!is.null(basin)) {
-  cat("??? Cropping rasters to basin extent...\n")
+  cat("✓ Cropping rasters to basin extent...\n")
   swe <- crop(swe, project(basin, crs(swe)))
   if (!is.null(scf_stack)) {
     scf_stack <- crop(scf_stack, project(basin, crs(scf_stack)))
@@ -203,7 +203,7 @@ if (!is.null(basin)) {
 
 # 3. Resample to common grid
 if (!is.null(scf_stack) && !compareGeom(scf_stack[[1]], swe[[1]], stopOnError = FALSE)) {
-  cat("??? Resampling SWE to match SCF grid...\n")
+  cat("✓ Resampling SWE to match SCF grid...\n")
   swe <- resample(swe, scf_stack, method = "bilinear")
 }
 
@@ -216,7 +216,7 @@ cat("\n===== MASKING SWE TO BASIN BOUNDARY =====\n")
 swe <- mask(swe, basin, inverse = FALSE, touches = TRUE)
 basin_pixels <- global(swe[[1]], "notNA")$notNA
 total_pixels <- ncell(swe)
-cat(sprintf("??? Basin masking complete: %d pixels (%.1f%% of raster)\n",
+cat(sprintf("✓ Basin masking complete: %d pixels (%.1f%% of raster)\n",
             basin_pixels, 100 * basin_pixels / total_pixels))
 
 # Safety Check against NaN calculation
@@ -228,7 +228,7 @@ if (is.na(basin_pixels) || basin_pixels == 0) {
 swe_mean_sample <- global(swe[[1]], "mean", na.rm = TRUE)$mean
 if (!is.na(swe_mean_sample) && swe_mean_sample < 10) {
   swe <- swe * 1000
-  cat("??? Converted SWE from meters to mm\n")
+  cat("✓ Converted SWE from meters to mm\n")
 }
 
 # ---- Convert SCF to fraction if needed ----
@@ -236,7 +236,7 @@ if (!is.null(scf_stack)) {
   scf_max <- global(scf_stack[[1]], "max", na.rm = TRUE)$max
   if (!is.na(scf_max) && scf_max > 1.5) {
     scf_stack <- scf_stack / 100
-    cat("??? Converted SCF from percent to fraction\n")
+    cat("✓ Converted SCF from percent to fraction\n")
   }
 }
 
@@ -251,7 +251,7 @@ cat(sprintf("Processing %d pixels of the rectangle covering basin ...\n", n_pixe
 # ==============================================================================
 #   USER CHOICE: SCF DOMAIN DEFINITION METHOD
 # ==============================================================================
-cat(sprintf("\n??? Proceeding with Method %s: %s\n", scf_method, scf_method_label))
+cat(sprintf("\n→ Proceeding with Method %s: %s\n", scf_method, scf_method_label))
 
 cat("\n===== STEP 2: Building SCF mask =====\n")
 target_k <- 3
@@ -259,9 +259,9 @@ target_k <- 3
 if (scf_method == "2") {
   
   # ============================================================================
-  #   BRANCH 2 ??? SSPI-1 (Zero-inflated Gamma, Monthly, No SCF Mask)
+  #   BRANCH 2 — SSPI-1 (Zero-inflated Gamma, Monthly, No SCF Mask)
   # ============================================================================
-  cat("\n??? SSPI-1 selected: skipping SCF mask build (not applicable).\n")
+  cat("\n→ SSPI-1 selected: skipping SCF mask build (not applicable).\n")
   cat("  Zero-inflated gamma fitting will be applied per calendar month.\n")
   scf_mask_list  <- NULL
   basin_scf_mask <- NULL
@@ -273,7 +273,7 @@ if (scf_method == "2") {
   if (length(ref_idx) < 400) {
     warning(sprintf("SSPI-1 reference period has only %d months (recommended: >=480)", length(ref_idx)))
   }
-  cat(sprintf("??? SSPI-1 reference period: %s to %s (%d months)\n",
+  cat(sprintf("✓ SSPI-1 reference period: %s to %s (%d months)\n",
               dates[ref_idx[1]], dates[ref_idx[length(ref_idx)]], length(ref_idx)))
   
   # Zero-inflation screening
@@ -282,7 +282,7 @@ if (scf_method == "2") {
   zero_prop_sspi <- rowMeans(ref_swe_sspi <= 0, na.rm = TRUE)
   invalid_pix_sspi <- which(zero_prop_sspi > 0.50)
   valid_pix_sspi   <- which(zero_prop_sspi <= 0.50)
-  cat(sprintf("??? Valid pixels (<=50%% zero SWE in ref period): %d (%.1f%%)\n",
+  cat(sprintf("✓ Valid pixels (<=50%% zero SWE in ref period): %d (%.1f%%)\n",
               length(valid_pix_sspi), 100 * length(valid_pix_sspi) / n_pixels))
   if (length(invalid_pix_sspi) > 0) {
     cat(sprintf("  Excluded pixels (>50%% zero SWE): %d\n", length(invalid_pix_sspi)))
@@ -292,10 +292,10 @@ if (scf_method == "2") {
 } else if (scf_method == "1") {
   
   # ============================================================================
-  #   BRANCH 1 ??? HUNING & AGHAKOUCHAK (2020) fixed 5% SCF threshold
+  #   BRANCH 1 — HUNING & AGHAKOUCHAK (2020) fixed 5% SCF threshold
   # ============================================================================
   scf_threshold <- 0.05
-  cat(sprintf("??? H&A (2020): building SCF mask with fixed %.0f%% threshold\n",
+  cat(sprintf("✓ H&A (2020): building SCF mask with fixed %.0f%% threshold\n",
               100 * scf_threshold))
   
   # Mask SCF stack to the basin so pixel indices align exactly with SWE
@@ -330,17 +330,17 @@ if (scf_method == "2") {
 }
 
 if (scf_method == "1") {
-  cat(sprintf("??? Basin SCF mask: months included = %s\n",
+  cat(sprintf("✓ Basin SCF mask: months included = %s\n",
               paste(month.abb[which(basin_scf_mask)], collapse = ", ")))
 }
 
 cat("\n===== COMPUTING BASIN-AVERAGED SWE =====\n")
 if (scf_method == "1") {
   swe_basin_avg_raw <- colMeans(swe_matrix, na.rm = TRUE)
-  cat(sprintf("??? Basin-averaged raw SWE: %d time steps\n", length(swe_basin_avg_raw)))
+  cat(sprintf("✓ Basin-averaged raw SWE: %d time steps\n", length(swe_basin_avg_raw)))
 } else {
   swe_basin_avg_raw <- NULL
-  cat("??? Basin-averaged SWE: skipped (not used by SSPI-1)\n")
+  cat("✓ Basin-averaged SWE: skipped (not used by SSPI-1)\n")
 }
 
 swe_basin_avg_smoothed <- NULL
@@ -508,7 +508,7 @@ timescales <- if (scf_method == "2") c(1) else c(3)
 
 # ---- Set up parallel cluster ----
 n_cores <- max(1L, detectCores() - 1L)
-cat(sprintf("\n??? Starting parallel cluster with %d cores\n", n_cores))
+cat(sprintf("\n✓ Starting parallel cluster with %d cores\n", n_cores))
 dir.create(tempdir(), recursive = TRUE, showWarnings = FALSE)
 cl <- makeCluster(n_cores)
 clusterSetRNGStream(cl, iseed = 40)  
@@ -648,7 +648,7 @@ for (sc in timescales) {
                longname = sprintf("Standardized SnowPack Index (SSPI-%d, monthly)", sc),
                unit = "standardized_index", missval = -9999, overwrite = TRUE)
     }
-    cat(sprintf("??? SSPI-%d complete\n", sc))
+    cat(sprintf("✓ SSPI-%d complete\n", sc))
     gc()
     next  
   }
@@ -664,7 +664,7 @@ for (sc in timescales) {
                                            align = "right",
                                            fill  = NA,
                                            na.rm = FALSE)
-  cat(sprintf("??? Basin-averaged %d-month smoothed SWE: %d steps, %.1f%% non-NA\n",
+  cat(sprintf("✓ Basin-averaged %d-month smoothed SWE: %d steps, %.1f%% non-NA\n",
               sc, length(swe_basin_avg_smoothed),
               100 * mean(!is.na(swe_basin_avg_smoothed))))
   
@@ -677,7 +677,7 @@ for (sc in timescales) {
                                         fill = NA,
                                         na.rm = FALSE) 
   }
-  cat(sprintf("??? %d-month rolling sum applied to SWE (SWEI preprocessing)\n", sc))
+  cat(sprintf("✓ %d-month rolling sum applied to SWE (SWEI preprocessing)\n", sc))
   
   clusterExport(cl, varlist = c("swe_smoothed"), envir = environment())
   
@@ -734,7 +734,7 @@ for (sc in timescales) {
   cat(sprintf("  Gridded compatibility: %s\n", grid_status))
   
   if (!is.na(na_rate_grid) && na_rate_grid >= 0.5) {
-    cat("  ???  High per-pixel NA is expected: the 75%%-nonzero-years criterion\n")
+    cat("  ⚠  High per-pixel NA is expected: the 75%%-nonzero-years criterion\n")
     cat("     and SCF mask are applied pixel-by-pixel, which is much stricter\n")
     cat("     than the basin-mean aggregate implies. The basin mean series is\n")
     cat("     suitable for time-series analysis; use gridded files for spatial\n")
@@ -834,13 +834,13 @@ for (sc in timescales) {
              longname = sprintf("Seasonal SWEI (SWEI-%d)", sc),
              unit = "standardized_index", missval = -9999, overwrite = TRUE)
   }
-  cat(sprintf("??? SWEI-%d complete\n", sc))
+  cat(sprintf("✓ SWEI-%d complete\n", sc))
   gc()
 }
 
 # ---- Shut down parallel cluster ----
 stopCluster(cl)
-cat("\n??? Parallel cluster stopped\n")
+cat("\n✓ Parallel cluster stopped\n")
 
 # ==============================================================================
 #   SAVE BASIN-AVERAGED SWEI TO CSV 
@@ -864,7 +864,7 @@ if (scf_method != "2") {
     }
     csv_file <- file.path(out_dir, sprintf("swei_%02d_basin_averaged_by_month.csv", sc))
     write.csv(df_out, csv_file, row.names = FALSE, na = "")
-    cat(sprintf("??? Saved basin-averaged SWEI-%d (12 monthly series) to: %s\n", sc, csv_file))
+    cat(sprintf("✓ Saved basin-averaged SWEI-%d (12 monthly series) to: %s\n", sc, csv_file))
   }
 }
 
@@ -928,7 +928,7 @@ if (scf_method == "2") {
     cat(sprintf("Time period: %s to %s (%d months)\n", min(dates), max(dates), length(dates)), file = summary_combined_file, append = TRUE)
     cat("\nMethodology:\n", file = summary_combined_file, append = TRUE)
     cat(sprintf("  - %d-month rolling sum applied to RAW SWE (window = sc = %d)\n", sc, sc), file = summary_combined_file, append = TRUE)
-    cat("  - SCF mask window fixed at k=3 (intentionally independent of SWE window,\n    per Huning & AghaKouchak 2020 ??? see target_k comment in script)\n", file = summary_combined_file, append = TRUE)
+    cat("  - SCF mask window fixed at k=3 (intentionally independent of SWE window,\n    per Huning & AghaKouchak 2020 — see target_k comment in script)\n", file = summary_combined_file, append = TRUE)
     cat(sprintf("  - SCF domain method: %s\n", scf_method_label), file = summary_combined_file, append = TRUE)
     cat(sprintf("    -> Fixed %.0f%% SCF threshold, right-aligned 3-month climatology\n", 100 * 0.05), file = summary_combined_file, append = TRUE)
     cat("  - Gringorten plotting position (non-parametric)\n  - Zero-SWE perturbation: random uniform in (0, min_nonzero) per Huning & AghaKouchak (2020)\n  - Minimum data requirement: >= 75% of years for a calendar month must have nonzero SWE\n  - No clipping applied to SWEI values (full distribution retained)\n", file = summary_combined_file, append = TRUE)
@@ -948,7 +948,7 @@ if (scf_method == "2") {
     }
     
     if (!is.na(s$na_rate) && s$na_rate >= 0.5) {
-      cat("  NOTE: The large gap between basin-mean completeness and per-pixel NA\n  is expected ??? spatial averaging masks individual pixel gaps, while the\n  75%%-nonzero-years criterion and SCF mask applied pixel-by-pixel are\n  much stricter. The basin mean series is suitable for time-series analysis;\n  use gridded files for spatial analysis with awareness of spatial coverage.\n", file = summary_combined_file, append = TRUE)
+      cat("  NOTE: The large gap between basin-mean completeness and per-pixel NA\n  is expected — spatial averaging masks individual pixel gaps, while the\n  75%%-nonzero-years criterion and SCF mask applied pixel-by-pixel are\n  much stricter. The basin mean series is suitable for time-series analysis;\n  use gridded files for spatial analysis with awareness of spatial coverage.\n", file = summary_combined_file, append = TRUE)
     }
     first_idx  <- 1:min(12, ncol(s$swei_indices))
     first_swei  <- s$swei_indices[, first_idx, drop = FALSE]
