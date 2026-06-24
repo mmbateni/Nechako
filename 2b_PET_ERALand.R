@@ -25,6 +25,8 @@
 #      Wind, radiation, and pressure remain at observed values so that only
 #      the temperature-mediated warming effect on PET is isolated.
 #      RUN_DETRENDED_BRANCH (Section 1) controls whether Section 5c executes.
+#   7. [Decadal Plots Update]: Section 5c now generates 8 decadal plots for PM 
+#      and 8 for Thornthwaite across 3 pages.
 ##############################################
 library(terra)
 library(ncdf4)
@@ -38,14 +40,14 @@ MONTHLY_DIR   <- "D:/Nechako_Drought/Nechako/monthly_data_direct"  # NetCDF outp
 PET_CALCS_DIR <- "D:/Nechako_Drought/Nechako/pet_calcs"            # diagnostics, aux rasters, log
 
 # OUTPUT LOCATION POLICY
-# ─────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────────
 # NetCDF rasters  → MONTHLY_DIR  (consumed by 3SPEI_ERALand.R, 10a, 10b)
 # Summary CSVs    → MONTHLY_DIR  (consumed by 7basin_timeseries.R Part 4d
 #                                 and 10b_PET_bias_nonstationarity.R)
 # Auxiliary tifs  → PET_CALCS_DIR  (Thornthwaite I, a, N rasters)
 # Diagnostic PDFs → PET_CALCS_DIR/diagnostics/
 # Processing log  → PET_CALCS_DIR/
-# ─────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────────
 
 # Counterfactual branch — requires 2a_detrend_temperature.R to have been run first.
 # Set TRUE  : Section 5c computes counterfactual PET from detrended T2m/Tdew.
@@ -273,7 +275,6 @@ log_event(sprintf("Layers with negative Rn pixels: %d of %d",
 # E. Soil Heat Flux (G) -- FAO-56 Eq.45 with cold-region constraint
 log_event("... Soil Heat Flux (G)")
 # Eq.45: G = 0.14 x (T_i - T_{i-1}).  Coefficient 0.14 is CORRECT here.
-# (0.07 belongs to Eq.44 which uses T_{i+1} - T_{i-1} -- a different formula.)
 if (nlyr(T_mean) > 1) {
   t_prev <- c(T_mean[[1]] * 0, T_mean[[1:(nlyr(T_mean) - 1)]])
   G      <- 0.14 * (T_mean - t_prev)   # FAO-56 Eq.45
@@ -282,9 +283,6 @@ if (nlyr(T_mean) > 1) {
   log_event("  G[[1]] = 0 (January 1950)")
   
   # COLD-REGION CONSTRAINT
-  # Frozen soil / snow cover: thermal conductivity drops ~3x, actual G rarely
-  # exceeds 15-25% of Rn (Langer et al. 2011; Katul et al. 2011).
-  # Cap |G| at 0.3 x |Rn| when T < 0 degC.
   G_cap <- 0.3 * abs(Rn)
   G     <- ifel(T_mean < 0,
                 ifel(G >  G_cap,  G_cap,
@@ -334,10 +332,6 @@ log_event(sprintf("Final ET0 range: %.3f to %.3f mm/day (mean: %.3f)",
 # ==============================================================================
 # --- 5b. THORNTHWAITE PET (Temperature-Only) ---
 # Pure thermodynamic signal for Dynamic vs. Thermodynamic decomposition.
-# Formula:  PET_thw = 16 x (10T/I)^a x (N/12) x (d/30)   [mm/day]
-#           PET_thw = 0  when T <= 0 degC
-# I, a computed per pixel from 1991-2020 climatological T.
-# N reuses Ra-loop sunset hour angle geometry (no duplication).
 # ==============================================================================
 log_event("==========================================")
 log_event("Starting THORNTHWAITE PET (temperature-only)...")
@@ -361,7 +355,6 @@ log_event(sprintf("  Climatological T: %.2f to %.2f degC (mean: %.2f)",
 
 # 5b-2. Annual heat index I (per pixel)
 log_event("... Heat index I per pixel")
-# NOTE: use T_clim_12[[1]] * 0 (NOT rast(...)) to keep spatial values
 I_rast <- T_clim_12[[1]] * 0
 for (m in 1:12)
   I_rast <- I_rast + (ifel(T_clim_12[[m]] <= 0, 0, T_clim_12[[m]]) / 5)^1.514
@@ -395,7 +388,7 @@ s <- global(N_clim_12, c("min", "max", "mean"), na.rm = TRUE)
 log_event(sprintf("  N: DJF mean=%.1f hr, JJA mean=%.1f hr",
                   mean(s$mean[c(1, 2, 12)]), mean(s$mean[6:8])))
 
-# 5b-5. Apply formula to all 912 time steps
+# 5b-5. Apply formula to all time steps
 log_event(sprintf("... Applying Thornthwaite to all %d time steps", n_months))
 et0_thw <- rast(lapply(seq_len(n_months), function(i) {
   m   <- month_indices[i]
@@ -415,15 +408,6 @@ names(et0_thw) <- sprintf("PET_THW_%04d_%02d",
 s <- global(et0_thw, c("min", "max", "mean"), na.rm = TRUE)
 log_event(sprintf("Thornthwaite PET: %.3f to %.3f mm/day (mean: %.3f)",
                   min(s$min), max(s$max), mean(s$mean)))
-log_event(sprintf("  Jan=%.3f mm/day, Jul=%.3f mm/day",
-                  global(et0_thw[[1]], "mean", na.rm = TRUE)[1, 1],
-                  global(et0_thw[[7]], "mean", na.rm = TRUE)[1, 1]))
-if (global(et0_thw[[7]], "mean", na.rm = TRUE)[1, 1] >
-    global(et0_thw[[1]], "mean", na.rm = TRUE)[1, 1]) {
-  log_event("  Seasonal cycle correct (July > January)")
-} else {
-  log_event("  WARNING: July <= January -- check latitude or T data!")
-}
 
 # 5b-6. Save Thornthwaite NetCDF
 log_event("Writing Thornthwaite PET NetCDF...")
@@ -451,8 +435,6 @@ pet_thw_summary  <- data.frame(
   max_pet  = global_stats_thw$max,
   std_dev  = global_stats_thw$sd
 )
-# Written to MONTHLY_DIR so 7basin_timeseries.R (Part 4d) and
-# 10b_PET_bias_nonstationarity.R can locate it without path changes.
 write.csv(pet_thw_summary,
           file.path(MONTHLY_DIR, "ERA5Land_Nechako_PET_Thornthwaite_monthly_summary.csv"),
           row.names = FALSE)
@@ -498,8 +480,6 @@ safe_writeCDF(et0, nc_file,
               longname = "Reference Evapotranspiration (FAO-56 Penman-Monteith)",
               unit     = "mm/day")
 
-# Written to MONTHLY_DIR so 7basin_timeseries.R (Part 4d) and
-# 10b_PET_bias_nonstationarity.R can locate it without path changes.
 write.csv(pet_summary,
           file.path(MONTHLY_DIR, "ERA5Land_Nechako_PET_monthly_summary.csv"),
           row.names = FALSE)
@@ -523,21 +503,10 @@ graphics.off()
 diag_dir <- file.path(PET_CALCS_DIR, "diagnostics")
 if (!dir.exists(diag_dir)) dir.create(diag_dir, showWarnings = FALSE)
 
-# Average days per calendar month (using 28.25 for Feb to account for leap years)
 days_per_month <- c(31, 28.25, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
 
-# ---------------------------------------------------------------------------
-# Helper: render a plot function into the currently open PDF device AND save
-# an individual PNG file.
-#   name     : filename stem (no extension) for the PNG
-#   plot_fn  : zero-argument function containing all plotting calls
-#   width/height : inches (shared by PDF page and PNG canvas)
-#   res      : PNG resolution in dpi
-# ---------------------------------------------------------------------------
 save_plot <- function(name, plot_fn, width = 12, height = 8, res = 150) {
-  # 1. Draw into the already-open PDF device
   plot_fn()
-  # 2. Also write an individual PNG
   png_path <- file.path(diag_dir, paste0(name, ".png"))
   tryCatch({
     png(png_path, width = width, height = height, units = "in", res = res)
@@ -593,7 +562,7 @@ if (nrow(anomalies) > 0) {
   log_event("All PM PET values within expected range (0-8 mm/day)")
 }
 
-# D. Monthly climatology (PM only, mm/day)
+# D. Monthly climatology (PM only)
 log_event("... D: Monthly climatology (PM)")
 save_plot("D_monthly_climatology_PM", function() {
   par(mfrow = c(1, 1), mar = c(5, 5, 4, 2))
@@ -656,12 +625,8 @@ save_plot("F_PM_spatial_maps", function() {
 })
 
 # F2. Thornthwaite vs. Penman-Monteith comparison
-# Scientific interpretation:
-#   Large PM-Thw summer bias  => radiation + wind also drive PET (not purely T)
-#   Small PM-Thw summer bias  => T dominates PET => Thornthwaite is good proxy
 log_event("... F2: PM vs. Thornthwaite comparison")
 
-# F2a. Time series overlay
 save_plot("F2a_timeseries_PM_vs_Thw", function() {
   par(mfrow = c(1, 1), mar = c(5, 5, 4, 2))
   y_lim <- range(c(pet_summary$mean_pet, pet_thw_summary$mean_pet), na.rm = TRUE)
@@ -676,26 +641,21 @@ save_plot("F2a_timeseries_PM_vs_Thw", function() {
   grid(lty = "dotted", col = "grey88")
 })
 
-# F2b. Seasonal climatology with error bars — UNIT FIX: convert mm/day -> mm/month
-log_event("... F2b: Seasonal PET climatology PM vs Thw (mm/month)")
 pet_clim_pm  <- monthly_stats$mean_pet     * days_per_month
 pet_clim_thw <- monthly_stats_thw$mean_pet * days_per_month
 sd_pm        <- monthly_stats$std_dev      * days_per_month
 sd_thw       <- monthly_stats_thw$std_dev  * days_per_month
 
 save_plot("F2b_seasonal_climatology_PM_vs_Thw", function() {
-  # ── Increased font sizes for readability ──────────────────────────────────
-  CEX_MAIN <- 1.65   # plot title
-  CEX_LAB  <- 1.60   # axis labels (x / y)
-  CEX_AXIS <- 1.50   # tick labels (both x month names and y numeric values)
-  CEX_LEG  <- 1.25   # legend text
-  LWD_LINE <- 2.5    # line width
+  CEX_MAIN <- 1.65
+  CEX_LAB  <- 1.60
+  CEX_AXIS <- 1.50
+  CEX_LEG  <- 1.25
+  LWD_LINE <- 2.5
   
   par(mfrow = c(1, 1), mar = c(5, 6, 4, 2))
   y_max <- max(c(pet_clim_pm, pet_clim_thw), na.rm = TRUE) * 1.15
   
-  # ── Base plot: Penman-Monteith (blue solid, filled circles) ───────────────
-  # cex.axis here controls the y-axis tick numbers; x-axis is redrawn below.
   plot(1:12, pet_clim_pm,
        type = "b", pch = 19, col = "blue", lwd = LWD_LINE,
        xlab = "Month", ylab = "Mean PET (mm/month)",
@@ -703,37 +663,20 @@ save_plot("F2b_seasonal_climatology_PM_vs_Thw", function() {
        xaxt = "n", ylim = c(0, y_max),
        cex.main = CEX_MAIN, cex.lab = CEX_LAB, cex.axis = CEX_AXIS, font.main = 2)
   axis(1, at = 1:12, labels = month.abb, cex.axis = CEX_AXIS)
-  
-  # ── Overlay: Thornthwaite (orange dashed, filled triangles) ──────────────
-  lines(1:12, pet_clim_thw,
-        type = "b", pch = 17, col = "darkorange", lwd = LWD_LINE, lty = 2)
-  
-  # ── Error bars (±1 SD) ────────────────────────────────────────────────────
+  lines(1:12, pet_clim_thw, type = "b", pch = 17, col = "darkorange", lwd = LWD_LINE, lty = 2)
   suppressWarnings({
     arrows(1:12, pet_clim_pm  - sd_pm,  1:12, pet_clim_pm  + sd_pm,
            angle = 90, code = 3, length = 0.05, col = "blue",       lwd = 1.5)
     arrows(1:12, pet_clim_thw - sd_thw, 1:12, pet_clim_thw + sd_thw,
            angle = 90, code = 3, length = 0.05, col = "darkorange", lwd = 1.5)
   })
-  
-  # ── Legend (label fixed: "Penman-Monteith" not "Penman-Monteith (ERA5)") ─
-  legend("topleft",
-         legend = c("Penman-Monteith", "Thornthwaite (T-only)"),
-         col    = c("blue", "darkorange"),
-         lwd    = LWD_LINE,
-         pch    = c(19L, 17L),
-         lty    = c(1L, 2L),
-         bty    = "n",
-         cex    = CEX_LEG)
-  
-  # ── Light dotted reference grid ───────────────────────────────────────────
+  legend("topleft", legend = c("Penman-Monteith", "Thornthwaite (T-only)"),
+         col = c("blue", "darkorange"), lwd = LWD_LINE, pch = c(19L, 17L),
+         lty = c(1L, 2L), bty = "n", cex = CEX_LEG)
   grid(lty = "dotted", col = "grey88", lwd = 0.8)
 })
 
-# F2c. Bias bar chart — UNIT FIX: convert mm/day -> mm/month
-log_event("... F2c: Monthly PET bias PM minus Thw (mm/month)")
 bias_monthly <- (monthly_stats$mean_pet - monthly_stats_thw$mean_pet) * days_per_month
-
 save_plot("F2c_monthly_bias_PM_minus_Thw", function() {
   par(mfrow = c(1, 1), mar = c(4, 5, 3, 1))
   barplot(bias_monthly, names.arg = month.abb,
@@ -742,19 +685,16 @@ save_plot("F2c_monthly_bias_PM_minus_Thw", function() {
           xlab = "Month", ylab = "PET bias (mm/month)",
           main = "PM minus Thornthwaite PET\n(red = PM higher [radiation/wind contribution])")
   abline(h = 0, lwd = 1.5)
-  grid(nx = NA, ny = NULL)
-  legend("topleft",
-         legend = c("PM > Thornthwaite", "Thornthwaite > PM"),
+  legend("topleft", legend = c("PM > Thornthwaite", "Thornthwaite > PM"),
          fill = c("#e31a1c", "#1f78b4"), bty = "n")
 })
 
-# F2d. Annual scatter
 annual_pm_thw <- merge(
   aggregate(mean_pet ~ year, data = pet_summary,     FUN = mean, na.rm = TRUE),
   aggregate(mean_pet ~ year, data = pet_thw_summary, FUN = mean, na.rm = TRUE),
   by = "year", suffixes = c("_pm", "_thw"))
-r_pm_thw <- cor(annual_pm_thw$mean_pet_pm, annual_pm_thw$mean_pet_thw,
-                use = "complete.obs")
+r_pm_thw <- cor(annual_pm_thw$mean_pet_pm, annual_pm_thw$mean_pet_thw, use = "complete.obs")
+
 save_plot("F2d_annual_scatter_PM_vs_Thw", function() {
   par(mfrow = c(1, 1), mar = c(4, 4, 3, 1))
   plot(annual_pm_thw$mean_pet_thw, annual_pm_thw$mean_pet_pm,
@@ -768,7 +708,6 @@ save_plot("F2d_annual_scatter_PM_vs_Thw", function() {
   grid()
 })
 
-# F2e. Annual trend comparison
 save_plot("F2e_annual_trends_PM_vs_Thw", function() {
   par(mfrow = c(1, 1), mar = c(4, 4, 3, 1))
   y_r <- range(c(annual_pm_thw$mean_pet_pm, annual_pm_thw$mean_pet_thw), na.rm = TRUE)
@@ -791,7 +730,6 @@ save_plot("F2e_annual_trends_PM_vs_Thw", function() {
   grid()
 })
 
-# F2f. Thornthwaite sample spatial maps
 save_plot("F2f_Thw_spatial_maps", function() {
   if (nlyr(et0_thw) >= 12) {
     par(mfrow = c(2, 2), mar = c(2, 2, 3, 4))
@@ -802,8 +740,6 @@ save_plot("F2f_Thw_spatial_maps", function() {
   }
 })
 
-# G. Distribution histogram (PM)
-log_event("... G: Distribution histogram")
 save_plot("G_distribution_histogram_PM", function() {
   par(mfrow = c(1, 1), mar = c(4, 4, 3, 1))
   hist(pet_summary$mean_pet, breaks = 30, col = "skyblue", border = "white",
@@ -816,8 +752,6 @@ save_plot("G_distribution_histogram_PM", function() {
          col = c("red", "blue"), lwd = 2, lty = c(1, 2), bty = "n")
 })
 
-# H. QC summary table
-log_event("... H: QC summary table")
 qc <- data.frame(
   Metric = c("Total Months",
              "PM Mean PET (mm/day)", "PM Min", "PM Max", "PM Std Dev",
@@ -860,13 +794,7 @@ log_event(sprintf("Individual PNGs saved in: %s/", diag_dir))
 # --- 5c. COUNTERFACTUAL PET FROM DETRENDED T2m / Tdew  [NEW] ---
 # Methodology: identical PM + Thornthwaite calculation as Sections 5 and 5b,
 # but T2m and Tdew are replaced by their month-specific linearly detrended
-# counterparts produced by 2a_detrend_temperature.R.  All other forcing
-# (wind, radiation, pressure) remains at observed values so that only the
-# temperature-mediated warming signal is removed from PET.
-#
-# Outputs:
-#   monthly_data_direct/potential_evapotranspiration_PM_detrended.nc
-#   monthly_data_direct/potential_evapotranspiration_Thw_detrended.nc
+# counterparts produced by 2a_detrend_temperature.R.
 # ==============================================================================
 if (RUN_DETRENDED_BRANCH) {
   
@@ -874,78 +802,50 @@ if (RUN_DETRENDED_BRANCH) {
   log_event("Section 5c: COUNTERFACTUAL PET (detrended T2m + Tdew)")
   log_event("==========================================")
   
-  # ── 5c-0. Check prerequisites ───────────────────────────────────────────────
   f_t2m_det  <- file.path(MONTHLY_DIR, "2m_temperature_detrended_monthly.nc")
   f_tdew_det <- file.path(MONTHLY_DIR, "2m_dewpoint_detrended_monthly.nc")
   
   if (!file.exists(f_t2m_det) || !file.exists(f_tdew_det)) {
     log_event("  WARNING: Detrended NC files not found — skipping Section 5c.")
-    log_event(sprintf("  Expected: %s", f_t2m_det))
-    log_event(sprintf("  Expected: %s", f_tdew_det))
-    log_event("  Run 2a_detrend_temperature.R first, then re-run this script.")
   } else {
-    
-    # ── 5c-1. Load detrended temperature fields ────────────────────────────────
     log_event("  Loading detrended T2m and Tdew...")
     t2m_det_raw  <- rast(f_t2m_det)
     tdew_det_raw <- rast(f_tdew_det)
     
-    # Align spatial grid to the already-loaded observed T2m (t2m_b)
     if (!same.crs(t2m_det_raw, t2m_b) || !compareGeom(t2m_det_raw, t2m_b, stopOnError = FALSE)) {
       t2m_det_raw  <- resample(t2m_det_raw,  t2m_b, method = "bilinear")
       tdew_det_raw <- resample(tdew_det_raw, t2m_b, method = "bilinear")
     }
     
-    # 2b outputs are in Kelvin (same units as ERA5-Land originals) — convert to °C
     T_det  <- t2m_det_raw  - 273.15
     Td_det <- tdew_det_raw - 273.15
     
-    # Physics guard: Tdew must not exceed T (RH <= 100%)
     n_viol <- global(Td_det > T_det, "sum", na.rm = TRUE)
     n_viol_total <- sum(n_viol[, 1], na.rm = TRUE)
     if (n_viol_total > 0L) {
-      log_event(sprintf("  Clamping %d Tdew_det > T_det instances to preserve VPD > 0.",
-                        n_viol_total))
+      log_event(sprintf("  Clamping %d Tdew_det > T_det instances to preserve VPD > 0.", n_viol_total))
       Td_det <- ifel(Td_det > T_det, T_det, Td_det)
-    } else {
-      log_event("  Physics check passed: Tdew_det <= T_det everywhere.")
     }
     
-    # Verify time dimension matches observed data
     n_det <- nlyr(T_det)
     if (n_det != n_months) {
-      log_event(sprintf("  WARNING: Detrended stack has %d layers; observed has %d.",
-                        n_det, n_months))
-      log_event("  Truncating/padding to match observed time axis.")
       if (n_det > n_months) {
         T_det  <- T_det[[1:n_months]]
         Td_det <- Td_det[[1:n_months]]
       }
     }
     
-    s <- global(T_det,  c("min", "max", "mean"), na.rm = TRUE)
-    log_event(sprintf("  Detrended T:    %.2f to %.2f degC (mean %.2f)",
-                      min(s$min), max(s$max), mean(s$mean)))
-    s <- global(Td_det, c("min", "max", "mean"), na.rm = TRUE)
-    log_event(sprintf("  Detrended Tdew: %.2f to %.2f degC (mean %.2f)",
-                      min(s$min), max(s$max), mean(s$mean)))
-    
-    # ── 5c-2. Penman-Monteith with detrended T (observed Rn, G uses det T) ────
+    # 5c-2. Penman-Monteith with detrended T
     log_event("  Computing PM PET (detrended T)...")
-    
-    # Saturation and actual vapour pressures from detrended temperatures
     es_det    <- 0.6108 * exp((17.27 * T_det)  / (T_det  + 237.3))
     ea_det    <- 0.6108 * exp((17.27 * Td_det) / (Td_det + 237.3))
-    # Slope of saturation VP curve at detrended T
     delta_det <- (4098 * es_det) / (T_det + 237.3)^2
     
-    # Ground heat flux using detrended T sequence (FAO-56 Eq.45)
     if (n_months > 1L) {
       t_prev_det  <- c(T_det[[1]] * 0, T_det[[1:(n_months - 1)]])
       G_det       <- 0.14 * (T_det - t_prev_det)
-      G_det[[1]]  <- G_det[[1]] * 0   # first layer: no prior month
-      # Cold-region constraint with detrended T
-      G_cap_det   <- 0.3 * abs(Rn)    # Rn is unchanged (observed)
+      G_det[[1]]  <- G_det[[1]] * 0
+      G_cap_det   <- 0.3 * abs(Rn)
       G_det       <- ifel(T_det < 0,
                           ifel(G_det >  G_cap_det,  G_cap_det,
                                ifel(G_det < -G_cap_det, -G_cap_det, G_det)),
@@ -954,25 +854,15 @@ if (RUN_DETRENDED_BRANCH) {
       G_det <- T_det * 0
     }
     
-    # PM numerator & denominator  (u2, gamma, Rn are all unchanged/observed)
-    num_det <- 0.408 * delta_det * (Rn - G_det) +
-      gamma * (900 / (T_det + 273)) * u2 * (es_det - ea_det)
+    num_det <- 0.408 * delta_det * (Rn - G_det) + gamma * (900 / (T_det + 273)) * u2 * (es_det - ea_det)
     den_det <- delta_det + gamma * (1 + 0.34 * u2)
     et0_det <- ifel(num_det / den_det < 0, 0, num_det / den_det)
     
     terra::time(et0_det) <- dates
-    names(et0_det) <- sprintf("PET_DET_%04d_%02d",
-                              as.numeric(format(dates, "%Y")),
-                              as.numeric(format(dates, "%m")))
+    names(et0_det) <- sprintf("PET_DET_%04d_%02d", as.numeric(format(dates, "%Y")), as.numeric(format(dates, "%m")))
     
-    s <- global(et0_det, c("min", "max", "mean"), na.rm = TRUE)
-    log_event(sprintf("  PM PET (det): %.3f to %.3f mm/day (mean %.3f)",
-                      min(s$min), max(s$max), mean(s$mean)))
-    
-    # ── 5c-3. Thornthwaite with detrended T ──────────────────────────────────
+    # 5c-3. Thornthwaite with detrended T
     log_event("  Computing Thornthwaite PET (detrended T)...")
-    
-    # 1991-2020 climatological mean T from the DETRENDED series (per pixel)
     clim_idx_det <- which(as.numeric(format(dates, "%Y")) >= 1991 &
                             as.numeric(format(dates, "%Y")) <= 2020)
     T_clim_det_12 <- rast(lapply(1:12, function(m) {
@@ -982,115 +872,142 @@ if (RUN_DETRENDED_BRANCH) {
     }))
     names(T_clim_det_12) <- month.abb
     
-    # Heat index I from detrended climatology
     I_det <- T_clim_det_12[[1]] * 0
     for (m in 1:12)
       I_det <- I_det + (ifel(T_clim_det_12[[m]] <= 0, 0, T_clim_det_12[[m]]) / 5)^1.514
     I_det <- ifel(I_det <= 0, NA_real_, I_det)
-    
-    # Exponent a from detrended I
     a_det <- 6.75e-7 * I_det^3 - 7.71e-5 * I_det^2 + 1.792e-2 * I_det + 0.49239
     
-    # Apply Thornthwaite to all time steps (reuse N_clim_12 from Section 5b-4)
     et0_thw_det <- rast(lapply(seq_len(n_months), function(i) {
       m_i   <- month_indices[i]
       d_m   <- days_in_month[i]
       T_i   <- T_det[[i]]
-      ratio     <- ifel(T_i <= 0, 0,
-                        ifel((10 * T_i) / I_det < 0, 0, (10 * T_i) / I_det))
-      pet_unadj <- ifel(T_i <= 0, 0,
-                        ifel(is.na(I_det), 0, 16 * ratio^a_det))
+      ratio     <- ifel(T_i <= 0, 0, ifel((10 * T_i) / I_det < 0, 0, (10 * T_i) / I_det))
+      pet_unadj <- ifel(T_i <= 0, 0, ifel(is.na(I_det), 0, 16 * ratio^a_det))
       pet_month <- ifel(pet_unadj * (N_clim_12[[m_i]] / 12) * (d_m / 30) < 0, 0,
                         pet_unadj * (N_clim_12[[m_i]] / 12) * (d_m / 30))
-      pet_month / d_m   # mm/month -> mm/day
+      pet_month / d_m
     }))
     terra::time(et0_thw_det) <- dates
-    names(et0_thw_det) <- sprintf("PET_THW_DET_%04d_%02d",
-                                  as.numeric(format(dates, "%Y")),
-                                  as.numeric(format(dates, "%m")))
+    names(et0_thw_det) <- sprintf("PET_THW_DET_%04d_%02d", as.numeric(format(dates, "%Y")), as.numeric(format(dates, "%m")))
     
-    s <- global(et0_thw_det, c("min", "max", "mean"), na.rm = TRUE)
-    log_event(sprintf("  Thw PET (det): %.3f to %.3f mm/day (mean %.3f)",
-                      min(s$min), max(s$max), mean(s$mean)))
-    
-    # ── 5c-4. Save NetCDFs ────────────────────────────────────────────────────
+    # 5c-4. Save NetCDFs
     log_event("  Writing detrended PET NetCDF files...")
+    safe_writeCDF(et0_det, file.path(MONTHLY_DIR, "potential_evapotranspiration_PM_detrended.nc"),
+                  varname = "pet_det", longname = "Reference Evapotranspiration (FAO-56 Penman-Monteith, detrended T2m)", unit = "mm/day")
+    safe_writeCDF(et0_thw_det, file.path(MONTHLY_DIR, "potential_evapotranspiration_Thw_detrended.nc"),
+                  varname = "pet_thw_det", longname = "Reference Evapotranspiration (Thornthwaite 1948, detrended T2m)", unit = "mm/day")
     
-    safe_writeCDF(
-      et0_det,
-      file.path(MONTHLY_DIR, "potential_evapotranspiration_PM_detrended.nc"),
-      varname  = "pet_det",
-      longname = "Reference Evapotranspiration (FAO-56 Penman-Monteith, detrended T2m+Tdew)",
-      unit     = "mm/day")
-    log_event("  Saved: potential_evapotranspiration_PM_detrended.nc")
-    
-    safe_writeCDF(
-      et0_thw_det,
-      file.path(MONTHLY_DIR, "potential_evapotranspiration_Thw_detrended.nc"),
-      varname  = "pet_thw_det",
-      longname = "Reference Evapotranspiration (Thornthwaite 1948, detrended T2m)",
-      unit     = "mm/day")
-    log_event("  Saved: potential_evapotranspiration_Thw_detrended.nc")
-    
-    # ── 5c-5. Quick comparison diagnostics (obs vs. detrended) ───────────────
+    # 5c-5. Quick comparison diagnostics (obs vs. detrended) - DECADAL UPDATE
     log_event("  Generating obs-vs-detrended comparison diagnostics...")
     
-    # Basin-average annual mean PET for each branch
-    ann_pm_obs  <- aggregate(global(et0,         "mean", na.rm = TRUE)[, 1],
-                             by = list(year = as.numeric(format(dates, "%Y"))), FUN = mean)
-    ann_pm_det  <- aggregate(global(et0_det,     "mean", na.rm = TRUE)[, 1],
-                             by = list(year = as.numeric(format(dates, "%Y"))), FUN = mean)
-    ann_thw_obs <- aggregate(global(et0_thw,     "mean", na.rm = TRUE)[, 1],
-                             by = list(year = as.numeric(format(dates, "%Y"))), FUN = mean)
-    ann_thw_det <- aggregate(global(et0_thw_det, "mean", na.rm = TRUE)[, 1],
-                             by = list(year = as.numeric(format(dates, "%Y"))), FUN = mean)
+    # Define decadal bins
+    decades <- list(
+      "1951-1960" = 1951:1960,
+      "1961-1970" = 1961:1970,
+      "1971-1980" = 1971:1980,
+      "1981-1990" = 1981:1990,
+      "1991-2000" = 1991:2000,
+      "2001-2010" = 2001:2010,
+      "2011-2020" = 2011:2020,
+      "2021-2025" = 2021:2025
+    )
     
-    # Monthly climatology (12-value vectors)
-    clim_pm_obs  <- tapply(global(et0,         "mean", na.rm = TRUE)[, 1], month_indices, mean)
-    clim_pm_det  <- tapply(global(et0_det,     "mean", na.rm = TRUE)[, 1], month_indices, mean)
-    clim_thw_obs <- tapply(global(et0_thw,     "mean", na.rm = TRUE)[, 1], month_indices, mean)
-    clim_thw_det <- tapply(global(et0_thw_det, "mean", na.rm = TRUE)[, 1], month_indices, mean)
+    year_array <- as.numeric(format(dates, "%Y"))
+    
+    # Raw basin-average time series
+    ts_pm_obs  <- global(et0,         "mean", na.rm = TRUE)[, 1]
+    ts_pm_det  <- global(et0_det,     "mean", na.rm = TRUE)[, 1]
+    ts_thw_obs <- global(et0_thw,     "mean", na.rm = TRUE)[, 1]
+    ts_thw_det <- global(et0_thw_det, "mean", na.rm = TRUE)[, 1]
+    
+    # Aggregated metrics for Panel 3 and 4
+    clim_pm_obs <- tapply(ts_pm_obs, month_indices, mean, na.rm = TRUE)
+    clim_pm_det <- tapply(ts_pm_det, month_indices, mean, na.rm = TRUE)
+    
+    ann_pm_obs  <- aggregate(ts_pm_obs, by = list(year = year_array), FUN = mean, na.rm = TRUE)
+    ann_pm_det  <- aggregate(ts_pm_det, by = list(year = year_array), FUN = mean, na.rm = TRUE)
     
     det_diag_dir <- file.path(PET_CALCS_DIR, "detrended_diagnostics")
     if (!dir.exists(det_diag_dir)) dir.create(det_diag_dir, showWarnings = FALSE)
     
     tryCatch({
       pdf(file.path(det_diag_dir, "PET_obs_vs_detrended.pdf"), width = 14, height = 10)
-      par(mfrow = c(2, 2), mar = c(4, 4.5, 3.5, 1.5), oma = c(0, 0, 2, 0))
       
-      # Panel 1: PM seasonal climatology (mm/day)
-      y_lim <- range(c(clim_pm_obs, clim_pm_det), na.rm = TRUE) * c(0.9, 1.15)
-      plot(1:12, clim_pm_obs, type = "b", pch = 19, col = "blue", lwd = 2,
-           xaxt = "n", ylim = y_lim,
-           xlab = "Month", ylab = "PET (mm/day)",
-           main = "PM: Observed vs. Detrended", font.main = 2)
-      lines(1:12, clim_pm_det, type = "b", pch = 17, col = "firebrick2", lwd = 2, lty = 2)
-      axis(1, at = 1:12, labels = month.abb)
-      legend("topleft",
-             legend = c("Observed T", "Detrended T"),
-             col = c("blue", "firebrick2"), pch = c(19, 17), lty = c(1, 2), lwd = 2, bty = "n")
-      grid(lty = "dotted", col = "grey88")
+      # --- PAGE 1: PM Decadal Plots ---
+      par(mfrow = c(2, 4), mar = c(4, 4, 3, 1), oma = c(0, 0, 3, 0))
       
-      # Panel 2: Thornthwaite seasonal climatology (mm/day)
-      y_lim2 <- range(c(clim_thw_obs, clim_thw_det), na.rm = TRUE) * c(0.9, 1.15)
-      plot(1:12, clim_thw_obs, type = "b", pch = 19, col = "darkorange", lwd = 2,
-           xaxt = "n", ylim = y_lim2,
-           xlab = "Month", ylab = "PET (mm/day)",
-           main = "Thornthwaite: Observed vs. Detrended", font.main = 2)
-      lines(1:12, clim_thw_det, type = "b", pch = 17, col = "purple3", lwd = 2, lty = 2)
-      axis(1, at = 1:12, labels = month.abb)
-      legend("topleft",
-             legend = c("Observed T", "Detrended T"),
-             col = c("darkorange", "purple3"), pch = c(19, 17), lty = c(1, 2), lwd = 2, bty = "n")
-      grid(lty = "dotted", col = "grey88")
+      for(d_name in names(decades)) {
+        d_years <- decades[[d_name]]
+        idx <- which(year_array %in% d_years)
+        
+        if (length(idx) == 0) {
+          plot.new()
+          title(main = paste("PM:", d_name, "(No Data)"))
+          next
+        }
+        
+        obs_monthly <- tapply(ts_pm_obs[idx], month_indices[idx], mean, na.rm = TRUE)
+        det_monthly <- tapply(ts_pm_det[idx], month_indices[idx], mean, na.rm = TRUE)
+        
+        y_limits <- range(c(obs_monthly, det_monthly), na.rm = TRUE) * c(0.95, 1.05)
+        
+        plot(1:12, obs_monthly, type = "b", pch = 19, col = "blue", lwd = 2, xaxt = "n",
+             xlab = "Month", ylab = "PET (mm/day)", ylim = y_limits,
+             main = paste("PM:", d_name), cex.main = 1.1)
+        axis(1, at = 1:12, labels = month.abb, las = 2)
+        lines(1:12, det_monthly, type = "b", pch = 17, col = "firebrick2", lwd = 2, lty = 2)
+        
+        if(d_name == "1951-1960") {
+          legend("topleft", legend = c("Observed", "Detrended"), 
+                 col = c("blue", "firebrick2"), pch = c(19, 17), lty = c(1, 2), lwd = 2, bty = "n", cex = 0.9)
+        }
+      }
+      mtext("Penman-Monteith: Observed vs. Detrended by Decade", outer = TRUE, font = 2, cex = 1.3)
       
-      # Panel 3: Monthly PM warming signal removed (mm/day)
+      # --- PAGE 2: Thornthwaite Decadal Plots ---
+      plot.new()
+      par(mfrow = c(2, 4), mar = c(4, 4, 3, 1), oma = c(0, 0, 3, 0))
+      
+      for(d_name in names(decades)) {
+        d_years <- decades[[d_name]]
+        idx <- which(year_array %in% d_years)
+        
+        if (length(idx) == 0) {
+          plot.new()
+          title(main = paste("Thw:", d_name, "(No Data)"))
+          next
+        }
+        
+        obs_monthly_thw <- tapply(ts_thw_obs[idx], month_indices[idx], mean, na.rm = TRUE)
+        det_monthly_thw <- tapply(ts_thw_det[idx], month_indices[idx], mean, na.rm = TRUE)
+        
+        y_limits_thw <- range(c(obs_monthly_thw, det_monthly_thw), na.rm = TRUE) * c(0.95, 1.05)
+        
+        plot(1:12, obs_monthly_thw, type = "b", pch = 19, col = "darkorange", lwd = 2, xaxt = "n",
+             xlab = "Month", ylab = "PET (mm/day)", ylim = y_limits_thw,
+             main = paste("Thw:", d_name), cex.main = 1.1)
+        axis(1, at = 1:12, labels = month.abb, las = 2)
+        lines(1:12, det_monthly_thw, type = "b", pch = 17, col = "purple3", lwd = 2, lty = 2)
+        
+        if(d_name == "1951-1960") {
+          legend("topleft", legend = c("Observed", "Detrended"), 
+                 col = c("darkorange", "purple3"), pch = c(19, 17), lty = c(1, 2), lwd = 2, bty = "n", cex = 0.9)
+        }
+      }
+      mtext("Thornthwaite: Observed vs. Detrended by Decade", outer = TRUE, font = 2, cex = 1.3)
+      
+      # --- PAGE 3: Remaining original bottom plots ---
+      plot.new()
+      par(mfrow = c(2, 1), mar = c(4, 4.5, 3.5, 1.5), oma = c(0, 0, 2, 0))
+      
+      # Panel 3: Monthly PM warming signal removed (mm/day) - Using whole period
       delta_pm <- clim_pm_obs - clim_pm_det
       barplot(delta_pm, names.arg = month.abb,
               col    = ifelse(delta_pm >= 0, "#d73027", "#4575b4"),
               border = "white",
-              xlab = "Month", ylab = "ΔPET (mm/day)",
-              main = "PM Warming Signal Removed\n(obs − detrended; red = warming raises PET)",
+              xlab = "Month", ylab = "PET Diff (mm/day)",
+              main = "PM Warming Signal Removed (Whole Period)\n(obs - detrended; red = warming raises PET)",
               font.main = 2)
       abline(h = 0, lwd = 1.5)
       
@@ -1112,8 +1029,9 @@ if (RUN_DETRENDED_BRANCH) {
              col = c("blue", "firebrick2"), lwd = 2, lty = c(1, 2), bty = "n")
       grid(lty = "dotted", col = "grey88")
       
-      mtext("PET: Observed vs. Detrended (counterfactual branch, Script 2b — Section 5c)",
+      mtext("PET: Observed vs. Detrended (counterfactual branch, Script 2b - Section 5c)",
             outer = TRUE, cex = 1.1, font = 2)
+      
       dev.off()
       log_event(sprintf("  Diagnostic PDF saved: %s/PET_obs_vs_detrended.pdf", det_diag_dir))
     }, error = function(e) {
@@ -1121,16 +1039,8 @@ if (RUN_DETRENDED_BRANCH) {
       log_event(sprintf("  WARNING: Diagnostic PDF failed — %s", conditionMessage(e)))
     })
     
-    log_event("==========================================")
-    log_event("Section 5c COMPLETE")
-    log_event(sprintf("  PM  PET (det) mean: %.3f mm/day",
-                      mean(global(et0_det,     "mean", na.rm = TRUE)[, 1], na.rm = TRUE)))
-    log_event(sprintf("  Thw PET (det) mean: %.3f mm/day",
-                      mean(global(et0_thw_det, "mean", na.rm = TRUE)[, 1], na.rm = TRUE)))
-    log_event("==========================================")
-    
-  }  # end detrended-files-exist block
-}  # end RUN_DETRENDED_BRANCH
+  } 
+} 
 
 # --- 8. FINISH ---
 log_event("==========================================")
