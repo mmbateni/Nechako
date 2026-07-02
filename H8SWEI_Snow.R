@@ -29,13 +29,24 @@
 #      of that pixel's reference-period SWE for the month) - Eq. (1)-(2) analogue.
 #   3. SCREENED for discordancy using Hosking & Wallis L-moment discordancy (Di)
 #      and regional heterogeneity (H0, Monte-Carlo on a fitted kappa distribution)
-#      before pooling - see discordancy_test() / heterogeneity_test().
-#   4. OPTIONALLY BIAS-CORRECTED against independent station SWE observations via
-#      a simple quantile-mapping scaling coefficient per region/month (Eq. 9-10
-#      analogue) - see fit_bias_correction().
-#   5. POOLED within each homogeneous region/month to fit a single regional gamma
-#      distribution (lmomco, L-moments), tested for goodness-of-fit with a
-#      Kolmogorov-Smirnov test - see fit_regional_gamma() / gof_test_gamma().
+#      before pooling - see discordancy_test() / heterogeneity_test(). Region/
+#      months with H0 >= H0_REGION_FLAG_THRESHOLD (or an untested/failed H0)
+#      are EXCLUDED from pooling entirely, not just flagged.
+#   4. OPTIONALLY BIAS-CORRECTED against independent station SWE observations -
+#      see the "BASIN-WIDE BIAS CORRECTION" section below and
+#      fit_basin_bias_correction(). Applied ONCE, basin-wide, directly to
+#      swe_matrix, before regionalization/gamma fitting even begins, so it
+#      benefits both the regionalized and pixel-by-pixel paths identically.
+#      (The original per-region quantile-mapping fit_bias_correction() is kept
+#      in the script, defined but unused - see Section F of the RFA
+#      construction block for why it was replaced.)
+#   5. POOLED within each homogeneous (H0-passing) region/month to fit a single
+#      regional gamma distribution (lmomco, L-moments), tested for goodness-of-
+#      fit with a Kolmogorov-Smirnov test - see fit_regional_gamma() /
+#      gof_test_gamma(). A region/month that fails GoF, or was excluded at the
+#      H0 step, falls straight through to per-pixel local fitting
+#      (monthly_sspi) - there is deliberately NO regional-empirical CDF
+#      fallback between "regional gamma" and "local".
 #
 # This stabilizes the gamma-parameter estimates for short/zero-inflated pixel
 # records (the regional sample size is far larger than any single pixel's record)
@@ -47,8 +58,8 @@
 # ------------------------------------------------------------------------------
 #
 # RUNNING THE SCRIPT:
-#   Interactive (RStudio / R console): source("8SWEI_Snow_fixed.R")
-#   Command line with argument:        Rscript 8SWEI_Snow_fixed.R 1
+#   Interactive (RStudio / R console): source("8SWEI_Snow.R")
+#   Command line with argument:        Rscript 8SWEI_Snow.R 1
 #   Batch / non-interactive fallback:  edit the DEFAULT_SCF_METHOD line below
 ##############################################
 
@@ -70,7 +81,7 @@ cat("============================================================\n")
 cat("  1 = Huning & AghaKouchak (2020) ??? fixed 5% SCF threshold\n")
 cat("                          (standard approach from the original global paper)\n")
 cat("  2 = SSPI-1 (Standardized SnowPack Index, monthly)\n")
-cat("                          (zero-inflated gamma, 1981-2020 reference, no SCF mask)\n\n")
+cat("                          (zero-inflated gamma, no SCF mask)\n\n")
 
 # ---- To use in batch/scheduled jobs, set DEFAULT_SCF_METHOD to "1" or "2"
 DEFAULT_SCF_METHOD <- "1"
@@ -133,7 +144,7 @@ if (length(args) >= 1 && trimws(args[1]) %in% c("1", "2")) {
 if (scf_method == "1") {
   cat("\n??? Method selected: Huning & AghaKouchak (2020) fixed 5% SCF threshold\n")
 } else {
-  cat("\n??? Method selected: SSPI-1 (zero-inflated gamma, monthly, 1981-2020 reference)\n")
+  cat("\n??? Method selected: SSPI-1 (zero-inflated gamma, monthly)\n")
 }
 
 scf_method_label <- if (scf_method == "1") "Huning & AghaKouchak (2020)" else "SSPI-1 (zero-inflated gamma, no SCF mask)"
@@ -141,14 +152,25 @@ scf_method_label <- if (scf_method == "1") "Huning & AghaKouchak (2020)" else "S
 # ---- Paths ----
 setwd("D:/Nechako_Drought/Nechako")
 out_dir <- if (scf_method == "2") "sspi_results_monthly" else "swei_results_seasonal"
+TIMESTAMP_OUTPUT_SUBDIR <- TRUE  # set TRUE to give every run its own folder
+if (TIMESTAMP_OUTPUT_SUBDIR) {
+  out_dir <- file.path(out_dir, format(Sys.time(), "%Y%m%d_%H%M%S"))
+}
 if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
-
+writeLines(
+  c(sprintf("run_timestamp: %s", format(Sys.time(), "%Y-%m-%d %H:%M:%S")),
+    sprintf("scf_method: %s (%s)", scf_method, scf_method_label),
+    sprintf("REGIONALIZE_SSPI: %s", if (scf_method == "2") REGIONALIZE_SSPI else NA),
+    sprintf("BIAS_CORRECT: %s", if (scf_method == "2") BIAS_CORRECT else NA),
+    sprintf("station_file_found: %s", if (scf_method == "2") file.exists(STATION_OBS_PATH) else NA)),
+  file.path(out_dir, "run_settings.txt")
+)
 # ==============================================================================
 #   REGIONAL FREQUENCY ANALYSIS (RFA) CONFIGURATION  [method 2 / SSPI-1 only]
 # ==============================================================================
 # Set REGIONALIZE_SSPI <- FALSE to fall back to the original pixel-by-pixel
 # SSPI-1 fitting (kept fully intact as a fallback path throughout the script).
-REGIONALIZE_SSPI <- TRUE
+REGIONALIZE_SSPI <- FALSE
 
 # --- Regionalization (homogeneous sub-region) settings ---
 # Optional DEM raster used to build elevation-band x aspect-class regions,
@@ -168,6 +190,11 @@ REGIONALIZE_SSPI <- TRUE
 DEM_PATH          <- "Spatial/nechako-dem"
 N_ELEV_BANDS      <- 4      # number of elevation quantile bands
 USE_ASPECT        <- TRUE   # split each elevation band further by aspect
+# (Restored after testing: USE_ASPECT <- FALSE roughly tripled mean H0
+#  (12.9 -> 31.7) and pushed the flag rate to 94% - aspect is capturing real
+#  solar-loading/melt-timing differences between slopes, not adding noise.
+#  N_ELEV_BANDS 4 -> 3 made no material difference to heterogeneity, so left
+#  at 4 for a somewhat finer elevation basis.)
 N_ASPECT_CLASSES  <- 4      # N / E / S / W (flat slopes pooled into nearest band only)
 N_REGIONS_FALLBACK <- 6     # number of regions for the k-means spatial fallback
 MIN_REGION_PIXELS <- 8      # regions smaller than this are merged into their
@@ -179,9 +206,9 @@ INDEX_VALUE_STAT <- "median"  # "median" (robust to zero-inflation skew) or "mea
 
 # --- Discordancy / heterogeneity screening (Hosking & Wallis 1993, 1997) ---
 DISCORDANCY_SCREENING <- TRUE
-HETEROGENEITY_NSIM    <- 100   # Monte-Carlo simulations for H0 (paper uses 5000;
+HETEROGENEITY_NSIM    <- 10   # Monte-Carlo simulations for H0 (paper uses 5000;
 # reduced here for tractability at pixel-grid scale -
-# H0 is stable to within ~0.05-0.1 at Nsim=100 for
+# H0 is stable to within ~0.05-0.1 at Nsim=10 for
 # regions of this size; increase if runtime allows)
 H0_REGION_FLAG_THRESHOLD <- 1  # H0 >= 1 -> "possibly heterogeneous" flag (paper convention)
 
@@ -194,6 +221,13 @@ GOF_ALPHA <- 0.05   # KS-test significance level; region/months failing this
 # Dates should bracket the SSPI reference period. If this file is absent,
 # bias correction is automatically skipped (BIAS_CORRECT is forced to FALSE)
 # and a console message documents that ERA5-Land is being used uncorrected.
+#
+# NOTE: correction is applied basin-wide (single scaling factor per calendar
+# month, pooled across all stations), NOT per-region. With only a handful of
+# stations spanning a narrow elevation range, per-region quantile mapping
+# (the original design) had far too little data per region/month to be
+# trustworthy - see fit_basin_bias_correction() and the "BASIN-WIDE BIAS
+# CORRECTION" section below.
 STATION_OBS_PATH <- "Spatial/station_swe_obs.csv"
 BIAS_CORRECT     <- TRUE
 BIAS_CORRECT_CLIP <- c(0.5, 2.0)  # sanity clip on correction coefficients C,
@@ -382,7 +416,41 @@ if (scf_method == "2") {
     cat(sprintf("  Excluded pixels (>50%% zero SWE): %d\n", length(invalid_pix_sspi)))
     swe_matrix[invalid_pix_sspi, ] <- NA
   }
+  # ---- Diagnostic: is this screen actually doing anything, or is the
+  # ~48% "valid pixel" figure just the basin boundary mask? Distinguishing
+  # these matters: if the screen removes 0 interior basin pixels, the 50%
+  # threshold is currently a no-op for this basin/period, not evidence the
+  # domain is being aggressively filtered.
+  basin_rows_prescreen <- which(is.finite(zero_prop_sspi))  # rows with real basin data
+  invalid_within_basin <- intersect(invalid_pix_sspi, basin_rows_prescreen)
   
+  cat("\n  --- Zero-inflation screen coverage check ---\n")
+  cat(sprintf("  Rectangle pixels (grid cells, incl. outside basin): %d\n", n_pixels))
+  cat(sprintf("  Basin-boundary pixels (from earlier masking step):  %d (%.1f%% of rectangle)\n",
+              basin_pixels, 100 * basin_pixels / n_pixels))
+  cat(sprintf("  Basin pixels with computable zero-fraction:         %d%s\n",
+              length(basin_rows_prescreen),
+              if (length(basin_rows_prescreen) != basin_pixels)
+                sprintf("  [!] differs from basin_pixels (%d) - check masking/cropping alignment", basin_pixels)
+              else "  (matches basin_pixels - masking consistent)"))
+  cat(sprintf("  Of those, excluded here for >50%% zero SWE:         %d (%.1f%% of basin)\n",
+              length(invalid_within_basin),
+              100 * length(invalid_within_basin) / max(1, length(basin_rows_prescreen))))
+  
+  if (length(invalid_within_basin) == 0) {
+    cat("  -> The zero-inflation screen removed ZERO interior basin pixels.\n")
+    cat("     The overall valid-pixel percentage reported above is driven entirely\n")
+    cat("     by the basin boundary mask, not by this screen. For this basin/period\n")
+    cat("     the 50% threshold is currently a no-op - it remains in place as a\n")
+    cat("     safeguard for other basins or reference periods where zero-inflation\n")
+    cat("     could plausibly exceed 50% (e.g. warmer/lower-elevation domains).\n")
+  } else {
+    cat(sprintf("  -> The zero-inflation screen actively excluded %d interior basin\n",
+                length(invalid_within_basin)))
+    cat("     pixel(s) beyond what the basin boundary mask alone removed. Review\n")
+    cat("     these if the count is unexpectedly high relative to basin size.\n")
+  }
+  cat("  ---------------------------------------------\n")
 } else if (scf_method == "1") {
   
   # ============================================================================
@@ -711,6 +779,11 @@ gof_test_gamma <- function(pooled_sample, par_obj, alpha = 0.05) {
 # ratio of station-to-ERA5-Land dimensionless quantiles, pooled across a
 # probability grid (more stable than a single quantile). One C per
 # region x calendar-month, applied to raw pixel SWE before normalization.
+#
+# NOTE: kept for reference / future use with a denser station network, but
+# NOT called anywhere in this script anymore - see fit_basin_bias_correction()
+# below and Section F of the RFA construction block for why it was replaced
+# by a single basin-wide monthly correction.
 fit_bias_correction <- function(station_obs, swe, region_id, swe_matrix, dates_vec,
                                 ref_idx, index_values, clip_range = c(0.5, 2.0)) {
   mon <- as.integer(format(dates_vec, "%m"))
@@ -777,6 +850,107 @@ fit_bias_correction <- function(station_obs, swe, region_id, swe_matrix, dates_v
   cat(sprintf("??? Bias correction: %d region/month combinations corrected from station data.\n",
               nrow(details)))
   list(C = C, details = details)
+}
+
+## ---- 7b. Basin-wide monthly bias correction against station SWE obs ----
+prep_station_file <- function(path, station_id, lon, lat, good_grades = c(0, 1)) {
+  raw <- read.csv(path, stringsAsFactors = FALSE)
+  raw$date <- as.Date(raw$`Start.of.Interval..UTC.`, format = "%m/%d/%Y")  # confirm actual format
+  raw <- raw[raw$Grade.Code %in% good_grades & is.finite(raw$SW.Daily.Average..mm.), ]
+  
+  raw$year_month <- format(raw$date, "%Y-%m")
+  monthly <- aggregate(SW.Daily.Average..mm. ~ year_month, data = raw, FUN = mean)
+  monthly$date <- as.Date(paste0(monthly$year_month, "-01"))
+  
+  data.frame(station_id = station_id, lon = lon, lat = lat,
+             date = monthly$date, swe_mm = monthly$SW.Daily.Average..mm.)
+}
+# Single multiplicative scaling factor per calendar month (<=12 numbers
+# total), pooled across ALL stations and applied uniformly to every basin
+# pixel for that month. For each station, uses the nearest ERA5-Land pixel;
+# for each calendar month, pools the ratio (station SWE mm) / (ERA5-Land SWE
+# mm at that pixel) across all stations and overlapping years, and takes the
+# median as the correction factor. Deliberately NOT quantile mapping (too few
+# points per probability bin) and NOT spatially interpolated (a handful of
+# stations can't support kriging/IDW without inventing spatial structure the
+# data can't back up) - this is the standard low-variance "delta method"
+# correction appropriate for a scarcely-observed basin.
+fit_basin_bias_correction <- function(station_obs, swe_template, swe_matrix,
+                                      dates_vec, clip_range = c(0.5, 2.0),
+                                      min_ratios_per_month = 5) {
+  factor_by_month <- rep(1, 12)
+  details <- data.frame()
+  
+  if (is.null(station_obs) || nrow(station_obs) == 0) {
+    cat("??? No station observations supplied: basin-wide bias correction set to 1 (no correction).\n")
+    return(list(factor = factor_by_month, details = details))
+  }
+  
+  station_obs$date <- as.Date(station_obs$date)
+  pts <- vect(station_obs, geom = c("lon", "lat"), crs = crs(swe_template))
+  
+  # Nearest cell to each station (works whether or not the station falls
+  # exactly inside a basin-masked NA-free pixel).
+  cellnum <- cells(swe_template, pts)[, "cell"]
+  station_obs$cell <- cellnum
+  station_obs <- station_obs[is.finite(station_obs$cell), ]
+  if (nrow(station_obs) == 0) {
+    cat("??? Stations did not resolve to any raster cell: skipping basin-wide bias correction.\n")
+    return(list(factor = factor_by_month, details = details))
+  }
+  
+  mon <- as.integer(format(dates_vec, "%m"))
+  yr  <- as.integer(format(dates_vec, "%Y"))
+  station_obs$s_mon <- as.integer(format(station_obs$date, "%m"))
+  station_obs$s_yr  <- as.integer(format(station_obs$date, "%Y"))
+  
+  for (m in 1:12) {
+    sub_m <- station_obs[station_obs$s_mon == m, ]
+    if (nrow(sub_m) == 0) next
+    
+    ratios_m <- c()
+    for (i in seq_len(nrow(sub_m))) {
+      cix <- sub_m$cell[i]
+      if (is.na(cix) || cix < 1 || cix > nrow(swe_matrix)) next
+      col <- which(mon == m & yr == sub_m$s_yr[i])
+      if (length(col) != 1) next               # need exactly one matching month
+      era_val <- swe_matrix[cix, col]
+      sta_val <- sub_m$swe_mm[i]
+      if (!is.finite(era_val) || era_val <= 0) next
+      if (!is.finite(sta_val) || sta_val <= 0) next
+      ratios_m <- c(ratios_m, sta_val / era_val)
+    }
+    ratios_m <- ratios_m[is.finite(ratios_m) & ratios_m > 0]
+    
+    if (length(ratios_m) < min_ratios_per_month) {
+      details <- rbind(details, data.frame(month = m, n_ratios = length(ratios_m),
+                                           factor = 1, applied = FALSE))
+      next
+    }
+    c_val <- stats::median(ratios_m)
+    c_val <- max(min(c_val, clip_range[2]), clip_range[1])
+    factor_by_month[m] <- c_val
+    details <- rbind(details, data.frame(month = m, n_ratios = length(ratios_m),
+                                         factor = c_val, applied = TRUE))
+  }
+  
+  n_applied <- sum(details$applied, na.rm = TRUE)
+  cat(sprintf("??? Basin-wide bias correction: %d/12 months corrected from %d station(s) (need >=%d ratios/month).\n",
+              n_applied, length(unique(station_obs$station_id)), min_ratios_per_month))
+  if (n_applied > 0) {
+    applied_rows <- details[details$applied, ]
+    cat("  Monthly factors: ",
+        paste(sprintf("%s=%.2f (n=%d)", month.abb[applied_rows$month],
+                      applied_rows$factor, applied_rows$n_ratios), collapse = ", "),
+        "\n", sep = "")
+  }
+  if (any(!details$applied)) {
+    skipped <- details$month[!details$applied]
+    cat(sprintf("  Skipped (insufficient overlapping station-months): %s\n",
+                paste(month.abb[skipped], collapse = ", ")))
+  }
+  
+  list(factor = factor_by_month, details = details)
 }
 
 gringorten_swei_seasonal <- function(v_smoothed, dates_vec, scf_mask_list,
@@ -958,8 +1132,17 @@ monthly_sspi_regional <- function(v, dates_vec, ref_idx, pixel_idx,
     par_info <- if (!is.na(region_here) && !is.null(region_par[[region_here]])) {
       region_par[[region_here]][[m]]
     } else NULL
-    pool_ok <- !is.null(par_info) && !is.null(par_info$pooled_sample) &&
-      length(par_info$pooled_sample) >= 15
+    # pool_ok now additionally requires gof_pass == TRUE. Region/months that
+    # failed the KS goodness-of-fit, OR were excluded from pooling upstream
+    # for failing the H0 heterogeneity screen (region_par[[r]][[m]]$status ==
+    # "heterogeneous_skip", set in the RFA construction block), have
+    # par = NULL / gof_pass = FALSE and so never qualify here. There is
+    # deliberately no regional-empirical fallback: a region/month either uses
+    # the pooled regional gamma, or falls straight through to per-pixel local
+    # fitting below (monthly_sspi) - see prior discussion on why a pooled
+    # empirical CDF was dropped as an intermediate option.
+    pool_ok <- !is.null(par_info) && isTRUE(par_info$gof_pass) && !is.null(par_info$par) &&
+      !is.null(par_info$pooled_sample) && length(par_info$pooled_sample) >= 15
     use_regional <- !is.na(region_here) && is.finite(mu) && mu > 0 && !disc_flag && pool_ok
     
     if (use_regional) {
@@ -978,25 +1161,12 @@ monthly_sspi_regional <- function(v, dates_vec, ref_idx, pixel_idx,
       p_m <- rep(NA_real_, length(obs_mon_idx))
       pos_idx <- which(is.finite(x_star) & x_star > 0)
       
-      if (isTRUE(par_info$gof_pass) && !is.null(par_info$par)) {
-        # ---- 1. Pooled regional gamma (passed KS goodness-of-fit) ----
-        if (length(pos_idx) > 0) {
-          Fg <- try(lmomco::cdfgam(x_star[pos_idx], par_info$par), silent = TRUE)
-          if (!inherits(Fg, "try-error")) p_m[pos_idx] <- p0 + (1 - p0) * as.numeric(Fg)
-        }
-        method_code <- 1L
-      } else {
-        # ---- 2. Pooled regional empirical CDF (Gringorten-style, GoF failed) ----
-        if (length(pos_idx) > 0) {
-          pooled <- par_info$pooled_sample
-          combined <- c(pooled, x_star[pos_idx])
-          r_all <- rank(combined, ties.method = "average")
-          r_obs <- utils::tail(r_all, length(pos_idx))
-          p_emp <- (r_obs - 0.44) / (length(combined) + 0.12)
-          p_m[pos_idx] <- p0 + (1 - p0) * p_emp
-        }
-        method_code <- 2L
+      # ---- Pooled regional gamma (passed KS goodness-of-fit AND H0 screen) ----
+      if (length(pos_idx) > 0) {
+        Fg <- try(lmomco::cdfgam(x_star[pos_idx], par_info$par), silent = TRUE)
+        if (!inherits(Fg, "try-error")) p_m[pos_idx] <- p0 + (1 - p0) * as.numeric(Fg)
       }
+      method_code <- 1L
       zero_idx2 <- which(is.finite(x_star) & x_star <= 0)
       if (length(zero_idx2) > 0) p_m[zero_idx2] <- p0
       p_m <- clip_prob(p_m, eps = eps)
@@ -1021,13 +1191,69 @@ monthly_sspi_regional <- function(v, dates_vec, ref_idx, pixel_idx,
 }
 
 # ==============================================================================
+#   BASIN-WIDE BIAS CORRECTION AGAINST STATION SWE OBSERVATIONS  [method 2 only]
+# ==============================================================================
+# Runs ONCE, here - after fit_basin_bias_correction() has been defined above,
+# and BEFORE the RFA construction block / main calculation loop use swe_matrix
+# for anything. Applying it at this point (rather than deep inside the
+# REGIONALIZE_SSPI==TRUE branch) means BOTH the regionalized path
+# (monthly_sspi_regional, via build_regions/compute_index_values/the pooled
+# gamma fits) and the pixel-by-pixel path (monthly_sspi) see the same
+# corrected swe_matrix, regardless of REGIONALIZE_SSPI.
+#
+# This is the ONLY place station correction is applied - see Section F inside
+# the RFA construction block below, which intentionally no-ops the old
+# per-region fit_bias_correction() to avoid double-correcting.
+if (scf_method == "2") {
+  cat("\n===== BASIN-WIDE BIAS CORRECTION vs STATION OBSERVATIONS =====\n")
+  
+  if (BIAS_CORRECT && file.exists(STATION_OBS_PATH)) {
+    station_obs_raw <- tryCatch(read.csv(STATION_OBS_PATH, stringsAsFactors = FALSE),
+                                error = function(e) NULL)
+    bbc <- fit_basin_bias_correction(station_obs_raw, swe[[1]], swe_matrix, dates,
+                                     clip_range = BIAS_CORRECT_CLIP)
+    basin_bias_factor <- bbc$factor
+    basin_bias_log     <- bbc$details
+    
+    months_vec_bc <- as.integer(format(dates, "%m"))
+    for (m in 1:12) {
+      if (basin_bias_factor[m] != 1) {
+        cols_m <- which(months_vec_bc == m)
+        swe_matrix[, cols_m] <- swe_matrix[, cols_m] * basin_bias_factor[m]
+      }
+    }
+    
+    bc_diag_dir <- file.path(out_dir, "rfa_diagnostics")
+    if (!dir.exists(bc_diag_dir)) dir.create(bc_diag_dir, recursive = TRUE)
+    if (nrow(basin_bias_log) > 0) {
+      write.csv(basin_bias_log, file.path(bc_diag_dir, "basin_wide_bias_correction_by_month.csv"),
+                row.names = FALSE)
+    }
+  } else {
+    basin_bias_factor <- rep(1, 12)
+    basin_bias_log <- data.frame()
+    if (isTRUE(BIAS_CORRECT)) {
+      cat(sprintf("??? BIAS_CORRECT = TRUE but no station file found at '%s'.\n", STATION_OBS_PATH))
+      cat("  Proceeding WITHOUT bias correction (factor = 1 for every month). ERA5-Land\n")
+      cat("  snow variables carry known systematic biases (Kouki et al. 2023; Blau et al.\n")
+      cat("  2024) - supply station SWE observations at STATION_OBS_PATH (columns:\n")
+      cat("  station_id, lon, lat, date, swe_mm) to enable this correction.\n")
+    } else {
+      cat("??? BIAS_CORRECT = FALSE: skipping basin-wide bias correction.\n")
+    }
+  }
+}
+
+# ==============================================================================
 #   REGIONAL FREQUENCY ANALYSIS (RFA) CONSTRUCTION  [SSPI-1 / method 2 only]
 # ==============================================================================
 # Builds everything monthly_sspi_regional() needs: homogeneous regions, per-
-# pixel index values, discordancy screening, heterogeneity diagnostics, an
-# optional station-based bias correction, and pooled regional gamma fits with
-# goodness-of-fit screening. All of this runs ONCE (not per-pixel-in-parallel)
-# and the resulting small objects are exported to the cluster workers.
+# pixel index values, discordancy screening, heterogeneity diagnostics, and
+# pooled regional gamma fits with goodness-of-fit screening. All of this runs
+# ONCE (not per-pixel-in-parallel) and the resulting small objects are
+# exported to the cluster workers. Station bias correction has already been
+# applied basin-wide, upstream, directly to swe_matrix (see above) - so this
+# block operates on already-corrected SWE.
 if (scf_method == "2" && REGIONALIZE_SSPI) {
   
   cat("\n============================================================\n")
@@ -1191,33 +1417,47 @@ if (scf_method == "2" && REGIONALIZE_SSPI) {
   }
   
   
+  # ---- E.1 Turn the H0 flag into an actual pooling decision ----
+  # Previously heterogeneity_log was written to disk and printed as a
+  # diagnostic but never actually consulted when fitting the regional gamma
+  # (every region/month pooled regardless of H0). Region/months flagged
+  # H0 >= H0_REGION_FLAG_THRESHOLD are now excluded from regional pooling
+  # entirely and fall through to per-pixel local fitting in
+  # monthly_sspi_regional() instead - see heterogeneous_mat below and its use
+  # in section G. NA/failed H0 tests (lmom_failed, fit_failed, sim_failed,
+  # too_few_sites) are treated as heterogeneous too, since "unknown" is not
+  # the same as "known homogeneous" and pooling on an untested sample
+  # defeats the purpose of the screen.
+  heterogeneous_mat <- matrix(TRUE, n_regions, 12)  # default: don't pool
   if (nrow(heterogeneity_log) > 0) {
+    for (k in seq_len(nrow(heterogeneity_log))) {
+      r <- heterogeneity_log$region[k]; m <- heterogeneity_log$month[k]
+      h <- heterogeneity_log$H0[k]
+      heterogeneous_mat[r, m] <- !(is.finite(h) && h < H0_REGION_FLAG_THRESHOLD)
+    }
     n_flag <- sum(heterogeneity_log$H0 >= H0_REGION_FLAG_THRESHOLD, na.rm = TRUE)
+    n_untested <- sum(!is.finite(heterogeneity_log$H0))
     cat(sprintf("??? Heterogeneity test: %d/%d region-months flagged H0 >= %.0f (possibly/definitely heterogeneous).\n",
                 n_flag, nrow(heterogeneity_log), H0_REGION_FLAG_THRESHOLD))
-    cat("  (Flagged region-months still pool, but consider revising DEM_PATH/N_ELEV_BANDS\n")
-    cat("   if a large share of region-months are flagged - see rfa_diagnostics/.)\n")
+    cat(sprintf("  %d additional region-months had no valid H0 (untested) and are also excluded from pooling.\n",
+                n_untested))
+    cat("  Flagged/untested region-months are EXCLUDED from regional pooling and fall back\n")
+    cat("  to per-pixel local fitting (monthly_sspi) for that region/month - no regional-\n")
+    cat("  empirical fallback is used. See rfa_diagnostics/ for the full H0 breakdown.\n")
   }
   
   ## ---- F. Bias correction vs. independent station SWE observations ----
-  if (BIAS_CORRECT && file.exists(STATION_OBS_PATH)) {
-    cat(sprintf("\n===== BIAS CORRECTION vs STATION OBSERVATIONS (%s) =====\n", STATION_OBS_PATH))
-    station_obs <- tryCatch(read.csv(STATION_OBS_PATH, stringsAsFactors = FALSE), error = function(e) NULL)
-    bc <- fit_bias_correction(station_obs, swe, region_id, swe_matrix, dates, ref_idx,
-                              index_values, clip_range = BIAS_CORRECT_CLIP)
-    C_matrix <- bc$C
-    bias_correction_log <- bc$details
-  } else {
-    if (isTRUE(BIAS_CORRECT)) {
-      cat(sprintf("\n??? BIAS_CORRECT = TRUE but no station file found at '%s'.\n", STATION_OBS_PATH))
-      cat("  Proceeding WITHOUT bias correction (C = 1 everywhere). ERA5-Land snow\n")
-      cat("  variables carry known systematic biases (Kouki et al. 2023; Blau et al.\n")
-      cat("  2024) - supply station SWE observations at STATION_OBS_PATH (columns:\n")
-      cat("  station_id, lon, lat, date, swe_mm) to enable Eq. 9-10-style correction.\n")
-    }
-    C_matrix <- matrix(1, nrow = max(n_regions, 1), ncol = 12)
-    bias_correction_log <- data.frame()
-  }
+  # Station correction already applied basin-wide (once) upstream, directly
+  # to swe_matrix, before this RFA block runs - see the "BASIN-WIDE BIAS
+  # CORRECTION" section above. Re-running fit_bias_correction() here would
+  # double-correct every pixel, so it is intentionally NOT called. C_matrix
+  # is fixed at identity so monthly_sspi_regional()'s `mu_corr <- mu * c_val`
+  # step remains a no-op. fit_bias_correction() is left defined earlier in
+  # the script (unused) in case a denser station network later makes
+  # per-region quantile mapping viable.
+  C_matrix <- matrix(1, nrow = max(n_regions, 1), ncol = 12)
+  bias_correction_log <- data.frame()
+  cat("??? Per-region station bias correction: skipped (basin-wide correction already applied upstream; see basin_bias_log).\n")
   
   ## ---- G. Pooled regional gamma fit + KS goodness-of-fit per region/month ----
   cat("\n===== FITTING POOLED REGIONAL GAMMA DISTRIBUTIONS =====\n")
@@ -1232,6 +1472,36 @@ if (scf_method == "2" && REGIONALIZE_SSPI) {
       if (length(keep) == 0 || length(cols) == 0) {
         region_par[[r]][[m]] <- list(par = NULL, pooled_sample = numeric(0),
                                      gof_pass = FALSE, status = "no_data")
+        # Previously silent (no gof_log row) - logging it so gof_log always
+        # has n_regions*12 rows and "missing" region-months don't have to be
+        # inferred by diffing row counts against n_regions*12.
+        gof_log <- rbind(gof_log, data.frame(region = r, month = m, n_pool = 0L,
+                                             fit_status = "no_data", ks_D = NA_real_,
+                                             ks_p = NA_real_, gamma_used = FALSE))
+        next
+      }
+      if (isTRUE(heterogeneous_mat[r, m])) {
+        # Region/month failed (or never passed) the H0 heterogeneity screen -
+        # do NOT pool. Leaving par = NULL and pooled_sample empty means
+        # pool_ok is FALSE in monthly_sspi_regional(), so every pixel in this
+        # region/month falls through to per-pixel local fitting instead of a
+        # regional gamma OR a regional-empirical CDF.
+        region_par[[r]][[m]] <- list(par = NULL, pooled_sample = numeric(0),
+                                     gof_pass = FALSE, status = "heterogeneous_skip")
+        # n_pool here is the pooled SAMPLE size the region/month WOULD have
+        # had (matching the units of every other row's n_pool), not the site
+        # count - a prior version of this log logged length(keep) (site
+        # count, e.g. 36) here instead of the actual pooled sample size (e.g.
+        # ~450-3000), which made heterogeneous_skip rows look like they had
+        # far less data than they actually did.
+        c_val_diag <- C_matrix[r, m]
+        sub_diag  <- swe_matrix[keep, cols, drop = FALSE] * c_val_diag
+        idxv_diag <- index_values[keep, m] * c_val_diag
+        x_star_diag <- sweep(sub_diag, 1, idxv_diag, "/")
+        n_pool_diag <- sum(is.finite(x_star_diag) & x_star_diag > 0)
+        gof_log <- rbind(gof_log, data.frame(region = r, month = m, n_pool = n_pool_diag,
+                                             fit_status = "heterogeneous_skip", ks_D = NA_real_,
+                                             ks_p = NA_real_, gamma_used = FALSE))
         next
       }
       c_val <- C_matrix[r, m]
@@ -1255,10 +1525,17 @@ if (scf_method == "2" && REGIONALIZE_SSPI) {
   }
   if (nrow(gof_log) > 0) {
     n_gamma <- sum(gof_log$gamma_used, na.rm = TRUE)
+    n_het_skip <- sum(gof_log$fit_status == "heterogeneous_skip", na.rm = TRUE)
     cat(sprintf("??? Regional gamma fitting: %d/%d region-months pass KS goodness-of-fit (alpha=%.2f)\n",
                 n_gamma, nrow(gof_log), GOF_ALPHA))
-    cat(sprintf("  Region-months using pooled empirical CDF instead (GoF failed): %d\n",
-                sum(!gof_log$gamma_used & gof_log$n_pool >= 15, na.rm = TRUE)))
+    cat(sprintf("  Region-months excluded from pooling for failing the H0 heterogeneity screen: %d\n",
+                n_het_skip))
+    # No regional-empirical fallback: every region-month that fails GoF or the
+    # H0 screen falls straight through to per-pixel local fitting instead
+    # (see monthly_sspi_regional / "Regional Empirical" is always 0% below).
+    cat(sprintf("  Region-months failing GoF (but passing H0) that fall back to LOCAL fitting: %d\n",
+                sum(!gof_log$gamma_used & gof_log$fit_status != "heterogeneous_skip" &
+                      gof_log$n_pool >= 15, na.rm = TRUE)))
   }
   
   ## ---- H. Diagnostic outputs (mirrors paper's Table 3/6 + Fig. 6) ----
@@ -1443,9 +1720,12 @@ for (sc in timescales) {
     
     cat("  -> Creating distribution map...\n")
     if (REGIONALIZE_SSPI) {
+      # Code 2 "Regional Empirical" is retained only for backward-compatible
+      # numbering; it is never assigned (no regional-empirical fallback is
+      # used - see monthly_sspi_regional). It will always show 0 pixels below.
       method_mapping <- data.frame(
         code  = c(1, 2, 3, 4, 5),
-        name  = c("Regional Gamma", "Regional Empirical", "Local Gamma (fallback)",
+        name  = c("Regional Gamma", "Regional Empirical (unused)", "Local Gamma (fallback)",
                   "Local Empirical (fallback)", "Local Zero-Var (fallback)"),
         color = c("#4575b4", "#74add1", "#fdae61", "#d73027", "#91bfdb"),
         stringsAsFactors = FALSE
@@ -1720,7 +2000,7 @@ if (scf_method == "2") {
     "============================================================\n",
     "MONTHLY SSPI-1 SUMMARY - NECHAKO BASIN\n",
     "ERA5-Land Snow Water Equivalent\n",
-    "Method 2: Zero-Inflated Gamma (1981-2020 reference, no SCF mask)\n",
+    "Method 2: Zero-Inflated Gamma (no SCF mask)\n",
     sprintf("Regional pooling (index-flood RFA): %s\n", if (REGIONALIZE_SSPI) "ENABLED" else "disabled"),
     "============================================================\n\n",
     file = summary_combined_file, sep = ""
@@ -1755,13 +2035,13 @@ if (scf_method == "2") {
                     GOF_ALPHA, sum(gof_log$gamma_used, na.rm = TRUE), nrow(gof_log)),
             file = summary_combined_file, append = TRUE)
       }
-      cat(sprintf("  - Bias correction vs. station obs: %s (%d region-month coefficients applied)\n",
+      cat(sprintf("  - Bias correction vs. station obs: %s (basin-wide, %d/12 months corrected; see basin_bias_log)\n",
                   ifelse(BIAS_CORRECT && file.exists(STATION_OBS_PATH), "ENABLED", "disabled (no station file)"),
-                  nrow(bias_correction_log)),
+                  sum(basin_bias_log$applied, na.rm = TRUE)),
           file = summary_combined_file, append = TRUE)
       cat("  - Per-pixel zero-probability retained (only the gamma shape/scale is pooled regionally)\n",
           file = summary_combined_file, append = TRUE)
-      cat("  - Region/months failing GoF use a pooled regional empirical (Gringorten-style) CDF\n",
+      cat("  - Region/months failing GoF, OR failing the H0 heterogeneity screen, are excluded\n    from pooling entirely and fall back to per-pixel local fitting (no regional-\n    empirical CDF fallback is used)\n",
           file = summary_combined_file, append = TRUE)
       cat("  - Pixels with no usable region/index value fall back to the original per-pixel fit\n",
           file = summary_combined_file, append = TRUE)
@@ -1773,7 +2053,7 @@ if (scf_method == "2") {
     if (REGIONALIZE_SSPI) {
       cat("\nMethod Distribution:\n", file = summary_combined_file, append = TRUE)
       cat(sprintf("  Regional gamma:             %.1f%%\n", s$regional_gamma_pct), file = summary_combined_file, append = TRUE)
-      cat(sprintf("  Regional empirical (GoF-fail): %.1f%%\n", s$regional_empirical_pct), file = summary_combined_file, append = TRUE)
+      cat(sprintf("  Regional empirical (unused, no fallback CDF): %.1f%%\n", s$regional_empirical_pct), file = summary_combined_file, append = TRUE)
       cat(sprintf("  Local gamma (fallback):      %.1f%%\n", s$local_gamma_pct), file = summary_combined_file, append = TRUE)
       cat(sprintf("  Local empirical (fallback):  %.1f%%\n", s$local_empirical_pct), file = summary_combined_file, append = TRUE)
       cat(sprintf("  Local zero-variance (fallback): %.1f%%\n", s$local_zerovar_pct), file = summary_combined_file, append = TRUE)
