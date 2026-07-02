@@ -208,9 +208,9 @@ if (!file.exists(ssda_path)) {
       cat("     that straddle shared boundaries between adjacent SSDAs.\n")
     }
     
-    if (sum(counts_correct) != basin_pixels) {
+    if (sum(freq_correct$count) != basin_pixels) {
       cat(sprintf("  ??? Correct-method sum (%d) still differs from whole-basin count (%d)\n",
-                  sum(counts_correct), basin_pixels))
+                  sum(freq_correct$count), basin_pixels))
       cat("     -> Check whether SSDA polygons fully nest inside the basin boundary\n")
       cat("        (possible geometry mismatch between the two source KMZ files).\n")
     }
