@@ -1,31 +1,31 @@
 ##############################################
 # SSI AND SSMI CALCULATION - PARALLEL VERSION
 #
-# SSI  — Standardized Soil Moisture Index (parametric)
-#         Distribution: Beta (primary) → Empirical Blom (fallback)
+# SSI  ??? Standardized Soil Moisture Index (parametric)
+#         Distribution: Beta (primary) ??? Empirical Blom (fallback)
 #         Procedure follows McKee et al. (1993) / Hao & AghaKouchak (2013)
 #         Monthly stratification per Kao & Govindaraju (2010)
 #
-# SSMI — Standardized Soil Moisture Index (non-parametric KDE)
-#         Boundary-corrected via logit transform → Gaussian KDE → back-transform
+# SSMI ??? Standardized Soil Moisture Index (non-parametric KDE)
+#         Boundary-corrected via logit transform ??? Gaussian KDE ??? back-transform
 #         Per Carrao et al. (2013) / Russo et al.
 #         Monthly stratification per Kao & Govindaraju (2010)
 #
 # Timescales : 1, 2, 3 months  (rolling mean of soil moisture)
 #
 # Layer configurations (ERA5-Land):
-#   L1_3  : Layers 1–3 (0–100 cm), depth-weighted average
-#             Layer 1: 0–7 cm   (7 cm thick)
-#             Layer 2: 7–28 cm  (21 cm thick)
-#             Layer 3: 28–100 cm (72 cm thick)
-#   L1_4  : All 4 layers (0–289 cm), depth-weighted average
-#             + Layer 4: 100–289 cm (189 cm thick)
+#   L1_3  : Layers 1???3 (0???100 cm), depth-weighted average
+#             Layer 1: 0???7 cm   (7 cm thick)
+#             Layer 2: 7???28 cm  (21 cm thick)
+#             Layer 3: 28???100 cm (72 cm thick)
+#   L1_4  : All 4 layers (0???289 cm), depth-weighted average
+#             + Layer 4: 100???289 cm (189 cm thick)
 #
-# Outputs (per index × layer config × timescale):
-#   • NetCDF per calendar month
-#   • CSV    per calendar month
-#   • Excel  workbook (all calendar months as sheets)
-#   • Summary .txt file
+# Outputs (per index ?? layer config ?? timescale):
+#   ??? NetCDF per calendar month
+#   ??? CSV    per calendar month
+#   ??? Excel  workbook (all calendar months as sheets)
+#   ??? Summary .txt file
 ##############################################
 
 # ---- Libraries ----
@@ -56,7 +56,7 @@ basin <- if (file.exists(basin_path)) {
 } else NULL
 
 if (!is.null(basin)) {
-  cat("✓ Basin boundary loaded\n")
+  cat("??? Basin boundary loaded\n")
 } else {
   stop("Basin boundary not found: ", basin_path)
 }
@@ -64,10 +64,10 @@ if (!is.null(basin)) {
 # ==============================================================================
 # LAYER DEPTH WEIGHTS  (ERA5-Land)
 # ==============================================================================
-# Layer 1 :   0–7 cm      →  7 cm
-# Layer 2 :   7–28 cm     → 21 cm
-# Layer 3 :  28–100 cm    → 72 cm
-# Layer 4 : 100–289 cm    → 189 cm
+# Layer 1 :   0???7 cm      ???  7 cm
+# Layer 2 :   7???28 cm     ??? 21 cm
+# Layer 3 :  28???100 cm    ??? 72 cm
+# Layer 4 : 100???289 cm    ??? 189 cm
 
 layer_depths <- c(L1 = 7, L2 = 21, L3 = 72, L4 = 189)   # cm
 
@@ -116,7 +116,7 @@ target_crs <- "EPSG:3005"
 for (obj_name in c("sm_l1", "sm_l2", "sm_l3", "sm_l4")) {
   obj <- get(obj_name)
   if (!same.crs(obj, target_crs)) {
-    cat(sprintf("✓ Reprojecting %s to BC Albers...\n", obj_name))
+    cat(sprintf("??? Reprojecting %s to BC Albers...\n", obj_name))
     assign(obj_name, project(obj, target_crs, method = "bilinear"), envir = .GlobalEnv)
   }
 }
@@ -132,25 +132,108 @@ sm_l3 <- mask(sm_l3, basin, inverse = FALSE, touches = TRUE)
 sm_l4 <- mask(sm_l4, basin, inverse = FALSE, touches = TRUE)
 
 basin_pixels <- sum(!is.na(values(sm_l1[[1]])))
-cat(sprintf("✓ Basin pixels: %d\n", basin_pixels))
+cat(sprintf("??? Basin pixels: %d\n", basin_pixels))
+
+# ==============================================================================
+# SSDA SUB-BASIN PIXEL COUNTS  (diagnostic: 963 vs 865 mismatch)
+# ==============================================================================
+cat("\n===== SSDA SUB-BASIN PIXEL COUNTS =====\n")
+
+ssda_path <- "Spatial/Nechako_Basin.kmz"
+if (!file.exists(ssda_path)) {
+  cat("??? SSDA file not found, skipping SSDA pixel count diagnostic: ", ssda_path, "\n")
+} else {
+  
+  tmp_ssda <- tempfile()
+  dir.create(tmp_ssda, showWarnings = FALSE)
+  utils::unzip(ssda_path, exdir = tmp_ssda)
+  kml_ssda <- list.files(tmp_ssda, pattern = "\\.kml$", full.names = TRUE, recursive = TRUE)[1]
+  ssda_raw <- vect(kml_ssda)
+  unlink(tmp_ssda, recursive = TRUE)
+  
+  if (!"WSCSSDANAM" %in% names(ssda_raw)) {
+    cat("??? WSCSSDANAM attribute not found. Available fields: ",
+        paste(names(ssda_raw), collapse = ", "), "\n")
+  } else {
+    
+    # Dissolve the 16 sub-drainage polygons into 5 SSDAs by name
+    ssda <- aggregate(ssda_raw, by = "WSCSSDANAM")
+    if (!same.crs(ssda, target_crs)) ssda <- project(ssda, target_crs)
+    
+    # Template raster: same grid/extent/CRS as the soil moisture data.
+    # NOTE: rast(sm_l1[[1]]) copies GEOMETRY ONLY (no cell values) -- fine
+    # for rasterize() (which just needs the grid definition), but NOT
+    # usable with mask() below, since mask() needs real values to keep.
+    template <- rast(sm_l1[[1]])
+    
+    # A companion raster with actual values (all 1s), same grid, for mask()
+    template_ones <- template
+    values(template_ones) <- 1
+    
+    # ---- METHOD 1 (correct): single categorical rasterize ----
+    # touches = TRUE here to match the RULE used for the whole-basin mask
+    # (apples-to-apples comparison). Still non-overlapping by construction:
+    # rasterize() assigns exactly ONE category per cell even with touches=TRUE
+    # (ties resolved by polygon draw order), so no double-counting is possible.
+    ssda_rast_correct <- rasterize(ssda, template, field = "WSCSSDANAM", touches = TRUE)
+    freq_correct <- freq(ssda_rast_correct)   # layer, value (label), count
+    
+    cat("\n[Method 1 - CORRECT: single categorical rasterize, no overlap possible]\n")
+    print(freq_correct)
+    cat(sprintf("  Sum across SSDAs        : %d\n", sum(freq_correct$count)))
+    cat(sprintf("  Whole-basin pixel count  : %d\n", basin_pixels))
+    
+    # ---- METHOD 2 (naive, likely source of 963): mask each SSDA
+    #      separately with touches = TRUE and sum non-NA counts.
+    #      Pixels straddling a shared boundary between two SSDAs get
+    #      counted once per neighboring polygon -> inflated total.
+    ssda_names <- unique(ssda$WSCSSDANAM)
+    counts_naive <- setNames(integer(length(ssda_names)), ssda_names)
+    for (nm in ssda_names) {
+      sub_poly <- ssda[ssda$WSCSSDANAM == nm, ]
+      masked   <- mask(template_ones, sub_poly, touches = TRUE)
+      counts_naive[nm] <- sum(!is.na(values(masked)))
+    }
+    
+    cat("\n[Method 2 - NAIVE: per-polygon mask(touches=TRUE) then sum]\n")
+    print(counts_naive)
+    cat(sprintf("  Sum across SSDAs        : %d\n", sum(counts_naive)))
+    cat(sprintf("  Whole-basin pixel count  : %d\n", basin_pixels))
+    
+    if (sum(counts_naive) != basin_pixels) {
+      cat(sprintf("  ??? Naive method sum exceeds/differs from whole-basin count by %d pixels\n",
+                  sum(counts_naive) - basin_pixels))
+      cat("  -> This is the likely source of the 963-vs-865 discrepancy:\n")
+      cat("     touches=TRUE masking applied per-polygon double-counts cells\n")
+      cat("     that straddle shared boundaries between adjacent SSDAs.\n")
+    }
+    
+    if (sum(counts_correct) != basin_pixels) {
+      cat(sprintf("  ??? Correct-method sum (%d) still differs from whole-basin count (%d)\n",
+                  sum(counts_correct), basin_pixels))
+      cat("     -> Check whether SSDA polygons fully nest inside the basin boundary\n")
+      cat("        (possible geometry mismatch between the two source KMZ files).\n")
+    }
+  }
+}
 
 # ==============================================================================
 # BUILD COMPOSITE SOIL MOISTURE (depth-weighted)
 # ==============================================================================
 cat("\n===== BUILDING COMPOSITE SOIL MOISTURE =====\n")
 
-# --- Version A : Layers 1–3 (0–100 cm) ---
+# --- Version A : Layers 1???3 (0???100 cm) ---
 w_A  <- layer_depths[1:3] / sum(layer_depths[1:3])
 sm_A <- sm_l1 * w_A[1] + sm_l2 * w_A[2] + sm_l3 * w_A[3]
 terra::time(sm_A) <- dates
-cat(sprintf("✓ L1_3  (0–100 cm) weights : L1=%.4f  L2=%.4f  L3=%.4f\n",
+cat(sprintf("??? L1_3  (0???100 cm) weights : L1=%.4f  L2=%.4f  L3=%.4f\n",
             w_A[1], w_A[2], w_A[3]))
 
-# --- Version B : All 4 layers (0–289 cm) ---
+# --- Version B : All 4 layers (0???289 cm) ---
 w_B  <- layer_depths / sum(layer_depths)
 sm_B <- sm_l1 * w_B[1] + sm_l2 * w_B[2] + sm_l3 * w_B[3] + sm_l4 * w_B[4]
 terra::time(sm_B) <- dates
-cat(sprintf("✓ L1_4  (0–289 cm) weights : L1=%.4f  L2=%.4f  L3=%.4f  L4=%.4f\n",
+cat(sprintf("??? L1_4  (0???289 cm) weights : L1=%.4f  L2=%.4f  L3=%.4f  L4=%.4f\n",
             w_B[1], w_B[2], w_B[3], w_B[4]))
 
 rm(sm_l1, sm_l2, sm_l3, sm_l4)
@@ -175,10 +258,10 @@ expand_to_full <- function(sub_mat, valid_idx, n_pixels_total) {
   full_mat
 }
 # ==============================================================================
-# SSI  —  PARAMETRIC (Beta → Empirical fallback)
+# SSI  ???  PARAMETRIC (Beta ??? Empirical fallback)
 # Monthly stratification per Kao & Govindaraju (2010):
 #   Distribution parameters are estimated separately for each calendar month.
-# Beta distribution is the natural choice for soil moisture ∈ (0, 1).
+# Beta distribution is the natural choice for soil moisture ??? (0, 1).
 # Method codes: 1 = Beta  |  2 = Empirical (Blom)
 # ==============================================================================
 compute_ssi <- function(v, scale, dates_vec, eps = 1e-6) {
@@ -186,7 +269,7 @@ compute_ssi <- function(v, scale, dates_vec, eps = 1e-6) {
   v_clean <- v
   v_clean[!is.finite(v_clean)] <- NA_real_
   
-  # Rolling mean aggregation (scale = 1 → raw monthly value)
+  # Rolling mean aggregation (scale = 1 ??? raw monthly value)
   x_agg <- if (scale == 1L) v_clean else roll_mean_right(v_clean, scale)
   
   n           <- length(x_agg)
@@ -241,7 +324,7 @@ compute_ssi <- function(v, scale, dates_vec, eps = 1e-6) {
     
   }
   
-  # Clamp to ±4.75 (matches SPI script)
+  # Clamp to ??4.75 (matches SPI script)
   fin <- is.finite(z)
   z[fin & z < -4.75] <- -4.75
   z[fin & z >  4.75] <-  4.75
@@ -250,12 +333,12 @@ compute_ssi <- function(v, scale, dates_vec, eps = 1e-6) {
 }
 
 # ==============================================================================
-# SSMI  —  NON-PARAMETRIC KDE with boundary-bias correction
+# SSMI  ???  NON-PARAMETRIC KDE with boundary-bias correction
 # Method per Carrao et al. (2013) / Russo et al. (ESPI formulation):
 #   Step 1 : Logit-transform to unbounded support  y = log(x / (1 - x))
 #   Step 2 : Gaussian KDE in transformed space, bandwidth by Silverman's rule
 #   Step 3 : KDE-CDF evaluated at each training point (kernel smoother CDF)
-#   Step 4 : Transform non-exceedance probability → standard normal
+#   Step 4 : Transform non-exceedance probability ??? standard normal
 # Monthly stratification per Kao & Govindaraju (2010).
 # ==============================================================================
 compute_ssmi <- function(v, scale, dates_vec, eps = 1e-6) {
@@ -286,15 +369,15 @@ compute_ssmi <- function(v, scale, dates_vec, eps = 1e-6) {
     # to silently fail to update z whenever the KDE step errored.
     ok_kde <- tryCatch({
       
-      # Step 1 — Logit transform  y = log(x / (1 - x))
+      # Step 1 ??? Logit transform  y = log(x / (1 - x))
       y <- log(samp_c / (1 - samp_c))
       
-      # Step 2 — Silverman bandwidth in transformed space
+      # Step 2 ??? Silverman bandwidth in transformed space
       bw <- bw.nrd0(y)
       if (!is.finite(bw) || bw <= 0) bw <- 0.5 * IQR(y) + .Machine$double.eps
       
-      # Step 3 — KDE-CDF at each training point
-      # F̂(yᵢ) = (1/n) Σⱼ Φ((yᵢ − yⱼ) / h)
+      # Step 3 ??? KDE-CDF at each training point
+      # F??(y???) = (1/n) ????? ??((y??? ??? y???) / h)
       p <- vapply(y, function(yi) mean(pnorm((yi - y) / bw)), numeric(1L))
       p <- clip_prob(p, eps)
       
@@ -312,7 +395,7 @@ compute_ssmi <- function(v, scale, dates_vec, eps = 1e-6) {
     z[idx] <- qnorm(p)
   }
   
-  # Clamp to ±4.75
+  # Clamp to ??4.75
   fin <- is.finite(z)
   z[fin & z < -4.75] <- -4.75
   z[fin & z >  4.75] <-  4.75
@@ -386,7 +469,7 @@ save_index_outputs <- function(index_matrix, method_matrix,
     write.csv(df, csv_file, row.names = FALSE)
   }
   
-  cat(sprintf("    ✓ %s outputs saved (%s, scale=%d)\n",
+  cat(sprintf("    ??? %s outputs saved (%s, scale=%d)\n",
               index_name, layer_label, scale))
 }
 
@@ -415,9 +498,9 @@ layer_configs <- list(
        desc  = "All 4 layers (0-289 cm, depth-weighted)")
 )
 
-# Parallel cluster — one cluster reused for all configurations
+# Parallel cluster ??? one cluster reused for all configurations
 n_cores <- max(1L, detectCores(logical = FALSE) - 1L)
-cat(sprintf("\n✓ Starting parallel cluster with %d cores\n", n_cores))
+cat(sprintf("\n??? Starting parallel cluster with %d cores\n", n_cores))
 cl <- makeCluster(n_cores)
 
 # Summary storage
@@ -434,13 +517,13 @@ for (cfg in layer_configs) {
   sm_rast   <- cfg$sm
   layer_lbl <- cfg$label
   
-  # ── rebuild sm_matrix_sub for this layer config ──
+  # ?????? rebuild sm_matrix_sub for this layer config ??????
   sm_mat_full   <- values(sm_rast, mat = TRUE)
   sm_matrix_sub <- sm_mat_full[valid_idx, , drop = FALSE]
   rm(sm_mat_full)
   cat(sprintf("Basin pixels : %d | Time steps : %d\n",
               n_valid, ncol(sm_matrix_sub)))
-  # ───────────────────────────────────────────────────────
+  # ?????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
   
   # Export to workers
   clusterExport(cl,
@@ -456,9 +539,9 @@ for (cfg in layer_configs) {
     
     clusterExport(cl, varlist = "sc", envir = environment())
     
-    # ──────────────────────────────
+    # ??????????????????????????????????????????????????????????????????????????????????????????
     #  SSI
-    # ──────────────────────────────
+    # ??????????????????????????????????????????????????????????????????????????????????????????
     cat(sprintf("  [SSI-%d  %s]  Computing...\n", sc, layer_lbl))
     start_t <- Sys.time()
     
@@ -550,9 +633,9 @@ for (cfg in layer_configs) {
     
     rm(ssi_results, ssi_indices, ssi_methods)
     
-    # ──────────────────────────────
+    # ??????????????????????????????????????????????????????????????????????????????????????????
     #  SSMI
-    # ──────────────────────────────
+    # ??????????????????????????????????????????????????????????????????????????????????????????
     cat(sprintf("  [SSMI-%d %s]  Computing...\n", sc, layer_lbl))
     start_t <- Sys.time()
     
@@ -569,7 +652,7 @@ for (cfg in layer_configs) {
     
     elapsed <- round(as.numeric(difftime(Sys.time(), start_t, units = "mins")), 2)
     na_rate_ssmi <- 100 * mean(is.na(ssmi_indices[basin_mask, ]))
-    idx_mat      <- ssmi_indices                          # ← was s$ssmi_indices
+    idx_mat      <- ssmi_indices                          # ??? was s$ssmi_indices
     cat(sprintf("  Done in %.2f min\n", elapsed))
     cat(sprintf("  NA rate (basin)   : %.3f%%\n", na_rate_ssmi))
     cat(sprintf("  Drought freq  Extreme (<-2.0): %.2f%%  Severe (<-1.5): %.2f%%  Moderate (<-1.0): %.2f%%\n",
@@ -603,7 +686,7 @@ for (cfg in layer_configs) {
   
 }  # end layer_configs loop
 stopCluster(cl)
-cat("\n✓ Parallel cluster stopped\n")
+cat("\n??? Parallel cluster stopped\n")
 rm(sm_matrix_sub, sm_A, sm_B); gc()
 # ==============================================================================
 # WRITE COMBINED SUMMARY FILES
@@ -624,7 +707,7 @@ write_summary <- function(summaries, index_name, out_dir) {
   hdr("Monthly stratification : Kao & Govindaraju (2010)\n")
   
   if (index_name == "SSI") {
-    hdr("Distribution           : Beta (primary) → Empirical Blom (fallback)\n")
+    hdr("Distribution           : Beta (primary) ??? Empirical Blom (fallback)\n")
     hdr("Reference              : Hao & AghaKouchak (2013), McKee et al. (1993)\n")
   } else {
     hdr("Method                 : Non-parametric KDE, logit boundary correction\n")
@@ -642,7 +725,7 @@ write_summary <- function(summaries, index_name, out_dir) {
                 min(dates), max(dates), length(dates)))
     hdr(sprintf("NA rate (basin)  : %.3f%%\n", s$na_rate))
     hdr(sprintf("compat.    : %s\n",
-                ifelse(s$na_rate < 0.5, "✓ READY (<0.5% NAs)", "⚠ CAUTION (>0.5% NAs)")))
+                ifelse(s$na_rate < 0.5, "??? READY (<0.5% NAs)", "??? CAUTION (>0.5% NAs)")))
     
     if (index_name == "SSI") {
       hdr("\nMethod distribution:\n")
@@ -668,7 +751,7 @@ write_summary <- function(summaries, index_name, out_dir) {
       idx_mat <- s$ssi_indices
     }# end if (index_name == "SSI")
     
-    # Drought frequency — for both SSI and SSMI
+    # Drought frequency ??? for both SSI and SSMI
     idx_field <- if (index_name == "SSI") "ssi_indices" else "ssmi_indices"
     if (!is.null(s[[idx_field]])) {
       idx_mat <- s[[idx_field]]
@@ -677,8 +760,8 @@ write_summary <- function(summaries, index_name, out_dir) {
       hdr(sprintf("  Severe      (< -1.5) : %.2f%%\n", 100 * mean(idx_mat < -1.5, na.rm = TRUE)))
       hdr(sprintf("  Moderate    (< -1.0) : %.2f%%\n", 100 * mean(idx_mat < -1.0, na.rm = TRUE)))
     }
-  }# ← end for (s in summaries)
-  cat(sprintf("✓ Summary saved: %s\n", summary_file))
+  }# ??? end for (s in summaries)
+  cat(sprintf("??? Summary saved: %s\n", summary_file))
 }
 
 write_summary(all_summaries_ssi,  "SSI",  out_dir_ssi)
@@ -692,13 +775,13 @@ cat("SSI AND SSMI CALCULATION COMPLETE!\n")
 cat("============================================================\n")
 cat(sprintf("\nSSI  outputs : %s\n", normalizePath(out_dir_ssi)))
 cat(sprintf("SSMI outputs : %s\n", normalizePath(out_dir_ssmi)))
-cat("\nFiles generated per index × layer config × timescale:\n")
-cat("  • NetCDF per calendar month  (*_monthNN_Mon.nc)\n")
-cat("  • CSV    per calendar month  (*_monthNN_Mon.csv)\n")
-cat("  • Excel  workbook            (*_all_months.xlsx)\n")
-cat("  • Combined summary text      (*_all_timescales_summary.txt)\n")
+cat("\nFiles generated per index ?? layer config ?? timescale:\n")
+cat("  ??? NetCDF per calendar month  (*_monthNN_Mon.nc)\n")
+cat("  ??? CSV    per calendar month  (*_monthNN_Mon.csv)\n")
+cat("  ??? Excel  workbook            (*_all_months.xlsx)\n")
+cat("  ??? Combined summary text      (*_all_timescales_summary.txt)\n")
 cat("\nNaming convention:\n")
 cat("  {index}_{L1_3|L1_4}_{scale:02d}_month{m:02d}_{Mon}.{ext}\n")
 cat("  e.g.  ssi_L1_3_03_month07_Jul.nc\n")
 cat("        ssmi_L1_4_01_all_months.xlsx\n")
-cat("\n✓✓✓ READY FOR FURTHER CALCULATIONS ✓✓✓\n")
+cat("\n????????? READY FOR FURTHER CALCULATIONS ?????????\n")

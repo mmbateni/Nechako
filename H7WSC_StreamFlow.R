@@ -1,27 +1,43 @@
 # ============================================================================
-# NECHAKO STREAMFLOW RIVER BASIN — SSI DROUGHT ANALYSIS (PIPELINE B ONLY)
+# NECHAKO STREAMFLOW RIVER BASIN — SSI DROUGHT ANALYSIS
 # Since Nechako Reservoir levels capture wetness/drought conditions,
 # we use only streamflow data unaffected by dam regulation.
-# Pipeline A (Daily):   DISABLED — Variable threshold drought, Raut & Ganguli (2024)
 # Pipeline B (Monthly): Standardized Streamflow Index, Peña-Angulo et al. (2022)
+# Pipeline C (Monthly, Extended Network): Same as Pipeline B + 08JC001 & 08JC002
+#   (naturalized-flow stations: observed pre-regulation + naturalized post-regulation,
+#    pre-merged into single CSVs)
 #
 # Shared preprocessing:
 #   - Data loading & completeness check  (original year-span logic)
 #   - Gap filling: Fritsch-Carlson PCHIP, gaps > MAX_FILL_DAYS left as NA  
 #   - Hard exclusion gate for stations < 50% completeness                  
 #
-# Pipeline A (COMMENTED OUT):
-#   - Per-DOY variable threshold (Q20 = 80% exceedance probability)        
-#   - Daily drought event identification (min 30 days)
-#   - NA gap-days are silently treated as "not drought" in Pipeline A
-#
 # Pipeline B adds:
 #   - Daily → monthly mean aggregation
-#   - Best-fit distribution selection via L-moments (lmomco)
+#   - Best-fit distribution selection via L-moments (lmomco), fit SEPARATELY
+#     per calendar month (Jan..Dec each get their own candidate-distribution
+#     contest, own GPA disqualification check, own close-margin bootstrap,
+#     and own CDF) rather than pooling all months into one fit. This mirrors
+#     the seasonal/day-of-year conditioning used by the retired daily-threshold
+#     approach and matches standard SPI/SSI practice (McKee et al. 1993;
+#     Vicente-Serrano et al. 2012; Peña-Angulo et al. 2022) — a January flow
+#     is judged only against other Januaries, not pooled with June snowmelt.
+#     Requires >= MIN_YEARS_PER_MONTH observations of that specific calendar
+#     month; months that don't meet this are left as NA in the SSI series
+#     rather than borrowing strength from other months.
 #   - SSI calculation and drought identification (SSI < -0.50)
 #
 # check_data_completeness() uses the original month-span denominator.
-#       
+#
+# Pipeline C also adds:
+#   - Homogeneity screening (Pettitt test) on the annual-mean series of each
+#     naturalized-flow station (08JC001/08JC002), since the observed/
+#     naturalized splice is merged upstream of this script with no marker of
+#     where the transition occurs. A significant result flags that station's
+#     "single homogeneous record" assumption as questionable (see
+#     check_naturalized_homogeneity()); it does not auto-exclude the station,
+#     but the flag is carried through to the summary CSV, Excel workbook, and
+#     saved RDS objects so it isn't silently lost.
 # ============================================================================
 
 rm(list = ls())
@@ -36,10 +52,10 @@ if (file.exists("DROUGHT_ANALYSIS_utils.R")) {
 packages_needed <- c(
   # Shared / general
   "tidyverse", "lubridate", "zoo",
-  # Pipeline A (daily threshold) — DISABLED
-  # "circular", "MASS", "trend", "Kendall", "boot", "copula", "kde1d",
   # Pipeline B (SSI)
   "lmomco", "fitdistrplus",
+  # Pipeline C (naturalized-flow homogeneity screening)
+  "trend",
   # Additional outputs (from SWEI code)
   "writexl"
 )
@@ -65,16 +81,46 @@ stations <- data.frame(
   stringsAsFactors = FALSE
 )
 
+# ── Pipeline C additions: naturalized-flow Nechako mainstem stations ───────
+# 08JC001 / 08JC002 blend observed discharge (pre-regulation) with naturalized
+# (de-regulated) flow (post-regulation) into a single continuous record. The
+# blending was done upstream of this script; each station's CSV already
+# contains the merged series, with no marker of where the observed ->
+# naturalized transition occurs. StartYear/EndYear are left NA here and are
+# populated automatically from the data once loaded (see PROCESS ALL
+# STATIONS — PIPELINE C). Each of these two stations is screened for an
+# undocumented step-change at the (unknown) splice point using a Pettitt
+# test on its annual-mean series — see check_naturalized_homogeneity().
+stations_naturalized <- data.frame(
+  StationID   = c("08JC001", "08JC002"),
+  StationName = c("NECHAKO RIVER AT VANDERHOOF",
+                  "NECHAKO RIVER AT ISLE PIERRE"),
+  StartYear   = c(NA_real_, NA_real_),
+  EndYear     = c(NA_real_, NA_real_),
+  stringsAsFactors = FALSE
+)
+
+# Pipeline C station list = Pipeline B's 4 stations + the 2 naturalized ones
+stations_C <- rbind(stations, stations_naturalized)
+
 setwd("D:/Nechako_Drought/Nechako")
 
 INPUT_DATA_DIR  <- paste0("D:/Nechako_Drought/Nechako/Hydrology/",
                           "data_retrievalWaterSurveyofCanada/data_downloads_geomet_api")
 
-# Single unified output root — both pipelines write under their own subdirs
+# Naturalized flow files (dat_natural_08JC001.csv, dat_natural_08JC002.csv):
+# pre-regulation observed + post-regulation naturalized flow, pre-merged
+NATURALIZED_DATA_DIR <- paste0("D:/Nechako_Drought/Nechako/Hydrology/",
+                               "data_retrievalWaterSurveyofCanada/naturalized_flows")
+
+# Single unified output root — all pipelines write under their own subdirs
 MAIN_OUTPUT_DIR <- "streamflow_results"
 
 # STATION DISPLAY HELPER
-get_station_display <- function(station_id, stations_df = stations) {
+# Defaults to stations_C (superset of stations + naturalized-flow stations)
+# so 08JC001/08JC002 names resolve correctly wherever this is called without
+# an explicit stations_df argument.
+get_station_display <- function(station_id, stations_df = stations_C) {
   name <- stations_df$StationName[stations_df$StationID == station_id]
   if (length(name) == 0) name <- "UNKNOWN"
   return(paste0(station_id, " - ", name))
@@ -84,10 +130,10 @@ for (sub in c(
   "",
   "shared/processed_data",          # daily gap-filled data
   "shared/completeness",
-  # "daily/thresholds",             # Pipeline A — DISABLED
-  # "daily/drought_events",         # Pipeline A — DISABLED
   "ssi/monthly_data",               # Pipeline B
   "ssi/drought_events",
+  "ssi_C/monthly_data",              # Pipeline C (Pipeline B stations + naturalized flow stations)
+  "ssi_C/drought_events",
   "figures",
   "reports"
 )) {
@@ -170,21 +216,9 @@ create_excel_summary <- function(stations, completeness,
       stringsAsFactors = FALSE
     )
     
-    # Pipeline A stats — DISABLED
-    # if (comp$meets_threshold && !is.null(daily_droughts[[sid]]$drought_events)) {
-    #   ev_a <- daily_droughts[[sid]]$drought_events
-    #   base$A_Drought_Events      <- nrow(ev_a)
-    #   base$A_Total_Days          <- sum(ev_a$duration)
-    #   base$A_Avg_Duration_Days   <- if (nrow(ev_a) > 0) round(mean(ev_a$duration), 1) else NA_real_
-    # } else {
-    #   base$A_Drought_Events      <- NA_integer_
-    #   base$A_Total_Days          <- NA_integer_
-    #   base$A_Avg_Duration_Days   <- NA_real_
-    # }
-    
     # Pipeline B stats - ALWAYS add these columns (NA if excluded)
     if (comp$meets_threshold && !is.null(ssi_results[[sid]])) {
-      base$B_Best_Distribution <- ssi_results[[sid]]$best_distribution
+      base$B_Best_Distribution <- ssi_results[[sid]]$best_distribution_str
     } else {
       base$B_Best_Distribution <- NA_character_
     }
@@ -205,16 +239,6 @@ create_excel_summary <- function(stations, completeness,
     summary_rows[[sid]] <- base
   }
   excel_data[["01_Station_Summary"]] <- do.call(rbind, summary_rows)
-  
-  # Sheets for Pipeline A Drought Events — DISABLED
-  # for (sid in names(daily_droughts)) {
-  #   if (!is.null(daily_droughts[[sid]]$drought_events)) {
-  #     ev <- daily_droughts[[sid]]$drought_events
-  #     if (nrow(ev) > 0) {
-  #       excel_data[[paste0("A_", sid, "_Daily_Droughts")]] <- as.data.frame(ev)
-  #     }
-  #   }
-  # }
   
   # Sheets for Pipeline B Drought Events (one per included station)
   for (sid in names(ssi_droughts)) {
@@ -302,25 +326,12 @@ create_text_report <- function(stations, completeness,
         file = report_file, append = TRUE)
     
     if (comp$meets_threshold) {
-      # Pipeline A (Daily Threshold) — DISABLED
-      # if (!is.null(daily_droughts[[sid]]$drought_events)) {
-      #   ev_a <- daily_droughts[[sid]]$drought_events
-      #   cat(sprintf("\nPipeline A (Daily Threshold):\n"),
-      #       file = report_file, append = TRUE)
-      #   cat(sprintf("  Drought events: %d\n", nrow(ev_a)),
-      #       file = report_file, append = TRUE)
-      #   cat(sprintf("  Total drought days: %d\n", sum(ev_a$duration)),
-      #       file = report_file, append = TRUE)
-      #   cat(sprintf("  Average duration: %.1f days\n", mean(ev_a$duration)),
-      #       file = report_file, append = TRUE)
-      # }
-      
       if (!is.null(ssi_droughts[[sid]]$drought_events)) {
         ev_b <- ssi_droughts[[sid]]$drought_events
         cat(sprintf("\nPipeline B (Monthly SSI):\n"),
             file = report_file, append = TRUE)
-        cat(sprintf("  Best distribution: %s\n", 
-                    ssi_results[[sid]]$best_distribution),
+        cat(sprintf("  Best distribution (per calendar month): %s\n", 
+                    ssi_results[[sid]]$best_distribution_str),
             file = report_file, append = TRUE)
         cat(sprintf("  Drought events: %d\n", nrow(ev_b)),
             file = report_file, append = TRUE)
@@ -376,7 +387,14 @@ MAX_FILL_DAYS        <- 14   # PCHIP only for gaps ≤ 14 days (FIX 2)
 SSI_DROUGHT_THRESHOLD   <- if (exists("DROUGHT_ONSET")) DROUGHT_ONSET else -0.50
 SSI_RECOVERY_THRESHOLD  <- if (exists("DROUGHT_END")) DROUGHT_END else -0.50  
 DISTRIBUTIONS <- c("gev", "pe3", "lnorm", "glo", "gpareto", "weibull")
-MIN_MONTHS_FOR_FIT     <- 120      # minimum 10 years of monthly data
+MIN_MONTHS_FOR_FIT     <- 120      # overall sanity gate: minimum 10 years (120 months) of
+# monthly data total before attempting any per-month fitting
+MIN_YEARS_PER_MONTH    <- 10       # minimum years of THAT calendar month (e.g. # of Januaries)
+# required before fitting a distribution to it; per-month
+# analogue of the old (pooled) MIN_MONTHS_FOR_FIT
+
+# ── Pipeline C: naturalized-flow homogeneity screening ──────────────────
+HOMOGENEITY_ALPHA <- 0.05          # significance level for the Pettitt change-point test
 
 # ============================================================================
 # SECTION 4: DATA LOADING
@@ -388,7 +406,10 @@ load_discharge_data <- function(station_id, data_path = INPUT_DATA_DIR) {
     file.path(data_path, paste0(station_id, " discharge.csv")),
     file.path(data_path, paste0(station_id, ".csv")),
     file.path(data_path, paste0("WSC ", station_id, ".csv")),
-    file.path(data_path, paste0(station_id, "_WaterSurveyofCanada.csv"))
+    file.path(data_path, paste0(station_id, "_WaterSurveyofCanada.csv")),
+    # Pipeline C: naturalized-flow CSVs (pre-regulation observed +
+    # post-regulation naturalized, pre-merged), e.g. dat_natural_08JC001.csv
+    file.path(data_path, paste0("dat_natural_", station_id, ".csv"))
   )
   data <- NULL
   for (file_name in file_patterns) {
@@ -404,8 +425,22 @@ load_discharge_data <- function(station_id, data_path = INPUT_DATA_DIR) {
   }
   
   colnames(data) <- tolower(colnames(data))
+  
+  # Naturalized-flow exports (dat_natural_*.csv) are in long format:
+  # station, date, parameter, value, symbol — with multiple parameters
+  # potentially stacked in one file. Keep only the Flow rows before
+  # looking for the discharge column.
+  if ("parameter" %in% colnames(data)) {
+    data <- data[!is.na(data$parameter) & tolower(trimws(data$parameter)) == "flow", ]
+  }
+  
   date_col      <- grep("date",            colnames(data), value = TRUE, ignore.case = TRUE)
   discharge_col <- grep("discharge|flow|q_", colnames(data), value = TRUE, ignore.case = TRUE)
+  if (length(discharge_col) == 0) {
+    # Long-format naturalized flow files store discharge in a generic
+    # "value" column (paired with parameter == "Flow", filtered above)
+    discharge_col <- grep("^value$", colnames(data), value = TRUE, ignore.case = TRUE)
+  }
   if (length(date_col) == 0 | length(discharge_col) == 0) {
     stop(sprintf("Cannot find date/discharge columns for station %s", station_id))
   }
@@ -424,6 +459,15 @@ load_discharge_data <- function(station_id, data_path = INPUT_DATA_DIR) {
   return(data)
 }
 
+# Pipeline C: route the naturalized-flow stations (08JC001, 08JC002) to their
+# own folder; everything else uses the standard INPUT_DATA_DIR
+get_data_path_for_station <- function(station_id) {
+  if (station_id %in% c("08JC001", "08JC002")) {
+    return(NATURALIZED_DATA_DIR)
+  }
+  return(INPUT_DATA_DIR)
+}
+
 # ============================================================================
 # SECTION 5: DATA COMPLETENESS CHECK  (month-span denominator)
 #
@@ -436,7 +480,9 @@ load_discharge_data <- function(station_id, data_path = INPUT_DATA_DIR) {
 # ============================================================================
 check_data_completeness <- function(data, station_id) {
   display_name <- get_station_display(station_id)
-  name <- stations$StationName[stations$StationID == station_id]
+  # stations_C is a superset of stations (adds 08JC001/08JC002), so this
+  # resolves names correctly for both Pipeline B and Pipeline C stations
+  name <- stations_C$StationName[stations_C$StationID == station_id]
   if (length(name) == 0) name <- "UNKNOWN"
   
   if (is.null(data) || nrow(data) == 0) {
@@ -832,87 +878,60 @@ bootstrap_best_distribution <- function(flow_vals, distributions,
               boot_best  = boot_best))
 }
 
-calculate_ssi <- function(monthly_data, station_id = NULL) {
-  if (is.null(monthly_data) || nrow(monthly_data) < MIN_MONTHS_FOR_FIT) {
-    cat("  [Pipeline B] Insufficient monthly data for SSI (need >= 120 months)\n")
-    return(NULL)
-  }
+# ── Per-calendar-month distribution fit + CDF/SSI for ONE month's data ──────
+# Factored out of calculate_ssi() so the exact same candidate-selection logic
+# (L-moment distance contest, GPA disqualification, close-margin bootstrap,
+# CDF fit) that used to run once on the pooled series now runs once PER
+# calendar month, on that month's own flow values only.
+fit_month_distribution_and_ssi <- function(flow_vals_m, target_vals_m,
+                                           month_label, station_id) {
+  cat(sprintf("  -- Calendar month: %-3s (n = %d years) --\n", month_label, length(flow_vals_m)))
   
-  flow_vals <- monthly_data$discharge_mean
-  flow_vals <- flow_vals[flow_vals > 0 & !is.na(flow_vals)]
-  if (length(flow_vals) < MIN_MONTHS_FOR_FIT) {
-    cat("  [Pipeline B] Insufficient positive flow values for SSI\n")
-    return(NULL)
-  }
-  
-  cat("  [Pipeline B] Fitting distributions (L-moments criterion)...\n")
-  
-  # Fit all candidate distributions and compute L-moments distance
   dist_distances <- data.frame(
     distribution = DISTRIBUTIONS,
     distance     = vapply(DISTRIBUTIONS,
-                          function(d) calculate_lmoments_distance(flow_vals, d),
+                          function(d) calculate_lmoments_distance(flow_vals_m, d),
                           numeric(1)),
     stringsAsFactors = FALSE
   )
   for (i in seq_len(nrow(dist_distances))) {
-    cat(sprintf("    %-10s L-moments distance = %.6f\n",
+    cat(sprintf("      %-10s L-moments distance = %.6f\n",
                 dist_distances$distribution[i], dist_distances$distance[i]))
   }
   
   best_dist <- dist_distances$distribution[which.min(dist_distances$distance)]
-  cat(sprintf("  Best distribution: %s (distance = %.6f)\n",
+  cat(sprintf("    Best distribution: %s (distance = %.6f)\n",
               best_dist, min(dist_distances$distance, na.rm = TRUE)))
   
-  # ── Fix 2: GPA finite-upper-bound disqualification ──────────────────────────
-  # GPA with kappa > 0 has a hard ceiling at xi + alpha/kappa.  If that ceiling
-  # falls below the observed maximum flow, GPA assigns zero probability to flows
-  # that actually occurred — a mathematical impossibility.  Disqualify and
-  # promote the runner-up.  When kappa <= 0 the upper tail is unbounded (passes
-  # silently, as happened for 08JE001).
-  gpa_disqualified <- FALSE
+  # ── Fix 2: GPA finite-upper-bound disqualification (per month) ─────────────
+  gpa_disqualified     <- FALSE
+  dist_distances_valid <- dist_distances
   if (best_dist == "gpareto") {
-    par_gpa <- lmomco::pargpa(lmomco::lmoms(flow_vals, nmom = 4))
+    par_gpa <- lmomco::pargpa(lmomco::lmoms(flow_vals_m, nmom = 4))
     kappa   <- par_gpa$para["kappa"]
     if (!is.na(kappa) && kappa > 0) {
       upper_bound <- par_gpa$para["xi"] + par_gpa$para["alpha"] / kappa
-      if (upper_bound < max(flow_vals, na.rm = TRUE)) {
+      if (upper_bound < max(flow_vals_m, na.rm = TRUE)) {
         cat(sprintf(
-          "  [Pipeline B] GPA disqualified: fitted ceiling (%.2f m\u00b3/s) < observed max (%.2f m\u00b3/s). Promoting runner-up.\n",
-          upper_bound, max(flow_vals, na.rm = TRUE)))
+          "    [%s] GPA disqualified: fitted ceiling (%.2f m\u00b3/s) < observed max (%.2f m\u00b3/s). Promoting runner-up.\n",
+          month_label, upper_bound, max(flow_vals_m, na.rm = TRUE)))
         dist_distances_valid <- dist_distances[dist_distances$distribution != "gpareto", ]
         best_dist            <- dist_distances_valid$distribution[which.min(dist_distances_valid$distance)]
         gpa_disqualified     <- TRUE
-        cat(sprintf("  [Pipeline B] Runner-up selected: %s\n", best_dist))
+        cat(sprintf("    Runner-up selected: %s\n", best_dist))
       } else {
-        cat(sprintf("  [Pipeline B] GPA kappa > 0 but ceiling (%.2f) >= observed max (%.2f) — retained.\n",
-                    upper_bound, max(flow_vals, na.rm = TRUE)))
+        cat(sprintf("    GPA kappa > 0 but ceiling (%.2f) >= observed max (%.2f) — retained.\n",
+                    upper_bound, max(flow_vals_m, na.rm = TRUE)))
       }
     } else {
-      cat(sprintf("  [Pipeline B] GPA kappa = %.4f (unbounded upper tail) — no disqualification needed.\n",
+      cat(sprintf("    GPA kappa = %.4f (unbounded upper tail) — no disqualification needed.\n",
                   ifelse(is.na(kappa), NA_real_, kappa)))
     }
   }
   
-  # ── Fix 1 + Fix 3: Close-margin warning and conditional bootstrap ────────────
-  #
-  # Both checks operate on dist_eligible — the surviving candidates AFTER any
-  # GPA disqualification above.  This ensures the margin and runner-up reported
-  # always reflect the actual decision space, not the original full table.
-  #
-  # Bootstrap (Fix 3) is expensive (BOOT_REPS resamples × 6 fits each).  It is
-  # only triggered when the winning margin is below CLOSE_MARGIN_PCT, i.e. when
-  # the single-sample selection is genuinely uncertain.  When the winner is
-  # clear the check is skipped and boot_result is set to NULL.
-  # Use the filtered table when GPA was disqualified, the full table otherwise.
-  # This ensures margin and bootstrap always reflect the actual candidate pool.
-  dist_eligible <- if (gpa_disqualified) {
-    dist_distances_valid[is.finite(dist_distances_valid$distance), ]
-  } else {
-    dist_distances[is.finite(dist_distances$distance), ]
-  }
-  
-  boot_result <- NULL
+  # ── Fix 1 + Fix 3: close-margin warning and conditional bootstrap (per month) ──
+  dist_eligible <- dist_distances_valid[is.finite(dist_distances_valid$distance), ]
+  boot_result   <- NULL
   
   if (nrow(dist_eligible) >= 2) {
     sorted_eligible <- dist_eligible[order(dist_eligible$distance), ]
@@ -921,74 +940,130 @@ calculate_ssi <- function(monthly_data, station_id = NULL) {
     runner_up       <- sorted_eligible$distribution[2]
     
     if (margin_pct < CLOSE_MARGIN_PCT) {
-      # ── Fix 1: warn ─────────────────────────────────────────────────────────
       warning(sprintf(
-        "[Pipeline B] UNSTABLE SELECTION for station %s: '%s' wins by only %.1f%% over '%s' — running bootstrap.",
+        "[Pipeline B] UNSTABLE SELECTION for station %s, month %s: '%s' wins by only %.1f%% over '%s' — running bootstrap.",
         ifelse(is.null(station_id), "unknown", station_id),
-        best_dist, margin_pct, runner_up))
+        month_label, best_dist, margin_pct, runner_up))
       
-      # ── Fix 3: bootstrap (only when margin is narrow) ───────────────────────
-      cat(sprintf("  [Pipeline B] Close margin (%.1f%% < %.0f%%) — running bootstrap (B = %d)...\n",
+      cat(sprintf("    Close margin (%.1f%% < %.0f%%) — running bootstrap (B = %d)...\n",
                   margin_pct, CLOSE_MARGIN_PCT, BOOT_REPS))
       boot_result <- tryCatch(
-        bootstrap_best_distribution(flow_vals, sorted_eligible$distribution),
+        bootstrap_best_distribution(flow_vals_m, sorted_eligible$distribution),
         error = function(e) {
-          cat(sprintf("  [Pipeline B] Bootstrap failed: %s\n", e$message))
+          cat(sprintf("    Bootstrap failed: %s\n", e$message))
           NULL
         }
       )
       if (!is.null(boot_result) && boot_result$boot_best != best_dist) {
         warning(sprintf(
-          "[Pipeline B] Bootstrap plurality ('%s', %.0f%%) DIFFERS from single-sample winner ('%s') for station %s. Consider overriding.",
-          boot_result$boot_best,
-          boot_result$win_pct[boot_result$boot_best],
-          best_dist,
-          ifelse(is.null(station_id), "unknown", station_id)))
+          "[Pipeline B] Bootstrap plurality ('%s', %.0f%%) DIFFERS from single-sample winner ('%s') for station %s month %s. Consider overriding.",
+          boot_result$boot_best, boot_result$win_pct[boot_result$boot_best],
+          best_dist, ifelse(is.null(station_id), "unknown", station_id), month_label))
       } else if (!is.null(boot_result)) {
-        cat(sprintf("  [Pipeline B] Bootstrap confirms '%s' as plurality winner (%.0f%% of draws).\n",
-                    boot_result$boot_best,
-                    boot_result$win_pct[boot_result$boot_best]))
+        cat(sprintf("    Bootstrap confirms '%s' as plurality winner (%.0f%% of draws).\n",
+                    boot_result$boot_best, boot_result$win_pct[boot_result$boot_best]))
       }
     } else {
-      cat(sprintf("  [Pipeline B] Margin clear (%.1f%% >= %.0f%%) — bootstrap not needed.\n",
+      cat(sprintf("    Margin clear (%.1f%% >= %.0f%%) — bootstrap not needed.\n",
                   margin_pct, CLOSE_MARGIN_PCT))
     }
   }
   
-  # ── CDF fit and SSI transformation ──────────────────────────────────────────
-  tryCatch({
-    lmom_sample <- lmomco::lmoms(flow_vals, nmom = 4)
+  # ── CDF fit and SSI transformation, using ONLY this month's L-moments ──────
+  ssi_out <- tryCatch({
+    lmom_sample_m <- lmomco::lmoms(flow_vals_m, nmom = 4)
     
     cdf_fn <- switch(best_dist,
-                     gev     = function(x) lmomco::cdfgev(x, lmomco::pargev(lmom_sample)),
-                     lnorm   = function(x) lmomco::cdfln3(x, lmomco::parln3(lmom_sample)),
-                     weibull = function(x) lmomco::cdfwei(x, lmomco::parwei(lmom_sample)),
-                     gpareto = function(x) lmomco::cdfgpa(x, lmomco::pargpa(lmom_sample)),
-                     glo     = function(x) lmomco::cdfglo(x, lmomco::parglo(lmom_sample)),
-                     pe3     = function(x) lmomco::cdfpe3(x, lmomco::parpe3(lmom_sample))
+                     gev     = function(x) lmomco::cdfgev(x, lmomco::pargev(lmom_sample_m)),
+                     lnorm   = function(x) lmomco::cdfln3(x, lmomco::parln3(lmom_sample_m)),
+                     weibull = function(x) lmomco::cdfwei(x, lmomco::parwei(lmom_sample_m)),
+                     gpareto = function(x) lmomco::cdfgpa(x, lmomco::pargpa(lmom_sample_m)),
+                     glo     = function(x) lmomco::cdfglo(x, lmomco::parglo(lmom_sample_m)),
+                     pe3     = function(x) lmomco::cdfpe3(x, lmomco::parpe3(lmom_sample_m))
     )
     
-    # Compute CDF values then transform to standard normal (SSI)
-    p_vals <- cdf_fn(monthly_data$discharge_mean)
-    # Clamp to avoid Inf at exact 0 or 1
+    p_vals <- cdf_fn(target_vals_m)
     p_vals <- pmax(1e-6, pmin(1 - 1e-6, p_vals))
-    monthly_data$ssi               <- qnorm(p_vals)
-    monthly_data$best_distribution <- best_dist
-    
-    cat(sprintf("  [Pipeline B] SSI calculated for %d months\n",
-                sum(!is.na(monthly_data$ssi))))
-    
-    return(list(
-      monthly_data      = monthly_data,
-      best_distribution = best_dist,
-      dist_distances    = dist_distances,
-      boot_result       = boot_result    # NULL if bootstrap failed
-    ))
-    
+    qnorm(p_vals)
   }, error = function(e) {
-    cat(sprintf("  [Pipeline B] SSI calculation error: %s\n", e$message))
-    return(NULL)
+    cat(sprintf("    SSI calculation error for %s: %s\n", month_label, e$message))
+    rep(NA_real_, length(target_vals_m))
   })
+  
+  dist_distances$month       <- month_label
+  
+  list(ssi = ssi_out, best_dist = best_dist,
+       dist_distances = dist_distances, boot_result = boot_result)
+}
+
+calculate_ssi <- function(monthly_data, station_id = NULL) {
+  if (is.null(monthly_data) || nrow(monthly_data) < MIN_MONTHS_FOR_FIT) {
+    cat(sprintf("  [Pipeline B] Insufficient monthly data for SSI (need >= %d months total)\n",
+                MIN_MONTHS_FOR_FIT))
+    return(NULL)
+  }
+  
+  cat(sprintf("  [Pipeline B] Fitting distributions SEPARATELY per calendar month (L-moments criterion, need >= %d years/month)...\n",
+              MIN_YEARS_PER_MONTH))
+  
+  monthly_data$ssi          <- NA_real_
+  monthly_data$distribution <- NA_character_
+  
+  dist_distances_all         <- list()
+  best_distribution_by_month <- setNames(rep(NA_character_, 12), month.abb)
+  boot_results_by_month      <- list()
+  
+  for (m in 1:12) {
+    month_label <- month.abb[m]
+    idx_m       <- which(monthly_data$month == m)
+    
+    flow_all_m  <- monthly_data$discharge_mean[idx_m]
+    flow_vals_m <- flow_all_m[flow_all_m > 0 & !is.na(flow_all_m)]
+    
+    if (length(flow_vals_m) < MIN_YEARS_PER_MONTH) {
+      cat(sprintf("    [%s] Insufficient data (%d years < %d required) — SSI left as NA for this month\n",
+                  month_label, length(flow_vals_m), MIN_YEARS_PER_MONTH))
+      next
+    }
+    
+    fit <- fit_month_distribution_and_ssi(
+      flow_vals_m   = flow_vals_m,
+      target_vals_m = monthly_data$discharge_mean[idx_m],
+      month_label   = month_label,
+      station_id    = station_id
+    )
+    
+    monthly_data$ssi[idx_m]          <- fit$ssi
+    monthly_data$distribution[idx_m] <- fit$best_dist
+    
+    best_distribution_by_month[m]        <- fit$best_dist
+    dist_distances_all[[month_label]]    <- fit$dist_distances
+    if (!is.null(fit$boot_result)) boot_results_by_month[[month_label]] <- fit$boot_result
+  }
+  
+  n_ssi <- sum(!is.na(monthly_data$ssi))
+  cat(sprintf("  [Pipeline B] SSI calculated for %d / %d months (fit separately per calendar month)\n",
+              n_ssi, nrow(monthly_data)))
+  
+  if (n_ssi == 0) {
+    cat("  [Pipeline B] No calendar month had sufficient data for a per-month distribution fit — SSI unavailable\n")
+    return(NULL)
+  }
+  
+  dist_distances_combined <- do.call(rbind, dist_distances_all)
+  rownames(dist_distances_combined) <- NULL
+  
+  fitted_months <- names(best_distribution_by_month)[!is.na(best_distribution_by_month)]
+  best_dist_str <- paste(sprintf("%s=%s", fitted_months, best_distribution_by_month[fitted_months]),
+                         collapse = ", ")
+  
+  return(list(
+    monthly_data          = monthly_data,
+    best_distribution     = best_distribution_by_month,  # named-by-month, e.g. best_distribution["Jan"]
+    best_distribution_str = best_dist_str,                # compact scalar summary for reports/Excel
+    dist_distances         = dist_distances_combined,     # one block of 6 rows per fitted month, tagged by $month
+    boot_result             = boot_results_by_month        # list keyed by month, only for months that triggered bootstrap
+  ))
 }
 
 # ============================================================================
@@ -1026,7 +1101,8 @@ identify_ssi_droughts <- function(ssi_result,
     }
     data$event_id <- NA_integer_
     return(list(monthly_data=data, drought_events=event_info, n_events=0L,
-                total_drought_months=0L, best_distribution=ssi_result$best_distribution, message="Success"))
+                total_drought_months=0L, best_distribution=ssi_result$best_distribution,
+                best_distribution_str=ssi_result$best_distribution_str, message="Success"))
   }
   
   # 2. Map events back to calculate H7WSC-specific numeric severity (deficit)
@@ -1060,7 +1136,11 @@ identify_ssi_droughts <- function(ssi_result,
   
   if (!is.null(station_id)) {
     event_info$station_id <- station_id
-    event_info$distribution <- ssi_result$best_distribution
+    # Each event is tagged with the distribution fitted for ITS OWN onset
+    # calendar month (per-month fitting means this can legitimately differ
+    # event to event, e.g. a winter-onset drought uses the January/February
+    # fit, a summer-onset drought uses the June/July fit).
+    event_info$distribution <- ssi_result$best_distribution[event_info$start_month]
   }
   
   # Re-map event_id to sequential IDs for downstream consistency
@@ -1073,12 +1153,13 @@ identify_ssi_droughts <- function(ssi_result,
               nrow(event_info), drought_threshold, recovery_threshold))
   
   return(list(
-    monthly_data         = data,
-    drought_events       = event_info,
-    n_events             = nrow(event_info),
-    total_drought_months = sum(event_info$duration_months),
-    best_distribution    = ssi_result$best_distribution,
-    message              = "Success"
+    monthly_data           = data,
+    drought_events         = event_info,
+    n_events               = nrow(event_info),
+    total_drought_months   = sum(event_info$duration_months),
+    best_distribution      = ssi_result$best_distribution,
+    best_distribution_str  = ssi_result$best_distribution_str,
+    message                = "Success"
   ))
 }
 
@@ -1161,6 +1242,198 @@ for (i in 1:nrow(stations)) {
 }
 
 # ============================================================================
+# SECTION 11b: PIPELINE C — NATURALIZED-FLOW HOMOGENEITY CHECK (Pettitt test)
+#
+# 08JC001/08JC002 blend *observed* pre-regulation flow with *naturalized*
+# post-regulation flow into one continuous CSV upstream of this script, with
+# NO marker in the file for where that splice occurs. Feeding a series with
+# an undocumented step-change into distribution fitting / SSI as if it were
+# a single homogeneous record can bias both the fitted distribution and any
+# drought events whose window straddles the transition.
+#
+# This screens each naturalized station's ANNUAL MEAN discharge series
+# (annual, rather than daily/monthly, to reduce autocorrelation/noise) with
+# the nonparametric Pettitt test (Pettitt, 1979) — the standard tool for
+# detecting a single unknown change-point in a hydrological record, and the
+# specific test named for exactly this observed/naturalized-splice situation.
+#
+# A significant result (p < HOMOGENEITY_ALPHA) does NOT auto-exclude the
+# station — naturalization is still the best available option for using
+# regulated mainstem stations at all — but it is surfaced to the analyst via
+# a warning(), printed diagnostics, and carried through into the saved RDS
+# objects, the Pipeline C summary CSV, and the Excel/text reports, rather
+# than silently assumed away.
+# ============================================================================
+check_naturalized_homogeneity <- function(daily_data, station_id) {
+  display_name <- get_station_display(station_id)
+  
+  if (is.null(daily_data) || nrow(daily_data) == 0) {
+    return(list(station_id = station_id, tested = FALSE, message = "No data available"))
+  }
+  
+  annual <- daily_data %>%
+    dplyr::group_by(year) %>%
+    dplyr::summarise(discharge_mean = mean(discharge, na.rm = TRUE),
+                     n_days = sum(!is.na(discharge)), .groups = "drop") %>%
+    dplyr::filter(n_days >= 300) %>%      # require near-complete years only
+    dplyr::arrange(year)
+  
+  if (nrow(annual) < 10) {
+    cat(sprintf("  [Pipeline C] Homogeneity check skipped for %s: insufficient near-complete annual data (%d years < 10)\n",
+                display_name, nrow(annual)))
+    return(list(station_id = station_id, tested = FALSE, message = "Insufficient annual data"))
+  }
+  if (!requireNamespace("trend", quietly = TRUE)) {
+    cat(sprintf("  [Pipeline C] Homogeneity check skipped for %s: 'trend' package unavailable\n", display_name))
+    return(list(station_id = station_id, tested = FALSE, message = "'trend' package unavailable"))
+  }
+  
+  pettitt_result <- tryCatch(trend::pettitt.test(annual$discharge_mean), error = function(e) NULL)
+  if (is.null(pettitt_result)) {
+    cat(sprintf("  [Pipeline C] Homogeneity check FAILED for %s\n", display_name))
+    return(list(station_id = station_id, tested = FALSE, message = "Pettitt test failed"))
+  }
+  
+  change_idx  <- pettitt_result$estimate[1]
+  change_year <- annual$year[change_idx]
+  p_value     <- pettitt_result$p.value
+  significant <- !is.na(p_value) && p_value < HOMOGENEITY_ALPHA
+  
+  if (change_idx >= 1 && change_idx < nrow(annual)) {
+    mean_before <- mean(annual$discharge_mean[seq_len(change_idx)], na.rm = TRUE)
+    mean_after  <- mean(annual$discharge_mean[(change_idx + 1):nrow(annual)], na.rm = TRUE)
+    pct_shift   <- (mean_after - mean_before) / mean_before * 100
+  } else {
+    # Change-point estimate landed on the series boundary — can't split into
+    # two non-empty segments, so report NA rather than a nonsensical shift
+    mean_before <- NA_real_
+    mean_after  <- NA_real_
+    pct_shift   <- NA_real_
+  }
+  
+  cat(sprintf("\n  [Pipeline C] Homogeneity check (Pettitt test) — %s:\n", display_name))
+  cat(sprintf("    Annual series: %d years (%d-%d)\n", nrow(annual), min(annual$year), max(annual$year)))
+  cat(sprintf("    Most likely change-point: %d  (K = %.0f, p = %.4f)\n",
+              change_year, pettitt_result$statistic, p_value))
+  cat(sprintf("    Mean before: %.2f m3/s | Mean after: %.2f m3/s | Shift: %+.1f%%\n",
+              mean_before, mean_after, pct_shift))
+  
+  if (significant) {
+    warning(sprintf(
+      "[Pipeline C] INHOMOGENEITY DETECTED for %s: Pettitt test finds a significant step-change around %d (p = %.4f, mean shift %+.1f%%). The observed/naturalized splice for this station may not be a single homogeneous series -- interpret its distribution fit and SSI drought events with caution.",
+      display_name, change_year, p_value, pct_shift))
+    cat(sprintf("    -> FLAGGED: p < %.2f — series is NOT homogeneous at the %.0f%% confidence level.\n",
+                HOMOGENEITY_ALPHA, (1 - HOMOGENEITY_ALPHA) * 100))
+  } else {
+    cat(sprintf("    -> No significant inhomogeneity detected (p >= %.2f).\n", HOMOGENEITY_ALPHA))
+  }
+  
+  return(list(
+    station_id  = station_id,
+    tested      = TRUE,
+    n_years     = nrow(annual),
+    change_year = change_year,
+    statistic   = as.numeric(pettitt_result$statistic),
+    p_value     = p_value,
+    significant = significant,
+    mean_before = mean_before,
+    mean_after  = mean_after,
+    pct_shift   = pct_shift,
+    alpha       = HOMOGENEITY_ALPHA,
+    message     = "Success"
+  ))
+}
+
+# ============================================================================
+# SECTION 12b: PROCESS ALL STATIONS — PIPELINE C
+#
+# Pipeline C is methodologically identical to Pipeline B (same SSI approach,
+# same shared preprocessing steps 1-6) but runs on an extended 6-station
+# network: the original 4 Pipeline B stations PLUS two naturalized-flow
+# Nechako mainstem stations:
+#   08JC001 — Nechako at Vanderhoof
+#   08JC002 — Nechako at Isle Pierre
+# For these two, each station's CSV already blends observed discharge
+# (pre-regulation period) with naturalized/de-regulated flow (post-regulation
+# period) into one continuous record, loaded from NATURALIZED_DATA_DIR. Each
+# of these two is additionally screened for an undocumented step-change at
+# the (unknown) splice point — see SECTION 11b above.
+# ============================================================================
+
+all_processed_data_C <- list()   # gap-filled daily data (Pipeline C)
+all_completeness_C   <- list()   # completeness check results (Pipeline C)
+all_ssi_results_C    <- list()   # Pipeline C SSI results
+all_ssi_droughts_C   <- list()   # Pipeline C SSI drought events
+all_homogeneity_C    <- list()   # Pipeline C naturalized-flow homogeneity screening (08JC001/08JC002 only)
+
+for (i in 1:nrow(stations_C)) {
+  station_id   <- stations_C$StationID[i]
+  station_name <- stations_C$StationName[i]
+  display_name <- paste0(station_id, " - ", station_name)
+  data_path    <- get_data_path_for_station(station_id)
+  
+  cat(sprintf("\n%s\n", strrep("=", 60)))
+  cat(sprintf("[PIPELINE C] PROCESSING STATION %d/%d: %s\n", i, nrow(stations_C), display_name))
+  cat(sprintf("%s\n", strrep("=", 60)))
+  
+  # ── [1/6] Load ─────────────────────────────────────────────────────────────
+  cat(sprintf("\n[1/6] Loading discharge data (source: %s)...\n", data_path))
+  raw_data <- load_discharge_data(station_id, data_path = data_path)
+  if (is.null(raw_data)) {
+    cat(sprintf("  SKIPPED: no data file found for %s [%s]\n", station_id, display_name))
+    next
+  }
+  
+  # Fill in StartYear/EndYear for the naturalized stations now that the data
+  # has been loaded (metadata was left NA for these two in stations_naturalized)
+  stations_C$StartYear[stations_C$StationID == station_id] <- min(raw_data$year)
+  stations_C$EndYear[stations_C$StationID == station_id]   <- max(raw_data$year)
+  
+  # ── [2/6] Completeness check ────────────────────────────────────────────────
+  cat("\n[2/6] Checking data completeness...\n")
+  completeness <- check_data_completeness(raw_data, station_id)
+  all_completeness_C[[station_id]] <- completeness
+  
+  if (!completeness$meets_threshold) {             # hard exclusion gate
+    cat(sprintf("  SKIPPED: %.2f%% < %.0f%% completeness threshold\n",
+                completeness$completeness, MIN_COMPLETENESS_PCT))
+    next
+  }
+  
+  # ── [3/6] Gap fill (shared) ─────────────────────────────────────────────────
+  cat(sprintf("\n[3/6] Filling gaps (Fritsch-Carlson PCHIP, max gap = %d days)...\n",
+              MAX_FILL_DAYS))
+  data_filled <- fill_missing_data(raw_data)
+  all_processed_data_C[[station_id]] <- data_filled
+  
+  # ── [3b/6] Homogeneity check (naturalized-flow stations only) ──────────────
+  if (station_id %in% c("08JC001", "08JC002")) {
+    homogeneity <- check_naturalized_homogeneity(data_filled, station_id)
+    all_homogeneity_C[[station_id]] <- homogeneity
+  }
+  
+  # ── [4/6] Aggregate to monthly ─────────────────────────────────────────────
+  cat("\n[4/6] Pipeline C — aggregating to monthly...\n")
+  monthly_data <- aggregate_to_monthly(data_filled)
+  
+  # ── [5/6] SSI calculation ─────────────────────────────────────────────────
+  cat("\n[5/6] Pipeline C — fitting distributions & calculating SSI...\n")
+  ssi_result <- calculate_ssi(monthly_data, station_id = station_id)
+  if (!is.null(ssi_result)) {
+    all_ssi_results_C[[station_id]] <- ssi_result
+    
+    # ── [6/6] SSI drought identification ─────────────────────────────────────
+    cat("\n[6/6] Pipeline C — identifying SSI drought events (SSI < -0.50)...\n")
+    ssi_droughts <- identify_ssi_droughts(ssi_result, station_id = station_id)
+    all_ssi_droughts_C[[station_id]] <- ssi_droughts
+  } else {
+    cat("  [Pipeline C] SSI skipped — insufficient monthly data\n")
+  }
+  
+  cat(sprintf("\n  [Pipeline C] Station %s complete.\n", station_id))
+}
+
+# ============================================================================
 # SECTION 13: SAVE RESULTS
 # ============================================================================
 cat(sprintf("\n%s\nSAVING RESULTS...\n%s\n", strrep("=", 60), strrep("=", 60)))
@@ -1193,6 +1466,61 @@ saveRDS(all_ssi_results,
 saveRDS(all_ssi_droughts,
         file.path(MAIN_OUTPUT_DIR, "ssi", "drought_events", "ssi_droughts_all.rds"))
 cat("  Pipeline B (SSI monthly) outputs saved\n")
+
+# Pipeline C (Pipeline B's 4 stations + 08JC001, 08JC002 naturalized flow)
+for (sid in names(all_processed_data_C)) {
+  saveRDS(all_processed_data_C[[sid]],
+          file.path(MAIN_OUTPUT_DIR, "shared", "processed_data",
+                    paste0(sid, "_pipelineC_daily_filled.rds")))
+}
+for (sid in names(all_ssi_results_C)) {
+  saveRDS(all_ssi_results_C[[sid]]$monthly_data,
+          file.path(MAIN_OUTPUT_DIR, "ssi_C", "monthly_data",
+                    paste0(sid, "_monthly_ssi.rds")))
+}
+saveRDS(all_ssi_results_C,
+        file.path(MAIN_OUTPUT_DIR, "ssi_C", "drought_events", "ssi_results_all.rds"))
+saveRDS(all_ssi_droughts_C,
+        file.path(MAIN_OUTPUT_DIR, "ssi_C", "drought_events", "ssi_droughts_all.rds"))
+saveRDS(stations_C,
+        file.path(MAIN_OUTPUT_DIR, "shared", "stations_metadata_pipelineC.rds"))
+saveRDS(all_homogeneity_C,
+        file.path(MAIN_OUTPUT_DIR, "ssi_C", "naturalized_homogeneity_check.rds"))
+cat("  Pipeline C (SSI monthly, extended network) outputs saved\n")
+cat("  Pipeline C naturalized-flow homogeneity check saved\n")
+
+all_results_C <- list(
+  stations           = stations_C,
+  completeness       = all_completeness_C,
+  processed_data     = all_processed_data_C,
+  ssi_results        = all_ssi_results_C,
+  ssi_droughts       = all_ssi_droughts_C,
+  homogeneity_check  = all_homogeneity_C,
+  metadata = list(
+    input_data_dir            = INPUT_DATA_DIR,
+    naturalized_data_dir      = NATURALIZED_DATA_DIR,
+    output_dir                = MAIN_OUTPUT_DIR,
+    completeness_denominator  = "month_span (first_day_of_first_month to last_day_of_last_month)",
+    min_completeness_pct      = MIN_COMPLETENESS_PCT,
+    max_fill_days             = MAX_FILL_DAYS,
+    interpolation_method      = "monoH.FC (Fritsch-Carlson PCHIP)",
+    pipeline_c                = "Peña-Angulo et al. (2022) SSI monthly, extended 6-station network",
+    naturalized_stations      = c("08JC001", "08JC002"),
+    naturalized_note          = "08JC001/08JC002: observed discharge (pre-regulation) blended with naturalized flow (post-regulation), pre-merged into a single CSV per station",
+    homogeneity_test          = "Pettitt test (trend::pettitt.test) on annual-mean discharge, alpha = HOMOGENEITY_ALPHA; see all_homogeneity_C / homogeneity_check for per-station results",
+    homogeneity_alpha         = HOMOGENEITY_ALPHA,
+    ssi_drought_threshold     = SSI_DROUGHT_THRESHOLD,
+    ssi_recovery_threshold    = SSI_RECOVERY_THRESHOLD,
+    distributions_tested      = DISTRIBUTIONS,
+    distribution_selection    = "minimum L-moments Euclidean distance (lmomco)",
+    min_months_for_fit        = MIN_MONTHS_FOR_FIT,
+    min_drought_duration_months = 1L,
+    processed_date            = Sys.Date(),
+    script_version             = "4.0_merged_dual_pipeline_plus_pipelineC"
+  )
+)
+saveRDS(all_results_C, file.path(MAIN_OUTPUT_DIR, "all_results_pipeline_C.rds"))
+cat("  Master file saved: all_results_pipeline_C.rds\n")
 
 # Master combined file
 all_results <- list(
@@ -1296,7 +1624,7 @@ for (sid in names(all_completeness)) {
     # Pipeline B stats
     ev_b <- all_ssi_droughts[[sid]]$drought_events
     base$B_Best_Distribution    <- if (!is.null(all_ssi_results[[sid]]))
-      all_ssi_results[[sid]]$best_distribution else NA_character_
+      all_ssi_results[[sid]]$best_distribution_str else NA_character_
     base$B_Drought_Events       <- if (!is.null(ev_b)) nrow(ev_b)                     else NA_integer_
     base$B_Total_Months         <- if (!is.null(ev_b)) sum(ev_b$duration_months)      else NA_integer_
     base$B_Avg_Duration_Months  <- if (!is.null(ev_b) && nrow(ev_b) > 0)
@@ -1313,14 +1641,81 @@ write.csv(summary_table,
           row.names = FALSE)
 print(summary_table, row.names = FALSE)
 
+# ============================================================================
+# SECTION 14b: PIPELINE C SUMMARY (Pipeline B stations + naturalized flow)
+# ============================================================================
+cat(sprintf("\n%s\nPIPELINE C SUMMARY (Extended Network: 4 Pipeline B stations + 08JC001, 08JC002)\n%s\n\n",
+            strrep("=", 60), strrep("=", 60)))
+
+summary_rows_C <- list()
+for (sid in names(all_completeness_C)) {
+  comp <- all_completeness_C[[sid]]
+  sname <- if (!is.null(comp$station_name)) comp$station_name else "UNKNOWN"
+  base <- data.frame(
+    StationID        = sid,
+    StationName      = sname,
+    StationDisplay   = paste0(sid, " - ", sname),
+    Period           = sprintf("%d-%d", comp$start_year, comp$end_year),
+    Completeness_pct = round(comp$completeness, 1),
+    Status           = ifelse(comp$meets_threshold, "INCLUDED", "EXCLUDED"),
+    DataSource       = ifelse(sid %in% c("08JC001", "08JC002"),
+                              "Naturalized (pre-reg observed + post-reg naturalized)",
+                              "Observed"),
+    stringsAsFactors = FALSE
+  )
+  if (!comp$meets_threshold) {
+    base$Best_Distribution   <- NA_character_
+    base$Drought_Events      <- NA_integer_
+    base$Total_Months        <- NA_integer_
+    base$Avg_Duration_Months <- NA_real_
+    base$Avg_Severity        <- NA_real_
+  } else {
+    ev_c <- all_ssi_droughts_C[[sid]]$drought_events
+    base$Best_Distribution   <- if (!is.null(all_ssi_results_C[[sid]]))
+      all_ssi_results_C[[sid]]$best_distribution_str else NA_character_
+    base$Drought_Events      <- if (!is.null(ev_c)) nrow(ev_c)                else NA_integer_
+    base$Total_Months        <- if (!is.null(ev_c)) sum(ev_c$duration_months) else NA_integer_
+    base$Avg_Duration_Months <- if (!is.null(ev_c) && nrow(ev_c) > 0)
+      round(mean(ev_c$duration_months), 1) else NA_real_
+    base$Avg_Severity        <- if (!is.null(ev_c) && nrow(ev_c) > 0)
+      round(mean(ev_c$severity), 2) else NA_real_
+  }
+  
+  # Naturalized-flow homogeneity screening (08JC001/08JC002 only; NA for
+  # observed-only stations since the Pettitt splice check doesn't apply)
+  hg <- all_homogeneity_C[[sid]]
+  if (!is.null(hg) && isTRUE(hg$tested)) {
+    base$Homogeneity_ChangeYear <- hg$change_year
+    base$Homogeneity_PValue     <- round(hg$p_value, 4)
+    base$Homogeneity_Flag       <- ifelse(hg$significant, "INHOMOGENEOUS", "homogeneous")
+  } else {
+    base$Homogeneity_ChangeYear <- NA_integer_
+    base$Homogeneity_PValue     <- NA_real_
+    base$Homogeneity_Flag       <- NA_character_
+  }
+  
+  summary_rows_C[[sid]] <- base
+}
+
+summary_table_C <- do.call(rbind, summary_rows_C)
+write.csv(summary_table_C,
+          file.path(MAIN_OUTPUT_DIR, "reports", "station_summary_pipeline_C.csv"),
+          row.names = FALSE)
+print(summary_table_C, row.names = FALSE)
+
 cat("\nOutputs written to: ", MAIN_OUTPUT_DIR, "/\n")
-cat("  shared/processed_data/            — gap-filled daily data\n")
+cat("  shared/processed_data/            — gap-filled daily data (Pipeline B + Pipeline C)\n")
 # cat("  daily/thresholds/                 — Pipeline A: Q20 variable thresholds\n")   # DISABLED
 # cat("  daily/drought_events/             — Pipeline A: daily drought events\n")       # DISABLED
-cat("  ssi/monthly_data/                 — Pipeline B: monthly SSI time series\n")
+cat("  ssi/monthly_data/                 — Pipeline B: monthly SSI time series (4 stations)\n")
 cat("  ssi/drought_events/               — Pipeline B: SSI drought events\n")
+cat("  ssi_C/monthly_data/               — Pipeline C: monthly SSI time series (6 stations)\n")
+cat("  ssi_C/naturalized_homogeneity_check.rds — Pipeline C: Pettitt-test homogeneity screening (08JC001, 08JC002)\n")
+cat("  ssi_C/drought_events/             — Pipeline C: SSI drought events\n")
 cat("  figures/                          — station_completeness_barplot.png\n")
 cat("  reports/                          — station_summary_dual_pipeline.csv\n")
+cat("                                    — station_summary_pipeline_C.csv\n")
 cat("                                    — nechako_streamflow_drought_summary.xlsx\n")
 cat("                                    — nechako_streamflow_drought_report.txt\n")
-cat("  all_results_dual_pipeline.rds     — master combined file\n")
+cat("  all_results_dual_pipeline.rds     — Pipeline A/B master combined file\n")
+cat("  all_results_pipeline_C.rds        — Pipeline C master combined file (6 stations)\n")

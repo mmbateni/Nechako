@@ -2,34 +2,133 @@
 # SURFACE-WATER SUPPLY INDEX (SWSI) — NECHAKO BASIN
 # DUAL-TRACK IMPLEMENTATION  |  Garen (1993) Revised — Z-score formulation
 #
+# PURPOSE
+#   Computes two parallel monthly drought indices for the Nechako River
+#   basin (central BC, Canada), a system regulated since 1952 by the
+#   Kenney Dam / Kemano inter-basin diversion. Because regulation
+#   decouples downstream flow from natural supply, a single SWSI cannot
+#   answer both "how dry is the climate?" and "how stressed is the
+#   managed system?" — hence the two-track design below. Both tracks
+#   share the same Garen (1993) Z-score machinery but differ in which
+#   stations/baselines feed it, so they are not directly comparable in
+#   absolute terms; they are meant to be read side by side.
+#
 # ┌──────────────────────────────────────────────────────────────────────────┐
 # │ TRACK 1 — H-SWSI  Hydrological Drought Index                            │
-# │   Objective : Isolate climate-driven anomalies (unregulated basin)       │
-# │   Baseline  : Pre-regulation naturalized record (pre-1952 preferred)     │
-# │   Components: Qnat · LakeStorage · Precipitation · SWE                  │
-# │   Weights   : Equal (0.25 each) or proportional to hydroclimate input   │
+# │   Objective : Isolate climate-driven anomalies, as if the basin were    │
+# │               still unregulated (removes the dam's influence)           │
+# │   Baseline  : Pre-regulation naturalized record where available          │
+# │               (pre-1952-10-01, see REGULATION_START); falls back to      │
+# │               the full naturalized record when <MIN_YEARS_FOR_DIST      │
+# │               pre-1952 months exist (e.g. GloLakes lake storage,         │
+# │               which only starts in 1984)                                 │
+# │   Components: Qnat (naturalized streamflow) · LakeNat (natural lake     │
+# │               storage) · Precip (basin YTD precipitation) ·             │
+# │               SWE (bias-corrected snow water equivalent)                │
+# │   Weights   : Equal by default (0.25 each); see HSWSI_WEIGHTS —          │
+# │               adjustable if area-weighted hydroclimate contributions     │
+# │               are known                                                  │
 # ├──────────────────────────────────────────────────────────────────────────┤
 # │ TRACK 2 — O-SWSI  Operational Supply Drought Index                      │
-# │   Objective : Measure actual system stress & management vulnerability    │
-# │   Baseline  : Post-regulation (1984+ constrained by GloLakes start)     │
-# │   Components: Active Reservoir Storage · SWE · Unregulated Inflow (Qin) │
-# │   Weights   : Heavily toward Storage (0.50) + SWE (0.35)                │
+# │   Objective : Measure actual system stress as experienced by            │
+# │               operators/users under current regulation — i.e. what      │
+# │               water is actually available given dam operating rules     │
+# │   Baseline  : Post-regulation only, common start 1984-01-01              │
+# │               (OSWSI_BASELINE_START), constrained by GloLakes record     │
+# │               start so all three components share one reference period  │
+# │   Components: Storage (active reservoir storage, GloLakes total minus   │
+# │               dead storage and environmental-flow reserve) ·            │
+# │               SWE (same bias-corrected series as Track 1) ·             │
+# │               Qin (unregulated inflow proxy — naturalized flow at       │
+# │               08JC002, standing in for water arriving at the reservoir  │
+# │               before any operational decision is applied)               │
+# │   Weights   : Storage-dominant; see OSWSI_WEIGHTS (Storage 0.50,        │
+# │               SWE 0.35, Qin 0.15) — storage and SWE are treated as the  │
+# │               primary supply buffers, Qin as a secondary check          │
 # └──────────────────────────────────────────────────────────────────────────┘
 #
-# Mathematical Core (Garen 1993 Revised):
-#   Pi  = non-exceedance probability [%] from historical baseline CDF
-#   Zi  = Φ⁻¹(Pi/100)   — standard normal variate (Z-score)
-#   SWSI = Σ(Wi · Zi)    — weighted sum; capped at ±4.2
+# Mathematical Core (Garen 1993 Revised, Z-score formulation):
+#   For each component i and each month:
+#     Pi   = non-exceedance probability [%] of the observed value, read
+#            off the CDF fitted to that component's historical baseline
+#            (Weibull plotting position or L-moment parametric fit —
+#            see compute_weibull_prob() / fit_parametric_cdf(), Section 9)
+#     Zi   = Φ⁻¹(Pi / 100)   — inverse standard normal CDF, i.e. the
+#            component's anomaly expressed in standard-deviation units
+#            relative to its own baseline distribution
+#     SWSI = Σ(Wi · Zi)      — weighted sum of component Z-scores, where
+#            Wi are the track-specific weights above (HSWSI_WEIGHTS or
+#            OSWSI_WEIGHTS, each summing to 1)
+#   The final SWSI value is capped at ±SWSI_CAP (±4.2), corresponding to
+#   non-exceedance probabilities of roughly 0.001% / 99.999% — i.e. the
+#   practical limits of the fitted distributions' tails.
+#   Drought triggers (Garen 1993, p.444): SWSI <= TRIGGER_WATCH (-1.0)
+#   flags a drought watch; SWSI <= TRIGGER_EMERGENCY (-2.0) flags
+#   emergency-level drought. See identify_droughts() (Section 12) and
+#   the SWSI Drought Scale printed in the Section 15 summary report for
+#   the full classification (abundant -> extreme).
 #
-# Station Notes:
-#   08JC001  Nechako R at Vanderhoof     | regulated + naturalized  (Qnat & Qin)
-#   08JC002  Nechako R at Isle Pierre   | regulated + naturalized  (Qnat & Qin PRIMARY)
-#   08JB002  STELLAKO RIVER AT GLENANNAN    | unaffected by regulation 1929-2024 
-#   08JA015  Stuart Lake outlet          | unregulated 1976-2023    [supplementary Qnat]
+# Station Notes (Water Survey of Canada gauge IDs; see also the
+# STATIONS routing table below, which is the source of truth the code
+# actually reads — keep both in sync if station roles change):
+#   08JC001  Nechako R at Vanderhoof   | regulated + naturalized available
+#            (Qnat eligible; not used for Qin)
+#   08JC002  Nechako R above Nautley R | regulated + naturalized available;
+#            PRIMARY station for both Qnat (H-SWSI, HSWSI_QNAT_PRIMARY) and
+#            Qin (O-SWSI, OSWSI_QIN_STATION) — chosen because it sits above
+#            the Nautley River confluence, so its naturalized record best
+#            isolates Nechako-specific (rather than tributary-mixed) input
+#   08JB002  Stellako River at Glenannan | unaffected by regulation,
+#            1929-2024 record; NOTE — the STATIONS data frame further
+#            below currently labels this code "Nechako R at Isle Pierre",
+#            which conflicts with this header; verify against WSC metadata
+#            and correct whichever is wrong before relying on this station
+#   08JA015  Stuart Lake outlet         | naturally unregulated, 1976-2023;
+#            supplementary Qnat source only (HSWSI_QNAT_SUPPLEMENT) — loaded
+#            if available but NOT automatically blended into HSWSI_QNAT_PRIMARY
 #
-# Natural Lakes for H-SWSI LakeNat component (GloLakes v2):
-#   Stuart Lake  ~825 km²  54.9°N 124.1°W  — Nechako basin
-#   Fraser Lake  ~176 km²  54.0°N 124.8°W  — Nechako basin
+# Natural Lakes for H-SWSI LakeNat component (GloLakes v2 storage record,
+# 1984-present; see NATURAL_LAKES and load_natural_lake_storage(), Sec. 4b):
+#   Stuart Lake  ~825 km²  54.9°N 124.1°W  — Nechako basin, unregulated
+#   Fraser Lake  ~176 km²  54.0°N 124.8°W  — Nechako basin, unregulated
+#   (aggregated to a single basin-level indicator by aggregate_natural_lakes(),
+#    Section 4c, before entering the H-SWSI Z-score calculation)
+#
+# Key Regulation / Adjustment Constants (see Section 2 for full list):
+#   REGULATION_START            1952-10-01 — Kenney Dam closure; defines the
+#                                pre/post-regulation split used by H-SWSI
+#   KENNEY_DEAD_STORAGE_MM3     minimum operating (unusable) reservoir volume,
+#                                subtracted from GloLakes total storage
+#   ENV_FLOW_RESERVE_MM3        legally reserved environmental-flow volume,
+#                                also subtracted to get "active" storage
+#   KEMANO_BASELINE_DIV_MM3_MONTH  Kemano tunnel diversion adjustment applied
+#                                to the Qin proxy (0 = no adjustment applied)
+#   These three feed adjust_reservoir_storage() / compute_oswsi() (Sec. 11)
+#   to convert raw GloLakes/WSC values into the operationally meaningful
+#   "active storage" and "inflow" series used by O-SWSI.
+#
+# Script Structure (see numbered SECTION banners below):
+#    1  Package loading                 9  Garen Z-score math core
+#    2  File paths & all parameters    10  H-SWSI computation
+#    3  Basin boundary (KMZ)           11  O-SWSI computation
+#    4  GloLakes storage (reservoir    12  Drought event identification
+#       + natural lakes)               13  Main processing pipeline (calls
+#    5  ERA5-Land climate data             the functions from Sections 3-12
+#    6  Snow-pillow bias correction        in sequence)
+#    7  WSC discharge / naturalized    14  Visualisations (time series,
+#       flow loading                       component panels, track
+#    8  Legacy forecast models             comparison, diagnostics)
+#       (disabled; kept for reference) 15  Master RDS + summary report
+#
+# Outputs (written under MAIN_OUTPUT_DIR = "swsi_results_dual_track/"):
+#   hswsi/, oswsi/          per-track time series, component Z-scores,
+#                           and drought-event tables (CSV)
+#   comparison/             H-SWSI vs O-SWSI overlay plots, incl. a
+#                           2022-2025 focus-period plot
+#   processed_data/         adjusted reservoir storage CSV
+#   era5_extracted/         basin-mean ERA5 monthly CSV + SWE bias factors
+#   all_results_dual_track.rds   master list bundling every intermediate
+#                           and final result for downstream analysis
 #
 # References:
 #   Garen, D.C. (1993). Revised Surface-Water Supply Index for Western
@@ -38,10 +137,14 @@
 #   Hou, J. et al. (2024). GloLakes v2. Earth Syst. Sci. Data.
 #
 # Data Sources:
-#   (1) GloLakes v2      — Lake / reservoir storage 1984-present
-#   (2) ERA5-Land        — SWE & Precipitation (monthly_data_direct/)
-#   (3) WSC              — Naturalized & regulated discharge
-#   (4) BC RFC           — Snow pillow SWE (Hydrology/SWE_data/)
+#   (1) GloLakes v2      — Lake / reservoir storage, 1984-present
+#                          (Lakes/GloLakes/nechako_extracted/)
+#   (2) ERA5-Land        — SWE & precipitation, reanalysis grid masked to
+#                          the Nechako basin polygon (monthly_data_direct/)
+#   (3) WSC              — Naturalized & regulated discharge, daily
+#                          (Hydrology/data_retrievalWaterSurveyofCanada/)
+#   (4) BC RFC           — Snow-pillow SWE, used to bias-correct ERA5 SWE
+#                          against ground observations (Hydrology/SWE_data/)
 # ============================================================================
 
 rm(list = ls())
