@@ -109,7 +109,101 @@ plot_standard_basin_ts <- function(df, index_name, color = "steelblue",
 # ============================================================================
 # ?????? SECTION 1 ??????  PIPELINE SELECTOR
 # ============================================================================
-PIPELINE_MODE <- "BOTH"   # "BASIN" | "NECHAKO_RESERVOIR" | "BOTH"
+VALID_PIPELINE_MODES <- c("BASIN", "NECHAKO_RESERVOIR", "BOTH")
+
+# ---- To use in batch/scheduled jobs, set DEFAULT_PIPELINE_MODE below ----
+DEFAULT_PIPELINE_MODE <- "BOTH"
+
+# Normalizes any accepted form of the answer ("1"/"2"/"3" or the mode name,
+# any case/whitespace) to one of VALID_PIPELINE_MODES, or NA if invalid.
+normalize_pipeline_answer <- function(ans) {
+  ans <- toupper(trimws(ans))
+  ans <- switch(ans,
+                "1" = "BASIN",
+                "2" = "NECHAKO_RESERVOIR",
+                "3" = "BOTH",
+                ans)
+  if (ans %in% VALID_PIPELINE_MODES) ans else NA_character_
+}
+
+prompt_pipeline_mode <- function() {
+  
+  menu_text <- paste0(
+    "Which pipeline should be run?\n\n",
+    "  1) BASIN\n",
+    "  2) NECHAKO_RESERVOIR\n",
+    "  3) BOTH\n"
+  )
+  
+  # Priority 1: command-line argument (e.g. Rscript H9NTSDI_GeoLakes_Extended.r BOTH)
+  args <- commandArgs(trailingOnly = TRUE)
+  if (length(args) >= 1 && !is.na(normalize_pipeline_answer(args[1]))) {
+    mode <- normalize_pipeline_answer(args[1])
+    cat(sprintf("\u2192 Pipeline set from command-line argument: %s\n", mode))
+    return(mode)
+  }
+  
+  # Priority 2: RStudio GUI dialog (pops a window - works with the Run button,
+  # not just source()). This is what fires when you click "Run"/"Source" in
+  # the RStudio editor rather than typing source() into the console.
+  if (interactive() && requireNamespace("rstudioapi", quietly = TRUE) &&
+      rstudioapi::isAvailable()) {
+    raw_input <- rstudioapi::showPrompt(
+      title   = "Pipeline Selection",
+      message = paste0(menu_text, "\nEnter BASIN / NECHAKO_RESERVOIR / BOTH (or 1/2/3):"),
+      default = DEFAULT_PIPELINE_MODE
+    )
+    if (is.null(raw_input)) {
+      # User clicked Cancel -> use the default
+      cat(sprintf("\u2192 Dialog cancelled: using default pipeline %s\n", DEFAULT_PIPELINE_MODE))
+      return(DEFAULT_PIPELINE_MODE)
+    }
+    mode <- normalize_pipeline_answer(raw_input)
+    while (is.na(mode)) {
+      raw_input <- rstudioapi::showPrompt(
+        title   = "Invalid input \u2014 try again",
+        message = "Please enter BASIN, NECHAKO_RESERVOIR, BOTH, or 1/2/3:",
+        default = DEFAULT_PIPELINE_MODE
+      )
+      if (is.null(raw_input)) {
+        cat(sprintf("\u2192 Dialog cancelled: using default pipeline %s\n", DEFAULT_PIPELINE_MODE))
+        return(DEFAULT_PIPELINE_MODE)
+      }
+      mode <- normalize_pipeline_answer(raw_input)
+    }
+    cat(sprintf("\u2192 Pipeline set from RStudio dialog: %s\n", mode))
+    return(mode)
+  }
+  
+  # Priority 3: plain readline() fallback (R console, non-RStudio interactive,
+  # or RStudio without the rstudioapi package available)
+  if (interactive()) {
+    cat("\n", menu_text, sep = "")
+    mode <- NA_character_
+    while (is.na(mode)) {
+      ans  <- readline(prompt = "Enter BASIN / NECHAKO_RESERVOIR / BOTH (or 1/2/3): ")
+      mode <- normalize_pipeline_answer(ans)
+      if (is.na(mode)) cat("Invalid selection '", ans, "'. Please try again.\n", sep = "")
+    }
+    return(mode)
+  }
+  
+  # Priority 4: non-interactive fallback (Rscript piped from a scheduler,
+  # no CLI argument supplied) - try stdin, else fall back to the default.
+  cat("\n", menu_text, sep = "")
+  cat("Enter BASIN / NECHAKO_RESERVOIR / BOTH (or 1/2/3): ")
+  ans  <- tryCatch(readLines(con = "stdin", n = 1), error = function(e) character(0))
+  mode <- if (length(ans) >= 1) normalize_pipeline_answer(ans[1]) else NA_character_
+  if (is.na(mode)) {
+    cat(sprintf("\u2192 No valid input received: using default pipeline %s\n", DEFAULT_PIPELINE_MODE))
+    cat("  (Edit DEFAULT_PIPELINE_MODE at the top of the script to change this.)\n")
+    mode <- DEFAULT_PIPELINE_MODE
+  }
+  mode
+}
+
+PIPELINE_MODE <- prompt_pipeline_mode()
+cat("\nSelected PIPELINE_MODE:", PIPELINE_MODE, "\n\n")
 
 # ============================================================================
 # ?????? SECTION 2 ??????  PIPELINE 1  SETTINGS  (basin-wide GeoLakes)
