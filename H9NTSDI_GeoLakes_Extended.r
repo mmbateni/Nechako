@@ -58,7 +58,11 @@ plot_standard_basin_ts <- function(df, index_name, color = "steelblue",
   
   in_drought <- df$value < drought_threshold
   rle_res    <- rle(in_drought)
-  n_ev       <- sum(rle_res$values & rle_res$lengths >= 1)
+  # FIX (bug #4): the old condition '& rle_res$lengths >= 1' was dead code --
+  # rle() run lengths are always >= 1 by definition, so it never filtered
+  # anything. No minimum-run-length filter on drought-event counting is
+  # intended here, so we just count every contiguous drought run directly.
+  n_ev       <- sum(rle_res$values)
   
   y_range <- max(df$value, na.rm = TRUE) - min(df$value, na.rm = TRUE)
   y_pad   <- y_range * 0.10
@@ -126,7 +130,7 @@ NECHAKO_DATA_SOURCE <- "LOCAL_DATA"   # FIXED ??? do not change
 # NOTE: despite the .csv extension, this file is whitespace-delimited
 # (Year, DOY, Level_m — 3 fields, no header), NOT comma-separated.
 # read_table() is used deliberately in run_pipeline_2(); do not switch to read_csv().
-LOCAL_DATA_FILE    <- "D:/Nechako_Drought/Nechako/Lakes/dailylevel.csv"
+LOCAL_DATA_FILE    <- "D:/Nechako_Drought/Nechako/Lakes/dailylevel.txt"
 
 # Choose data type:
 #   "STORAGE"      ??? CSV already contains storage in Mm??
@@ -306,7 +310,7 @@ compute_tsdi <- function(df_in,
   # ?????? Internal helper: attempt calibration on one dry run ?????????????????????????????????????????????????????????
   try_calibrate <- function(run_idx) {
     ds <- starts[run_idx]; de <- ends[run_idx]
-    if ((de - ds + 1) < 6) return(NULL)   # need ???3 points for regression
+    if ((de - ds + 1) < 6) return(NULL)   # need ≥6 points for regression
     d <- df_valid[ds:de, ] %>%
       mutate(drought_time = as.numeric(date - min(date)) / 30.44,  # months, real elapsed time
              local_cum_TSD = cumsum(TSD))
@@ -398,12 +402,26 @@ compute_tsdi <- function(df_in,
   if (!is.na(first_valid))
     TSDI[first_valid] <- 0.02 * df$TSD[first_valid]
   
-  for (i in seq_len(n)[-seq_len(max(1L, first_valid - 1L))][-1L]) {
-    if (!is.na(df$TSD[i])) {
-      prev    <- if (!is.na(TSDI[i - 1])) TSDI[i - 1] else 0
-      TSDI[i] <- p * prev + q * df$TSD[i]
-    } else {
-      TSDI[i] <- TSDI[i - 1]
+  # FIX (bug #2): the original index expression
+  #   seq_len(n)[-seq_len(max(1L, first_valid - 1L))][-1L]
+  # was meant to iterate i = (first_valid + 1):n, but when first_valid == 1
+  # (i.e. the series starts with a valid TSD value -- true for Pipeline 1,
+  # which begins Jan 1984 with full climatology), max(1L, first_valid-1L)
+  # evaluates to 1, so seq_len(1) = 1, and the outer [-1] then ALSO strips the
+  # first remaining element -- together dropping i = 2 entirely from the loop.
+  # TSDI[2] was left NA, and when the loop resumed at i = 3, 'prev' silently
+  # fell back to 0 instead of the true TSDI[2], injecting a wrong initial
+  # condition one step into the series (the error then decays at rate p each
+  # step, but it is a real bug, not just a style issue -- worse the closer p
+  # is to 1). Replaced with an explicit, unambiguous sequence.
+  if (!is.na(first_valid) && first_valid < n) {
+    for (i in seq.int(first_valid + 1L, n)) {
+      if (!is.na(df$TSD[i])) {
+        prev    <- if (!is.na(TSDI[i - 1])) TSDI[i - 1] else 0
+        TSDI[i] <- p * prev + q * df$TSD[i]
+      } else {
+        TSDI[i] <- TSDI[i - 1]
+      }
     }
   }
   df[[label]] <- TSDI
@@ -604,6 +622,27 @@ check_regulated_lakes <- function(
     ) %>%
     arrange(desc(mean_storage_Mm3))
   
+  # FIX (bug #3): elevation_m is NA for every lake in this dataset (GeoLakes
+  # does not populate it here). The `is.na(elevation_m) | elevation_m >=
+  # elev_min_m` guard was silently treating every NA as a PASS, which means
+  # the documented elevation >= 840 m criterion was never actually being
+  # enforced -- in_reservoir_zone was really just a lat/lon box test. That is
+  # not fixable by inferring elevation (we don't have it), so instead we make
+  # the no-op explicit and loud rather than silent.
+  n_no_elev <- sum(is.na(lake_summary$elevation_m))
+  if (n_no_elev > 0) {
+    cat(sprintf(
+      "\n  NOTE: %d / %d lakes have no elevation_m value. The documented\n",
+      n_no_elev, nrow(lake_summary)))
+    cat(sprintf(
+      "  elevation >= %g m reservoir-zone criterion CANNOT be applied to\n",
+      RESERVOIR_ZONE$elev_min_m))
+    cat("  these lakes and is being skipped (treated as pass-through) for\n")
+    cat("  them -- in_reservoir_zone is effectively a lat/lon-only test for\n")
+    cat("  these rows. Verify elevation_m is genuinely unavailable upstream\n")
+    cat("  in the GeoLakes extraction if a real elevation filter is needed.\n\n")
+  }
+  
   # ?????? Regulation flag ?????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
   lake_summary <- lake_summary %>%
     mutate(
@@ -612,6 +651,10 @@ check_regulated_lakes <- function(
         abs(lon - NECHAKO_LON) <= NECHAKO_TOL * 3,
       
       # 2. Reservoir zone: west of dam, within impoundment footprint
+      # NOTE: elevation_m is missing for all/most lakes here (see console
+      # diagnostic above) -- the elevation part of this test is a documented
+      # pass-through (no-op) whenever elevation_m is NA, not an enforced
+      # filter. See note above.
       in_reservoir_zone = between(lat, RESERVOIR_ZONE$lat[1], RESERVOIR_ZONE$lat[2]) &
         between(lon, RESERVOIR_ZONE$lon[1], RESERVOIR_ZONE$lon[2]) &
         (is.na(elevation_m) | elevation_m >= RESERVOIR_ZONE$elev_min_m),
@@ -631,6 +674,12 @@ check_regulated_lakes <- function(
     )
   
   # ?????? Console table ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  # FIX (bug #5): the previous print() relied on tibble's default terminal
+  # width, which silently hid regulation_status off-screen ("i 1 more
+  # variable: regulation_status <chr>") -- the one column this diagnostic
+  # exists to report never actually showed up in the console. Fixed with
+  # width = Inf plus a dedicated compact status table and a category-count
+  # summary so the classification is unmissable.
   cat("?????? Per-lake summary (sorted by mean storage) ??????????????????????????????????????????????????????????????????\n")
   print(
     lake_summary %>%
@@ -640,7 +689,25 @@ check_regulated_lakes <- function(
                     regulation_status) %>%
       mutate(across(c(lat, lon, lake_area_km2, elevation_m,
                       mean_storage_Mm3, sd_storage_Mm3), ~round(., 3))),
-    n = Inf
+    n = Inf, width = Inf
+  )
+  
+  cat("\n?????? Regulation status ??? compact view (guaranteed visible) ????????????????????????????????????????????????????\n")
+  print(
+    lake_summary %>%
+      dplyr::select(file_idx, lake_name, lat, lon, regulation_status) %>%
+      mutate(lat = round(lat, 3), lon = round(lon, 3)) %>%
+      as.data.frame(),
+    row.names = FALSE
+  )
+  
+  cat("\n?????? Regulation status ??? category counts ???????????????????????????????????????????????????????????????????????????????????\n")
+  print(
+    lake_summary %>%
+      count(regulation_status, name = "n_lakes") %>%
+      arrange(desc(n_lakes)) %>%
+      as.data.frame(),
+    row.names = FALSE
   )
   
   # ?????? Optional basin-column cross-check ???????????????????????????????????????????????????????????????????????????????????????????????????????????????
@@ -998,14 +1065,82 @@ run_pipeline_2 <- function() {
     
   } else if (LOCAL_DATA_TYPE == "LEVEL_DAILY") {
     cat("  Parsing Year + Day-of-Year format and converting to storage...\n")
-    # File is whitespace-delimited with exactly 3 fields per row:
-    #   Year, DOY, Level_m  (no header, no trailing column).
-    # Verified against dailylevel.csv: 25,933 rows, all 3-field, no parse
-    # failures, years 1955-2025, DOY 1-366, levels 842.8-853.7 m ASL.
-    df_input <- read_table(LOCAL_DATA_FILE,
-                           col_names = c("Year", "DOY", "Level_m"),
-                           col_types     = "iid",
-                           show_col_types = FALSE) %>%
+    # FIX (bug #1): the file was previously assumed to be whitespace-delimited
+    # with exactly 3 fields (Year, DOY, Level_m). In practice every row in the
+    # live file triggered a readr parsing failure ("expected 3 columns, actual
+    # 4 columns"), meaning the fixed 3-column spec below was WRONG and was
+    # silently mis-parsing every row (readr drops/misaligns the unexpected
+    # trailing field instead of erroring out).
+    #
+    # Fix: detect the actual field count from the file itself (via
+    # count.fields()) instead of hard-coding it, print a diagnostic so the
+    # extra column is visible/verifiable, and only then parse. If a 4th field
+    # is present we assume it is a trailing quality/status flag (common in
+    # BC Hydro / BCWIS daily level exports) and drop it after showing its
+    # unique values -- but we no longer do this silently.
+    # Read raw lines and strip leading/trailing whitespace first. The file
+    # has trailing whitespace after Level_m on every row, which was making
+    # read_table()'s positional column-guesser infer a phantom 4th (empty)
+    # column even though count.fields() correctly saw 3. Trimming removes
+    # the ambiguity so both diagnosis and parsing agree.
+    lines_raw   <- readLines(LOCAL_DATA_FILE)
+    lines_clean <- trimws(lines_raw)
+    lines_clean <- lines_clean[nzchar(lines_clean)]   # drop blank lines
+    
+    n_fields_per_line <- utils::count.fields(textConnection(lines_clean), sep = "")
+    field_tbl <- table(n_fields_per_line)
+    cat("  Detected field counts across rows of", LOCAL_DATA_FILE, "(post-trim):\n")
+    print(field_tbl)
+    n_fields <- as.integer(names(field_tbl)[which.max(field_tbl)])
+    cat("  Using n_fields =", n_fields,
+        "(most common field count; used to build column spec)\n")
+    
+    if (any(n_fields_per_line != n_fields)) {
+      n_bad <- sum(n_fields_per_line != n_fields)
+      warning(n_bad, " row(s) in ", LOCAL_DATA_FILE,
+              " do not match the dominant field count (", n_fields,
+              "). These rows may parse incorrectly -- inspect them directly.")
+    }
+    
+    if (n_fields == 3) {
+      col_names_ld <- c("Year", "DOY", "Level_m")
+      col_classes_ld <- c("integer", "integer", "numeric")
+    } else if (n_fields == 4) {
+      col_names_ld <- c("Year", "DOY", "Level_m", "Extra_field")
+      col_classes_ld <- c("integer", "integer", "numeric", "character")
+    } else {
+      stop("LOCAL_DATA_FILE has an unexpected number of whitespace-delimited ",
+           "fields (", n_fields, "). Expected 3 (Year, DOY, Level_m) or 4 ",
+           "(Year, DOY, Level_m, extra flag/column). Inspect the file before ",
+           "proceeding.")
+    }
+    
+    df_raw_ld <- read.table(
+      text        = lines_clean,
+      header      = FALSE,
+      col.names   = col_names_ld,
+      colClasses  = col_classes_ld,
+      strip.white = TRUE
+    ) %>% as_tibble()
+    
+    # Verification gate: parsed row count must match cleaned line count.
+    if (nrow(df_raw_ld) != length(lines_clean)) {
+      stop("Parsed row count (", nrow(df_raw_ld), ") does not match cleaned ",
+           "line count (", length(lines_clean), "). Parsing is misaligned -- ",
+           "inspect the file before proceeding.")
+    }
+    
+    if (n_fields == 4) {
+      cat("  NOTE: file has a 4th whitespace-delimited field beyond",
+          "Year/DOY/Level_m. Unique values of that field (first 20 shown):\n")
+      print(utils::head(sort(unique(df_raw_ld$Extra_field)), 20))
+      cat("  This 4th field is being DROPPED from the analysis below.\n",
+          "  If it is a quality/status flag (e.g. estimated vs. measured),\n",
+          "  consider filtering on it before proceeding.\n")
+    }
+    
+    
+    df_input <- df_raw_ld %>%
       filter(Year <= year(Sys.Date())) %>%
       mutate(date       = as.Date(paste(Year, DOY), format = "%Y %j"),
              storage_m3 = level_to_storage(Level_m)) %>%
@@ -1028,7 +1163,7 @@ run_pipeline_2 <- function() {
   
   cat(sprintf("  Valid storage records: %d  (%s to %s)\n",
               n_after, min(df_input$date), max(df_input$date)))
-  df_input <- df_input %>% filter(date <= as_date("2025-01-01"))
+  df_input <- df_input %>% filter(date <= as_date("2026-01-01"))
   # Aggregate daily ??? monthly (TSDI algorithm expects monthly input)
   df_in <- df_input %>%
     mutate(year  = year(date), month = month(date)) %>%
