@@ -157,14 +157,9 @@ if (TIMESTAMP_OUTPUT_SUBDIR) {
   out_dir <- file.path(out_dir, format(Sys.time(), "%Y%m%d_%H%M%S"))
 }
 if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
-writeLines(
-  c(sprintf("run_timestamp: %s", format(Sys.time(), "%Y-%m-%d %H:%M:%S")),
-    sprintf("scf_method: %s (%s)", scf_method, scf_method_label),
-    sprintf("REGIONALIZE_SSPI: %s", if (scf_method == "2") REGIONALIZE_SSPI else NA),
-    sprintf("BIAS_CORRECT: %s", if (scf_method == "2") BIAS_CORRECT else NA),
-    sprintf("station_file_found: %s", if (scf_method == "2") file.exists(STATION_OBS_PATH) else NA)),
-  file.path(out_dir, "run_settings.txt")
-)
+# NOTE: run_settings.txt is written further below, after the RFA CONFIGURATION
+# block, because it reports on REGIONALIZE_SSPI / BIAS_CORRECT / STATION_OBS_PATH,
+# which aren't defined until that block runs.
 # ==============================================================================
 #   REGIONAL FREQUENCY ANALYSIS (RFA) CONFIGURATION  [method 2 / SSPI-1 only]
 # ==============================================================================
@@ -236,6 +231,15 @@ BIAS_CORRECT_CLIP <- c(0.5, 2.0)  # sanity clip on correction coefficients C,
 
 cat(sprintf("\n??? RFA regionalization for SSPI-1: %s\n",
             if (scf_method == "2" && REGIONALIZE_SSPI) "ENABLED" else "disabled"))
+
+writeLines(
+  c(sprintf("run_timestamp: %s", format(Sys.time(), "%Y-%m-%d %H:%M:%S")),
+    sprintf("scf_method: %s (%s)", scf_method, scf_method_label),
+    sprintf("REGIONALIZE_SSPI: %s", if (scf_method == "2") REGIONALIZE_SSPI else NA),
+    sprintf("BIAS_CORRECT: %s", if (scf_method == "2") BIAS_CORRECT else NA),
+    sprintf("station_file_found: %s", if (scf_method == "2") file.exists(STATION_OBS_PATH) else NA)),
+  file.path(out_dir, "run_settings.txt")
+)
 
 
 # ---- Load Basin Boundary ----
