@@ -107,6 +107,107 @@ plot_standard_basin_ts <- function(df, index_name, color = "steelblue",
 }
 
 # ============================================================================
+# HELPER — standalone basin time series PNG (shared across both pipelines)
+# ============================================================================
+# Mirrors plot_index_timeseries()/plot_ssi_timeseries() in the companion
+# H1SSI_SSMI_ERALand.R, H7WSC_StreamFlow.R, and H8SWEI_Snow.R scripts, so all
+# four families of standardized index (SSI/SSMI, SWEI/SSPI-1, TSDI/NTSDI)
+# share the same onset convention, drought-shading rule, and visual language:
+#   - blue/green/red severity background bands
+#   - dashed reference lines at +/-1, dotted at +/-1.5 and +/-2
+#   - drought shading ONLY on runs that cross the onset threshold (default
+#     -0.5, matching SSI_DROUGHT_THRESHOLD elsewhere), filled all the way up
+#     to zero rather than stopped at onset
+#   - subtitle reporting the number of drought events at that onset
+# Unlike plot_standard_basin_ts() (used inline in the multi-panel diagnostic
+# PDF via plot_pipeline()), this writes its own standalone PNG to
+# out_dir/figures/, matching how the other three scripts' plots are saved.
+plot_index_timeseries <- function(dates_vec, values_vec, index_label,
+                                  title_label, out_dir, onset = -0.5) {
+  df <- data.frame(date = dates_vec, value = values_vec)
+  df <- df[is.finite(df$value), ]
+  if (nrow(df) == 0L) {
+    cat(sprintf("  [PLOT] Skipping %s time series: no finite values\n", index_label))
+    return(invisible(NULL))
+  }
+  
+  # Drought event count (contiguous runs below onset threshold)
+  below_onset <- df$value < onset
+  below_onset[is.na(below_onset)] <- FALSE
+  n_events <- sum(rle(below_onset)$values)
+  
+  # Shade only the runs that actually cross the onset threshold, but filled
+  # all the way up to zero (not stopped at onset) -- same rule used in the
+  # companion SSI/SSMI, SWEI/SSPI-1 scripts. Separate contiguous runs so the
+  # ribbon fill doesn't bridge unrelated dry spells.
+  df$below <- below_onset
+  df$grp   <- cumsum(c(1L, diff(as.integer(df$below)) != 0L))
+  
+  y_lo <- min(-2.2, floor(min(df$value) * 10) / 10)
+  y_hi <- max( 2.2, ceiling(max(df$value) * 10) / 10)
+  
+  p <- ggplot2::ggplot(df, ggplot2::aes(x = date, y = value)) +
+    
+    # ---- severity background bands ----
+  ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin = 1,    ymax = Inf,
+                    fill = "#4472C4", alpha = 0.10) +
+    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin = 0,    ymax = 1,
+                      fill = "#70AD47", alpha = 0.08) +
+    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin = -1,   ymax = 0,
+                      fill = "#70AD47", alpha = 0.05) +
+    ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = -1,
+                      fill = "#C00000", alpha = 0.08) +
+    
+    # ---- reference lines ----
+  ggplot2::geom_hline(yintercept = 0,             color = "black", linewidth = 0.6) +
+    ggplot2::geom_hline(yintercept = c(-1, 1),      color = "grey30", linetype = "dashed",
+                        linewidth = 0.4) +
+    ggplot2::geom_hline(yintercept = c(-1.5, 1.5),  color = "grey55", linetype = "dotted",
+                        linewidth = 0.4) +
+    ggplot2::geom_hline(yintercept = c(-2, 2),      color = "grey55", linetype = "dotted",
+                        linewidth = 0.4) +
+    
+    # ---- drought shading: ONLY months that cross the onset threshold,
+    #      filled all the way up to zero (not stopped at onset) ----
+  ggplot2::geom_ribbon(data = subset(df, below),
+                       ggplot2::aes(ymin = value, ymax = 0, group = grp),
+                       fill = "#C0504D", alpha = 0.45) +
+    
+    # ---- the series itself ----
+  ggplot2::geom_line(color = "#1F77B4", linewidth = 0.45) +
+    
+    ggplot2::scale_x_date(date_breaks = "5 years", date_labels = "%Y",
+                          expand = ggplot2::expansion(mult = c(0.01, 0.015))) +
+    ggplot2::scale_y_continuous(breaks = seq(-4, 4, 1)) +
+    ggplot2::coord_cartesian(ylim = c(y_lo, y_hi)) +
+    
+    ggplot2::labs(
+      title    = sprintf("%s Time Series  |  NECHAKO BASIN", title_label),
+      subtitle = sprintf("%d drought events detected  (onset < %.2f)",
+                         n_events, onset),
+      x = "Year", y = sprintf("%s Index Value", index_label)
+    ) +
+    ggplot2::theme_minimal(base_size = 13) +
+    ggplot2::theme(
+      panel.grid.minor    = ggplot2::element_blank(),
+      panel.grid.major.x  = ggplot2::element_line(color = "grey85"),
+      panel.grid.major.y  = ggplot2::element_blank(),
+      plot.title          = ggplot2::element_text(face = "bold", size = 15),
+      plot.subtitle       = ggplot2::element_text(color = "grey40", size = 11),
+      axis.text.x         = ggplot2::element_text(angle = 30, hjust = 1),
+      plot.margin         = ggplot2::margin(10, 16, 10, 10)
+    )
+  
+  figures_dir <- file.path(out_dir, "figures")
+  if (!dir.exists(figures_dir)) dir.create(figures_dir, recursive = TRUE)
+  fname <- file.path(figures_dir, sprintf("%s_basin_timeseries.png", tolower(index_label)))
+  ggplot2::ggsave(fname, p, width = 11, height = 5.5, dpi = 200, bg = "white")
+  cat(sprintf("  [PLOT] %s time series saved: %s  (%d events)\n",
+              index_label, basename(fname), n_events))
+  invisible(p)
+}
+
+# ============================================================================
 # ?????? SECTION 1 ??????  PIPELINE SELECTOR
 # ============================================================================
 VALID_PIPELINE_MODES <- c("BASIN", "NECHAKO_RESERVOIR", "BOTH")
@@ -1387,10 +1488,31 @@ if (PIPELINE_MODE %in% c("BASIN", "BOTH")) {
   # This checks which GeoLakes lakes in the Nechako watershed may be affected
   # by regulation from Kenney Dam (Nechako Reservoir, 1952).
   res_reg <- check_regulated_lakes()
+  
+  # Standalone basin-mean time series PNG (TSDI_norm), same onset/shading
+  # convention and visual style as the companion SSI/SWEI/SSPI-1 scripts.
+  plot_index_timeseries(
+    dates_vec   = res_p1$data$date,
+    values_vec  = res_p1$data$TSDI_norm,
+    index_label = "TSDI",
+    title_label = "TSDI (Basin-Wide)",
+    out_dir     = OUT_DIR,
+    onset       = -0.5
+  )
 }
 
 if (PIPELINE_MODE %in% c("NECHAKO_RESERVOIR", "BOTH")) {
   res_p2 <- run_pipeline_2()
+  
+  # Standalone basin-mean time series PNG (NTSDI_norm)
+  plot_index_timeseries(
+    dates_vec   = res_p2$data$date,
+    values_vec  = res_p2$data$NTSDI_norm,
+    index_label = "NTSDI",
+    title_label = "NTSDI (Nechako Reservoir)",
+    out_dir     = OUT_DIR,
+    onset       = -0.5
+  )
 }
 
 if (PIPELINE_MODE == "BOTH" && !is.null(res_p1) && !is.null(res_p2)) {
@@ -1401,3 +1523,4 @@ if (PIPELINE_MODE == "BOTH" && !is.null(res_p1) && !is.null(res_p2)) {
 
 sink()
 cat("\n\nDone. All outputs saved to:", normalizePath(OUT_DIR), "\n")
+cat("Basin-mean time series plots saved to:", file.path(normalizePath(OUT_DIR), "figures"), "\n")

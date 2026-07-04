@@ -130,6 +130,122 @@ detect_col <- function(df, patterns, label) {
   m[1]
 }
 
+# ============================================================================
+# HELPER — standalone basin time series PNG (shared drought-plot convention)
+# ============================================================================
+# Mirrors plot_index_timeseries()/plot_ssi_timeseries() in the companion
+# H1SSI_SSMI_ERALand.R, H7WSC_StreamFlow.R, H8SWEI_Snow.R, and
+# H9NTSDI_GeoLakes_Extended.r scripts, so SGI shares the same onset
+# convention, drought-shading rule, and visual language as SSI/SSMI,
+# SWEI/SSPI-1, and TSDI/NTSDI:
+#   - blue/green/red severity background bands
+#   - dashed reference lines at +/-1, dotted at +/-1.5 and +/-2
+#   - drought shading ONLY on runs that cross the onset threshold (default
+#     -0.5, matching SSI_DROUGHT_THRESHOLD elsewhere), filled all the way up
+#     to zero rather than stopped at onset
+#   - subtitle reporting the number of drought events at that onset
+plot_index_timeseries <- function(dates_vec, values_vec, index_label,
+                                  title_label, out_dir, onset = -0.5,
+                                  clamp_floor = NULL, clamp_label = NULL) {
+  df <- data.frame(date = dates_vec, value = values_vec)
+  df <- df[is.finite(df$value), ]
+  if (nrow(df) == 0L) {
+    message(sprintf("  [PLOT] Skipping %s time series: no finite values", index_label))
+    return(invisible(NULL))
+  }
+  
+  # Drought event count (contiguous runs below onset threshold)
+  below_onset <- df$value < onset
+  below_onset[is.na(below_onset)] <- FALSE
+  n_events <- sum(rle(below_onset)$values)
+  
+  # Shade only the runs that actually cross the onset threshold, but filled
+  # all the way up to zero (not stopped at onset) -- same rule used in the
+  # companion SSI/SSMI, SWEI/SSPI-1, and TSDI/NTSDI scripts. Separate
+  # contiguous runs so the ribbon fill doesn't bridge unrelated dry spells.
+  df$below <- below_onset
+  df$grp   <- cumsum(c(1L, diff(as.integer(df$below)) != 0L))
+  
+  y_lo <- if (!is.null(clamp_floor)) {
+    min(-2.2, floor(min(df$value) * 10) / 10, floor(clamp_floor * 10) / 10 - 0.1)
+  } else {
+    min(-2.2, floor(min(df$value) * 10) / 10)
+  }
+  y_hi <- max( 2.2, ceiling(max(df$value) * 10) / 10)
+  
+  p <- ggplot(df, aes(x = date, y = value)) +
+    
+    # ---- severity background bands ----
+  annotate("rect", xmin = -Inf, xmax = Inf, ymin = 1,    ymax = Inf,
+           fill = "#4472C4", alpha = 0.10) +
+    annotate("rect", xmin = -Inf, xmax = Inf, ymin = 0,    ymax = 1,
+             fill = "#70AD47", alpha = 0.08) +
+    annotate("rect", xmin = -Inf, xmax = Inf, ymin = -1,   ymax = 0,
+             fill = "#70AD47", alpha = 0.05) +
+    annotate("rect", xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = -1,
+             fill = "#C00000", alpha = 0.08) +
+    
+    # ---- reference lines ----
+  geom_hline(yintercept = 0,             color = "black", linewidth = 0.6) +
+    geom_hline(yintercept = c(-1, 1),      color = "grey30", linetype = "dashed",
+               linewidth = 0.4) +
+    geom_hline(yintercept = c(-1.5, 1.5),  color = "grey55", linetype = "dotted",
+               linewidth = 0.4) +
+    geom_hline(yintercept = c(-2, 2),      color = "grey55", linetype = "dotted",
+               linewidth = 0.4) +
+    
+    # ---- plotting-position floor (numerical limit of the rank-based
+    #      normal-score transform for the shortest well/month record
+    #      actually used, not a data limit -- see clamp_floor computation
+    #      at the call site). Only drawn if a clamp_floor was supplied. ----
+  {if (!is.null(clamp_floor)) list(
+    geom_hline(yintercept = clamp_floor, color = "grey35", linetype = "dashed",
+               linewidth = 0.45),
+    annotate("text", x = min(df$date), y = clamp_floor, hjust = 0, vjust = -0.6,
+             label = clamp_label %||% sprintf("plotting-position floor (SGI = %.3f)", clamp_floor),
+             color = "grey35", size = 3.2, fontface = "italic")
+  )} +
+    
+    # ---- drought shading: ONLY months that cross the onset threshold,
+    #      filled all the way up to zero (not stopped at onset) ----
+  geom_ribbon(data = subset(df, below),
+              aes(ymin = value, ymax = 0, group = grp),
+              fill = "#C0504D", alpha = 0.45) +
+    
+    # ---- the series itself ----
+  geom_line(color = "#1F77B4", linewidth = 0.45) +
+    
+    scale_x_date(date_breaks = "5 years", date_labels = "%Y",
+                 expand = expansion(mult = c(0.01, 0.015))) +
+    scale_y_continuous(breaks = seq(-4, 4, 1)) +
+    coord_cartesian(ylim = c(y_lo, y_hi)) +
+    
+    labs(
+      title    = sprintf("%s Time Series  |  NECHAKO BASIN", title_label),
+      subtitle = sprintf("%d drought events detected  (onset < %.2f)",
+                         n_events, onset),
+      x = "Year", y = sprintf("%s Index Value", index_label)
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      panel.grid.minor    = element_blank(),
+      panel.grid.major.x  = element_line(color = "grey85"),
+      panel.grid.major.y  = element_blank(),
+      plot.title          = element_text(face = "bold", size = 15),
+      plot.subtitle       = element_text(color = "grey40", size = 11),
+      axis.text.x         = element_text(angle = 30, hjust = 1),
+      plot.margin         = margin(10, 16, 10, 10)
+    )
+  
+  figures_dir <- file.path(out_dir, "figures")
+  if (!dir.exists(figures_dir)) dir.create(figures_dir, recursive = TRUE)
+  fname <- file.path(figures_dir, sprintf("%s_basin_timeseries.png", tolower(index_label)))
+  ggsave(fname, p, width = 11, height = 5.5, dpi = 200, bg = "white")
+  message(sprintf("  [PLOT] %s time series saved: %s  (%d events)",
+                  index_label, basename(fname), n_events))
+  invisible(p)
+}
+
 #---- 3. Load Basin ----------------------------------------------------------
 message("Loading basin boundary …")
 basin <- read_kmz(cfg$basin_kmz)
@@ -155,7 +271,7 @@ message(sprintf("  Basin bbox: lat %.3f to %.3f | lon %.3f to %.3f",
                 basin_bbox["ymin"], basin_bbox["ymax"], basin_bbox["xmin"], basin_bbox["xmax"]))
 
 area_ok <- basin_area_km2 >= cfg$basin_area_km2_expected_range[1] &&
-           basin_area_km2 <= cfg$basin_area_km2_expected_range[2]
+  basin_area_km2 <= cfg$basin_area_km2_expected_range[2]
 lat_ok  <- basin_bbox["ymin"] >= cfg$basin_bbox_lat_range[1] && basin_bbox["ymax"] <= cfg$basin_bbox_lat_range[2]
 lon_ok  <- basin_bbox["xmin"] >= cfg$basin_bbox_lon_range[1] && basin_bbox["xmax"] <= cfg$basin_bbox_lon_range[2]
 
@@ -215,7 +331,7 @@ load_pgown <- function() {
   message(sprintf("\n  --- Sign-convention check (invert_gw_sign = %s) ---", cfg$invert_gw_sign))
   raw_sample <- utils::head(ts_raw[[col_val]], 10)
   message(sprintf("  Sample raw '%s' values: %s", col_val, paste(round(raw_sample, 3), collapse = ", ")))
-
+  
   # Heuristic 1: magnitude. BC PGOWN depth-to-water is typically 0-30 m.
   # Elevation/head (masl) in the BC interior is typically several hundred
   # metres. A median well below ~50 strongly suggests depth-below-ground
@@ -225,9 +341,9 @@ load_pgown <- function() {
   heuristic_says_depth <- med_abs_val < 50
   message(sprintf("  Median |%s| across all records: %.2f -> heuristic suggests: %s",
                   col_val, med_abs_val, ifelse(heuristic_says_depth,
-                                                "depth-below-ground (should invert)",
-                                                "elevation/head (should NOT invert)")))
-
+                                               "depth-below-ground (should invert)",
+                                               "elevation/head (should NOT invert)")))
+  
   heuristic_mismatch <- heuristic_says_depth != cfg$invert_gw_sign
   if (heuristic_mismatch) {
     message(strrep("!", 70))
@@ -235,7 +351,7 @@ load_pgown <- function() {
     message("  Every drought/no-drought label downstream may be inverted.")
     message(strrep("!", 70))
   }
-
+  
   # Heuristic 2: try to pull the PGOWN dataset's CKAN metadata and search its
   # description/notes text for wording that indicates which convention the
   # med_gwl field actually uses. This is best-effort - if the API call fails
@@ -261,7 +377,7 @@ load_pgown <- function() {
       list(checked = FALSE, status = httr::status_code(resp))
     }
   }, error = function(e) list(checked = FALSE, error = conditionMessage(e)))
-
+  
   if (isTRUE(dict_hit$checked)) {
     if (length(dict_hit$found_depth) || length(dict_hit$found_elev)) {
       message(sprintf("  CKAN metadata text mentions: depth-related terms [%s] | elevation-related terms [%s]",
@@ -282,7 +398,7 @@ load_pgown <- function() {
   message("  ACTION: confirm med_gwl's convention against the PGOWN field definitions")
   message("  (https://catalogue.data.gov.bc.ca/dataset/) before trusting drought_cat labels.")
   message(strrep("-", 70))
-
+  
   ts <- ts_raw %>%
     rename(well_num = all_of(col_wn), date = all_of(col_dt), gw_raw = all_of(col_val)) %>%
     mutate(
@@ -314,10 +430,10 @@ load_pgown <- function() {
     dplyr::distinct(well_num, lat, lon) %>%
     sf::st_as_sf(coords = c("lon", "lat"), crs = 4326, remove = FALSE)
   in_basin <- sf::st_within(wells_sf, basin, sparse = FALSE)[, 1]
-
+  
   message(sprintf("  Distinct candidate wells with coordinates: %d | inside basin: %d",
                   nrow(wells_sf), sum(in_basin)))
-
+  
   # Diagnostic plot: basin polygon + every candidate well, coloured by
   # inside/outside, so a suspiciously low well count can be checked visually
   # against the actual polygon shape instead of trusted from the count alone.
@@ -334,12 +450,12 @@ load_pgown <- function() {
   ggsave(paste0(cfg$output_prefix, "_basin_extent_check.png"), p_extent, width = 8, height = 7, dpi = 150)
   message(sprintf("  Diagnostic plot saved: %s_basin_extent_check.png (inspect this before trusting the well count)",
                   cfg$output_prefix))
-
+  
   if(sum(in_basin) == 0) {
     message("  No wells from time series are inside the basin.")
     return(NULL)
   }
-
+  
   keep_wells <- wells_sf$well_num[in_basin]
   ts_filtered <- ts_with_coords %>%
     filter(well_num %in% keep_wells) %>%
@@ -479,6 +595,30 @@ sgi_long <- ts_filtered %>%
   mutate(sgi = normal_scores(gw)) %>%
   ungroup()
 
+# ---- SGI's "clamp floor" ----------------------------------------------------
+# normal_scores() uses the Hazen plotting position p = (2r-1)/(2n), which has
+# no fixed epsilon clamp (unlike the SSI script's pmax(1e-6, ...)) -- it's
+# automatically bounded away from 0/1 by n, the number of years of that
+# calendar month available for a given well. The smallest n actually used
+# across all well/month groups (only groups with n >= 4 produce a non-NA SGI
+# -- see normal_scores()) sets the most extreme (most negative) SGI value
+# achievable anywhere in this run: qnorm(1 / (2 * n_min)).
+sgi_group_n <- ts_filtered %>%
+  mutate(cal_month = month(as.Date(paste0(month_label, "-01")))) %>%
+  group_by(well_num, cal_month) %>%
+  summarise(n_obs = sum(!is.na(gw)), .groups = "drop") %>%
+  filter(n_obs >= 4)
+
+sgi_clamp_floor <- NA_real_
+sgi_clamp_label <- NULL
+if (nrow(sgi_group_n) > 0) {
+  n_min <- min(sgi_group_n$n_obs, na.rm = TRUE)
+  sgi_clamp_floor <- qnorm(1 / (2 * n_min))
+  sgi_clamp_label <- sprintf("plotting-position floor (n=%d \u2192 SGI=%.3f)", n_min, sgi_clamp_floor)
+  message(sprintf("  SGI plotting-position floor: n_min=%d well/month groups -> SGI floor = %.3f",
+                  n_min, sgi_clamp_floor))
+}
+
 # Basin aggregate: median across wells
 sgi_basin <- sgi_long %>%
   group_by(month_label) %>%
@@ -543,6 +683,19 @@ out_csv <- paste0(cfg$output_prefix, ".csv")
 readr::write_csv(sgi_basin, out_csv)
 message(sprintf("\nSaved: %s", out_csv))
 
+# Standalone basin-mean time series PNG, same onset/shading convention and
+# visual style as the companion SSI/SSMI, SWEI/SSPI-1, and TSDI/NTSDI scripts.
+plot_index_timeseries(
+  dates_vec   = sgi_basin$date,
+  values_vec  = sgi_basin$sgi_median,
+  index_label = "SGI",
+  title_label = "SGI (Groundwater, Basin-Median)",
+  out_dir     = ".",
+  onset       = -0.5,
+  clamp_floor = if (is.na(sgi_clamp_floor)) NULL else sgi_clamp_floor,
+  clamp_label = sgi_clamp_label
+)
+
 #---- 10. Plot ---------------------------------------------------------------
 p <- ggplot(sgi_basin, aes(x = date, y = sgi_median)) +
   geom_ribbon(aes(ymin = pmin(sgi_median, 0), ymax = 0), fill = "#d73027", alpha = 0.3) +
@@ -583,5 +736,9 @@ for(w in unique(sgi_long$well_num)) {
     theme(plot.title = element_text(face = "bold"), panel.grid.minor = element_blank())
   ggsave(paste0(cfg$output_prefix, "_well_", w, ".png"), p_well, width = 10, height = 4, dpi = 150)
   message("Plot saved: ", cfg$output_prefix, "_well_", w, ".png")
+}
+sgi_ts_png <- file.path(".", "figures", "sgi_basin_timeseries.png")
+if (file.exists(sgi_ts_png)) {
+  message(sprintf("\nBasin-mean time series plot (shared style): %s", normalizePath(sgi_ts_png)))
 }
 #---- END --------------------------------------------------------------------

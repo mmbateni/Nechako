@@ -687,6 +687,176 @@ for (cfg in layer_configs) {
 }  # end layer_configs loop
 stopCluster(cl)
 cat("\n??? Parallel cluster stopped\n")
+
+# ==============================================================================
+# BASIN-AVERAGED SSI / SSMI TIME SERIES PLOTS  (SPEI-style aesthetic)
+# ==============================================================================
+# Must run BEFORE sm_A / sm_B are removed below, since we use sm_A[[1]] to
+# get exact per-cell geometry (extent/CRS/resolution) for area weighting.
+cat("\n===== GENERATING BASIN-AVERAGED TIME SERIES PLOTS =====\n")
+
+if (!requireNamespace("ggplot2", quietly = TRUE)) install.packages("ggplot2")
+library(ggplot2)
+
+plot_dir <- "timeseries_plots"
+if (!dir.exists(plot_dir)) dir.create(plot_dir, recursive = TRUE)
+
+# ---- Area weights ----
+# Grid is BC Albers (EPSG:3005, equal-area), so cell area varies only
+# slightly (reprojection/resampling artifacts). True per-cell areas are used
+# for a proper area-weighted basin average instead of assuming every pixel
+# counts equally.
+cell_area_rast <- terra::cellSize(sm_A[[1]], unit = "km")
+area_vec       <- as.vector(terra::values(cell_area_rast))
+area_vec[!basin_mask] <- NA_real_
+
+cat(sprintf("[Area weights] Basin pixels: %d | Total basin area: %.1f km^2\n",
+            sum(basin_mask), sum(area_vec, na.rm = TRUE)))
+
+# ---- Helper: area-weighted basin mean at every time step ----
+area_weighted_mean_ts <- function(index_matrix, w) {
+  vapply(seq_len(ncol(index_matrix)), function(j) {
+    col <- index_matrix[, j]
+    ok  <- is.finite(col) & is.finite(w)
+    if (!any(ok)) return(NA_real_)
+    sum(col[ok] * w[ok]) / sum(w[ok])
+  }, numeric(1))
+}
+
+# ---- Helper: count drought events (contiguous runs below onset threshold) ----
+count_drought_events <- function(x, onset = -0.5) {
+  below <- x < onset
+  below[is.na(below)] <- FALSE
+  rl <- rle(below)
+  sum(rl$values)
+}
+
+# ---- Helper: SPEI-style ggplot for one basin-averaged series ----
+plot_index_timeseries <- function(dates_vec, values_vec,
+                                  index_label,      # "SSI" or "SSMI"
+                                  scale,             # 1, 2, 3 ...
+                                  layer_label,       # "L1_3" / "L1_4"
+                                  out_dir,
+                                  onset = -0.5) {
+  
+  df <- data.frame(date = dates_vec, value = values_vec)
+  df <- df[is.finite(df$value), ]
+  if (nrow(df) == 0L) {
+    cat(sprintf("  ! Skipping %s-%02d (%s): no finite values\n",
+                index_label, scale, layer_label))
+    return(invisible(NULL))
+  }
+  
+  n_events <- count_drought_events(df$value, onset = onset)
+  
+  # Shade only the runs that actually cross the onset threshold, so the red
+  # fill visually matches the events counted above -- not just any negative
+  # month. Separate contiguous runs so the fill doesn't bridge gaps.
+  below_onset <- df$value < onset
+  below_onset[is.na(below_onset)] <- FALSE
+  df$below <- below_onset
+  df$grp   <- cumsum(c(1L, diff(as.integer(df$below)) != 0L))
+  
+  y_lo <- min(-2.2, floor(min(df$value) * 10) / 10)
+  y_hi <- max( 2.2, ceiling(max(df$value) * 10) / 10)
+  
+  p <- ggplot(df, aes(x = date, y = value)) +
+    
+    # ---- severity background bands ----
+  annotate("rect", xmin = -Inf, xmax = Inf, ymin = 1,    ymax = Inf,
+           fill = "#4472C4", alpha = 0.10) +
+    annotate("rect", xmin = -Inf, xmax = Inf, ymin = 0,    ymax = 1,
+             fill = "#70AD47", alpha = 0.08) +
+    annotate("rect", xmin = -Inf, xmax = Inf, ymin = -1,   ymax = 0,
+             fill = "#70AD47", alpha = 0.05) +
+    annotate("rect", xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = -1,
+             fill = "#C00000", alpha = 0.08) +
+    
+    # ---- reference lines ----
+  geom_hline(yintercept = 0,             color = "black", linewidth = 0.6) +
+    geom_hline(yintercept = c(-1, 1),      color = "grey30", linetype = "dashed",
+               linewidth = 0.4) +
+    geom_hline(yintercept = c(-1.5, 1.5),  color = "grey55", linetype = "dotted",
+               linewidth = 0.4) +
+    geom_hline(yintercept = c(-2, 2),      color = "grey55", linetype = "dotted",
+               linewidth = 0.4) +
+    
+    # ---- drought shading: ONLY months that cross the onset threshold,
+    #      but filled all the way up to zero (not stopped at onset) so
+    #      the shaded region reads as a continuous deficit down to the
+    #      curve, not a band truncated mid-air at the onset line ----
+  geom_ribbon(data = subset(df, below),
+              aes(ymin = value, ymax = 0, group = grp),
+              fill = "#C0504D", alpha = 0.45) +
+    
+    # ---- the series itself ----
+  geom_line(color = "#1F77B4", linewidth = 0.45) +
+    
+    scale_x_date(date_breaks = "5 years", date_labels = "%Y",
+                 expand = expansion(mult = c(0.01, 0.015))) +
+    scale_y_continuous(breaks = seq(-4, 4, 1)) +
+    coord_cartesian(ylim = c(y_lo, y_hi)) +
+    
+    labs(
+      title    = sprintf("%s-%02d  Basin-Averaged Time Series (Area-Weighted)  |  %s",
+                         index_label, scale, layer_label),
+      subtitle = sprintf("%d drought events detected  (onset < %.1f)",
+                         n_events, onset),
+      x = "Year",
+      y = sprintf("%s-%02d Index Value", index_label, scale)
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      panel.grid.minor    = element_blank(),
+      panel.grid.major.x  = element_line(color = "grey85"),
+      panel.grid.major.y  = element_blank(),
+      plot.title          = element_text(face = "bold", size = 15),
+      plot.subtitle       = element_text(color = "grey40", size = 11),
+      axis.text.x         = element_text(angle = 30, hjust = 1),
+      plot.margin         = margin(10, 16, 10, 10)
+    )
+  
+  fname <- file.path(out_dir,
+                     sprintf("%s_%s_%02d_timeseries.png",
+                             tolower(index_label), layer_label, scale))
+  ggsave(fname, p, width = 11, height = 5.5, dpi = 200, bg = "white")
+  cat(sprintf("  \u2713 Plot saved: %s  (%d events)\n", fname, n_events))
+  invisible(p)
+}
+
+# ---- Generate all plots ----
+for (key in names(all_summaries_ssi)) {
+  s <- all_summaries_ssi[[key]]
+  ts_vals <- area_weighted_mean_ts(s$ssi_indices, area_vec)
+  plot_index_timeseries(
+    dates_vec   = dates,
+    values_vec  = ts_vals,
+    index_label = "SSI",
+    scale       = s$scale,
+    layer_label = s$layer,
+    out_dir     = plot_dir,
+    onset       = -0.5
+  )
+}
+
+for (key in names(all_summaries_ssmi)) {
+  s <- all_summaries_ssmi[[key]]
+  ts_vals <- area_weighted_mean_ts(s$ssmi_indices, area_vec)
+  plot_index_timeseries(
+    dates_vec   = dates,
+    values_vec  = ts_vals,
+    index_label = "SSMI",
+    scale       = s$scale,
+    layer_label = s$layer,
+    out_dir     = plot_dir,
+    onset       = -0.5
+  )
+}
+
+cat(sprintf("\n??? All time series plots saved to: %s\n", normalizePath(plot_dir)))
+cat("Naming convention: {index}_{layer}_{scale:02d}_timeseries.png\n")
+cat("  e.g. ssi_L1_3_03_timeseries.png , ssmi_L1_4_01_timeseries.png\n")
+
 rm(sm_matrix_sub, sm_A, sm_B); gc()
 # ==============================================================================
 # WRITE COMBINED SUMMARY FILES
@@ -773,15 +943,18 @@ write_summary(all_summaries_ssmi, "SSMI", out_dir_ssmi)
 cat("\n============================================================\n")
 cat("SSI AND SSMI CALCULATION COMPLETE!\n")
 cat("============================================================\n")
-cat(sprintf("\nSSI  outputs : %s\n", normalizePath(out_dir_ssi)))
-cat(sprintf("SSMI outputs : %s\n", normalizePath(out_dir_ssmi)))
+cat(sprintf("\nSSI  outputs   : %s\n", normalizePath(out_dir_ssi)))
+cat(sprintf("SSMI outputs   : %s\n", normalizePath(out_dir_ssmi)))
+cat(sprintf("Timeseries PNGs: %s\n", normalizePath(plot_dir)))
 cat("\nFiles generated per index ?? layer config ?? timescale:\n")
 cat("  ??? NetCDF per calendar month  (*_monthNN_Mon.nc)\n")
 cat("  ??? CSV    per calendar month  (*_monthNN_Mon.csv)\n")
 cat("  ??? Excel  workbook            (*_all_months.xlsx)\n")
 cat("  ??? Combined summary text      (*_all_timescales_summary.txt)\n")
+cat("  ??? Basin-averaged PNG plot    (*_timeseries.png)\n")
 cat("\nNaming convention:\n")
 cat("  {index}_{L1_3|L1_4}_{scale:02d}_month{m:02d}_{Mon}.{ext}\n")
 cat("  e.g.  ssi_L1_3_03_month07_Jul.nc\n")
 cat("        ssmi_L1_4_01_all_months.xlsx\n")
+cat("        ssi_L1_3_03_timeseries.png\n")
 cat("\n????????? READY FOR FURTHER CALCULATIONS ?????????\n")

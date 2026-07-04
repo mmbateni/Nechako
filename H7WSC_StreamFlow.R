@@ -94,7 +94,7 @@ stations <- data.frame(
   StationName = c("NECHAKO RIVER AT VANDERHOOF",
                   "STUART RIVER NEAR FORT ST. JAMES"),
   StartYear   = c(NA_real_, 1929),
-  EndYear     = c(NA_real_, 2024),
+  EndYear     = c(NA_real_, 2025),
   stringsAsFactors = FALSE
 )
 
@@ -113,7 +113,7 @@ stations_C <- data.frame(
   StationName = c("NECHAKO RIVER AT VANDERHOOF",
                   "STUART RIVER NEAR FORT ST. JAMES"),
   StartYear   = c(NA_real_, 1929),
-  EndYear     = c(NA_real_, 2024),
+  EndYear     = c(NA_real_, 2025),
   stringsAsFactors = FALSE
 )
 
@@ -473,7 +473,31 @@ load_discharge_data <- function(station_id, data_path = INPUT_DATA_DIR) {
     stop(sprintf("Cannot find date/discharge columns for station %s", station_id))
   }
   
-  data$date       <- as.Date(data[[date_col[1]]])
+  # ── Robust date parsing ─────────────────────────────────────────────────
+  # Different source files use different date formats: the standard WSC
+  # exports (*_WSC_DISCHARGE.csv) are ISO "YYYY-MM-DD", but the naturalized-
+  # flow exports (dat_natural_*.csv) are US "M/D/YYYY" (e.g. "1/1/1955").
+  # as.Date()'s default tryFormats (%Y-%m-%d, %Y/%m/%d) silently misparse
+  # "M/D/YYYY" strings -- e.g. "1/1/1955" gets read positionally as
+  # year=1, month=1, day=1955, and day=1955 overflows via date arithmetic
+  # into a bogus date instead of raising an error. The result: an entire
+  # 1955-2025 record collapses into an apparent "year 1 to year 12" span
+  # with no warning. lubridate::parse_date_time() tries several orders and
+  # picks whichever one actually parses the string correctly.
+  raw_date_str <- as.character(data[[date_col[1]]])
+  parsed_date  <- suppressWarnings(
+    lubridate::parse_date_time(raw_date_str, orders = c("Ymd", "mdy", "dmy"))
+  )
+  data$date <- as.Date(parsed_date)
+  
+  n_unparsed <- sum(!is.na(raw_date_str) & raw_date_str != "" & is.na(data$date))
+  if (n_unparsed > 0) {
+    warning(sprintf(
+      "  [%s] %d date value(s) could not be parsed under any of Ymd/mdy/dmy and were set to NA. Inspect raw values, e.g.: %s",
+      station_id, n_unparsed,
+      paste(head(raw_date_str[!is.na(raw_date_str) & raw_date_str != "" & is.na(data$date)], 5), collapse = ", ")))
+  }
+  
   data$discharge  <- as.numeric(data[[discharge_col[1]]])
   data            <- data[!is.na(data$date) & !is.na(data$discharge), ]
   data$year       <- year(data$date)
@@ -481,6 +505,18 @@ load_discharge_data <- function(station_id, data_path = INPUT_DATA_DIR) {
   data$day        <- day(data$date)
   data$doy        <- yday(data$date)
   data$station_id <- station_id
+  
+  # Sanity check: a station's records should span more than a couple of
+  # calendar years. A span this narrow (e.g. "year 1 to year 12") is the
+  # signature of exactly the M/D/YYYY misparse described above rather than
+  # a genuine short record, so surface it loudly instead of proceeding
+  # silently with garbage dates.
+  if (nrow(data) > 0 && (max(data$year) - min(data$year)) < 2 && min(data$year) < 1800) {
+    warning(sprintf(
+      "  [%s] Parsed year range (%d-%d) looks implausible (< 2 years, year < 1800) -- likely a date-format misparse, not a genuine short record. Raw date sample: %s",
+      station_id, min(data$year), max(data$year),
+      paste(head(raw_date_str, 5), collapse = ", ")))
+  }
   
   cat(sprintf("  Records loaded: %d (%d-%d) [%s]\n",
               nrow(data), min(data$year), max(data$year), display_name))
@@ -1649,6 +1685,159 @@ cat(sprintf("\n%s\nGENERATING ADDITIONAL OUTPUTS...\n%s\n",
 # Station completeness plot
 create_station_completeness_plot(stations, all_completeness, MAIN_OUTPUT_DIR)
 
+# ============================================================================
+# SECTION 13.5b: SSI TIME SERIES PLOTS (SPEI-style aesthetic)
+# ============================================================================
+# One PNG per station per pipeline, showing the monthly SSI series with:
+#   - blue line for the index itself
+#   - red/pink fill under zero, split into separate polygons per drought
+#     excursion so it doesn't visually bridge unrelated dry spells
+#   - dashed reference lines at +/-1, dotted at +/-1.5 and +/-2
+#   - soft background bands (blue = wet, green = near-normal, red = dry)
+#   - subtitle reporting the number of drought events at the onset threshold
+plot_ssi_timeseries <- function(monthly_data, station_id, station_name,
+                                pipeline_label, out_dir,
+                                onset = SSI_DROUGHT_THRESHOLD) {
+  
+  if (is.null(monthly_data) || !"ssi" %in% names(monthly_data)) {
+    cat(sprintf("  [PLOT] Skipping %s (%s): no SSI data available\n",
+                station_id, pipeline_label))
+    return(invisible(NULL))
+  }
+  
+  df <- data.frame(date = monthly_data$date, ssi = monthly_data$ssi)
+  df <- df[is.finite(df$ssi), ]
+  if (nrow(df) == 0L) {
+    cat(sprintf("  [PLOT] Skipping %s (%s): no finite SSI values\n",
+                station_id, pipeline_label))
+    return(invisible(NULL))
+  }
+  
+  # Drought event count (contiguous runs below onset threshold)
+  below_onset <- df$ssi < onset
+  below_onset[is.na(below_onset)] <- FALSE
+  n_events <- sum(rle(below_onset)$values)
+  
+  # Shade only the runs that actually cross the onset threshold, so the red
+  # fill visually matches the events counted above -- not just any negative
+  # month. Separate contiguous runs so the ribbon fill doesn't bridge
+  # unrelated dry spells.
+  df$below <- below_onset
+  df$grp   <- cumsum(c(1L, diff(as.integer(df$below)) != 0L))
+  
+  # SSI values are floored via the probability clamp applied before qnorm()
+  # in the SSI transformation step (p_vals <- pmax(1e-6, pmin(1 - 1e-6,
+  # p_vals))). Computed here from the same clamp probability so the
+  # reference line always tracks that constant if it's ever changed.
+  ssi_clamp_p  <- 1e-6
+  ssi_clamp_lo <- qnorm(ssi_clamp_p)
+  
+  y_lo <- min(-2.2, floor(min(df$ssi) * 10) / 10, floor(ssi_clamp_lo * 10) / 10 - 0.1)
+  y_hi <- max( 2.2, ceiling(max(df$ssi) * 10) / 10)
+  
+  p <- ggplot(df, aes(x = date, y = ssi)) +
+    
+    # ---- severity background bands ----
+  annotate("rect", xmin = -Inf, xmax = Inf, ymin = 1,    ymax = Inf,
+           fill = "#4472C4", alpha = 0.10) +
+    annotate("rect", xmin = -Inf, xmax = Inf, ymin = 0,    ymax = 1,
+             fill = "#70AD47", alpha = 0.08) +
+    annotate("rect", xmin = -Inf, xmax = Inf, ymin = -1,   ymax = 0,
+             fill = "#70AD47", alpha = 0.05) +
+    annotate("rect", xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = -1,
+             fill = "#C00000", alpha = 0.08) +
+    
+    # ---- reference lines ----
+  geom_hline(yintercept = 0,             color = "black", linewidth = 0.6) +
+    geom_hline(yintercept = c(-1, 1),      color = "grey30", linetype = "dashed",
+               linewidth = 0.4) +
+    geom_hline(yintercept = c(-1.5, 1.5),  color = "grey55", linetype = "dotted",
+               linewidth = 0.4) +
+    geom_hline(yintercept = c(-2, 2),      color = "grey55", linetype = "dotted",
+               linewidth = 0.4) +
+    
+    # ---- SSI clamp floor (numerical limit of the qnorm transform, not a
+    #      data limit — see ssi_clamp_lo above) ----
+  geom_hline(yintercept = ssi_clamp_lo, color = "grey35", linetype = "dashed",
+             linewidth = 0.45) +
+    annotate("text", x = min(df$date), y = ssi_clamp_lo, hjust = 0, vjust = -0.6,
+             label = sprintf("clamp floor (p = %.0e \u2192 SSI = %.3f)",
+                             ssi_clamp_p, ssi_clamp_lo),
+             color = "grey35", size = 3.2, fontface = "italic") +
+    
+    # ---- drought shading: ONLY months that cross the onset threshold,
+    #      but filled all the way up to zero (not stopped at onset) so
+    #      the shaded region reads as a continuous deficit down to the
+    #      curve, not a band truncated mid-air at the onset line ----
+  geom_ribbon(data = subset(df, below),
+              aes(ymin = ssi, ymax = 0, group = grp),
+              fill = "#C0504D", alpha = 0.45) +
+    
+    # ---- the series itself ----
+  geom_line(color = "#1F77B4", linewidth = 0.45) +
+    
+    scale_x_date(date_breaks = "5 years", date_labels = "%Y",
+                 expand = expansion(mult = c(0.01, 0.015))) +
+    scale_y_continuous(
+      breaks = sort(unique(c(seq(-4, 4, 1), round(ssi_clamp_lo, 2)))),
+      labels = function(v) ifelse(v == round(ssi_clamp_lo, 2),
+                                  sprintf("%.2f", v), as.character(v))
+    ) +
+    coord_cartesian(ylim = c(y_lo, y_hi)) +
+    
+    labs(
+      title    = sprintf("SSI Time Series  |  %s - %s", station_id, station_name),
+      subtitle = sprintf("%s  |  %d drought events detected  (onset < %.2f)",
+                         pipeline_label, n_events, onset),
+      x = "Year", y = "SSI Index Value"
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      panel.grid.minor    = element_blank(),
+      panel.grid.major.x  = element_line(color = "grey85"),
+      panel.grid.major.y  = element_blank(),
+      plot.title          = element_text(face = "bold", size = 15),
+      plot.subtitle       = element_text(color = "grey40", size = 11),
+      axis.text.x         = element_text(angle = 30, hjust = 1),
+      plot.margin         = margin(10, 16, 10, 10)
+    )
+  
+  pipeline_tag <- gsub("[^A-Za-z0-9]+", "", pipeline_label)
+  fname <- file.path(out_dir, "figures",
+                     sprintf("ssi_%s_%s_timeseries.png", station_id, pipeline_tag))
+  ggsave(fname, p, width = 11, height = 5.5, dpi = 200, bg = "white")
+  cat(sprintf("  [PLOT] SSI time series saved: %s  (%d events)\n",
+              basename(fname), n_events))
+  invisible(p)
+}
+
+cat("\n[PLOTS] Pipeline B (naturalized 08JC001 + observed 08JE001)...\n")
+for (sid in names(all_ssi_results)) {
+  sname <- stations$StationName[stations$StationID == sid][1]
+  plot_ssi_timeseries(
+    monthly_data   = all_ssi_results[[sid]]$monthly_data,
+    station_id     = sid,
+    station_name   = sname,
+    pipeline_label = if (sid == "08JC001") "Pipeline B (naturalized flow)"
+    else "Pipeline B (observed)",
+    out_dir        = MAIN_OUTPUT_DIR
+  )
+}
+
+cat("\n[PLOTS] Pipeline C (original/post-regulation 08JC001 + observed 08JE001)...\n")
+for (sid in names(all_ssi_results_C)) {
+  sname <- stations_C$StationName[stations_C$StationID == sid][1]
+  plot_ssi_timeseries(
+    monthly_data   = all_ssi_results_C[[sid]]$monthly_data,
+    station_id     = sid,
+    station_name   = sname,
+    pipeline_label = if (sid == "08JC001")
+      sprintf("Pipeline C (observed, post-reg >= %d)", POST_REGULATION_START_YEAR)
+    else "Pipeline C (observed)",
+    out_dir        = MAIN_OUTPUT_DIR
+  )
+}
+
 # Excel summary workbook
 create_excel_summary(stations, all_completeness,
                      all_daily_droughts, all_ssi_droughts,
@@ -1795,6 +1984,7 @@ cat("  ssi/naturalized_homogeneity_check.rds — Pipeline B: Pettitt-test homoge
 cat("  ssi_C/monthly_data/               — Pipeline C: monthly SSI time series (08JC001 original/post-regulation, 08JE001)\n")
 cat("  ssi_C/drought_events/             — Pipeline C: SSI drought events\n")
 cat("  figures/                          — station_completeness_barplot.png\n")
+cat("  figures/                          — ssi_{StationID}_{PipelineTag}_timeseries.png\n")
 cat("  reports/                          — station_summary_dual_pipeline.csv\n")
 cat("                                    — station_summary_pipeline_C.csv\n")
 cat("                                    — nechako_streamflow_drought_summary.xlsx\n")

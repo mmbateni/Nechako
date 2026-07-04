@@ -70,6 +70,7 @@ library(zoo)
 library(writexl)
 library(parallel)
 library(lmomco)   # required for option 2 (SSPI-1 zero-inflated gamma)
+library(ggplot2)  # basin-averaged time series plots (see TIME SERIES PLOTS section)
 # also used for the regional L-moment / kappa-distribution
 # machinery (discordancy, heterogeneity, regional gamma fit)
 # stats::ks.test (base R) is used for the gamma goodness-of-fit test.
@@ -1995,6 +1996,193 @@ for (sc in timescales) {
 }
 
 # ==============================================================================
+#   TIME SERIES PLOTS (BASIN-AVERAGED)
+# ==============================================================================
+# Two kinds of figures, written to out_dir/figures/:
+#   1. plot_index_timeseries()   - basin-mean SWEI/SSPI-1 series per timescale,
+#      SPI/SSI-style: standardized-index line, red fill for excursions below
+#      zero (split into separate polygons per contiguous dry spell so the
+#      ribbon doesn't visually bridge unrelated events), dashed/dotted
+#      reference lines at +/-1/1.5/2, soft severity background bands, and a
+#      subtitle reporting the number of drought events at the chosen onset
+#      threshold. Mirrors plot_ssi_timeseries() from the streamflow SSI script
+#      for a consistent look across indices.
+#   2. plot_raw_swe_timeseries() - basin-mean RAW SWE (mm), the physical
+#      variable the index is standardized from, for context alongside the
+#      standardized series.
+figures_dir <- file.path(out_dir, "figures")
+if (!dir.exists(figures_dir)) dir.create(figures_dir, recursive = TRUE)
+
+plot_index_timeseries <- function(dates_vec, values_vec, sc, index_lbl,
+                                  index_full_name, title_label, out_dir, onset,
+                                  method_label) {
+  df <- data.frame(date = dates_vec, value = values_vec)
+  df <- df[is.finite(df$value), ]
+  if (nrow(df) == 0L) {
+    cat(sprintf("  [PLOT] Skipping %s-%d time series: no finite values\n",
+                toupper(index_lbl), sc))
+    return(invisible(NULL))
+  }
+  
+  # Drought event count (contiguous runs below onset threshold)
+  below_onset <- df$value < onset
+  below_onset[is.na(below_onset)] <- FALSE
+  n_events <- sum(rle(below_onset)$values)
+  
+  # Shade only the runs that actually cross the onset threshold, so the red
+  # fill visually matches the events counted above -- not just any negative
+  # month (which would shade e.g. a -0.3 dip identically to a -2.5 deficit
+  # even though only the latter is a counted event). Separate contiguous
+  # runs so the ribbon fill doesn't bridge unrelated dry spells.
+  df$below <- below_onset
+  df$grp   <- cumsum(c(1L, diff(as.integer(df$below)) != 0L))
+  
+  y_lo <- min(-2.2, floor(min(df$value) * 10) / 10)
+  y_hi <- max( 2.2, ceiling(max(df$value) * 10) / 10)
+  
+  p <- ggplot(df, aes(x = date, y = value)) +
+    
+    # ---- severity background bands ----
+  annotate("rect", xmin = -Inf, xmax = Inf, ymin = 1,    ymax = Inf,
+           fill = "#4472C4", alpha = 0.10) +
+    annotate("rect", xmin = -Inf, xmax = Inf, ymin = 0,    ymax = 1,
+             fill = "#70AD47", alpha = 0.08) +
+    annotate("rect", xmin = -Inf, xmax = Inf, ymin = -1,   ymax = 0,
+             fill = "#70AD47", alpha = 0.05) +
+    annotate("rect", xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = -1,
+             fill = "#C00000", alpha = 0.08) +
+    
+    # ---- reference lines ----
+  geom_hline(yintercept = 0,             color = "black", linewidth = 0.6) +
+    geom_hline(yintercept = c(-1, 1),      color = "grey30", linetype = "dashed",
+               linewidth = 0.4) +
+    geom_hline(yintercept = c(-1.5, 1.5),  color = "grey55", linetype = "dotted",
+               linewidth = 0.4) +
+    geom_hline(yintercept = c(-2, 2),      color = "grey55", linetype = "dotted",
+               linewidth = 0.4) +
+    
+    # ---- drought shading: ONLY months that cross the onset threshold,
+    #      but filled all the way up to zero (not stopped at onset) so
+    #      the shaded region reads as a continuous deficit down to the
+    #      curve, not a band truncated mid-air at the onset line ----
+  geom_ribbon(data = subset(df, below),
+              aes(ymin = value, ymax = 0, group = grp),
+              fill = "#C0504D", alpha = 0.45) +
+    
+    # ---- the series itself ----
+  geom_line(color = "#1F77B4", linewidth = 0.45) +
+    
+    scale_x_date(date_breaks = "5 years", date_labels = "%Y",
+                 expand = expansion(mult = c(0.01, 0.015))) +
+    scale_y_continuous(breaks = seq(-4, 4, 1)) +
+    coord_cartesian(ylim = c(y_lo, y_hi)) +
+    
+    labs(
+      title    = sprintf("%s Time Series  |  NECHAKO BASIN (basin-mean)",
+                         title_label),
+      subtitle = sprintf("%s  |  %d snow-drought events detected  (onset < %.2f)",
+                         method_label, n_events, onset),
+      x = "Year", y = sprintf("%s Index Value", index_full_name)
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      panel.grid.minor    = element_blank(),
+      panel.grid.major.x  = element_line(color = "grey85"),
+      panel.grid.major.y  = element_blank(),
+      plot.title          = element_text(face = "bold", size = 15),
+      plot.subtitle       = element_text(color = "grey40", size = 11),
+      axis.text.x         = element_text(angle = 30, hjust = 1),
+      plot.margin         = margin(10, 16, 10, 10)
+    )
+  
+  fname <- file.path(out_dir, "figures",
+                     sprintf("%s_%02d_basin_timeseries.png", index_lbl, sc))
+  ggsave(fname, p, width = 11, height = 5.5, dpi = 200, bg = "white")
+  cat(sprintf("  [PLOT] %s-%d basin-mean time series saved: %s  (%d events)\n",
+              toupper(index_lbl), sc, basename(fname), n_events))
+  invisible(p)
+}
+
+plot_raw_swe_timeseries <- function(dates_vec, swe_vec, out_dir) {
+  df <- data.frame(date = dates_vec, swe = swe_vec)
+  df <- df[is.finite(df$swe), ]
+  if (nrow(df) == 0L) {
+    cat("  [PLOT] Skipping raw basin-mean SWE time series: no finite values\n")
+    return(invisible(NULL))
+  }
+  
+  p <- ggplot(df, aes(x = date, y = swe)) +
+    geom_area(fill = "#4472C4", alpha = 0.20) +
+    geom_line(color = "#2E5A9C", linewidth = 0.45) +
+    scale_x_date(date_breaks = "5 years", date_labels = "%Y",
+                 expand = expansion(mult = c(0.01, 0.015))) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+    labs(
+      title    = "Basin-Averaged Raw SWE  |  NECHAKO BASIN",
+      subtitle = "ERA5-Land snow water equivalent, spatial mean over basin pixels (pre-standardization)",
+      x = "Year", y = "SWE (mm)"
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      panel.grid.minor    = element_blank(),
+      panel.grid.major.x  = element_line(color = "grey85"),
+      plot.title          = element_text(face = "bold", size = 15),
+      plot.subtitle       = element_text(color = "grey40", size = 11),
+      axis.text.x         = element_text(angle = 30, hjust = 1),
+      plot.margin         = margin(10, 16, 10, 10)
+    )
+  
+  fname <- file.path(out_dir, "figures", "raw_swe_basin_timeseries.png")
+  ggsave(fname, p, width = 11, height = 5.5, dpi = 200, bg = "white")
+  cat(sprintf("  [PLOT] Raw basin-mean SWE time series saved: %s\n", basename(fname)))
+  invisible(p)
+}
+
+cat("\n===== GENERATING TIME SERIES PLOTS =====\n")
+
+# Onset threshold for the drought-event count in the subtitle: -0.5, matching
+# SSI_DROUGHT_THRESHOLD in the companion streamflow SSI script (H7WSC_
+# StreamFlow.R), so "event" means the same thing (index crosses below -0.5)
+# across indices rather than mixing an onset convention here with a
+# McKee-style severity-tier value there.
+index_onset      <- -0.5
+index_full_name  <- if (scf_method == "2") "SSPI-1" else "SWEI"
+
+# Plot-only method label: scf_method_label (used elsewhere for run_settings.txt
+# / the text summary) includes a "(zero-inflated gamma, no SCF mask)"
+# parenthetical that's implementation detail, not something the figure
+# subtitle needs -- kept short here instead.
+plot_method_label <- if (scf_method == "2") "SSPI-1" else scf_method_label
+
+for (sc in timescales) {
+  # SSPI-1's own name already encodes its timescale ("-1"), so don't also
+  # append "-%d" (which produced "SSPI-1-1"); SWEI's name doesn't, so it
+  # still needs "-3" etc. appended to identify the timescale.
+  title_label <- if (scf_method == "2") index_full_name else sprintf("%s-%d", index_full_name, sc)
+  
+  plot_index_timeseries(
+    dates_vec        = dates,
+    values_vec        = basin_avg_swei_results[[as.character(sc)]],
+    sc                = sc,
+    index_lbl         = index_lbl,
+    index_full_name   = index_full_name,
+    title_label       = title_label,
+    out_dir           = out_dir,
+    onset             = index_onset,
+    method_label      = plot_method_label
+  )
+}
+
+# Raw SWE is only pre-computed for method 1 (swe_basin_avg_raw); recompute
+# from swe_matrix for method 2 so the plot is available for both methods.
+swe_basin_avg_for_plot <- if (!is.null(swe_basin_avg_raw)) {
+  swe_basin_avg_raw
+} else {
+  colMeans(swe_matrix, na.rm = TRUE)
+}
+plot_raw_swe_timeseries(dates, swe_basin_avg_for_plot, out_dir)
+
+# ==============================================================================
 #   WRITE SUMMARY FILE AT END 
 # ==============================================================================
 cat("\n===== WRITING SUMMARY FILE =====\n")
@@ -2134,4 +2322,5 @@ cat(if (scf_method == "2") "SSPI-1 CALCULATION COMPLETE!\n" else "SWEI CALCULATI
 cat("============================================================\n")
 cat(sprintf("\nOutput directory: %s\n", normalizePath(out_dir)))
 cat(sprintf("Summary file: %s\n", summary_combined_file))
+cat(sprintf("Time series plots: %s\n", file.path(out_dir, "figures")))
 cat("\n--- READY FOR ANALYSIS ---\n")
