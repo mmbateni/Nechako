@@ -690,7 +690,7 @@ plot_index_timeseries(
   values_vec  = sgi_basin$sgi_median,
   index_label = "SGI",
   title_label = "SGI (Groundwater, Basin-Median)",
-  out_dir  <- "sgi_results_GW"
+  out_dir  <- "sgi_results_GW",
   onset       = -0.5,
   clamp_floor = if (is.na(sgi_clamp_floor)) NULL else sgi_clamp_floor,
   clamp_label = sgi_clamp_label
@@ -740,5 +740,20 @@ for(w in unique(sgi_long$well_num)) {
 sgi_ts_png <- file.path(figures_dir, "sgi_basin_timeseries.png")
 if (file.exists(sgi_ts_png)) {
   message(sprintf("\nBasin-mean time series plot (shared style): %s", normalizePath(sgi_ts_png)))
+}
+
+#---- 11. Clean up cache directory --------------------------------------------
+# Preserve anything in cache_dir by copying it into out_dir first, then remove
+# the cache directory (and its contents) entirely.
+if(dir.exists(cfg$cache_dir)) {
+  cache_files <- list.files(cfg$cache_dir, full.names = TRUE, recursive = TRUE)
+  if(length(cache_files) > 0) {
+    if(!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+    file.copy(cache_files, out_dir, overwrite = TRUE)
+    message(sprintf("  Copied %d cached file(s) from %s to %s before cleanup",
+                    length(cache_files), cfg$cache_dir, out_dir))
+  }
+  unlink(cfg$cache_dir, recursive = TRUE)
+  message(sprintf("  Removed cache directory: %s", cfg$cache_dir))
 }
 #---- END --------------------------------------------------------------------

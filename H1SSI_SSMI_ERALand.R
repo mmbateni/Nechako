@@ -37,7 +37,7 @@ library(parallel)
 
 # ---- Paths ----
 setwd("D:/Nechako_Drought/Nechako")
-out_dir_ssi  <- "ssi_results_seasonal"
+out_dir_ssi  <- "ssi_SM_results_seasonal"
 out_dir_ssmi <- "ssmi_results_seasonal"
 if (!dir.exists(out_dir_ssi))  dir.create(out_dir_ssi,  recursive = TRUE)
 if (!dir.exists(out_dir_ssmi)) dir.create(out_dir_ssmi, recursive = TRUE)
