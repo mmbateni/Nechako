@@ -8,7 +8,7 @@
 #       Right-aligned 3-month climatology, matches original paper.
 #   2 = SSPI-1: Standardized SnowPack Index (monthly, no SCF mask)
 #       Zero-inflated gamma distribution, following Stagge et al. (2015) and JRC EDO (2020).
-#       Output to: sspi_results_monthly/
+#       Output to: sspi_Snow_results_monthly/
 #
 # Other methodological alignments with Huning & AghaKouchak (2020):
 #   - Zero-SWE perturbation: random uniform in (0, min_nonzero)  [method 1]
@@ -152,7 +152,7 @@ scf_method_label <- if (scf_method == "1") "Huning & AghaKouchak (2020)" else "S
 
 # ---- Paths ----
 setwd("D:/Nechako_Drought/Nechako")
-out_dir <- if (scf_method == "2") "sspi_results_monthly" else "swei_results_seasonal"
+out_dir <- if (scf_method == "2") "sspi_Snow_results_monthly" else "swei_results_seasonal"
 TIMESTAMP_OUTPUT_SUBDIR <- TRUE  # set TRUE to give every run its own folder
 if (TIMESTAMP_OUTPUT_SUBDIR) {
   out_dir <- file.path(out_dir, format(Sys.time(), "%Y%m%d_%H%M%S"))
