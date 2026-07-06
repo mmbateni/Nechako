@@ -690,7 +690,7 @@ plot_index_timeseries(
   values_vec  = sgi_basin$sgi_median,
   index_label = "SGI",
   title_label = "SGI (Groundwater, Basin-Median)",
-  out_dir     = ".",
+  out_dir  <- "sgi_results_GW"
   onset       = -0.5,
   clamp_floor = if (is.na(sgi_clamp_floor)) NULL else sgi_clamp_floor,
   clamp_label = sgi_clamp_label
