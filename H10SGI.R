@@ -737,7 +737,7 @@ for(w in unique(sgi_long$well_num)) {
   ggsave(paste0(cfg$output_prefix, "_well_", w, ".png"), p_well, width = 10, height = 4, dpi = 150)
   message("Plot saved: ", cfg$output_prefix, "_well_", w, ".png")
 }
-sgi_ts_png <- file.path(".", "figures", "sgi_basin_timeseries.png")
+sgi_ts_png <- file.path(figures_dir, "sgi_basin_timeseries.png")
 if (file.exists(sgi_ts_png)) {
   message(sprintf("\nBasin-mean time series plot (shared style): %s", normalizePath(sgi_ts_png)))
 }
