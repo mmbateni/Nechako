@@ -8,7 +8,11 @@
 #       Right-aligned 3-month climatology, matches original paper.
 #   2 = SSPI-1: Standardized SnowPack Index (monthly, no SCF mask)
 #       Zero-inflated gamma distribution, following Stagge et al. (2015) and JRC EDO (2020).
-#       Output to: sspi_Snow_results_monthly/
+#       Output to: sspi_results_monthly/
+#       [Nechako SAF pipeline] Run this method (2) BEFORE A03_saf_core_pipeline.R.
+#       Files are written as sspi_01_month{MM}_{Mon}.nc, which
+#       assemble_index_raster(prefix="sspi", scale_tag="01") in
+#       A03_saf_core_pipeline.R reads directly -- no renaming needed.
 #
 # Other methodological alignments with Huning & AghaKouchak (2020):
 #   - Zero-SWE perturbation: random uniform in (0, min_nonzero)  [method 1]
@@ -85,7 +89,12 @@ cat("  2 = SSPI-1 (Standardized SnowPack Index, monthly)\n")
 cat("                          (zero-inflated gamma, no SCF mask)\n\n")
 
 # ---- To use in batch/scheduled jobs, set DEFAULT_SCF_METHOD to "1" or "2"
-DEFAULT_SCF_METHOD <- "1"
+# NOTE: changed from "1" to "2" so that non-interactive / batch sourcing
+# (e.g. as part of the automated Nechako SAF pipeline, which now consumes
+# SSPI-1 as an additional input alongside SPI-1/SPEI-1/SPI-3/SPEI-3) produces
+# SSPI-1 (sspi_results_monthly/) by default. Set back to "1" if you need the
+# original SWEI (Huning & AghaKouchak 2020) output instead.
+DEFAULT_SCF_METHOD <- "2"
 
 scf_method <- ""
 
