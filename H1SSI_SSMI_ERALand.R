@@ -26,6 +26,15 @@
 #   ??? CSV    per calendar month
 #   ??? Excel  workbook (all calendar months as sheets)
 #   ??? Summary .txt file
+#
+# [Nechako SAF pipeline] SSMI-1 is the additional pipeline input. Run this
+# script BEFORE A03_saf_core_pipeline.R. By default the pipeline reads the
+# SSMI-1, L1_3 (0-100 cm) files:
+#   ssmi_results_seasonal/ssmi_L1_3_01_month{MM}_{Mon}.nc
+# via assemble_index_raster(prefix = "ssmi_L1_3", scale_tag = "01"). Set
+# SSMI_LAYER <- "L1_4" at the top of A03_saf_core_pipeline.R to use the
+# all-layer (0-289 cm) product instead -- no changes needed here either way,
+# since both layer configs are written out by this script automatically.
 ##############################################
 
 # ---- Libraries ----
