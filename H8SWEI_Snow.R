@@ -162,7 +162,7 @@ scf_method_label <- if (scf_method == "1") "Huning & AghaKouchak (2020)" else "S
 # ---- Paths ----
 setwd("D:/Nechako_Drought/Nechako")
 out_dir <- if (scf_method == "2") "sspi_Snow_results_monthly" else "swei_results_seasonal"
-TIMESTAMP_OUTPUT_SUBDIR <- TRUE  # set TRUE to give every run its own folder
+TIMESTAMP_OUTPUT_SUBDIR <- FALSE  # set TRUE to give every run its own timestamped folder
 if (TIMESTAMP_OUTPUT_SUBDIR) {
   out_dir <- file.path(out_dir, format(Sys.time(), "%Y%m%d_%H%M%S"))
 }
