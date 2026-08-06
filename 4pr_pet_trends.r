@@ -90,6 +90,7 @@ TEMP_START_YR            <- 1950L
 # ===== INPUT PATHS =====
 precip_path   <- "monthly_data_direct/total_precipitation_monthly.nc"
 pet_path      <- "monthly_data_direct/potential_evapotranspiration_monthly.nc"
+aet_path      <- "monthly_data_direct/total_evaporation_monthly.nc"  # ERA5-Land actual total evaporation
 # [NEW] Thornthwaite PET — produced by 2preq_PET_ERALand.R (Section 5b)
 pet_thw_path  <- "monthly_data_direct/potential_evapotranspiration_thornthwaite_monthly.nc"
 
@@ -189,6 +190,8 @@ log_event("Loading Precipitation, PET (PM + Thornthwaite), and Temperature data.
 
 precip_full <- rast(precip_path)
 pet_full    <- rast(pet_path)
+if (!file.exists(aet_path)) stop("ERA5-Land total evaporation NetCDF not found: ", aet_path)
+aet_full    <- rast(aet_path)
 
 # [NEW] Thornthwaite PET
 if (!file.exists(pet_thw_path))
@@ -223,29 +226,32 @@ years  <- as.integer(format(dates, "%Y"))
 months <- as.integer(format(dates, "%m"))
 
 # ── Unit conversions ─────────────────────────────────────────────────────────────
-# Use detect_precip_unit() to determine the correct m→mm factor for each
-# variable rather than hardcoding × 1000.  The function samples a July layer
-# and returns 1000 (m/day), 1 (already mm/day), or NA (already mm/month).
-precip_unit_info   <- detect_precip_unit(precip_full,   dates_vec = dates_full, var_label = "Precip")
-pet_unit_info      <- detect_precip_unit(pet_full,      dates_vec = dates_full, var_label = "PET_PM")
-pet_thw_unit_info  <- detect_precip_unit(pet_thw_full,  dates_vec = dates_full, var_label = "PET_Thw")
-
-if (!is.na(precip_unit_info$factor)  && precip_unit_info$factor  != 1)
-  precip_full  <- precip_full  * precip_unit_info$factor
-if (!is.na(pet_unit_info$factor)     && pet_unit_info$factor     != 1)
-  pet_full     <- pet_full     * pet_unit_info$factor
-if (!is.na(pet_thw_unit_info$factor) && pet_thw_unit_info$factor != 1)
-  pet_thw_full <- pet_thw_full * pet_thw_unit_info$factor
-
+# precip_full <- precip_full * 1000    # m → mm/day
 month_days_base  <- c(31,28,31,30,31,30,31,31,30,31,30,31)
 is_leap <- function(yr) (yr%%4==0) & (yr%%100!=0 | yr%%400==0)
 days_in_month <- month_days_base[months]
 days_in_month[is_leap(years) & months==2] <- 29
 
-log_event("Converting Pr, PET (PM), and PET (Thw) from mm/day to mm/month...")
+# ERA5-Land total_evaporation follows the ECMWF flux sign convention: evaporation
+# is normally negative (upward water flux). Convert to positive actual evaporation
+# depth in mm/day before converting to monthly totals. If a preprocessed file is
+# already positive, retain its sign rather than flipping it a second time.
+aet_sample <- as.numeric(terra::global(aet_full[[which(months == 7)[1]]], "mean", na.rm=TRUE)[1,1])
+if (is.finite(aet_sample) && aet_sample < 0) {
+  aet_full <- -aet_full
+  log_event("  [AET] ERA5 sign convention detected; multiplied total_evaporation by -1.")
+}
+aet_sample2 <- as.numeric(terra::global(aet_full[[which(months == 7)[1]]], "mean", na.rm=TRUE)[1,1])
+if (is.finite(aet_sample2) && aet_sample2 < 0.01) {
+  aet_full <- aet_full * 1000
+  log_event("  [AET] Converted total_evaporation from m/day to mm/day.")
+}
+
+log_event("Converting Pr, PET (PM), PET (Thw), and AET from mm/day to mm/month...")
 for (i in seq_len(nlyr(precip_full)))   precip_full[[i]]   <- precip_full[[i]]   * days_in_month[i]
 for (i in seq_len(nlyr(pet_full)))      pet_full[[i]]      <- pet_full[[i]]      * days_in_month[i]
 for (i in seq_len(nlyr(pet_thw_full)))  pet_thw_full[[i]]  <- pet_thw_full[[i]]  * days_in_month[i]
+for (i in seq_len(nlyr(aet_full)))      aet_full[[i]]      <- aet_full[[i]]      * days_in_month[i]
 
 # Temperature: Kelvin → °C
 tair_sample <- as.numeric(terra::global(tair_full[[1]], "mean", na.rm=TRUE))
@@ -274,6 +280,7 @@ log_event("Reprojecting to BC Albers (EPSG:3005)...")
 precip_full   <- project(precip_full,   "EPSG:3005", method="bilinear")
 pet_full      <- project(pet_full,      "EPSG:3005", method="bilinear")
 pet_thw_full  <- project(pet_thw_full,  "EPSG:3005", method="bilinear")  # [NEW]
+aet_full      <- project(aet_full,      "EPSG:3005", method="bilinear")
 tair_full     <- project(tair_full,     "EPSG:3005", method="bilinear")
 
 log_event("Clipping to Nechako Basin extent...")
@@ -281,6 +288,7 @@ basin_extent     <- ext(basin_boundary)
 precip_clipped   <- mask(crop(precip_full,   basin_extent), vect(basin_boundary), touches=TRUE)
 pet_clipped      <- mask(crop(pet_full,      basin_extent), vect(basin_boundary), touches=TRUE)
 pet_thw_clipped  <- mask(crop(pet_thw_full,  basin_extent), vect(basin_boundary), touches=TRUE)  # [NEW]
+aet_clipped      <- mask(crop(aet_full,      basin_extent), vect(basin_boundary), touches=TRUE)
 tair_clipped     <- mask(crop(tair_full,     basin_extent), vect(basin_boundary), touches=TRUE)
 
 clipped_template <- rast(precip_clipped, nlyrs=1); values(clipped_template) <- NA_real_
@@ -304,6 +312,9 @@ log_event("Computing basin-averaged monthly time series (all variables)...")
 precip_monthly_avg    <- as.vector(global(precip_clipped,  fun="mean", na.rm=TRUE)[,1])
 pet_monthly_avg       <- as.vector(global(pet_clipped,     fun="mean", na.rm=TRUE)[,1])
 pet_thw_monthly_avg   <- as.vector(global(pet_thw_clipped, fun="mean", na.rm=TRUE)[,1])  # [NEW]
+aet_monthly_avg       <- as.vector(global(aet_clipped,     fun="mean", na.rm=TRUE)[,1])
+wb_aet_monthly_avg    <- precip_monthly_avg - aet_monthly_avg
+wb_pet_monthly_avg    <- precip_monthly_avg - pet_monthly_avg
 tair_monthly_avg      <- as.vector(global(tair_clipped,    fun="mean", na.rm=TRUE)[,1])
 
 # Annual aggregation
@@ -312,6 +323,12 @@ precip_annual_avg_matrix   <- aggregate_to_annual_fast(
 pet_annual_avg_matrix      <- aggregate_to_annual_warmseason_fast(
   matrix(pet_monthly_avg, ncol=1), years, months_vec=months,
   warm_months=warm_months_pet, method="sum")
+aet_annual_avg_matrix      <- aggregate_to_annual_fast(
+  matrix(aet_monthly_avg, ncol=1), years, method="sum")
+wb_aet_annual_avg_matrix   <- aggregate_to_annual_fast(
+  matrix(wb_aet_monthly_avg, ncol=1), years, method="sum")
+wb_pet_annual_avg_matrix   <- aggregate_to_annual_fast(
+  matrix(wb_pet_monthly_avg, ncol=1), years, method="sum")
 pet_thw_annual_avg_matrix  <- aggregate_to_annual_warmseason_fast(          # [NEW]
   matrix(pet_thw_monthly_avg, ncol=1), years, months_vec=months,
   warm_months=warm_months_pet, method="sum")
@@ -321,6 +338,9 @@ tair_annual_avg_matrix     <- aggregate_to_annual_fast(
 precip_annual_avg    <- precip_annual_avg_matrix[,1]
 pet_annual_avg       <- pet_annual_avg_matrix[,1]
 pet_thw_annual_avg   <- pet_thw_annual_avg_matrix[,1]  # [NEW]
+aet_annual_avg       <- aet_annual_avg_matrix[,1]
+wb_aet_annual_avg    <- wb_aet_annual_avg_matrix[,1]
+wb_pet_annual_avg    <- wb_pet_annual_avg_matrix[,1]
 tair_annual_avg      <- tair_annual_avg_matrix[,1]
 annual_years         <- as.integer(rownames(precip_annual_avg_matrix))
 tair_annual_years    <- as.integer(rownames(tair_annual_avg_matrix))
@@ -341,6 +361,9 @@ valid_xy           <- xyFromCell(precip_clipped, valid_cell_indices)
 precip_matrix      <- t(values(precip_clipped)[valid_mask,    , drop=FALSE])
 pet_matrix         <- t(values(pet_clipped)[valid_mask,       , drop=FALSE])
 pet_thw_matrix     <- t(values(pet_thw_clipped)[valid_mask,   , drop=FALSE])  # [NEW]
+aet_matrix         <- t(values(aet_clipped)[valid_mask,       , drop=FALSE])
+wb_aet_matrix      <- precip_matrix - aet_matrix
+wb_pet_matrix      <- precip_matrix - pet_matrix
 tair_matrix        <- t(values(tair_clipped)[valid_mask,      , drop=FALSE])
 
 coords_dt <- data.table(
@@ -511,6 +534,12 @@ basin_pet_results       <- process_basin_series(pet_monthly_avg,     pet_annual_
                                                 "PET", is_precip=FALSE)
 basin_pet_thw_results   <- process_basin_series(pet_thw_monthly_avg, pet_thw_annual_avg,  # [NEW]
                                                 "PET_Thw", is_precip=FALSE)
+basin_aet_results       <- process_basin_series(aet_monthly_avg, aet_annual_avg,
+                                                "Total_Evaporation", is_precip=FALSE, skip_min_filter=TRUE)
+basin_wb_aet_results    <- process_basin_series(wb_aet_monthly_avg, wb_aet_annual_avg,
+                                                "P_minus_AET", is_precip=FALSE, skip_min_filter=TRUE)
+basin_wb_pet_results    <- process_basin_series(wb_pet_monthly_avg, wb_pet_annual_avg,
+                                                "P_minus_PET", is_precip=FALSE, skip_min_filter=TRUE)
 basin_tair_results      <- process_basin_series(tair_monthly_avg,    tair_annual_avg,
                                                 "Temperature", is_precip=FALSE,
                                                 skip_min_filter=TRUE,
@@ -521,19 +550,18 @@ basin_tair_results      <- process_basin_series(tair_monthly_avg,    tair_annual
 ####################################################################################
 process_variable_final <- function(data_matrix, var_name, coords_dt,
                                    is_precip=FALSE, skip_min_filter=FALSE,
-                                   yrs=years, mos=months) {
+                                   yrs=years, mos=months, annual_mode=NULL) {
   log_event(paste("Processing", var_name, "pixels..."))
-  if (!is_precip && !skip_min_filter) {
-    log_event("  Aggregating PET to warm-season annual sum (Apr-Oct)...")
+  if (is.null(annual_mode)) annual_mode <- if (is_precip) "sum" else if (skip_min_filter) "mean" else "pet_warm_sum"
+  if (identical(annual_mode, "pet_warm_sum")) {
+    log_event("  Aggregating PET to warm-season annual sum (Apr-Oct).")
     annual_matrix <- aggregate_to_annual_warmseason_fast(
       data_matrix, yrs, months_vec=mos, warm_months=warm_months_pet, method="sum")
-  } else if (skip_min_filter) {
-    log_event("  Aggregating Temperature to full-year annual mean...")
+  } else if (identical(annual_mode, "mean")) {
     annual_matrix <- aggregate_to_annual_fast(data_matrix, yrs, method="mean")
-  } else {
-    log_event("  Aggregating Precipitation to annual sum...")
+  } else if (identical(annual_mode, "sum")) {
     annual_matrix <- aggregate_to_annual_fast(data_matrix, yrs, method="sum")
-  }
+  } else stop("Unknown annual_mode: ", annual_mode)
   
   conf_env          <- new.env(parent=emptyenv())
   start_year_annual <- min(as.integer(rownames(annual_matrix)))
@@ -555,8 +583,7 @@ process_variable_final <- function(data_matrix, var_name, coords_dt,
   monthly_results_list <- vector("list", 12L)
   for (m in 1:12) {
     mi_key  <- as.character(m)
-    mi_use  <- if (skip_min_filter) month_index_list_t[[mi_key]] else
-      month_index_list[[mi_key]]
+    mi_use  <- compute_month_index(mos)[[mi_key]]
     monthly_sub <- if (length(mi_use)) data_matrix[mi_use, , drop=FALSE] else
       matrix(NA_real_, 0, ncol(data_matrix))
     mn_count  <- if (!skip_min_filter && !is_precip) min_nonzero_pet_monthly else NULL
@@ -615,6 +642,15 @@ pet_results      <- process_variable_final(pet_matrix,     "PET",       coords_d
 log_event("=== STARTING PET (Thornthwaite) ANALYSIS ===")   # [NEW]
 pet_thw_results  <- process_variable_final(pet_thw_matrix, "PET_Thw",   coords_dt,
                                            is_precip=FALSE)
+log_event("=== STARTING TOTAL EVAPORATION (AET) ANALYSIS ===")
+aet_results      <- process_variable_final(aet_matrix, "Total_Evaporation", coords_dt,
+                                           is_precip=FALSE, skip_min_filter=TRUE, annual_mode="sum")
+log_event("=== STARTING P - AET WATER-BALANCE ANALYSIS ===")
+wb_aet_results   <- process_variable_final(wb_aet_matrix, "P_minus_AET", coords_dt,
+                                           is_precip=FALSE, skip_min_filter=TRUE, annual_mode="sum")
+log_event("=== STARTING P - PET WATER-BALANCE ANALYSIS ===")
+wb_pet_results   <- process_variable_final(wb_pet_matrix, "P_minus_PET", coords_dt,
+                                           is_precip=FALSE, skip_min_filter=TRUE, annual_mode="sum")
 log_event("=== STARTING TEMPERATURE ANALYSIS ===")
 tair_results     <- process_variable_final(tair_matrix,    "Temperature", coords_dt,
                                            is_precip=FALSE, skip_min_filter=TRUE,
@@ -656,17 +692,20 @@ extract_point_monthly <- function(rast_clipped, pts, dates_vec, var_name, unit_l
 pt_pr      <- extract_point_monthly(precip_clipped,  pts_proj, dates,   "Precipitation", "mm/month")
 pt_pet     <- extract_point_monthly(pet_clipped,     pts_proj, dates,   "PET",           "mm/month")
 pt_pet_thw <- extract_point_monthly(pet_thw_clipped, pts_proj, dates,   "PET_Thw",       "mm/month")  # [NEW]
+pt_aet     <- extract_point_monthly(aet_clipped,     pts_proj, dates,   "Total_Evaporation", "mm/month")
+pt_wb_aet  <- copy(pt_pr); pt_wb_aet[, `:=`(value = pt_pr$value - pt_aet$value, variable="P_minus_AET")]
+pt_wb_pet  <- copy(pt_pr); pt_wb_pet[, `:=`(value = pt_pr$value - pt_pet$value, variable="P_minus_PET")]
 pt_tair    <- extract_point_monthly(tair_clipped,    pts_proj, dates_t, "Temperature",   "degC")
 
 # Combine and save raw monthly series (all 4 variables)
-point_monthly_ts <- rbindlist(list(pt_pr, pt_pet, pt_pet_thw, pt_tair),
+point_monthly_ts <- rbindlist(list(pt_pr, pt_pet, pt_pet_thw, pt_aet, pt_wb_aet, pt_wb_pet, pt_tair),
                               use.names=TRUE, fill=TRUE)
 fwrite(point_monthly_ts, file.path(out_dir, "point_monthly_timeseries.csv"))
 log_event(sprintf("✓ Saved point_monthly_timeseries.csv  (%d rows)", nrow(point_monthly_ts)))
 
 run_point_trends <- function(pt_df, var_name, is_precip,
                              skip_min_filter = FALSE,
-                             warm_season_annual = FALSE) {
+                             warm_season_annual = FALSE, annual_sum = FALSE) {
   results <- list()
   for (pid in unique(pt_df$point_id)) {
     sub <- pt_df[point_id == pid]
@@ -677,6 +716,8 @@ run_point_trends <- function(pt_df, var_name, is_precip,
       ann_mat <- aggregate_to_annual_warmseason_fast(
         matrix(sub$value, ncol=1), sub$year, months_vec=sub$month,
         warm_months=warm_months_pet, method="sum")
+    } else if (annual_sum) {
+      ann_mat <- aggregate_to_annual_fast(matrix(sub$value, ncol=1), sub$year, method="sum")
     } else if (skip_min_filter) {
       ann_mat <- aggregate_to_annual_fast(matrix(sub$value, ncol=1), sub$year, method="mean")
     } else {
@@ -742,11 +783,14 @@ pt_pet_trends     <- run_point_trends(pt_pet,     "PET",           is_precip=FAL
                                       warm_season_annual=TRUE)
 pt_pet_thw_trends <- run_point_trends(pt_pet_thw, "PET_Thw",       is_precip=FALSE,   # [NEW]
                                       warm_season_annual=TRUE)
+pt_aet_trends     <- run_point_trends(pt_aet,     "Total_Evaporation", is_precip=FALSE, skip_min_filter=TRUE, annual_sum=TRUE)
+pt_wb_aet_trends  <- run_point_trends(pt_wb_aet,  "P_minus_AET", is_precip=FALSE, skip_min_filter=TRUE, annual_sum=TRUE)
+pt_wb_pet_trends  <- run_point_trends(pt_wb_pet,  "P_minus_PET", is_precip=FALSE, skip_min_filter=TRUE, annual_sum=TRUE)
 pt_tair_trends    <- run_point_trends(pt_tair,    "Temperature",   is_precip=FALSE,
                                       skip_min_filter=TRUE)
 
 point_trend_stats <- rbindlist(
-  list(pt_pr_trends, pt_pet_trends, pt_pet_thw_trends, pt_tair_trends),
+  list(pt_pr_trends, pt_pet_trends, pt_pet_thw_trends, pt_aet_trends, pt_wb_aet_trends, pt_wb_pet_trends, pt_tair_trends),
   use.names=TRUE, fill=TRUE)
 fwrite(point_trend_stats, file.path(out_dir, "point_trend_stats.csv"))
 log_event(sprintf("✓ Saved point_trend_stats.csv  (%d rows × %d cols)",
@@ -765,8 +809,8 @@ print(as.data.frame(smry_pts))
 ####################################################################################
 log_event("Combining all pixel-level and basin results (4 variables)...")
 all_results <- rbindlist(
-  list(precip_results,     pet_results,     pet_thw_results,  tair_results,
-       basin_precip_results, basin_pet_results, basin_pet_thw_results, basin_tair_results),
+  list(precip_results, pet_results, pet_thw_results, aet_results, wb_aet_results, wb_pet_results, tair_results,
+       basin_precip_results, basin_pet_results, basin_pet_thw_results, basin_aet_results, basin_wb_aet_results, basin_wb_pet_results, basin_tair_results),
   use.names=TRUE, fill=TRUE)
 
 saveRDS(all_results, file.path(out_dir, "all_results.rds"), compress="gzip")
@@ -775,10 +819,16 @@ saveRDS(list(
   precip_results        = precip_results,
   pet_results           = pet_results,
   pet_thw_results       = pet_thw_results,       # [NEW]
+  aet_results           = aet_results,
+  wb_aet_results        = wb_aet_results,
+  wb_pet_results        = wb_pet_results,
   tair_results          = tair_results,
   basin_precip_results  = basin_precip_results,
   basin_pet_results     = basin_pet_results,
   basin_pet_thw_results = basin_pet_thw_results,  # [NEW]
+  basin_aet_results     = basin_aet_results,
+  basin_wb_aet_results  = basin_wb_aet_results,
+  basin_wb_pet_results  = basin_wb_pet_results,
   basin_tair_results    = basin_tair_results,
   basin_pixels          = n_basin_pixels,
   bbox_cells            = n_bbox_cells,
@@ -796,6 +846,9 @@ saveRDS(list(
     precip_mm_month    = precip_monthly_avg,
     pet_mm_month       = pet_monthly_avg,
     pet_thw_mm_month   = pet_thw_monthly_avg,   # [NEW]
+    aet_mm_month       = aet_monthly_avg,
+    p_minus_aet_mm_month = wb_aet_monthly_avg,
+    p_minus_pet_mm_month = wb_pet_monthly_avg,
     tair_degC_month    = tair_monthly_avg[seq_len(length(dates))]
   ),
   basin_avg_annual = data.frame(
@@ -803,6 +856,9 @@ saveRDS(list(
     precip_mm_year     = precip_annual_avg,
     pet_mm_year        = pet_annual_avg,
     pet_thw_mm_year    = pet_thw_annual_avg,     # [NEW]
+    aet_mm_year        = aet_annual_avg,
+    p_minus_aet_mm_year = wb_aet_annual_avg,
+    p_minus_pet_mm_year = wb_pet_annual_avg,
     tair_degC_year     = tair_annual_avg[seq_len(length(annual_years))]
   ),
   specific_pts = SPECIFIC_PTS

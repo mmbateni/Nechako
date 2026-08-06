@@ -50,12 +50,12 @@ if (max(st_sspi$max) > 5 || min(st_sspi$min) < -5) {
   cat("✓ SSPI-1 range valid.\n")
 }
 
-# --- 2c. SSMI-1 range check (KDE/logit-based standardized index, clamped at ±4.75) -
+# --- 2c. SSMI-1 range check (KDE/logit-based standardized index, clamped at ±5.00) -
 ssmi1_jan <- rast(files[6])
 cat(sprintf("SSMI-1 (%s) Layers: %d | Cells: %d\n", SSMI_LAYER, nlyr(ssmi1_jan), ncell(ssmi1_jan)))
 st_ssmi <- global(ssmi1_jan, c("min","max"), na.rm = TRUE)
-if (max(st_ssmi$max) > 4.75 || min(st_ssmi$min) < -4.75) {
-  warning("⚠ SSMI-1 values outside expected [-4.75, 4.75] range.")
+if (max(st_ssmi$max) > 5.00 || min(st_ssmi$min) < -5.00) {
+  warning("⚠ SSMI-1 values outside expected [-5.00, 5.00] range.")
 } else {
   cat("✓ SSMI-1 range valid.\n")
 }

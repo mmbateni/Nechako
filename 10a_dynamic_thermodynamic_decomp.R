@@ -1,5 +1,5 @@
 # ==============================================================================
-#   10a_dynamic_thermodynamic_decomp.R (MERGED VERSION)
+#   w11a_dynamic_thermodynamic_decomp.R (MERGED VERSION)
 # DYNAMIC vs. THERMODYNAMIC DROUGHT DECOMPOSITION
 # Nechako River Basin, BC — 2022-2025 Drought Study
 # Loads pre-computed SPEI from 3SPEI_ERALand.R outputs
@@ -70,14 +70,7 @@ load_spei_scale <- function(scale, pet_type, target_dir) {
   # Combine months into matrix [pixels × time]
   valid_months <- which(!sapply(spei_list, is.null))
   if (length(valid_months) == 0) return(NULL)
-  n_yrs    <- ncol(spei_list[[valid_months[1]]])
-  spei_mat <- matrix(NA_real_,
-                     nrow = nrow(spei_list[[valid_months[1]]]),
-                     ncol = n_yrs * 12L)
-  for (k in seq_along(valid_months)) {
-    m <- valid_months[k]
-    spei_mat[, seq(m, ncol(spei_mat), by = 12L)] <- spei_list[[m]]
-  }
+  spei_mat <- do.call(cbind, spei_list[valid_months])
   return(spei_mat)
 }
 # Load all scales for both PET types in one pass (avoids two separate loops)
@@ -117,7 +110,7 @@ target_crs <- "EPSG:3005"
 if (!same.crs(basin, target_crs)) basin <- project(basin, target_crs)
 # Get basin mask from first SPEI file (non-NA pixels)
 spei_sample <- rast(file.path(spei_pm_dir, "spei_03_month01_Jan.nc"))
-basin_mask  <- !is.na(terra::values(spei_sample))
+basin_mask  <- !is.na(values(spei_sample))
 n_pixels    <- sum(basin_mask)
 cat(sprintf("✓ Metadata loaded: %d months, %d basin pixels\n", length(dates), n_pixels))
 
@@ -136,7 +129,7 @@ area_weights_all[!basin_mask | is.na(area_weights_all) | !is.finite(area_weights
 
 # Guard: replace any basin pixel with a bad weight by the median basin weight.
 basin_w <- area_weights_all[basin_mask]
-bad_w   <- is.na(basin_w) | !is.finite(basin_w) | basin_w <= 0
+bad_w   <- basin_w <= 0
 if (any(bad_w)) {
   med_w <- median(basin_w[!bad_w], na.rm = TRUE)
   replacement <- if (is.finite(med_w) && med_w > 0) med_w else 1
@@ -820,14 +813,14 @@ fig6 <- ggplot2::ggplot() +
   ggplot2::labs(
     title    = "Increasing thermodynamic fraction of JJA drought severity — Nechako Basin",
     subtitle = paste0(
-      "Annual mean |SPEI_Thw| / |SPEI_PM| for June–August, SPEI3, 1950–2025.   ",
+      "Annual mean |SPEI₀| / |SPEIₚₘ| for June–August, SPEI3, 1950–2025.   ",
       "Solid red = full-record OLS ± 95% CI ribbon.   ",
       "Dashed red = post-1990 OLS ± 90% CI ribbon."),
     x        = "Year",
     y        = expression(italic(F)[thm]*"  (thermodynamic fraction of drought severity)"),
     caption  = paste0(
-      "F_thm = mean |SPEI_Thw| / (|SPEI_PM| + eps);   ",
-      "eps = 10^-6 prevents division by zero.   ",
+      "Fₜₕₘ = mean |SPEI₀| / (|SPEIₚₘ| + ε);   ",
+      "ε = 10⁻⁶ prevents division by zero.   ",
       "OLS fitted by ordinary least squares; CI from classical normal theory.")) +
   theme_ms +
   ggplot2::theme(
@@ -916,7 +909,7 @@ fig6_patched <- ggplot2::ggplot() +
   ggplot2::labs(
     title    = "Increasing thermodynamic fraction of JJA drought severity — Nechako Basin",
     subtitle = paste0(
-      "Annual mean |SPEI_Thw| / |SPEI_PM| for June–August, SPEI3, 1950–2025."),
+      "Annual mean |SPEI₀| / |SPEIₚₘ| for June–August, SPEI3, 1950–2025."),
     x = "Year",
     y = expression(italic(F)[thm]*"  (thermodynamic fraction of drought severity)")) +
   theme_ms +
@@ -943,7 +936,7 @@ tryCatch({
 #  Fig6_thermodynamic_trend_SPEI123_PATCHED_v2.R
 #
 #  DROP-IN REPLACEMENT for the PATCHED Fig6 block in
-#  10a_dynamic_thermodynamic_decomp.R.
+#  w11a_dynamic_thermodynamic_decomp.R.
 #
 #  Changes relative to the original PATCHED block
 #  ------------------------------------------------
@@ -961,7 +954,7 @@ tryCatch({
 #                         y-tick text     → 12 pt  (all panels, was implicit)
 #  4. Axis titles       : 9 → 13 pt  (both axes)
 #
-#  REQUIRES (already in environment after running 10a Steps 1–5):
+#  REQUIRES (already in environment after running w11a Steps 1–5):
 #    decomp_all   — data.frame produced in STEP 3
 #    out_dir      — output directory (default: "decomp_results")
 #    COL_THW      — "#e31a1c"
@@ -970,7 +963,7 @@ tryCatch({
 
 # ── Guard: ensure required objects exist ──────────────────────────────────────
 if (!exists("decomp_all"))
-  stop("Run 10a Steps 1–5 first so decomp_all, out_dir, COL_THW, theme_ms exist.")
+  stop("Run w11a Steps 1–5 first so decomp_all, out_dir, COL_THW, theme_ms exist.")
 if (!exists("out_dir"))  out_dir  <- "decomp_results"
 if (!exists("COL_THW"))  COL_THW  <- "#e31a1c"
 if (!exists("theme_ms")) {
@@ -1411,7 +1404,7 @@ for (ext in c("pdf", "png")) {
   tryCatch(
     ggplot2::ggsave(out_5c, fig5c,
                     width  = 7.5, height = 9.5, units = "in",
-                    dpi    = if (ext == "png") 300 else "print",
+                    dpi    = if (ext == "png") 300 else NULL,
                     device = ext),
     error = function(e) cat(sprintf("  ⚠ Fig5c %s: %s\n", ext, e$message)))
   cat(sprintf("  ✓ Saved: %s\n", basename(out_5c)))
@@ -1501,7 +1494,7 @@ for (ext in c("pdf", "png")) {
   tryCatch(
     ggplot2::ggsave(out_5d, fig5d,
                     width  = 7.5, height = 9.5, units = "in",
-                    dpi    = if (ext == "png") 300 else "print",
+                    dpi    = if (ext == "png") 300 else NULL,
                     device = ext),
     error = function(e) cat(sprintf("  ⚠ Fig5d %s: %s\n", ext, e$message)))
   cat(sprintf("  ✓ Saved: %s\n", basename(out_5d)))

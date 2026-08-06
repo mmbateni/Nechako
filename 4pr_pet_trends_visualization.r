@@ -84,6 +84,9 @@ cat(sprintf("✓ Template: %d x %d, res=%.0f m\n",
 .vars_present <- unique(trimws(all_results$variable))
 cat("\n📊 Variables in all_results:", paste(.vars_present, collapse=", "), "\n")
 has_pet_thw <- "PET_Thw" %in% .vars_present
+has_aet <- "Total_Evaporation" %in% .vars_present
+has_wb_aet <- "P_minus_AET" %in% .vars_present
+has_wb_pet <- "P_minus_PET" %in% .vars_present
 if (!has_pet_thw)
   cat("\n⚠️  PET_Thw NOT in all_results — re-run 4pr_pet_trends.r with Thw enabled.\n",
       "   Dual-PET comparison plots (Function 14) will be skipped.\n\n")
@@ -171,6 +174,9 @@ precip_annual  <- prep_annual("Precipitation")
 pet_annual     <- prep_annual("PET")
 pet_thw_annual <- if (has_pet_thw) prep_annual("PET_Thw") else NULL
 tair_annual    <- prep_annual("Temperature")
+aet_annual     <- if (has_aet) prep_annual("Total_Evaporation") else NULL
+wb_aet_annual  <- if (has_wb_aet) prep_annual("P_minus_AET") else NULL
+wb_pet_annual  <- if (has_wb_pet) prep_annual("P_minus_PET") else NULL
 make_rasters   <- function(dt, prefix) {
   if (is.null(dt)) return(NULL)
   list(
@@ -189,13 +195,17 @@ r_precip   <- make_rasters(precip_annual, "precip")
 r_pet      <- make_rasters(pet_annual, "pet")
 r_pet_thw  <- if (has_pet_thw) make_rasters(pet_thw_annual, "pet_thw") else NULL
 r_tair     <- make_rasters(tair_annual, "tair")
+r_aet      <- if (has_aet) make_rasters(aet_annual, "aet") else NULL
+r_wb_aet   <- if (has_wb_aet) make_rasters(wb_aet_annual, "wb_aet") else NULL
+r_wb_pet   <- if (has_wb_pet) make_rasters(wb_pet_annual, "wb_pet") else NULL
 ####################################################################################
 # FUNCTION 1: Publication map per variable
 ####################################################################################
 create_publication_figure <- function(var_name, method="vc") {
   rlist <- switch(var_name,
                   PET=r_pet, PET_Thw=r_pet_thw,
-                  Precipitation=r_precip, Temperature=r_tair, NULL)
+                  Precipitation=r_precip, Temperature=r_tair,
+                  Total_Evaporation=r_aet, P_minus_AET=r_wb_aet, P_minus_PET=r_wb_pet, NULL)
   if (is.null(rlist)) { cat("⚠️ No rasters for", var_name, "— skipping\n"); return(NULL) }
   pdf_path   <- file.path(out_dir,
                           sprintf("%s_%s_publication_map.pdf",
@@ -287,7 +297,7 @@ create_comparison_figure <- function() {
 # FUNCTION 3: Regime shift maps (all 4 variables)
 ####################################################################################
 create_regime_shift_maps <- function() {
-  vars_here <- intersect(c("Precipitation", "PET", "PET_Thw", "Temperature"),
+  vars_here <- intersect(c("Precipitation", "PET", "PET_Thw", "Total_Evaporation", "P_minus_AET", "P_minus_PET", "Temperature"),
                          .vars_present)
   pdf_path <- file.path(out_dir, "regime_shifts_changepoints.pdf")
   result <- .pdf_safe(pdf_path, width=5*length(vars_here), height=5, expr_fn=function() {
@@ -314,7 +324,7 @@ create_regime_shift_maps <- function() {
 # FUNCTION 4: Spectral maps (all 4 variables)
 ####################################################################################
 create_spectral_analysis_maps <- function() {
-  vars_here <- intersect(c("Precipitation", "PET", "PET_Thw", "Temperature"),
+  vars_here <- intersect(c("Precipitation", "PET", "PET_Thw", "Total_Evaporation", "P_minus_AET", "P_minus_PET", "Temperature"),
                          .vars_present)
   pdf_path <- file.path(out_dir, "spectral_analysis.pdf")
   result <- .pdf_safe(pdf_path, width=5*length(vars_here), height=5, expr_fn=function() {
@@ -340,7 +350,7 @@ create_spectral_analysis_maps <- function() {
 # FUNCTION 5: Spatial pattern analysis
 ####################################################################################
 create_spatial_pattern_analysis <- function() {
-  vars_here <- intersect(c("Precipitation", "PET", "PET_Thw", "Temperature"),
+  vars_here <- intersect(c("Precipitation", "PET", "PET_Thw", "Total_Evaporation", "P_minus_AET", "P_minus_PET", "Temperature"),
                          .vars_present)
   pdf_path <- file.path(out_dir, "spatial_patterns.pdf")
   result <- .pdf_safe(pdf_path, width=5*length(vars_here), height=5, expr_fn=function() {
@@ -367,19 +377,21 @@ create_spatial_pattern_analysis <- function() {
 create_method_comparison <- function() {
   comp_data <- all_results[period=="annual" & !is_basin_average &
                              !filtered_vc & !filtered_tfpw &
-                             variable %in% c("Precipitation", "PET", "PET_Thw", "Temperature")]
+                             variable %in% c("Precipitation", "PET", "PET_Thw", "Total_Evaporation", "P_minus_AET", "P_minus_PET", "Temperature")]
   if (!nrow(comp_data)) { cat("⚠️ No valid pixels for method comparison.\n"); return(NULL) }
   comp_data[, vc_sig := p_value_vc < 0.05]
   comp_data[, tfpw_sig := p_value_tfpw < 0.05]
   tau_range <- range(c(comp_data$tau_vc, comp_data$tau_tfpw), na.rm=TRUE)
-  var_cols <- c(Precipitation="#4575b4", PET="#d73027",
-                PET_Thw="#e08214", Temperature="#1a9641")
+  var_cols <- c(Precipitation="#4575b4", PET="#d73027", PET_Thw="#e08214",
+                Total_Evaporation="#1b9e77", P_minus_AET="#7570b3", P_minus_PET="#e7298a",
+                Temperature="#1a9641")
   p1 <- ggplot(comp_data, aes(x=tau_vc, y=tau_tfpw, color=variable)) +
     geom_abline(slope=1, intercept=0, linetype="dashed", color="gray40") +
     geom_point(alpha=0.35, size=1.0) +
     facet_wrap(~variable, labeller=labeller(variable=c(
-      Precipitation="Precipitation", PET="PET (PM)",
-      PET_Thw="PET (Thw)", Temperature="Temperature"))) +
+      Precipitation="Precipitation", PET="PET (PM)", PET_Thw="PET (Thw)",
+      Total_Evaporation="Actual evaporation (ERA5-Land)",
+      P_minus_AET="P - AET", P_minus_PET="P - PET(PM)", Temperature="Temperature"))) +
     scale_color_manual(values=var_cols) +
     coord_equal(xlim=tau_range, ylim=tau_range) +
     theme_bw(base_size=10) + theme(legend.position="none") +
@@ -633,6 +645,25 @@ create_all_calmonth_temporal_changes <- function() {
       pdf_stem = "calmonth_temporal_PET_Thw")
   } else {
     cat(" ⚠ 13c: pet_thw_mm_month not found — skipped\n")
+  }
+  if ("aet_mm_month" %in% names(basin_avg_monthly)) {
+    create_calmonth_temporal_changes(
+      var_label = "Total evaporation (AET, ERA5-Land)",
+      monthly_vec = basin_avg_monthly$aet_mm_month, dates = basin_avg_monthly$date,
+      y_unit = "mm/month", color_line = "#1b9e77", color_ols = "#00441b",
+      pdf_stem = "calmonth_temporal_Total_Evaporation")
+  }
+  if ("p_minus_aet_mm_month" %in% names(basin_avg_monthly)) {
+    create_calmonth_temporal_changes(
+      var_label = "P - AET", monthly_vec = basin_avg_monthly$p_minus_aet_mm_month,
+      dates = basin_avg_monthly$date, y_unit = "mm/month",
+      color_line = "#7570b3", color_ols = "#3f007d", pdf_stem = "calmonth_temporal_P_minus_AET")
+  }
+  if ("p_minus_pet_mm_month" %in% names(basin_avg_monthly)) {
+    create_calmonth_temporal_changes(
+      var_label = "P - PET(PM)", monthly_vec = basin_avg_monthly$p_minus_pet_mm_month,
+      dates = basin_avg_monthly$date, y_unit = "mm/month",
+      color_line = "#e7298a", color_ols = "#7a0177", pdf_stem = "calmonth_temporal_P_minus_PET")
   }
   if ("tair_degC_month" %in% names(basin_avg_monthly)) {
     create_calmonth_temporal_changes(
@@ -1340,12 +1371,13 @@ create_point_monthly_trend_plots <- function() {
     cat("⚠️ point_trend_stats.csv not available — skipping.\n"); return(NULL)
   }
   cat("📊 Creating specific-point monthly trend bar charts...\n")
-  var_units <- c(Precipitation="Sen slope (mm/yr per month)",
-                 PET="Sen slope (mm/yr per month)",
-                 PET_Thw="Sen slope (mm/yr per month)",
+  var_units <- c(Precipitation="Sen slope (mm/yr per month)", PET="Sen slope (mm/yr per month)",
+                 PET_Thw="Sen slope (mm/yr per month)", Total_Evaporation="Sen slope (mm/yr per month)",
+                 P_minus_AET="Sen slope (mm/yr per month)", P_minus_PET="Sen slope (mm/yr per month)",
                  Temperature="Sen slope (°C/yr)")
-  var_colors <- c(Precipitation="#4575b4", PET="#d73027",
-                  PET_Thw="#e08214", Temperature="#7b2d8b")
+  var_colors <- c(Precipitation="#4575b4", PET="#d73027", PET_Thw="#e08214",
+                  Total_Evaporation="#1b9e77", P_minus_AET="#7570b3", P_minus_PET="#e7298a",
+                  Temperature="#7b2d8b")
   for (pid in unique(point_trend_stats$point_id)) {
     sub <- point_trend_stats[point_id == pid & period == "monthly"]
     if (!nrow(sub)) next
@@ -1355,7 +1387,7 @@ create_point_monthly_trend_plots <- function() {
     sub[, label_y := sl_vc + ifelse(!is.na(sl_vc) & sl_vc >=0,
                                     0.03*max(abs(sl_vc),na.rm=TRUE),
                                     -0.03*max(abs(sl_vc),na.rm=TRUE))]
-    panels <- lapply(c("Precipitation", "PET", "PET_Thw", "Temperature"), function(var) {
+    panels <- lapply(c("Precipitation", "PET", "PET_Thw", "Total_Evaporation", "P_minus_AET", "P_minus_PET", "Temperature"), function(var) {
       d <- sub[variable == var]
       if (!nrow(d)) return(ggplot()+theme_void()+labs(title=paste(var, "— no data")))
       ggplot(d, aes(x=month_abb, y=sl_vc)) +
@@ -1368,7 +1400,7 @@ create_point_monthly_trend_plots <- function() {
         theme_classic(base_size=10) +
         theme(plot.title=element_text(face="bold",hjust=0.5))
     })
-    combined <- (panels[[1]] | panels[[2]] | panels[[3]] | panels[[4]]) +
+    combined <- patchwork::wrap_plots(panels, ncol=4) +
       plot_annotation(
         title = sprintf("Per-Month Sen's Slope — Point #%d (%.4f°N, %.4f°W)",
                         pid, lat, abs(lon)),
@@ -1513,12 +1545,533 @@ create_temperature_dedicated_plots <- function() {
   invisible(NULL)
 }
 ####################################################################################
+# FUNCTION 17: Actual evaporation and climatic-water-balance comparison
+####################################################################################
+create_aet_water_balance_comparison <- function() {
+  req <- c("date", "precip_mm_month", "pet_mm_month", "aet_mm_month",
+           "p_minus_aet_mm_month", "p_minus_pet_mm_month")
+  if (!all(req %in% names(basin_avg_monthly))) {
+    cat("⚠ Function 17 skipped: AET / water-balance metadata columns are missing.\n")
+    return(invisible(NULL))
+  }
+  
+  d <- data.table::as.data.table(basin_avg_monthly)[, .(
+    date, P = precip_mm_month, PET = pet_mm_month, AET = aet_mm_month,
+    `P - AET` = p_minus_aet_mm_month, `P - PET` = p_minus_pet_mm_month
+  )]
+  d[, year := as.integer(format(date, "%Y"))]
+  d[, month := as.integer(format(date, "%m"))]
+  
+  long_wb <- data.table::melt(d, id.vars=c("date","year","month"),
+                              measure.vars=c("P - AET","P - PET"),
+                              variable.name="Balance", value.name="value")
+  long_wb[, roll12 := zoo::rollmean(value, 12, fill=NA, align="center"), by=Balance]
+  
+  p1 <- ggplot2::ggplot(long_wb, ggplot2::aes(date, value, colour=Balance)) +
+    ggplot2::geom_hline(yintercept=0, linewidth=0.35, colour="grey35") +
+    ggplot2::geom_line(alpha=0.22, linewidth=0.35) +
+    ggplot2::geom_line(ggplot2::aes(y=roll12), linewidth=0.9, na.rm=TRUE) +
+    ggplot2::theme_bw(base_size=11) +
+    ggplot2::labs(title="Basin climatic water balance: actual vs atmospheric-demand formulation",
+                  subtitle="Monthly values (faint) and centred 12-month rolling means",
+                  x=NULL, y="Water balance (mm/month)", colour=NULL)
+  
+  annual <- d[, .(`P - AET`=sum(`P - AET`, na.rm=TRUE),
+                  `P - PET`=sum(`P - PET`, na.rm=TRUE)), by=year]
+  annual_long <- data.table::melt(annual, id.vars="year", variable.name="Balance", value.name="value")
+  p2 <- ggplot2::ggplot(annual_long, ggplot2::aes(year, value, colour=Balance)) +
+    ggplot2::geom_hline(yintercept=0, linewidth=0.35, colour="grey35") +
+    ggplot2::geom_line(linewidth=0.8) + ggplot2::geom_smooth(method="lm", se=TRUE, linewidth=0.7) +
+    ggplot2::theme_bw(base_size=11) +
+    ggplot2::labs(title="Annual water-balance trajectories", x="Year", y="Annual balance (mm/year)", colour=NULL)
+  
+  mon <- long_wb[, .(mean_balance=mean(value, na.rm=TRUE)), by=.(Balance, month)]
+  p3 <- ggplot2::ggplot(mon, ggplot2::aes(factor(month, levels=1:12, labels=month.abb),
+                                          mean_balance, fill=Balance)) +
+    ggplot2::geom_hline(yintercept=0, linewidth=0.35) +
+    ggplot2::geom_col(position="dodge") + ggplot2::theme_bw(base_size=11) +
+    ggplot2::labs(title="Mean seasonal cycle of water balance", x=NULL, y="1950–2025 mean (mm/month)", fill=NULL)
+  
+  sc <- d[is.finite(`P - AET`) & is.finite(`P - PET`)]
+  p4 <- ggplot2::ggplot(sc, ggplot2::aes(`P - PET`, `P - AET`, colour=factor(month))) +
+    ggplot2::geom_abline(slope=1, intercept=0, linetype="dashed", colour="grey35") +
+    ggplot2::geom_point(alpha=0.45, size=0.8) + ggplot2::theme_bw(base_size=11) +
+    ggplot2::labs(title="P - AET versus P - PET(PM)", x="P - PET(PM) (mm/month)",
+                  y="P - AET (mm/month)", colour="Month")
+  
+  fig <- (p1 / p2) | (p3 / p4)
+  ggplot2::ggsave(file.path(out_dir, "Fig_AET_WaterBalance_Comparison.png"), fig,
+                  width=15, height=10, dpi=300)
+  ggplot2::ggsave(file.path(out_dir, "Fig_AET_WaterBalance_Comparison.pdf"), fig,
+                  width=15, height=10)
+  
+  # Pixelwise annual trend-difference diagnostic: Sen slope(P-AET) - Sen slope(P-PET).
+  a <- all_results[variable=="P_minus_AET" & period=="annual" & !is_basin_average & !filtered_vc,
+                   .(x,y,sl_aet=sl_vc,tau_aet=tau_vc,p_aet=p_value_vc)]
+  b <- all_results[variable=="P_minus_PET" & period=="annual" & !is_basin_average & !filtered_vc,
+                   .(x,y,sl_pet=sl_vc,tau_pet=tau_vc,p_pet=p_value_vc)]
+  cmp <- merge(a,b,by=c("x","y"))
+  if (nrow(cmp)) {
+    cmp[, slope_difference := sl_aet - sl_pet]
+    rdiff <- create_raster_from_table(cmp, template_bc, "slope_difference")
+    pdf_path <- file.path(out_dir, "Map_WaterBalance_SenSlope_Difference.pdf")
+    .pdf_safe(pdf_path, 7, 6, expr_fn=function() {
+      lim <- max(abs(values(rdiff)), na.rm=TRUE)
+      plot_raster_panel(rdiff, "Sen slope difference: (P-AET) - (P-PET)", c(-lim,lim),
+                        hcl.colors(101,"RdBu",rev=TRUE), legend_title="mm/yr")
+    })
+    data.table::fwrite(cmp, file.path(out_dir, "water_balance_pixel_trend_comparison.csv"))
+  }
+  invisible(fig)
+}
+####################################################################################
+# FUNCTION 18: CALENDAR-MONTH PIXEL TREND MAPS — P−AET AND P−PET
+#
+# PURPOSE
+#   Maps pixel-level calendar-month trends separately for January–December for:
+#     1. P_minus_AET = Precipitation − Actual Evapotranspiration
+#     2. P_minus_PET = Precipitation − Potential Evapotranspiration (PM)
+#
+# TREND ESTIMATOR
+#   Sen's slope from the variance-corrected Mann-Kendall (VC-MK) analysis.
+#
+# INPUT
+#   Uses monthly pixel rows already stored in all_results.rds:
+#       period == "monthly"
+#       month  == 1:12
+#
+# OUTPUTS
+#   trend_analysis_pr_pet/
+#     Map_P_minus_AET_CalendarMonth_SenSlope.pdf
+#     Map_P_minus_AET_CalendarMonth_SenSlope.png
+#     Map_P_minus_PET_CalendarMonth_SenSlope.pdf
+#     Map_P_minus_PET_CalendarMonth_SenSlope.png
+#
+#   Each figure contains 12 panels:
+#       Jan Feb Mar Apr
+#       May Jun Jul Aug
+#       Sep Oct Nov Dec
+#
+# INTERPRETATION
+#   Sen slope > 0 : monthly water balance becoming wetter / less negative
+#   Sen slope < 0 : monthly water balance becoming drier / more negative
+#
+#   Units:
+#       mm yr^-1
+#
+#   Black dots:
+#       pixels with nominal VC-MK p < 0.05.
+#
+# IMPORTANT
+#   A COMMON symmetric colour scale is used across all 12 months for a given
+#   water-balance variable. Therefore colours are directly comparable among
+#   calendar months within each figure.
+####################################################################################
+
+create_water_balance_monthly_trend_maps <- function() {
+  
+  wb_vars <- c("P_minus_AET", "P_minus_PET")
+  
+  wb_labels <- c(
+    P_minus_AET = "P - AET",
+    P_minus_PET = "P - PET (PM)"
+  )
+  
+  # ---------------------------------------------------------------------------
+  # Internal helper: draw significance points without reprojecting coordinates.
+  # x/y in all_results are already in the CRS of template_bc.
+  # ---------------------------------------------------------------------------
+  add_sig_points <- function(dt, p_col = "p_value_vc", alpha = 0.05) {
+    
+    if (!p_col %in% names(dt))
+      return(invisible(NULL))
+    
+    sig <- dt[
+      !is.na(get(p_col)) &
+        get(p_col) < alpha &
+        !is.na(x) &
+        !is.na(y)
+    ]
+    
+    if (!nrow(sig))
+      return(invisible(NULL))
+    
+    graphics::points(
+      sig$x,
+      sig$y,
+      pch = 20,
+      cex = 0.22,
+      col = "black"
+    )
+    
+    invisible(NULL)
+  }
+  
+  # ---------------------------------------------------------------------------
+  # Process each water-balance definition independently.
+  # ---------------------------------------------------------------------------
+  for (var_name in wb_vars) {
+    
+    if (!var_name %in% .vars_present) {
+      cat(sprintf(
+        "⚠️  %s not present in all_results — monthly map skipped.\n",
+        var_name
+      ))
+      next
+    }
+    
+    cat(sprintf(
+      "\n🗺️  Creating calendar-month pixel trend map: %s\n",
+      wb_labels[[var_name]]
+    ))
+    
+    # -------------------------------------------------------------------------
+    # Extract all valid monthly pixel results for this variable.
+    #
+    # Do NOT filter by significance here:
+    # the slope field should show the complete spatial trend field.
+    # Significance is overlaid separately.
+    # -------------------------------------------------------------------------
+    dt_all <- all_results[
+      variable == var_name &
+        period == "monthly" &
+        !is_basin_average &
+        !filtered_vc &
+        !is.na(month) &
+        month >= 1L &
+        month <= 12L &
+        !is.na(x) &
+        !is.na(y) &
+        is.finite(sl_vc)
+    ]
+    
+    if (!nrow(dt_all)) {
+      cat(sprintf(
+        "⚠️  No valid monthly pixel trends found for %s.\n",
+        var_name
+      ))
+      next
+    }
+    
+    # -------------------------------------------------------------------------
+    # Common symmetric Sen-slope scale across Jan-Dec.
+    #
+    # Quantile clipping prevents a very small number of extreme pixels from
+    # destroying colour contrast over the rest of the basin.
+    #
+    # The raster values themselves are NOT modified; only plotting limits are.
+    # -------------------------------------------------------------------------
+    abs_slopes <- abs(dt_all$sl_vc)
+    abs_slopes <- abs_slopes[is.finite(abs_slopes)]
+    
+    if (!length(abs_slopes)) {
+      cat(sprintf(
+        "⚠️  No finite Sen slopes found for %s.\n",
+        var_name
+      ))
+      next
+    }
+    
+    slope_lim <- as.numeric(
+      stats::quantile(
+        abs_slopes,
+        probs = 0.98,
+        na.rm = TRUE,
+        names = FALSE
+      )
+    )
+    
+    if (!is.finite(slope_lim) || slope_lim <= 0)
+      slope_lim <- max(abs_slopes, na.rm = TRUE)
+    
+    if (!is.finite(slope_lim) || slope_lim <= 0)
+      slope_lim <- 1
+    
+    slope_zlim <- c(-slope_lim, slope_lim)
+    
+    # Diverging palette:
+    # negative = drying
+    # zero     = neutral
+    # positive = wetting
+    slope_cols <- grDevices::hcl.colors(
+      101,
+      "RdBu",
+      rev = TRUE
+    )
+    
+    # -------------------------------------------------------------------------
+    # Function that actually draws the 12-panel map.
+    # Used identically for PDF and PNG.
+    # -------------------------------------------------------------------------
+    draw_12_month_map <- function() {
+      
+      old_par <- graphics::par(no.readonly = TRUE)
+      on.exit(graphics::par(old_par), add = TRUE)
+      
+      graphics::par(
+        mfrow = c(3, 4),
+        mar   = c(1.3, 1.0, 2.4, 1.0),
+        oma   = c(2.5, 1.5, 4.0, 1.5)
+      )
+      
+      for (m in 1:12) {
+        
+        dt_m <- dt_all[month == m]
+        
+        if (!nrow(dt_m)) {
+          
+          graphics::plot.new()
+          
+          graphics::text(
+            0.5,
+            0.55,
+            month.name[m],
+            cex  = 1.15,
+            font = 2
+          )
+          
+          graphics::text(
+            0.5,
+            0.43,
+            "No valid pixel trends",
+            cex = 0.85,
+            col = "gray40"
+          )
+          
+          next
+        }
+        
+        # ---------------------------------------------------------------------
+        # Convert monthly pixel Sen slopes to basin raster.
+        # ---------------------------------------------------------------------
+        r_slope <- create_raster_from_table(
+          dt_m,
+          template_bc,
+          "sl_vc"
+        )
+        
+        # ---------------------------------------------------------------------
+        # Draw complete Sen-slope field.
+        #
+        # plot_raster_panel() already:
+        #   - applies the existing raster display treatment,
+        #   - plots the basin boundary,
+        #   - handles NA pixels.
+        # ---------------------------------------------------------------------
+        plot_raster_panel(
+          r_slope,
+          month.name[m],
+          zlim         = slope_zlim,
+          col          = slope_cols,
+          legend       = TRUE,
+          categorical  = FALSE,
+          legend_title = "mm/yr"
+        )
+        
+        # ---------------------------------------------------------------------
+        # Nominal VC-MK significance overlay.
+        # ---------------------------------------------------------------------
+        add_sig_points(
+          dt_m,
+          p_col = "p_value_vc",
+          alpha = 0.05
+        )
+        
+        # ---------------------------------------------------------------------
+        # Small per-panel diagnostic:
+        # percentage of valid mapped pixels significant at p < 0.05.
+        # ---------------------------------------------------------------------
+        n_valid <- sum(
+          is.finite(dt_m$sl_vc) &
+            !is.na(dt_m$p_value_vc)
+        )
+        
+        n_sig <- sum(
+          is.finite(dt_m$sl_vc) &
+            !is.na(dt_m$p_value_vc) &
+            dt_m$p_value_vc < 0.05
+        )
+        
+        pct_sig <- if (n_valid > 0L)
+          100 * n_sig / n_valid
+        else
+          NA_real_
+        
+        if (is.finite(pct_sig)) {
+          graphics::mtext(
+            sprintf("p < 0.05: %.1f%%", pct_sig),
+            side = 1,
+            line = 0.05,
+            cex  = 0.62,
+            col  = "gray30"
+          )
+        }
+      }
+      
+      graphics::mtext(
+        sprintf(
+          "%s — Calendar-Month Pixel Trends (1950–2025)",
+          wb_labels[[var_name]]
+        ),
+        outer = TRUE,
+        side  = 3,
+        line  = 2.1,
+        cex   = 1.25,
+        font  = 2
+      )
+      
+      graphics::mtext(
+        "VC-MK Sen's slope | negative = drying, positive = wetting | black dots = nominal p < 0.05",
+        outer = TRUE,
+        side  = 3,
+        line  = 0.8,
+        cex   = 0.82,
+        col   = "gray25"
+      )
+      
+      graphics::mtext(
+        sprintf(
+          "Common Jan–Dec colour range: %.3f to +%.3f mm/yr; limits based on 98th percentile of |Sen slope|",
+          -slope_lim,
+          slope_lim
+        ),
+        outer = TRUE,
+        side  = 1,
+        line  = 1.0,
+        cex   = 0.72,
+        col   = "gray35"
+      )
+      
+      invisible(NULL)
+    }
+    
+    # -------------------------------------------------------------------------
+    # Output filenames.
+    # -------------------------------------------------------------------------
+    file_stub <- sprintf(
+      "Map_%s_CalendarMonth_SenSlope",
+      var_name
+    )
+    
+    pdf_path <- file.path(
+      out_dir,
+      paste0(file_stub, ".pdf")
+    )
+    
+    png_path <- file.path(
+      out_dir,
+      paste0(file_stub, ".png")
+    )
+    
+    # -------------------------------------------------------------------------
+    # Vector PDF.
+    # -------------------------------------------------------------------------
+    pdf_result <- .pdf_safe(
+      pdf_path,
+      width  = 14,
+      height = 10.5,
+      expr_fn = draw_12_month_map
+    )
+    
+    if (!is.null(pdf_result)) {
+      cat(sprintf(
+        "  ✓ PDF: %s\n",
+        basename(pdf_path)
+      ))
+    }
+    
+    # -------------------------------------------------------------------------
+    # 300-dpi PNG.
+    # -------------------------------------------------------------------------
+    png_open <- FALSE
+    
+    tryCatch({
+      
+      grDevices::png(
+        filename = png_path,
+        width    = 14,
+        height   = 10.5,
+        units    = "in",
+        res      = 300,
+        type     = if (.Platform$OS.type == "windows") "windows" else "cairo"
+      )
+      
+      png_open <- TRUE
+      
+      draw_12_month_map()
+      
+      grDevices::dev.off()
+      png_open <- FALSE
+      
+      cat(sprintf(
+        "  ✓ PNG: %s\n",
+        basename(png_path)
+      ))
+      
+    }, error = function(e) {
+      
+      if (png_open && grDevices::dev.cur() > 1)
+        grDevices::dev.off()
+      
+      cat(sprintf(
+        "  ⚠ PNG failed (%s): %s\n",
+        basename(png_path),
+        conditionMessage(e)
+      ))
+    })
+    
+    # -------------------------------------------------------------------------
+    # Export the underlying monthly pixel trend statistics.
+    # This makes the figure exactly reproducible without reopening all_results.rds.
+    # -------------------------------------------------------------------------
+    export_cols <- intersect(
+      c(
+        "space_idx",
+        "x",
+        "y",
+        "variable",
+        "period",
+        "month",
+        "tau_vc",
+        "p_value_vc",
+        "sl_vc",
+        "tau_tfpw",
+        "p_value_tfpw",
+        "sl_tfpw",
+        "filtered_vc",
+        "filtered_tfpw"
+      ),
+      names(dt_all)
+    )
+    
+    csv_path <- file.path(
+      out_dir,
+      sprintf(
+        "%s_calendar_month_pixel_trends.csv",
+        tolower(var_name)
+      )
+    )
+    
+    data.table::fwrite(
+      dt_all[, ..export_cols],
+      csv_path
+    )
+    
+    cat(sprintf(
+      "  ✓ CSV: %s\n",
+      basename(csv_path)
+    ))
+  }
+  
+  invisible(NULL)
+}
+####################################################################################
 # ── GENERATE ALL OUTPUTS
 ####################################################################################
 cat("\n========================================\n")
 cat("\U0001f3a8 CREATING VISUALIZATIONS\n")
 cat("========================================\n\n")
-for (var in c("Precipitation","PET","PET_Thw","Temperature")) {
+for (var in c("Precipitation","PET","PET_Thw","Total_Evaporation","P_minus_AET","P_minus_PET","Temperature")) {
   for (meth in c("vc","tfpw")) create_publication_figure(var, meth)
 }
 create_comparison_figure()
@@ -1529,6 +2082,8 @@ create_method_comparison()
 create_statistics_table()
 create_basin_timeseries_plot()
 create_all_calmonth_temporal_changes()
+create_aet_water_balance_comparison()
+create_water_balance_monthly_trend_maps()
 create_pet_comparison_plots()
 create_pet_seasonal_trends()
 create_seasonality_p_pet_plot()

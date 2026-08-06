@@ -37,6 +37,54 @@ setwd("D:/Nechako_Drought/Nechako")
 DROUGHT_THRESHOLD <- -0.5
 OUT_ROOT          <- "spatial_drought"
 
+#==============================================================================
+# TIE-FRACTION THRESHOLD (q) SENSITIVITY LOGGER  [temporary diagnostic]
+#==============================================================================
+# Purpose: fit_copulas() gates the CFG tail-dependence estimator on whether
+# area_pct has a tie/atom pile-up in its upper q-quantile (see
+# tie_fraction_upper(), currently called with q = 0.95). That single q is an
+# arbitrary bias-variance convention, not a derived optimum (Frahm, Junker &
+# Schmidt 2005; Schmidt & Stadtmuller 2006 — threshold selection for
+# rank-based tail estimators is an open, heuristic problem with no universal
+# "correct" value). This logger sweeps q across {0.90, 0.95, 0.975, 0.99} for
+# every index/duration-class combination fit_copulas() is called on, in the
+# SAME pipeline run (no need to re-run the pipeline once per q), so the
+# threshold choice can be assessed empirically afterward:
+#   - pct_at_max is the actual boundary-atom size (area_pct == max), which is
+#     the ground truth independent of any arbitrary q
+#   - ratio flat (~1) across all four q's -> marginal is clean, q doesn't matter
+#   - ratio spikes at a particular q -> pinpoints where the atom sits
+#   - flagged_1.5x flipping between q's for the same index/subset -> the
+#     current fixed q = 0.95 choice is consequential for that subset
+# Writes spatial_drought/tie_fraction_q_sweep.csv at the end of the script.
+# Safe to delete this whole block (and the two call sites tagged
+# "TIE-SWEEP LOGGER" below) once the threshold question is settled — it does
+# not alter any existing pipeline logic, it only observes dc$area_pct.
+#==============================================================================
+.tie_sweep_log <- data.frame()
+
+sweep_tie_diagnostics <- function(x, qs = c(0.90, 0.95, 0.975, 0.99)) {
+  x        <- x[is.finite(x)]
+  n_total  <- length(x)
+  max_val  <- if (n_total > 0) max(x) else NA_real_
+  n_at_max <- sum(x == max_val, na.rm = TRUE)
+  do.call(rbind, lapply(qs, function(q) {
+    d      <- tie_fraction_upper(x, q = q)
+    thresh <- if (n_total >= 10) quantile(x, q, na.rm = TRUE) else NA_real_
+    data.frame(
+      q            = q,
+      n_total      = n_total,
+      thresh       = as.numeric(thresh),
+      n_tail       = if (is.finite(d$frac)) round(d$frac * n_total) else NA_integer_,
+      frac         = d$frac,
+      ratio        = d$ratio,
+      flagged_1.5x = is.finite(d$ratio) && d$ratio > 1.5,
+      n_at_max     = n_at_max,
+      pct_at_max   = n_at_max / n_total
+    )
+  }))
+}
+
 # Which SSMI layer configuration to use as the SSMI-1 pipeline input.
 # H1SSI_SSMI_ERALand.R writes both "L1_3" (0-100 cm) and "L1_4" (0-289 cm);
 # "L1_3" (root-zone depth) is used by default as it is the more conventional
@@ -844,6 +892,13 @@ fit_copulas <- function(drought_data, marginal_fits, index_name, out_dir,
   A_05  <- compute_cfg_pickands(uS, uA, t_val = 0.5)
   emp_lambda_U <- max(0, 2 * (1 - A_05))
   
+  # TIE-SWEEP LOGGER: record the q-sensitivity of the tie-fraction gate for
+  # this index/duration-class (see setup block near top of script).
+  sweep_tbl              <- sweep_tie_diagnostics(dc$area_pct)
+  sweep_tbl$index_name   <- index_name
+  sweep_tbl$emp_lambda_U <- emp_lambda_U
+  .tie_sweep_log        <<- rbind(.tie_sweep_log, sweep_tbl)
+  
   # 2. Calculate overall rank correlation (Kendall's tau)
   tau_val <- cor(uS, uA, method = "kendall")
   
@@ -1362,3 +1417,146 @@ res_sspi1 <- run_saf_pipeline("SSPI1", sspi1, file.path(OUT_ROOT, "SSPI1_analysi
 res_ssmi1 <- run_saf_pipeline("SSMI1", ssmi1, file.path(OUT_ROOT, "SSMI1_analysis"), scale = 1)
 
 log_event("=== MAIN PIPELINE COMPLETE. Check drought_analysis/ for results. ===")
+
+# TIE-SWEEP LOGGER: write the q-sensitivity table accumulated across every
+# fit_copulas() call above (one row per index/duration-class per q). See the
+# setup block near the top of the script for how to read this table.
+if (nrow(.tie_sweep_log) > 0) {
+  write.csv(.tie_sweep_log,
+            file.path(OUT_ROOT, "tie_fraction_q_sweep.csv"),
+            row.names = FALSE)
+  log_event(sprintf("[tie-sweep] Wrote %d rows to %s",
+                    nrow(.tie_sweep_log),
+                    file.path(OUT_ROOT, "tie_fraction_q_sweep.csv")))
+}
+
+#==============================================================================
+# 10. PLOT SAF SURFACES (formerly A05_plot_SAF_surfaces.R)
+#==============================================================================
+# Reads the *_SAF_conditional_*.csv and *_SAF_kendall_*.csv files just written
+# by derive_SAF_curves_conditional()/derive_SAF_curves_kendall() above, and
+# renders three complementary views for every Index x DurationClass found:
+#
+#   1. small_multiples : one panel per return period (facet), Conditional vs
+#      Kendall overlaid in each panel. RECOMMENDED DEFAULT -- most precise,
+#      and directly answers "do the two methods agree?" at each T.
+#   2. overlay          : all four return periods on one axis (color = T,
+#      linetype = Method) -- a compact single-figure summary.
+#   3. surface          : Area x Return-period heatmap, fill = Severity, one
+#      per method -- more visually striking "surface" look for a
+#      presentation, but coarser to read precisely (only 4 T's).
+#
+# Uses ggplot2/dplyr/viridis, already loaded via the pkgs loop at the top of
+# this script, and OUT_ROOT, already set above -- no new setup needed.
+#
+# NOTE: if a panel for T=50 or T=100 shows only the Conditional line, that is
+# expected, not a bug -- this script intentionally skips the Kendall method
+# for T >= 50 when copula_fit$td_mismatch is TRUE (zero-tail copula selected
+# despite empirical tail dependence; see fit_copulas() above). A missing
+# Kendall line there is itself informative and should be called out, not
+# "fixed".
+#==============================================================================
+PLOT_DIR <- file.path(OUT_ROOT, "SAF_surface_plots")
+dir.create(PLOT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# ---------------------------------------------------------------------------
+# 10.1 Collect every SAF_conditional / SAF_kendall CSV under OUT_ROOT
+# ---------------------------------------------------------------------------
+cond_files <- list.files(OUT_ROOT, pattern = "_SAF_conditional_.*\\.csv$",
+                         recursive = TRUE, full.names = TRUE)
+kend_files <- list.files(OUT_ROOT, pattern = "_SAF_kendall_.*\\.csv$",
+                         recursive = TRUE, full.names = TRUE)
+
+read_all <- function(files) {
+  if (length(files) == 0) return(data.frame())
+  do.call(rbind, lapply(files, function(f) {
+    tryCatch(read.csv(f, stringsAsFactors = FALSE), error = function(e) NULL)
+  }))
+}
+
+saf <- rbind(read_all(cond_files), read_all(kend_files))
+
+if (nrow(saf) == 0) {
+  log_event("[SAF-plots] No SAF_conditional/SAF_kendall CSVs found -- skipping plots.")
+} else {
+  saf$ReturnPeriod_years <- factor(saf$ReturnPeriod_years,
+                                   levels = sort(unique(saf$ReturnPeriod_years)))
+  saf$Method <- factor(saf$Method, levels = c("Conditional", "Kendall"))
+  
+  # -------------------------------------------------------------------------
+  # 10.2 Small-multiples: one panel per return period, both methods overlaid
+  # -------------------------------------------------------------------------
+  plot_small_multiples <- function(sub, index_name, duration_class) {
+    ggplot(sub, aes(x = Area_pct, y = Severity, color = Method, linetype = Method)) +
+      geom_line(linewidth = 0.9) +
+      facet_wrap(~ ReturnPeriod_years, labeller = label_both) +
+      scale_color_manual(values = c(Conditional = "#2a78d6", Kendall = "#1baf7a")) +
+      scale_linetype_manual(values = c(Conditional = "solid", Kendall = "22")) +
+      labs(title = sprintf("%s | %s \u2014 Severity-Area-Frequency", index_name, duration_class),
+           x = "Area affected (%)", y = "Severity (SAF units)") +
+      theme_minimal(base_size = 11) +
+      theme(legend.position = "top", panel.grid.minor = element_blank())
+  }
+  
+  # -------------------------------------------------------------------------
+  # 10.3 Single overlay: all return periods on one axis
+  # -------------------------------------------------------------------------
+  plot_overlay <- function(sub, index_name, duration_class) {
+    ggplot(sub, aes(x = Area_pct, y = Severity,
+                    color = ReturnPeriod_years, linetype = Method,
+                    group = interaction(ReturnPeriod_years, Method))) +
+      geom_line(linewidth = 0.8) +
+      scale_color_viridis_d(name = "Return period (yr)", option = "D", end = 0.9) +
+      scale_linetype_manual(values = c(Conditional = "solid", Kendall = "22")) +
+      labs(title = sprintf("%s | %s \u2014 SAF curve family", index_name, duration_class),
+           x = "Area affected (%)", y = "Severity (SAF units)") +
+      theme_minimal(base_size = 11) +
+      theme(legend.position = "right", panel.grid.minor = element_blank())
+  }
+  
+  # -------------------------------------------------------------------------
+  # 10.4 Heatmap "surface" view: Area x Return period grid, fill = Severity
+  # -------------------------------------------------------------------------
+  plot_surface <- function(sub, index_name, duration_class, method_name) {
+    s <- sub[sub$Method == method_name, ]
+    if (nrow(s) == 0) return(NULL)
+    ggplot(s, aes(x = Area_pct, y = ReturnPeriod_years, fill = Severity)) +
+      geom_tile() +
+      scale_fill_viridis_c(option = "D") +
+      labs(title = sprintf("%s | %s \u2014 %s method surface", index_name, duration_class, method_name),
+           x = "Area affected (%)", y = "Return period (yr)", fill = "Severity") +
+      theme_minimal(base_size = 11) +
+      theme(panel.grid = element_blank())
+  }
+  
+  # -------------------------------------------------------------------------
+  # 10.5 Loop over every Index x DurationClass combination and save all three
+  # -------------------------------------------------------------------------
+  combos <- unique(saf[, c("Index", "DurationClass")])
+  
+  for (i in seq_len(nrow(combos))) {
+    idx <- combos$Index[i]; cls <- combos$DurationClass[i]
+    sub <- saf[saf$Index == idx & saf$DurationClass == cls, ]
+    if (nrow(sub) == 0) next
+    tag <- gsub("[^A-Za-z0-9]", "_", paste(idx, cls, sep = "_"))
+    
+    ggsave(file.path(PLOT_DIR, sprintf("%s_small_multiples.png", tag)),
+           plot_small_multiples(sub, idx, cls), width = 8, height = 6, dpi = 150)
+    
+    ggsave(file.path(PLOT_DIR, sprintf("%s_overlay.png", tag)),
+           plot_overlay(sub, idx, cls), width = 7, height = 5, dpi = 150)
+    
+    p_cond <- plot_surface(sub, idx, cls, "Conditional")
+    if (!is.null(p_cond))
+      ggsave(file.path(PLOT_DIR, sprintf("%s_surface_conditional.png", tag)),
+             p_cond, width = 7, height = 4, dpi = 150)
+    
+    p_kend <- plot_surface(sub, idx, cls, "Kendall")
+    if (!is.null(p_kend))
+      ggsave(file.path(PLOT_DIR, sprintf("%s_surface_kendall.png", tag)),
+             p_kend, width = 7, height = 4, dpi = 150)
+  }
+  
+  log_event(sprintf("[SAF-plots] Wrote plots for %d index/duration-class combinations to %s",
+                    nrow(combos), PLOT_DIR))
+}
