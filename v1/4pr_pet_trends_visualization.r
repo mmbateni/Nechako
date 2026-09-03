@@ -1,0 +1,2249 @@
+####################################################################################
+# 4pr_pet_trends_visualization_v2.r  ??  Trend Maps + Temporal Change + Dual-PET Plots
+# ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+# Reads results produced by 4pr_pet_trends.r (observed PM + ERA5-Land PEV framework)
+# and generates:
+#   BASIN-WIDE MAPS  (Pr, PET_PM, PET_ERA5, Temperature)
+# ??? Publication maps:  tau, Sen's slope, direction  (VC & TFPW) ??? all 4 vars
+# ??? Comparison map:    Pr / PET_PM / PET_ERA5 / Tair side-by-side
+# ??? Regime shift maps: decade of first changepoint ??? all 4 vars
+# ??? Spectral analysis maps: dominant period ??? all 4 vars
+# ??? Spatial variability maps: CV of Sen's slope ??? all 4 vars
+# ??? Method comparison:  VC vs TFPW scatter + agreement bar charts
+# [NEW] CALENDAR-MONTHLY TEMPORAL CHANGE PLOTS  (Functions 13a???13d)
+# For each variable, a 12-panel figure where each panel shows the inter-annual
+# time series of all values for that calendar month (e.g. all Januaries 1950???
+#                                                    2025), with OLS trend line + significance annotation.
+# 13a  Precipitation ??? 12-panel calendar-month temporal series
+# 13b  PET Penman-Monteith ??? same layout
+# 13c  PET ERA5-Land PEV ??? same layout
+# 13d  Temperature ??? same layout
+# 13e  Four-variable comparison:  Sen's slope profile (all months ?? all vars)
+# [NEW] PET_PM vs PET_ERA5 COMPARISON  (Function 14)
+# 14a  Time series overlay (basin averages, monthly + 12-mo rolling mean)
+# 14b  Per-month OLS slope comparison bar chart (PM vs ERA5 side by side)
+# 14c  Basin trend maps side-by-side for every calendar month (Sen's slope)
+# 14d  Bias (PM ??? ERA5) barplot by calendar month
+# 14e  Per-month scatter: PM value vs ERA5 value coloured by year
+# SPECIFIC-POINT PLOTS
+# ??? 4-panel time series per point: Pr / PET_PM / PET_ERA5 / Temperature
+# ??? Per-month trend bars: all 4 variables
+# ??? Trend statistics summary CSV + console print
+# BASIN TIME SERIES  (Function 8 ??? extended for PET_ERA5)
+# ??? Pr + PET_PM + PET_ERA5 (triple-panel) + Temperature (fourth panel)
+# TEMPERATURE DEDICATED ANALYSIS  (Function 12, unchanged)
+####################################################################################
+####################################################################################
+
+library(sf)
+library(zoo)
+library(ggplot2)
+library(patchwork)
+library(scales)
+library(data.table)
+setwd("D:/Nechako_Drought/Nechako/")
+
+# ?????? Shared project constants and basin utilities ????????????????????????????????????????????????????????????????????????????????????????????????
+# DROUGHT_ANALYSIS_utils.R supplies WD_PATH, EQUAL_AREA_CRS, FIG_* constants,
+# load_basin(), safe_pdf(), save_figure(), and the Section J statistical
+# functions (not used here ??? this script reads pre-computed .rds results).
+source("DROUGHT_ANALYSIS_utils_v2.R")
+
+out_dir <- "trend_analysis_pr_pet"
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive=TRUE)
+####################################################################################
+# ?????? LOAD DATA
+####################################################################################
+cat("???? Loading results, basin boundary, and metadata...\n")
+all_results    <- readRDS(file.path(out_dir, "all_results.rds"))
+basin_boundary <- readRDS(file.path(out_dir, "basin_boundary.rds"))
+metadata       <- readRDS(file.path(out_dir, "analysis_metadata.rds"))
+names(all_results)                <- trimws(names(all_results))
+names(metadata$basin_avg_monthly) <- trimws(names(metadata$basin_avg_monthly))
+names(metadata$basin_avg_annual)  <- trimws(names(metadata$basin_avg_annual))
+basin_avg_monthly <- metadata$basin_avg_monthly
+basin_avg_annual  <- metadata$basin_avg_annual
+SPECIFIC_PTS      <- metadata$specific_pts
+pt_trend_file <- file.path(out_dir, "point_trend_stats.csv")
+pt_ts_file    <- file.path(out_dir, "point_monthly_timeseries.csv")
+if (!file.exists(pt_trend_file))
+  warning("point_trend_stats.csv not found ??? skipping specific-point plots")
+if (!file.exists(pt_ts_file))
+  warning("point_monthly_timeseries.csv not found ??? skipping specific-point TS plots")
+point_trend_stats <- if (file.exists(pt_trend_file)) fread(pt_trend_file) else NULL
+point_monthly_ts  <- if (file.exists(pt_ts_file))    fread(pt_ts_file)    else NULL
+clipped_template_file <- file.path(out_dir, "clipped_template.rds")
+if (!file.exists(clipped_template_file))
+  stop("clipped_template.rds not found ??? re-run 4pr_pet_trends.r")
+clipped_template <- readRDS(clipped_template_file)
+template_bc      <- clipped_template
+cat(sprintf("??? Template: %d x %d, res=%.0f m\n",
+            nrow(template_bc), ncol(template_bc), res(template_bc)[1]))
+####################################################################################
+# ?????? SANITY CHECKS
+####################################################################################
+.vars_present <- unique(trimws(all_results$variable))
+cat("\n???? Variables in all_results:", paste(.vars_present, collapse=", "), "\n")
+has_pet_era5 <- "PET_ERA5" %in% .vars_present
+if (!has_pet_era5)
+  cat("\n??????  PET_ERA5 NOT in all_results ??? re-run 4pr_pet_trends.r with ERA5 enabled.\n",
+      "   Dual-PET comparison plots (Function 14) will be skipped.\n\n")
+n_coords_ok <- sum(!all_results$is_basin_average & !is.na(all_results$x) & !is.na(all_results$y))
+cat(sprintf("???? Pixel rows with valid x/y: %d\n", n_coords_ok))
+if (n_coords_ok == 0) stop("All pixel coordinates are NA ??? re-run the processing script.")
+required_cols   <- c("x", "y", "variable", "period", "tau_vc", "p_value_vc", "sl_vc",
+                     "tau_tfpw", "p_value_tfpw", "filtered_vc", "is_basin_average")
+missing_cols    <- required_cols[!required_cols %in% names(all_results)]
+if (length(missing_cols))
+  stop(sprintf("Missing required columns: %s", paste(missing_cols, collapse=", ")))
+####################################################################################
+# ?????? HELPER FUNCTIONS
+####################################################################################
+create_raster_from_table <- function(results_dt, template, value_col) {
+  value_col <- trimws(value_col)
+  if (!value_col %in% names(results_dt))
+    stop(sprintf("Column '%s' not found.", value_col))
+  results_dt <- results_dt[!is.na(x) & !is.na(y)]
+  if (!nrow(results_dt)) { r <- template; values(r) <- NA; return(r) }
+  pts <- vect(as.data.frame(results_dt), geom=c("x","y"), crs=crs(template))
+  r   <- rasterize(pts, template, field=value_col, touches=TRUE)
+  mask(r, vect(basin_boundary))
+}
+smooth_raster <- function(r) {
+  if (all(is.na(values(r)))) return(r)
+  focal(r, w=matrix(1,3,3), fun=mean, na.rm=TRUE)
+}
+plot_raster_panel <- function(r, main, zlim=NULL, col, breaks=NULL,
+                              legend=TRUE, categorical=FALSE, legend_title="") {
+  valid_pct <- 0
+  if (!is.null(r)) {
+    vals <- values(r)
+    valid_pct <- sum(!is.na(vals)) / length(vals) * 100
+  }
+  if (!categorical) r <- smooth_raster(r)
+  if (is.null(r) || all(is.na(values(r)))) {
+    plot.new()
+    text(0.5, 0.5, "No valid trend data\n(Pixels filtered by quality criteria)",
+         cex=1.1, col="gray40", font=3)
+    return(invisible(NULL))
+  }
+  plg_args <- list(cex=0.9)
+  if (legend_title != "") plg_args$title <- legend_title
+  if (!is.null(breaks))
+    plot(r, main=main, cex.main=1.0, col=col, breaks=breaks,
+         axes=FALSE, box=FALSE, legend=legend, plg=plg_args, colNA=NA)
+  else
+    plot(r, main=main, cex.main=1.0, col=col, zlim=zlim,
+         axes=FALSE, box=FALSE, legend=legend, plg=plg_args, colNA=NA)
+  plot(st_geometry(basin_boundary), add=TRUE, col=NA, border="black", lwd=2.5)
+  if (valid_pct < 10) {
+    mtext("Note: Most pixels filtered due to data quality criteria\n(see methodology: ties, min-values, autocorrelation)",
+          side=1, line=0.5, cex=0.7, col="gray40")
+  }
+}
+.pdf_safe <- function(pdf_path, width, height, family='Helvetica', expr_fn) {
+  opened <- FALSE
+  tryCatch({
+    pdf(pdf_path, width=width, height=height, family=family)
+    opened <- TRUE
+    expr_fn()
+    dev.off()
+    opened <- FALSE
+    invisible(pdf_path)
+  }, error = function(e) {
+    if (opened && dev.cur() > 1) dev.off()
+    cat(sprintf('  ??? PDF failed (%s): %s\n', basename(pdf_path), conditionMessage(e)))
+    invisible(NULL)
+  })
+}
+prep_annual <- function(var_name) {
+  
+  cat("\n========================================\n")
+  cat("Variable:", var_name, "\n")
+  
+  cat("Total rows:",
+      nrow(all_results[variable == var_name]), "\n")
+  
+  cat("Annual:",
+      nrow(all_results[
+        variable == var_name &
+          period == "annual"
+      ]), "\n")
+  
+  cat("Annual + pixel:",
+      nrow(all_results[
+        variable == var_name &
+          period == "annual" &
+          !is_basin_average
+      ]), "\n")
+  
+  cat("Annual + pixel + VC:",
+      nrow(all_results[
+        variable == var_name &
+          period == "annual" &
+          !is_basin_average &
+          !filtered_vc
+      ]), "\n")
+  
+  dt <- all_results[
+    variable == var_name &
+      period == "annual" &
+      !is_basin_average &
+      !filtered_vc
+  ]
+  
+  if (!nrow(dt)) return(NULL)
+  
+  dt[, combined_vc :=
+       fifelse(p_value_vc < 0.05, abs(tau_vc), 0)]
+  
+  dt[, combined_tfpw :=
+       fifelse(p_value_tfpw < 0.05, abs(tau_tfpw), 0)]
+  
+  dt[, direction_vc :=
+       fifelse(
+         p_value_vc < 0.05 & tau_vc < 0, -1L,
+         fifelse(
+           p_value_vc < 0.05 & tau_vc > 0,
+           1L,
+           0L
+         )
+       )]
+  
+  dt[, direction_tfpw :=
+       fifelse(
+         p_value_tfpw < 0.05 & tau_tfpw < 0, -1L,
+         fifelse(
+           p_value_tfpw < 0.05 & tau_tfpw > 0,
+           1L,
+           0L
+         )
+       )]
+  
+  dt
+}
+cat("??????  Preparing trend metrics...\n")
+precip_annual  <- prep_annual("Precipitation")
+pet_annual     <- prep_annual("PET")
+pet_era5_annual <- if (has_pet_era5) prep_annual("PET_ERA5") else NULL
+tair_annual    <- prep_annual("Temperature")
+make_rasters   <- function(dt, prefix) {
+  if (is.null(dt)) return(NULL)
+  list(
+    comb_vc   = create_raster_from_table(dt, template_bc, "combined_vc"),
+    comb_tfpw = create_raster_from_table(dt, template_bc, "combined_tfpw"),
+    dir_vc    = create_raster_from_table(dt, template_bc, "direction_vc"),
+    dir_tfpw  = create_raster_from_table(dt, template_bc, "direction_tfpw"),
+    mag_vc    = create_raster_from_table(dt, template_bc, "sl_vc"),
+    mag_tfpw  = create_raster_from_table(dt, template_bc, "sl_tfpw"),
+    tau_vc    = create_raster_from_table(dt, template_bc, "tau_vc"),
+    tau_tfpw  = create_raster_from_table(dt, template_bc, "tau_tfpw")
+  )
+}
+cat("???????  Generating rasters (Pr, PET_PM, PET_ERA5, Temperature)...\n")
+r_precip   <- make_rasters(precip_annual, "precip")
+r_pet      <- make_rasters(pet_annual, "pet")
+r_pet_era5  <- if (has_pet_era5) make_rasters(pet_era5_annual, "pet_era5") else NULL
+r_tair     <- make_rasters(tair_annual, "tair")
+####################################################################################
+# FUNCTION 0: SUPPLEMENTARY HYDROCLIMATIC TREND MAP
+#
+# Added publication product:
+#   2 × 2 map of annual TFPW Sen's slopes for
+#   Precipitation, PET-PM, PET-ERA5-Land PEV, and 2-m air temperature.
+#
+# BH-FDR correction is calculated across the valid basin pixels separately
+# for each variable from the existing annual TFPW p-values. No trend statistic
+# is recomputed; the figure uses the annual TFPW Sen slopes already present in
+# all_results.rds.
+####################################################################################
+create_supp_hydroclimatic_trend_figure <- function(
+    out_png = file.path(out_dir, "FigSx_Spatial_Hydroclimatic_Trends_SenSlope.png"),
+    out_pdf = file.path(out_dir, "FigSx_Spatial_Hydroclimatic_Trends_SenSlope.pdf")) {
+
+  cat("  Supplementary hydroclimatic Sen-slope/FDR map: ")
+
+  vars <- c("Precipitation", "PET", "PET_ERA5", "Temperature")
+  labels <- c(
+    Precipitation = "Precipitation",
+    PET           = "PET-PM",
+    PET_ERA5       = "PET-ERA5-Land PEV",
+    Temperature   = "2-m air temperature"
+  )
+
+  d <- data.table::copy(all_results[
+    period == "annual" &
+      !is_basin_average &
+      variable %in% vars &
+      is.finite(sl_tfpw) &
+      is.finite(p_value_tfpw)
+  ])
+
+  if (!nrow(d)) {
+    cat("no valid annual TFPW trend rows found\n")
+    return(invisible(NULL))
+  }
+
+  # BH-FDR is applied separately within each variable because the four
+  # hypotheses concern different physical fields and have different units.
+  d[, p_fdr_tfpw_plot := {
+    ok <- is.finite(p_value_tfpw)
+    out <- rep(NA_real_, .N)
+    if (sum(ok) > 1L) out[ok] <- stats::p.adjust(p_value_tfpw[ok], method = "BH")
+    else if (sum(ok) == 1L) out[ok] <- p_value_tfpw[ok]
+    out
+  }, by = variable]
+
+  d[, sig_fdr := is.finite(p_fdr_tfpw_plot) & p_fdr_tfpw_plot < 0.05]
+
+  # Build a common symmetric colour range separately for precipitation/PET
+  # (mm yr-1) and temperature (°C yr-1), because the physical units differ.
+  mm_d <- d[variable %in% c("Precipitation", "PET", "PET_ERA5"), sl_tfpw]
+  temp_d <- d[variable == "Temperature", sl_tfpw]
+
+  mm_z <- max(abs(mm_d), na.rm = TRUE)
+  temp_z <- max(abs(temp_d), na.rm = TRUE)
+  if (!is.finite(mm_z) || mm_z <= 0) mm_z <- 1
+  if (!is.finite(temp_z) || temp_z <= 0) temp_z <- 0.1
+
+  basin_wgs <- tryCatch(
+    sf::st_transform(sf::st_as_sf(basin_boundary), 4326),
+    error = function(e) sf::st_as_sf(basin_boundary)
+  )
+
+  # The source x/y coordinates are in the same projected CRS as template_bc.
+  # Transform the trend points to WGS84 before plotting with coord_sf().
+  pts_sf <- sf::st_as_sf(
+    as.data.frame(d),
+    coords = c("x", "y"),
+    crs = terra::crs(template_bc),
+    remove = FALSE
+  )
+  pts_sf <- sf::st_transform(pts_sf, 4326)
+  xy <- sf::st_coordinates(pts_sf)
+  pts_sf$plot_x <- xy[, 1]
+  pts_sf$plot_y <- xy[, 2]
+
+  # Determine grid spacing for geom_tile from the transformed coordinates.
+  grid_spacing <- function(v) {
+    u <- sort(unique(round(v, 8)))
+    dd <- diff(u)
+    dd <- dd[is.finite(dd) & dd > 0]
+    if (!length(dd)) return(0.05)
+    stats::median(dd)
+  }
+  dx <- grid_spacing(pts_sf$plot_x)
+  dy <- grid_spacing(pts_sf$plot_y)
+
+  make_panel <- function(v) {
+    s <- pts_sf[pts_sf$variable == v, ]
+    if (!nrow(s)) {
+      return(
+        ggplot2::ggplot() +
+          ggplot2::annotate("text", x = 0.5, y = 0.5,
+                            label = paste(labels[[v]], "\nno valid data"), size = 4) +
+          ggplot2::theme_void()
+      )
+    }
+
+    zlim <- if (v == "Temperature") c(-temp_z, temp_z) else c(-mm_z, mm_z)
+    unit_lab <- if (v == "Temperature") "°C yr⁻¹" else "mm yr⁻¹"
+    cols <- grDevices::hcl.colors(101, "RdBu", rev = TRUE)
+    n_total <- sum(s$sl_tfpw == s$sl_tfpw)
+    n_sig <- sum(s$sig_fdr, na.rm = TRUE)
+    pct <- if (n_total) 100 * n_sig / n_total else NA_real_
+
+    ggplot2::ggplot(s, ggplot2::aes(x = plot_x, y = plot_y, fill = sl_tfpw)) +
+      ggplot2::geom_tile(width = dx, height = dy) +
+      ggplot2::scale_fill_gradientn(
+        colours = cols,
+        limits = zlim,
+        oob = scales::squish,
+        name = "Sen's slope",
+        guide = ggplot2::guide_colorbar(
+          title.position = "top",
+          barwidth = ggplot2::unit(3.0, "cm"),
+          barheight = ggplot2::unit(0.28, "cm")
+        )
+      ) +
+      ggplot2::geom_point(
+        data = s[s$sig_fdr, ],
+        ggplot2::aes(x = plot_x, y = plot_y),
+        inherit.aes = FALSE,
+        shape = 21,
+        size = 0.65,
+        stroke = 0.15,
+        fill = "black",
+        colour = "black"
+      ) +
+      ggplot2::geom_sf(
+        data = basin_wgs,
+        inherit.aes = FALSE,
+        fill = NA,
+        colour = "black",
+        linewidth = 0.5
+      ) +
+      ggplot2::coord_sf(expand = FALSE) +
+      ggplot2::labs(
+        title = labels[[v]],
+        subtitle = sprintf("BH-FDR significant: %d/%d pixels (%.1f%%)",
+                           n_sig, n_total, pct),
+        x = NULL,
+        y = NULL
+      ) +
+      ggplot2::theme_void(base_size = 9) +
+      ggplot2::theme(
+        plot.title = ggplot2::element_text(size = 10, face = "bold",
+                                           hjust = 0.5,
+                                           margin = ggplot2::margin(b = 2)),
+        plot.subtitle = ggplot2::element_text(size = 7, hjust = 0.5,
+                                              colour = "grey30",
+                                              margin = ggplot2::margin(b = 2)),
+        legend.position = "bottom",
+        legend.title = ggplot2::element_text(size = 7, face = "bold"),
+        legend.text = ggplot2::element_text(size = 6),
+        legend.key.width = ggplot2::unit(1.0, "cm"),
+        legend.key.height = ggplot2::unit(0.25, "cm"),
+        plot.margin = ggplot2::margin(2, 3, 2, 3)
+      )
+  }
+
+  panels <- lapply(vars, make_panel)
+
+  fig <- patchwork::wrap_plots(
+    panels,
+    nrow = 2,
+    ncol = 2,
+    guides = "collect"
+  ) &
+    ggplot2::theme(legend.position = "bottom")
+
+  fig <- fig + patchwork::plot_annotation(
+    title = "Spatial hydroclimatic trends — Nechako River Basin (1950–2025)",
+    subtitle = paste0(
+      "Annual TFPW Mann–Kendall Sen's slope; black points = BH-FDR-significant pixels (α = 0.05).",
+      " Units: mm yr⁻¹ for precipitation/PET and °C yr⁻¹ for temperature."
+    ),
+    theme = ggplot2::theme(
+      plot.title = ggplot2::element_text(size = 13, face = "bold", hjust = 0.5,
+                                         margin = ggplot2::margin(b = 3)),
+      plot.subtitle = ggplot2::element_text(size = 8.5, hjust = 0.5,
+                                            colour = "grey30",
+                                            margin = ggplot2::margin(b = 5))
+    )
+  )
+
+  ggplot2::ggsave(out_png, fig, width = 10.5, height = 8.8, units = "in", dpi = 300)
+  ggplot2::ggsave(out_pdf, fig, width = 10.5, height = 8.8, units = "in", device = "pdf")
+  cat(sprintf("✓ %s / %s\n", basename(out_png), basename(out_pdf)))
+  invisible(fig)
+}
+
+####################################################################################
+# FUNCTION 1: Publication map per variable
+####################################################################################
+create_publication_figure <- function(var_name, method="vc") {
+  rlist <- switch(var_name,
+                  PET=r_pet, PET_ERA5=r_pet_era5,
+                  Precipitation=r_precip, Temperature=r_tair, NULL)
+  if (is.null(rlist)) { cat("?????? No rasters for", var_name, "??? skipping\n"); return(NULL) }
+  pdf_path   <- file.path(out_dir,
+                          sprintf("%s_%s_publication_map.pdf",
+                                  gsub("_", "",tolower(var_name)), method))
+  r_comb   <- if (method=="vc") rlist$comb_vc else rlist$comb_tfpw
+  r_dir    <- if (method=="vc") rlist$dir_vc else rlist$dir_tfpw
+  r_mag    <- if (method=="vc") rlist$mag_vc else rlist$mag_tfpw
+  r_tau    <- if (method=="vc") rlist$tau_vc else rlist$tau_tfpw
+  result  <- .pdf_safe(pdf_path, width=10, height=6.67, expr_fn=function() {
+    par(mfrow=c(1,3), mar=c(2,1.5,2.5,1), oma=c(1,1,3,1))
+    if (var_name == "Temperature") {
+      plot_raster_panel(r_tau, "Kendall's Tau", c(-0.3, 0.3),
+                        hcl.colors(101, "RdBu",rev=TRUE), legend_title="??")
+      plot_raster_panel(r_mag, "Sen's Slope (??C/yr)", range(values(r_mag), na.rm=TRUE),
+                        hcl.colors(101, "RdBu",rev=TRUE), legend_title="??C/yr")
+      plot_raster_panel(r_dir, "Direction (p < 0.05)", NULL,
+                        c("#4575b4", "#f0f0f0", "#d73027"),
+                        breaks=c(-1.5,-0.5,0.5,1.5), legend=FALSE, categorical=TRUE)
+      legend("bottomright", legend=c("Cooling", "Non-sig.", "Warming"),
+             fill=c("#4575b4", "#f0f0f0", "#d73027"), bty="n", cex=1.1)
+    } else if (grepl("^PET", var_name)) {
+      plot_raster_panel(r_comb, "Combined Trend Strength", c(0,0.25),
+                        hcl.colors(101, "YlOrRd"), legend_title="|??|")
+      mtext("Shows |tau| only for significant trends (p < 0.05); others zero",
+            side=3, line=0.1, cex=0.7, col="gray50")
+      plot_raster_panel(r_mag, "Sen's Slope (mm/yr)", c(0,1.5),
+                        hcl.colors(101, "YlOrRd"), legend_title="mm/yr")
+      mtext("Magnitude shown for all valid pixels (significance in other panels)",
+            side=1, line=0.1, cex=0.7, col="gray40")
+      plot_raster_panel(r_dir, "Direction (p < 0.05)", NULL,
+                        c("#4575b4", "#f0f0f0", "#d73027"),
+                        breaks=c(-1.5,-0.5,0.5,1.5), legend=FALSE, categorical=TRUE)
+      legend("bottomright", legend=c("Decreasing", "Non-sig.", "Increasing"),
+             fill=c("#4575b4", "#f0f0f0", "#d73027"), bty="n", cex=1.1)
+    } else {
+      plot_raster_panel(r_comb, "Combined Trend Strength", c(-0.15,0.15),
+                        hcl.colors(101, "RdBu",rev=TRUE), legend_title="?? (sig.)")
+      mtext("Shows |tau| only for significant trends (p < 0.05); others zero",
+            side=3, line=0.1, cex=0.7, col="gray50")
+      plot_raster_panel(r_mag, "Sen's Slope (mm/yr)", c(-2,2),
+                        hcl.colors(101, "RdBu",rev=TRUE), legend_title="mm/yr")
+      plot_raster_panel(r_tau, "Kendall's Tau", c(-0.3,0.3),
+                        hcl.colors(101, "RdBu",rev=TRUE), legend_title="??")
+    }
+    mtext(sprintf("%s Annual Trends (1950-2025) | %s Method",
+                  var_name, ifelse(method=="vc", "Variance-Corrected MK", "TFPW-Corrected MK")),
+          outer=TRUE, cex=1.1, font=2, line=0.5)
+  })
+  if (!is.null(result)) cat(sprintf("??? %s %s map: %s\n", var_name, method, basename(pdf_path)))
+  invisible(result)
+}
+####################################################################################
+# FUNCTION 2: 4-variable comparison map
+####################################################################################
+create_comparison_figure <- function() {
+  vars_avail <- Filter(function(v) {
+    r_name <- paste0("r_", v)
+    if (!exists(r_name)) return(FALSE)
+    r_obj <- get(r_name)
+    !is.null(r_obj) && !is.null(r_obj$tau_vc) &&
+      sum(!is.na(values(r_obj$tau_vc)), na.rm=TRUE) > 0
+  }, c(precip="precip", pet="pet", pet_era5="pet_era5", tair="tair"))
+  r_list <- lapply(vars_avail, function(v) get(paste0("r_",v))$tau_vc)
+  var_labels <- c(precip="Precipitation ??", pet="PET_PM ??",
+                  pet_era5="PET_ERA5 ??", tair="Temperature ??")
+  missing_vars <- setdiff(c("precip", "pet", "pet_era5", "tair"), names(vars_avail))
+  n <- length(r_list)
+  if (n == 0) { cat("?????? No variables available for comparison map.\n"); return(NULL) }
+  pdf_name <- if (n < 4)
+    file.path(out_dir, sprintf("%s_variable_trend_comparison.pdf", n))
+  else
+    file.path(out_dir, "four_variable_trend_comparison.pdf")
+  result <- .pdf_safe(pdf_name, width=5*n, height=6, expr_fn=function() {
+    par(mfrow=c(1,n), mar=c(2,1.5,2.5,1), oma=c(1,1,3,1))
+    for (v in names(r_list))
+      plot_raster_panel(r_list[[v]], var_labels[v], c(-0.3,0.3),
+                        hcl.colors(101,"RdBu",rev=TRUE), legend_title="??")
+    main_title <- "Nechako Basin Annual Trends (1950-2025) | VC-MK"
+    if (n < 4) {
+      main_title <- paste0(main_title, "\n",
+                           paste("Missing:", paste(toupper(missing_vars), collapse=", "), "(filtered/no data)"))
+    }
+    mtext(main_title, outer=TRUE, cex=1.2, font=2, line=0.5)
+  })
+  if (!is.null(result)) cat(sprintf("??? %s-variable comparison map: %s\n", n, basename(pdf_name)))
+  invisible(result)
+}
+####################################################################################
+# FUNCTION 3: Regime shift maps (all 4 variables)
+####################################################################################
+create_regime_shift_maps <- function() {
+  vars_here <- intersect(c("Precipitation", "PET", "PET_ERA5", "Temperature"),
+                         .vars_present)
+  pdf_path <- file.path(out_dir, "regime_shifts_changepoints.pdf")
+  result <- .pdf_safe(pdf_path, width=5*length(vars_here), height=5, expr_fn=function() {
+    par(mfrow=c(1,length(vars_here)), mar=c(2,1.5,2.5,1), oma=c(1,1,3,1))
+    for (var in vars_here) {
+      var_data <- all_results[variable==var & period=="annual" &
+                                !is_basin_average & changepoint_detected==TRUE]
+      if (!nrow(var_data)) {
+        plot.new(); text(0.5,0.5,paste("No regime shifts\n",var),cex=1.2); next
+      }
+      var_data[, shift_decade_num := as.numeric(cut(
+        first_changepoint_year, breaks=seq(1950,2030,by=10), include.lowest=TRUE))]
+      r_decade <- create_raster_from_table(var_data, template_bc, "shift_decade_num")
+      plot_raster_panel(r_decade, paste0(var, ": Regime Shift Decade"),
+                        c(1,8), hcl.colors(8, "Spectral",rev=TRUE))
+    }
+    mtext("Regime Shift Detection (PELT) ??? 1950-2025",
+          outer=TRUE, cex=1.1, font=2, line=0.5)
+  })
+  if (!is.null(result)) cat(sprintf("??? Regime shift map: %s\n", basename(pdf_path)))
+  invisible(result)
+}
+####################################################################################
+# FUNCTION 4: Spectral maps (all 4 variables)
+####################################################################################
+create_spectral_analysis_maps <- function() {
+  vars_here <- intersect(c("Precipitation", "PET", "PET_ERA5", "Temperature"),
+                         .vars_present)
+  pdf_path <- file.path(out_dir, "spectral_analysis.pdf")
+  result <- .pdf_safe(pdf_path, width=5*length(vars_here), height=5, expr_fn=function() {
+    par(mfrow=c(1,length(vars_here)), mar=c(2,1.5,2.5,1), oma=c(1,1,3,1))
+    for (var in vars_here) {
+      var_data <- all_results[variable==var & period=="annual" &
+                                !is_basin_average & n_spectral_peaks > 0]
+      if (!nrow(var_data)) {
+        plot.new(); text(0.5,0.5,paste("No spectral peaks\n",var),cex=1.2); next
+      }
+      r_p <- create_raster_from_table(var_data, template_bc, "dominant_period")
+      plot_raster_panel(r_p, paste0(var, ": Dominant Cycle (yr)"),
+                        range(var_data$dominant_period, na.rm=TRUE),
+                        hcl.colors(101, "plasma"), legend_title="Years")
+    }
+    mtext("Spectral Analysis: Dominant Periodicities",
+          outer=TRUE, cex=1.1, font=2, line=0.5)
+  })
+  if (!is.null(result)) cat(sprintf("??? Spectral map: %s\n", basename(pdf_path)))
+  invisible(result)
+}
+####################################################################################
+# FUNCTION 5: Spatial pattern analysis
+####################################################################################
+create_spatial_pattern_analysis <- function() {
+  vars_here <- intersect(c("Precipitation", "PET", "PET_ERA5", "Temperature"),
+                         .vars_present)
+  pdf_path <- file.path(out_dir, "spatial_patterns.pdf")
+  result <- .pdf_safe(pdf_path, width=5*length(vars_here), height=5, expr_fn=function() {
+    par(mfrow=c(1,length(vars_here)), mar=c(2,1.5,2.5,1), oma=c(1,1,3,1))
+    for (var in vars_here) {
+      var_data <- all_results[variable==var & period=="annual" & !is_basin_average & !filtered_vc]
+      if (!nrow(var_data)) {
+        plot.new(); text(0.5,0.5,paste("No data\n",var),cex=1.2); next
+      }
+      var_data[, spatial_cv := abs(sl_vc) / (abs(mean(sl_vc, na.rm=TRUE)) + 0.001)]
+      r_cv <- create_raster_from_table(var_data, template_bc, "spatial_cv")
+      plot_raster_panel(r_cv, paste0(var, ": Spatial Variability (CV)"),
+                        c(0,5), hcl.colors(101, "YlOrRd"), legend_title="CV")
+    }
+    mtext("Spatial Variability of Annual Trends (CV)",
+          outer=TRUE, cex=1.1, font=2, line=0.5)
+  })
+  if (!is.null(result)) cat(sprintf("??? Spatial pattern map: %s\n", basename(pdf_path)))
+  invisible(result)
+}
+####################################################################################
+# FUNCTION 6: Method comparison (VC vs TFPW)
+####################################################################################
+create_method_comparison <- function() {
+  comp_data <- all_results[period=="annual" & !is_basin_average &
+                             !filtered_vc & !filtered_tfpw &
+                             variable %in% c("Precipitation", "PET", "PET_ERA5", "Temperature")]
+  if (!nrow(comp_data)) { cat("?????? No valid pixels for method comparison.\n"); return(NULL) }
+  comp_data[, vc_sig := p_value_vc < 0.05]
+  comp_data[, tfpw_sig := p_value_tfpw < 0.05]
+  tau_range <- range(c(comp_data$tau_vc, comp_data$tau_tfpw), na.rm=TRUE)
+  var_cols <- c(Precipitation="#4575b4", PET="#d73027",
+                PET_ERA5="#e08214", Temperature="#1a9641")
+  p1 <- ggplot(comp_data, aes(x=tau_vc, y=tau_tfpw, color=variable)) +
+    geom_abline(slope=1, intercept=0, linetype="dashed", color="gray40") +
+    geom_point(alpha=0.35, size=1.0) +
+    facet_wrap(~variable, labeller=labeller(variable=c(
+      Precipitation="Precipitation", PET="PET (PM)",
+      PET_ERA5="PET (ERA5)", Temperature="Temperature"))) +
+    scale_color_manual(values=var_cols) +
+    coord_equal(xlim=tau_range, ylim=tau_range) +
+    theme_bw(base_size=10) + theme(legend.position="none") +
+    labs(title="A) Kendall's Tau: VC vs TFPW", x="VC Method (??)", y="TFPW Method (??)")
+  agreement <- comp_data[, .(
+    Both_Sig = sum(vc_sig & tfpw_sig),
+    Only_VC = sum(vc_sig & !tfpw_sig),
+    Only_TFPW = sum(!vc_sig & tfpw_sig),
+    Neither = sum(!vc_sig & !tfpw_sig)
+  ), by=variable]
+  ag_l <- melt(agreement, id.vars="variable")
+  p2 <- ggplot(ag_l, aes(x=variable, y=value, fill=variable)) +
+    geom_col() + facet_wrap(~variable, scales="free_x") +
+    geom_text(aes(label=sprintf("%.0f%%", value/sum(value)*100), group=variable),
+              position=position_stack(vjust=0.5), size=2.8) +
+    scale_fill_manual(values=var_cols) +
+    theme_bw(base_size=10) + theme(legend.position="none",
+                                   axis.text.x=element_blank(), axis.ticks.x=element_blank()) +
+    labs(title="B) Method Agreement", x=NULL, y="N Pixels")
+  combined <- p1 / p2 +
+    plot_annotation(title="Mann-Kendall Method Comparison (VC vs TFPW)",
+                    theme=theme(plot.title=element_text(size=12,face="bold",hjust=0.5)))
+  ggsave(file.path(out_dir,"method_comparison_vc_vs_tfpw.png"),
+         combined, width=14, height=10, dpi=300)
+  cat("??? Method comparison plot saved\n")
+  invisible(combined)
+}
+####################################################################################
+####################################################################################
+# FUNCTION 7: Statistics table
+####################################################################################
+create_statistics_table <- function() {
+  has_rho_vc <- "rho1_vc" %in% names(all_results)
+  has_rho_tfpw <- "rho1_tfpw" %in% names(all_results)
+  stats_summary <- all_results[period=="annual" & !is_basin_average, .(
+    N_Pixels = .N,
+    N_Valid_VC = sum(!filtered_vc),
+    N_Valid_TFPW = sum(!filtered_tfpw),
+    Pct_Sig_VC = {
+      n <- sum(!filtered_vc)
+      if (n > 0) sprintf("%.1f%%", sum(p_value_vc < 0.05 & !filtered_vc, na.rm=TRUE) / n * 100)
+      else "N/A"
+    },
+    Pct_Sig_TFPW = {
+      n <- sum(!filtered_tfpw)
+      if (n > 0) sprintf("%.1f%%", sum(p_value_tfpw < 0.05 & !filtered_tfpw, na.rm=TRUE) / n * 100)
+      else "N/A"
+    },
+    Median_Tau_VC = { v <- tau_vc[!filtered_vc]; if (length(v) > 0) sprintf("%.3f", median(v, na.rm=TRUE)) else "N/A" },
+    Median_Slope_VC = { v <- sl_vc[!filtered_vc]; if (length(v) > 0) sprintf("%.4f", median(v, na.rm=TRUE)) else "N/A" },
+    Mean_Autocorr = if (has_rho_vc) { v <- rho1_vc[!filtered_vc]; if (length(v) > 0) sprintf("%.3f", mean(v, na.rm=TRUE)) else "N/A" } else NA_character_
+  ), by=.(variable)]
+  fwrite(stats_summary, file.path(out_dir, "summary_statistics.csv"))
+  cat("??? Statistics table saved\n"); print(as.data.frame(stats_summary))
+  invisible(stats_summary)
+}
+####################################################################################
+# FUNCTION 8: Basin time series (Pr + PET_PM + PET_ERA5 + Temperature)
+####################################################################################
+create_basin_timeseries_plot <- function() {
+  has_tair <- "tair_degC_month" %in% names(basin_avg_monthly)
+  has_pet_era5 <- "pet_era5_mm_month" %in% names(basin_avg_monthly)
+  .ols_line <- function(dates, vals) {
+    yr <- as.numeric(format(dates, "%Y")) +
+      (as.numeric(format(dates, "%m")) - 0.5) / 12
+    ok <- !is.na(yr) & !is.na(vals)
+    if (sum(ok) < 10) return(NULL)
+    lm(vals[ok] ~ yr[ok])
+  }
+  n_panels <- 2L + has_pet_era5 + has_tair
+  png_path <- file.path(out_dir, "basin_average_timeseries.png")
+  png(png_path, width=12, height=4*n_panels, units="in", res=300)
+  layout(matrix(seq_len(n_panels), nrow=n_panels), heights=rep(1, n_panels))
+  pr_roll <- rollmean(basin_avg_monthly$precip_mm_month, k=12, fill=NA, align="center")
+  par(mar=c(3,5,3.5,2))
+  plot(basin_avg_monthly$date, basin_avg_monthly$precip_mm_month,
+       type="l", col=rgb(0.2,0.4,0.8,0.3), lwd=0.8,
+       xlab="", ylab="Precipitation (mm/month)",
+       main="Nechako Basin Climate Variables (1950???2025)",
+       ylim=c(0, max(basin_avg_monthly$precip_mm_month, na.rm=TRUE)*1.1),
+       cex.lab=1.1, cex.main=1.2)
+  lines(basin_avg_monthly$date, pr_roll, col="blue", lwd=2.5)
+  legend("topright", legend=c("Pr (monthly)", "Pr 12-mo mean"),
+         col=c(rgb(0.2,0.4,0.8,0.3), "blue"), lwd=c(0.8,2.5), bty="n", cex=0.9)
+  pet_pm <- basin_avg_monthly$pet_mm_month
+  ylim_p <- c(0, max(c(pet_pm, if (has_pet_era5) basin_avg_monthly$pet_era5_mm_month else 0),
+                     na.rm=TRUE) * 1.15)
+  plot(basin_avg_monthly$date, pet_pm,
+       type="l", col=rgb(0.8,0.2,0.2,0.25), lwd=0.6,
+       xlab="", ylab="PET (mm/month)", ylim=ylim_p, cex.lab=1.1,
+       main="Potential Evapotranspiration ??? Penman-Monteith vs ERA5-Land PEV")
+  lines(basin_avg_monthly$date, rollmean(pet_pm, k=12, fill=NA, align="center"),
+        col="red3", lwd=2.5)
+  if (has_pet_era5) {
+    pet_era5 <- basin_avg_monthly$pet_era5_mm_month
+    lines(basin_avg_monthly$date, pet_era5, col=rgb(0.9,0.5,0,0.25), lwd=0.6)
+    lines(basin_avg_monthly$date, rollmean(pet_era5, k=12, fill=NA, align="center"),
+          col="#e08214", lwd=2.5)
+    legend("topright",
+           legend=c("PET_PM (monthly)", "PET_PM 12-mo", "PET_ERA5 (monthly)", "PET_ERA5 12-mo"),
+           col=c(rgb(0.8,0.2,0.2,0.3), "red3",rgb(0.9,0.5,0,0.3), "#e08214"),
+           lwd=c(0.6,2.5,0.6,2.5), bty="n", cex=0.85)
+  } else {
+    legend("topright", legend=c("PET_PM (monthly)", "PET_PM 12-mo"),
+           col=c(rgb(0.8,0.2,0.2,0.3), "red3"), lwd=c(0.6,2.5), bty="n", cex=0.9)
+  }
+  if (has_tair) {
+    tair <- basin_avg_monthly$tair_degC_month
+    tair_roll <- rollmean(tair, k=12, fill=NA, align="center")
+    par(mar=c(if (n_panels >3) 3 else 4, 5, 2, 2))
+    plot(basin_avg_monthly$date, tair,
+         type="l", col=rgb(0.6,0.2,0.6,0.25), lwd=0.6,
+         xlab="", ylab="Temperature (??C)", cex.lab=1.1,
+         ylim=range(tair, na.rm=TRUE) + c(-0.5,0.5),
+         main="Basin-Mean 2-m Air Temperature")
+    lines(basin_avg_monthly$date, tair_roll, col="purple", lwd=2.5)
+    fit_t <- tryCatch({
+      yr_frac <- as.numeric(format(basin_avg_monthly$date, "%Y")) +
+        (as.numeric(format(basin_avg_monthly$date, "%m"))-0.5)/12
+      ok <- !is.na(yr_frac) & !is.na(tair)
+      if (sum(ok) < 10) NULL else lm(tair[ok] ~ yr_frac[ok])
+    }, error=function(e) NULL)
+    if (!is.null(fit_t)) {
+      yr_seq <- seq(min(as.numeric(format(basin_avg_monthly$date, "%Y"))),
+                    max(as.numeric(format(basin_avg_monthly$date, "%Y"))) + 1, length.out=200)
+      pred_y <- coef(fit_t)[1] + coef(fit_t)[2] * (yr_seq + 0.5/12)
+      lines(as.Date(paste0(floor(yr_seq), "-07-01")), pred_y, col="#d73027", lwd=2, lty=2)
+      mtext(sprintf("OLS: %+.4f ??C/yr", coef(fit_t)[2]),
+            side=3, line=0, adj=1, cex=0.85, col="#d73027", font=2)
+    }
+    legend("topleft", legend=c("Tair (monthly)", "12-mo mean", "OLS trend"),
+           col=c(rgb(0.6,0.2,0.6,0.25), "purple", "#d73027"),
+           lwd=c(0.6,2.5,2), lty=c(1,1,2), bty="n", cex=0.9)
+  }
+  dev.off()
+  cat(sprintf("??? Basin time series: %s\n", basename(png_path)))
+  invisible(png_path)
+}
+####################################################################################
+# FUNCTION 13: CALENDAR-MONTHLY TEMPORAL CHANGE PLOTS  [NEW]
+####################################################################################
+.build_calmonth_df <- function(dates, monthly_vec) {
+  data.frame(
+    year = as.integer(format(dates, "%Y")),
+    month = as.integer(format(dates, "%m")),
+    month_abb = factor(month.abb[as.integer(format(dates, "%m"))],
+                       levels=month.abb),
+    value = as.numeric(monthly_vec),
+    stringsAsFactors = FALSE
+  )
+}
+create_calmonth_temporal_changes <- function(var_label, monthly_vec, dates,
+                                             y_unit, color_line, color_ols,
+                                             pdf_stem) {
+  df <- .build_calmonth_df(dates, monthly_vec)
+  df <- df[!is.na(df$value), ]
+  if (!nrow(df)) {
+    cat(sprintf(" ??? %s: no data ??? skipping\n", var_label)); return(invisible(NULL))
+  }
+  panels <- lapply(1:12, function(m) {
+    sub <- df[df$month == m, ]
+    n_obs <- nrow(sub)
+    y_lbl <- if (m %in% c(1,5,9)) y_unit else NULL
+    p <- ggplot2::ggplot(sub, ggplot2::aes(x=year, y=value)) +
+      ggplot2::geom_point(colour=color_line, size=0.9, alpha=0.65) +
+      ggplot2::geom_line(colour=color_line, linewidth=0.45, alpha=0.5)
+    sig_label <- ""
+    if (n_obs >= 10) {
+      fit <- tryCatch(lm(value ~ year, data=sub), error=function(e) NULL)
+      if (!is.null(fit)) {
+        coef_sum <- summary(fit)$coefficients
+        if ("year" %in% rownames(coef_sum)) {
+          pval <- coef_sum["year", 4]
+          slope <- coef(fit)["year"]
+          pred <- data.frame(year=range(sub$year, na.rm=TRUE))
+          pred$y <- predict(fit, newdata=pred)
+          p <- p +
+            ggplot2::geom_line(data=pred,
+                               ggplot2::aes(x=year, y=y),
+                               colour=color_ols, linewidth=1.1, linetype="solid",
+                               inherit.aes=FALSE)
+          sig_label <- if (!is.na(pval) && pval < 0.05)
+            sprintf("%+.3f/yr *", slope) else sprintf("%+.3f/yr", slope)
+        }
+      }
+    }
+    p +
+      ggplot2::annotate("text", x=-Inf, y=Inf, label=sig_label,
+                        hjust=-0.1, vjust=1.4, size=2.5,
+                        colour=ifelse(grepl("\\*", sig_label), color_ols, "grey45"),
+                        fontface="bold") +
+      ggplot2::scale_x_continuous(breaks=seq(1960, 2020, by=20)) +
+      ggplot2::labs(title=month.abb[m], x=NULL, y=y_lbl,
+                    subtitle=sprintf("n=%d", n_obs)) +
+      ggplot2::theme_classic(base_size=8.5) +
+      ggplot2::theme(
+        plot.title = ggplot2::element_text(face="bold", size=9, hjust=0.5),
+        plot.subtitle = ggplot2::element_text(size=7, colour="grey50", hjust=0.5),
+        axis.title.y = ggplot2::element_text(size=8),
+        axis.text = ggplot2::element_text(size=7),
+        panel.grid.major = ggplot2::element_line(colour="grey94", linewidth=0.25),
+        plot.margin = ggplot2::margin(2,3,2,3)
+      )
+  })
+  fig <- patchwork::wrap_plots(panels, ncol=4) +
+    patchwork::plot_annotation(
+      title = sprintf("Calendar-Monthly Temporal Changes ??? %s ??? Nechako Basin", var_label),
+      subtitle = paste0(
+        "Each panel = one calendar month; each dot = one year's value. ",
+        "Solid line = OLS trend. * p < 0.05. ",
+        "Slope in ", y_unit, "/yr."),
+      theme = ggplot2::theme(
+        plot.title = ggplot2::element_text(face="bold", size=11, hjust=0.5),
+        plot.subtitle = ggplot2::element_text(size=8, colour="grey35", hjust=0)))
+  out_pdf <- file.path(out_dir, paste0(pdf_stem, ".pdf"))
+  out_png <- file.path(out_dir, paste0(pdf_stem, ".png"))
+  tryCatch(ggplot2::ggsave(out_pdf, fig, width=13, height=9, units="in", device="pdf"),
+           error=function(e) cat(" ??? PDF: ", e$message, "\n"))
+  tryCatch(ggplot2::ggsave(out_png, fig, width=13, height=9, units="in",
+                           dpi=300, device="png"),
+           error=function(e) cat(" ??? PNG: ", e$message, "\n"))
+  cat(sprintf(" ??? %s: %s / %s\n", var_label, basename(out_pdf), basename(out_png)))
+  invisible(fig)
+}
+create_all_calmonth_temporal_changes <- function() {
+  cat("\n?????? Function 13: Calendar-monthly temporal change plots ??????\n")
+  create_calmonth_temporal_changes(
+    var_label = "Precipitation",
+    monthly_vec = basin_avg_monthly$precip_mm_month,
+    dates = basin_avg_monthly$date,
+    y_unit = "mm/month",
+    color_line = "#4575b4",
+    color_ols = "#08306b",
+    pdf_stem = "calmonth_temporal_Precipitation")
+  create_calmonth_temporal_changes(
+    var_label = "PET ??? Penman-Monteith",
+    monthly_vec = basin_avg_monthly$pet_mm_month,
+    dates = basin_avg_monthly$date,
+    y_unit = "mm/month",
+    color_line = "#d73027",
+    color_ols = "#67000d",
+    pdf_stem = "calmonth_temporal_PET_PM")
+  if ("pet_era5_mm_month" %in% names(basin_avg_monthly)) {
+    create_calmonth_temporal_changes(
+      var_label = "PET ??? ERA5-Land PEV",
+      monthly_vec = basin_avg_monthly$pet_era5_mm_month,
+      dates = basin_avg_monthly$date,
+      y_unit = "mm/month",
+      color_line = "#e08214",
+      color_ols = "#7f2704",
+      pdf_stem = "calmonth_temporal_PET_ERA5")
+  } else {
+    cat(" ??? 13c: pet_era5_mm_month not found ??? skipped\n")
+  }
+  if ("tair_degC_month" %in% names(basin_avg_monthly)) {
+    create_calmonth_temporal_changes(
+      var_label = "Temperature (2-m)",
+      monthly_vec = basin_avg_monthly$tair_degC_month,
+      dates = basin_avg_monthly$date,
+      y_unit = "??C",
+      color_line = "#6a3d9a",
+      color_ols = "#3d0072",
+      pdf_stem = "calmonth_temporal_Temperature")
+  } else {
+    cat(" ??? 13d: tair_degC_month not found ??? skipped\n")
+  }
+  cat(" 13e: combined per-month slope profile...\n")
+  .slope_profile_df <- function(dates, vals, var_label, unit) {
+    do.call(rbind, lapply(1:12, function(m) {
+      yr <- as.integer(format(dates, "%Y"))
+      mo <- as.integer(format(dates, "%m"))
+      sub <- data.frame(year=yr[mo==m], value=vals[mo==m])
+      sub <- sub[!is.na(sub$value), ]
+      if (nrow(sub) < 10) return(data.frame(
+        month=m, month_abb=month.abb[m], slope=NA_real_, pval=NA_real_,
+        sig=FALSE, variable=var_label, unit=unit, stringsAsFactors=FALSE))
+      fit <- tryCatch(lm(value ~ year, data=sub), error=function(e) NULL)
+      if (is.null(fit)) return(data.frame(
+        month=m, month_abb=month.abb[m], slope=NA_real_, pval=NA_real_,
+        sig=FALSE, variable=var_label, unit=unit, stringsAsFactors=FALSE))
+      data.frame(
+        month = m,
+        month_abb = month.abb[m],
+        slope = coef(fit)["year"],
+        pval = summary(fit)$coefficients["year",4],
+        sig = summary(fit)$coefficients["year",4] < 0.05,
+        variable = var_label, unit=unit, stringsAsFactors=FALSE)
+    }))
+  }
+  sp_list <- list(
+    .slope_profile_df(basin_avg_monthly$date,
+                      basin_avg_monthly$precip_mm_month, "Precipitation", "mm/month"),
+    .slope_profile_df(basin_avg_monthly$date,
+                      basin_avg_monthly$pet_mm_month, "PET_PM", "mm/month")
+  )
+  if ("pet_era5_mm_month" %in% names(basin_avg_monthly))
+    sp_list[[length(sp_list)+1]] <- .slope_profile_df(
+      basin_avg_monthly$date, basin_avg_monthly$pet_era5_mm_month, "PET_ERA5", "mm/month")
+  if ("tair_degC_month" %in% names(basin_avg_monthly))
+    sp_list[[length(sp_list)+1]] <- .slope_profile_df(
+      basin_avg_monthly$date, basin_avg_monthly$tair_degC_month, "Temperature", "??C")
+  sp_df <- do.call(rbind, sp_list)
+  sp_df$month_abb <- factor(sp_df$month_abb, levels=month.abb)
+  sp_df$variable <- factor(sp_df$variable,
+                           levels=c("Precipitation","PET_PM","PET_ERA5","Temperature"))
+  fwrite(as.data.table(sp_df),
+         file.path(out_dir, "calmonth_ols_slope_profiles.csv"))
+  var_pal <- c(Precipitation="#4575b4", PET_PM="#d73027",
+               PET_ERA5="#e08214", Temperature="#6a3d9a")
+  p13e <- ggplot2::ggplot(sp_df,
+                          ggplot2::aes(x=month_abb, y=slope, fill=variable,
+                                       alpha=sig)) +
+    ggplot2::geom_col(position="dodge", colour="white", linewidth=0.2, width=0.8) +
+    ggplot2::geom_point(
+      data=sp_df[sp_df$sig, ],
+      ggplot2::aes(x=month_abb, y=slope + sign(slope)*max(abs(sp_df$slope),na.rm=TRUE)*0.07,
+                   colour=variable, group=variable),
+      shape=8, size=2.0, position=ggplot2::position_dodge(0.8),
+      inherit.aes=FALSE, show.legend=FALSE) +
+    ggplot2::geom_hline(yintercept=0, linewidth=0.45) +
+    ggplot2::facet_wrap(~variable, ncol=1, scales="free_y",
+                        labeller=ggplot2::labeller(variable=c(
+                          Precipitation="Precipitation (mm/month/yr)",
+                          PET_PM="PET ??? Penman-Monteith (mm/month/yr)",
+                          PET_ERA5="PET ??? ERA5-Land PEV (mm/month/yr)",
+                          Temperature="Temperature (??C/yr)"))) +
+    ggplot2::scale_fill_manual(values=var_pal, guide="none") +
+    ggplot2::scale_colour_manual(values=var_pal, guide="none") +
+    ggplot2::scale_alpha_manual(values=c("TRUE"=1.0, "FALSE"=0.40), guide="none") +
+    ggplot2::labs(
+      title = "Per-Calendar-Month OLS Slope Profile ??? All Variables",
+      subtitle = "Solid bars = significant (p < 0.05); faded = non-significant. ??? = p < 0.05 marker.",
+      x = "Calendar month",
+      y = "OLS slope (unit/yr)") +
+    ggplot2::theme_classic(base_size=10) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(face="bold", size=12, hjust=0.5),
+      strip.text = ggplot2::element_text(face="bold", size=9),
+      axis.title.x = ggplot2::element_text(size=9),
+      panel.grid.major.y = ggplot2::element_line(colour="grey92", linewidth=0.3),
+      plot.margin = ggplot2::margin(4,10,4,4))
+  out_pdf13e <- file.path(out_dir, "calmonth_slope_profile_all_vars.pdf")
+  out_png13e <- file.path(out_dir, "calmonth_slope_profile_all_vars.png")
+  tryCatch(ggplot2::ggsave(out_pdf13e, p13e, width=12, height=10, units="in", device="pdf"),
+           error=function(e) cat(" ??? 13e PDF: ", e$message, "\n"))
+  tryCatch(ggplot2::ggsave(out_png13e, p13e, width=12, height=10, units="in",
+                           dpi=300, device="png"),
+           error=function(e) cat(" ??? 13e PNG: ", e$message, "\n"))
+  cat(sprintf(" ??? 13e combined slope profile: %s\n", basename(out_png13e)))
+  cat("?????? Function 13 complete.\n")
+  invisible(NULL)
+}
+####################################################################################
+# FUNCTION 14: PET_PM vs PET_ERA5 COMPARISON  [NEW]
+####################################################################################
+create_pet_comparison_plots <- function() {
+  if (!has_pet_era5) {
+    cat("\n?????? PET_ERA5 not present ??? skipping Function 14.\n")
+    return(invisible(NULL))
+  }
+  if (!"pet_era5_mm_month" %in% names(basin_avg_monthly)) {
+    cat("\n?????? pet_era5_mm_month not in basin_avg_monthly ??? skipping Function 14.\n")
+    return(invisible(NULL))
+  }
+  cat("\n?????? Function 14: PET_PM vs PET_ERA5 comparison plots ??????\n")
+  pet_pm <- basin_avg_monthly$pet_mm_month
+  pet_era5 <- basin_avg_monthly$pet_era5_mm_month
+  dates <- basin_avg_monthly$date
+  yr <- as.integer(format(dates, "%Y"))
+  mo <- as.integer(format(dates, "%m"))
+  theme_cmp <- ggplot2::theme_classic(base_size=10) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(face="bold", size=11, hjust=0),
+      plot.subtitle = ggplot2::element_text(size=8.5, colour="grey40", hjust=0),
+      panel.grid.major = ggplot2::element_line(colour="grey93", linewidth=0.3),
+      plot.margin = ggplot2::margin(4,8,4,4))
+  cat(" 14a: time series overlay...\n")
+  df_ts <- data.frame(
+    date = dates,
+    PET_PM = pet_pm,
+    PET_ERA5 = pet_era5,
+    pm_roll = rollmean(pet_pm, k=12, fill=NA, align="center"),
+    era5_roll = rollmean(pet_era5, k=12, fill=NA, align="center"))
+  p14a <- ggplot2::ggplot(df_ts, ggplot2::aes(x=date)) +
+    ggplot2::geom_line(ggplot2::aes(y=PET_PM), colour=rgb(0.84,0.19,0.15,0.25), linewidth=0.45) +
+    ggplot2::geom_line(ggplot2::aes(y=PET_ERA5), colour=rgb(0.88,0.51,0.08,0.25), linewidth=0.45) +
+    ggplot2::geom_line(ggplot2::aes(y=pm_roll), colour="#d73027", linewidth=1.2, na.rm=TRUE) +
+    ggplot2::geom_line(ggplot2::aes(y=era5_roll), colour="#e08214", linewidth=1.2, linetype="dashed", na.rm=TRUE) +
+    ggplot2::scale_x_date(date_breaks="10 years", date_labels="%Y",
+                          expand=ggplot2::expansion(mult=c(0.01,0.01))) +
+    ggplot2::labs(title="Basin-Mean PET ??? Penman-Monteith vs ERA5-Land PEV (1950???2025)",
+                  subtitle="Thick lines = 12-month rolling mean. Red = PM, Orange-dashed = ERA5.",
+                  x="Year", y="PET (mm/month)") +
+    theme_cmp
+  tryCatch(ggplot2::ggsave(file.path(out_dir, "pet_comparison_14a_timeseries.pdf"),
+                           p14a, width=12, height=5, units="in", device="pdf"),
+           error=function(e) cat(" ??? 14a PDF: ", e$message, "\n"))
+  tryCatch(ggplot2::ggsave(file.path(out_dir, "pet_comparison_14a_timeseries.png"),
+                           p14a, width=12, height=5, units="in", dpi=300, device="png"),
+           error=function(e) cat(" ??? 14a PNG: ", e$message, "\n"))
+  cat(" ??? 14a saved\n")
+  cat(" 14b: per-month slope comparison...\n")
+  slopes_b <- do.call(rbind, lapply(1:12, function(m) {
+    idx <- mo == m
+    .fit <- function(x) {
+      sub <- data.frame(yr=yr[idx], v=x[idx]); sub <- sub[!is.na(sub$v),]
+      if (nrow(sub) <10) return(c(NA,NA))
+      f <- tryCatch(lm(v~yr, data=sub), error=function(e) NULL)
+      if (is.null(f)) return(c(NA,NA))
+      c(coef(f)["yr"], summary(f)$coefficients["yr",4])
+    }
+    spm <- .fit(pet_pm); sth <- .fit(pet_era5)
+    data.frame(month=m, month_abb=month.abb[m],
+               slope_PM=spm[1], pval_PM=spm[2], sig_PM=!is.na(spm[2]) & spm[2] <0.05,
+               slope_ERA5=sth[1], pval_ERA5=sth[2], sig_ERA5=!is.na(sth[2]) & sth[2] <0.05)
+  }))
+  slopes_b$month_abb <- factor(slopes_b$month_abb, levels=month.abb)
+  slopes_long <- data.table::melt(as.data.table(slopes_b),
+                                  id.vars=c("month", "month_abb"),
+                                  measure.vars=c("slope_PM", "slope_ERA5"),
+                                  variable.name="method", value.name="slope")
+  slopes_long[, sig := ifelse(method=="slope_PM",
+                              slopes_b$sig_PM[match(month, slopes_b$month)],
+                              slopes_b$sig_ERA5[match(month, slopes_b$month)])]
+  slopes_long[, method_lbl := ifelse(method=="slope_PM", "Penman-Monteith", "ERA5-Land PEV")]
+  p14b <- ggplot2::ggplot(slopes_long,
+                          ggplot2::aes(x=month_abb, y=slope, fill=method_lbl,
+                                       alpha=sig)) +
+    ggplot2::geom_col(position="dodge", colour="white", linewidth=0.2, width=0.75) +
+    ggplot2::geom_hline(yintercept=0, linewidth=0.5) +
+    ggplot2::scale_fill_manual(values=c("Penman-Monteith"="#d73027",
+                                        "ERA5-Land PEV"="#e08214"),
+                               name=NULL) +
+    ggplot2::scale_alpha_manual(values=c("TRUE"=1.0, "FALSE"=0.35), guide="none") +
+    ggplot2::labs(
+      title = "Per-Month OLS Slope: PET_PM vs PET_ERA5",
+      subtitle = "Solid bars = p < 0.05; faded = non-significant. (mm/month per year)",
+      x="Calendar month", y="OLS slope (mm/month/yr)") +
+    theme_cmp + ggplot2::theme(legend.position="top")
+  tryCatch(ggplot2::ggsave(file.path(out_dir, "pet_comparison_14b_monthly_slopes.pdf"),
+                           p14b, width=11, height=5, units="in", device="pdf"),
+           error=function(e) cat(" ??? 14b PDF: ", e$message, "\n"))
+  tryCatch(ggplot2::ggsave(file.path(out_dir, "pet_comparison_14b_monthly_slopes.png"),
+                           p14b, width=11, height=5, units="in", dpi=300, device="png"),
+           error=function(e) cat(" ??? 14b PNG: ", e$message, "\n"))
+  cat(" ??? 14b saved\n")
+  cat(" 14c: basin trend maps (Sen's slope, PM vs ERA5)...\n")
+  result <- .pdf_safe(file.path(out_dir, "pet_comparison_14c_trendsmap.pdf"),
+                      width=10, height=5, expr_fn=function() {
+                        par(mfrow=c(1,2), mar=c(2,1.5,2.5,1), oma=c(1,1,3,1))
+                        if (!is.null(r_pet))
+                          plot_raster_panel(r_pet$mag_vc, "PET_PM: Sen's Slope (mm/yr)", c(-0.5,3),
+                                            hcl.colors(101, "YlOrRd"), legend_title="mm/yr")
+                        if (!is.null(r_pet_era5))
+                          plot_raster_panel(r_pet_era5$mag_vc, "PET_ERA5: Sen's Slope (mm/yr)", c(-0.5,3),
+                                            hcl.colors(101, "YlOrRd"), legend_title="mm/yr")
+                        mtext("PET Trend Comparison ??? VC-MK Sen's Slope | Penman-Monteith vs ERA5-Land PEV",
+                              outer=TRUE, cex=1.1, font=2, line=0.5)
+                      })
+  if (!is.null(result)) cat(" ??? 14c saved\n")
+  cat(" 14d: monthly PET bias (PM ??? ERA5)...\n")
+  bias_df <- do.call(rbind, lapply(1:12, function(m) {
+    idx <- mo == m
+    mu_pm <- mean(pet_pm[idx], na.rm=TRUE)
+    mu_era5 <- mean(pet_era5[idx], na.rm=TRUE)
+    data.frame(month=m, month_abb=month.abb[m],
+               bias=mu_pm - mu_era5, mu_pm=mu_pm, mu_era5=mu_era5)
+  }))
+  bias_df$month_abb <- factor(bias_df$month_abb, levels=month.abb)
+  bias_df$sign_col <- ifelse(bias_df$bias > 0, "PM > ERA5", "ERA5 > PM")
+  p14d <- ggplot2::ggplot(bias_df,
+                          ggplot2::aes(x=month_abb, y=bias, fill=sign_col)) +
+    ggplot2::geom_col(colour="white", linewidth=0.25) +
+    ggplot2::geom_hline(yintercept=0, linewidth=0.5) +
+    ggplot2::scale_fill_manual(values=c("PM > ERA5"="#d73027", "ERA5 > PM"="#e08214"),
+                               name=NULL) +
+    ggplot2::labs(
+      title = "Monthly Mean PET Bias: Penman-Monteith minus ERA5-Land PEV",
+      subtitle = "Positive = PM exceeds ERA5 (radiation+wind component active)",
+      x="Calendar month", y="PET bias (mm/month)") +
+    theme_cmp + ggplot2::theme(legend.position="top")
+  tryCatch(ggplot2::ggsave(file.path(out_dir, "pet_comparison_14d_monthly_bias.pdf"),
+                           p14d, width=10, height=5, units="in", device="pdf"),
+           error=function(e) cat(" ??? 14d PDF: ", e$message, "\n"))
+  tryCatch(ggplot2::ggsave(file.path(out_dir, "pet_comparison_14d_monthly_bias.png"),
+                           p14d, width=10, height=5, units="in", dpi=300, device="png"),
+           error=function(e) cat(" ??? 14d PNG: ", e$message, "\n"))
+  cat(" ??? 14d saved\n")
+  cat(" 14e: per-month scatter PM vs ERA5...\n")
+  sc_df <- data.frame(date=dates, pm=pet_pm, era5=pet_era5,
+                      month_abb=factor(month.abb[mo], levels=month.abb),
+                      decade=factor(paste0(floor(yr/10)*10, "s")))
+  sc_df <- sc_df[!is.na(sc_df$pm) & !is.na(sc_df$era5), ]
+  p14e <- ggplot2::ggplot(sc_df,
+                          ggplot2::aes(x=era5, y=pm, colour=decade)) +
+    ggplot2::geom_abline(slope=1, intercept=0, linetype="dashed", colour="grey40") +
+    ggplot2::geom_point(size=0.8, alpha=0.5) +
+    ggplot2::facet_wrap(~month_abb, ncol=4, scales="free") +
+    ggplot2::scale_colour_brewer(palette="RdYlBu", direction=-1, name="Decade") +
+    ggplot2::labs(
+      title = "Monthly PET Scatter: Penman-Monteith (y) vs ERA5-Land PEV (x)",
+      subtitle = "Dashed 1:1 line. Colour = decade. Divergence from 1:1 = radiation/wind component.",
+      x="PET ERA5-Land PEV (mm/month)", y="PET Penman-Monteith (mm/month)") +
+    theme_cmp +
+    ggplot2::theme(strip.text=ggplot2::element_text(face="bold", size=8),
+                   legend.position="right")
+  tryCatch(ggplot2::ggsave(file.path(out_dir, "pet_comparison_14e_scatter.pdf"),
+                           p14e, width=13, height=9, units="in", device="pdf"),
+           error=function(e) cat(" ??? 14e PDF: ", e$message, "\n"))
+  tryCatch(ggplot2::ggsave(file.path(out_dir, "pet_comparison_14e_scatter.png"),
+                           p14e, width=13, height=9, units="in", dpi=300, device="png"),
+           error=function(e) cat(" ??? 14e PNG: ", e$message, "\n"))
+  cat(" ??? 14e saved\n")
+  cat("?????? Function 14 complete.\n")
+  invisible(NULL)
+}
+################################################################################
+################################################################################
+# FUNCTION 15: PET SEASONAL TRENDS PLOTS (PET-PM, PET-ERA5, and combined panel)
+#
+# Outputs
+#   FigS_PET_Seasonal_Trends.png/.pdf        ??? PET-PM only  (unchanged)
+#   FigS_PET_ERA5_Seasonal_Trends.png/.pdf    ??? PET-ERA5 only (new)
+#   FigS_PET_Both_Seasonal_Trends.png/.pdf   ??? PM + ERA5 side-by-side (new)
+################################################################################
+
+# ?????? internal helper: build seasonal-means table from a monthly numeric vector ??????
+.pet_seas_means <- function(df_dt, value_col, year_start, year_end) {
+  SEASON_LEVELS <- c(
+    "DJF (Dec\u2013Feb)", "MAM (Mar\u2013May)",
+    "JJA (Jun\u2013Aug)", "SON (Sep\u2013Nov)"
+  )
+  raw <- df_dt[, .(date = as.Date(date), pet = as.numeric(get(value_col)))]
+  raw <- raw[!is.na(pet)]
+  raw[, year  := as.integer(format(date, "%Y"))]
+  raw[, month := as.integer(format(date, "%m"))]
+  raw <- raw[year >= year_start & year <= year_end]
+  raw[, season := data.table::fcase(
+    month %in% c(12L, 1L, 2L), "DJF (Dec\u2013Feb)",
+    month %in% c(3L, 4L, 5L),  "MAM (Mar\u2013May)",
+    month %in% c(6L, 7L, 8L),  "JJA (Jun\u2013Aug)",
+    month %in% c(9L, 10L, 11L),"SON (Sep\u2013Nov)"
+  )]
+  raw[, season_year := data.table::fifelse(month == 12L, year + 1L, year)]
+  sm <- raw[, .(pet_mean = mean(pet, na.rm = TRUE) * 3), by = .(season_year, season)]
+  sm <- sm[season_year >= year_start & season_year <= year_end]
+  sm[, season := factor(season, levels = SEASON_LEVELS)]
+  list(seas_means = sm, SEASON_LEVELS = SEASON_LEVELS)
+}
+
+# ?????? internal helper: OLS trend label string ??????
+.pet_trend_label <- function(seas_means, SEASON_LEVELS) {
+  trend_stats <- seas_means[, {
+    fit  <- lm(pet_mean ~ season_year)
+    list(
+      slope   = coef(fit)[["season_year"]],
+      p_value = summary(fit)$coefficients["season_year", "Pr(>|t|)"]
+    )
+  }, by = season]
+  paste(
+    sapply(SEASON_LEVELS, function(s) {
+      row <- trend_stats[season == s]
+      sig <- if (!is.na(row$p_value) && row$p_value < 0.05) " *" else ""
+      sprintf("%s: %+.4f mm/yr%s", sub(" \\(.*", "", s), row$slope, sig)
+    }),
+    collapse = "   |   "
+  )
+}
+
+# ?????? internal helper: build one seasonal-trend ggplot panel ??????
+.pet_seas_ggplot <- function(seas_means, SEASON_LEVELS,
+                             title_str, subtitle_str, ylab_str,
+                             year_start, year_end,
+                             base_size = 16) {
+  season_colours <- c(
+    "DJF (Dec\u2013Feb)" = "#4472C4",
+    "MAM (Mar\u2013May)" = "#70AD47",
+    "JJA (Jun\u2013Aug)" = "#C00000",
+    "SON (Sep\u2013Nov)" = "#ED7D31"
+  )
+  ggplot2::ggplot(
+    seas_means,
+    ggplot2::aes(x = season_year, y = pet_mean,
+                 colour = season, group = season)
+  ) +
+    ggplot2::geom_line(linewidth = 0.6, alpha = 0.85) +
+    ggplot2::geom_point(size = 1.2, alpha = 0.75) +
+    ggplot2::geom_smooth(method = "lm", formula = y ~ x,
+                         se = FALSE, linetype = "dashed", linewidth = 1.6) +
+    ggplot2::geom_hline(yintercept = 0, linetype = "dotted",
+                        colour = "grey50", linewidth = 0.4) +
+    ggplot2::scale_colour_manual(
+      values = season_colours, name = NULL,
+      guide  = ggplot2::guide_legend(
+        direction = "horizontal", nrow = 1,
+        override.aes = list(linewidth = 1.4, size = 2)
+      )
+    ) +
+    ggplot2::scale_x_continuous(
+      breaks = seq(year_start, year_end, by = 10),
+      expand = ggplot2::expansion(mult = 0.01)
+    ) +
+    ggplot2::labs(title    = title_str,
+                  subtitle = subtitle_str,
+                  x = "Year", y = ylab_str) +
+    ggplot2::theme_bw(base_size = base_size) +
+    ggplot2::theme(
+      plot.title    = ggplot2::element_text(face = "bold", size = base_size + 1,
+                                            margin = ggplot2::margin(b = 2)),
+      plot.subtitle = ggplot2::element_text(size = base_size - 2.5,
+                                            colour = "grey30",
+                                            margin = ggplot2::margin(b = 8)),
+      legend.position   = "top",
+      legend.text       = ggplot2::element_text(size = base_size - 2),
+      legend.key.width  = ggplot2::unit(1.6, "cm"),
+      panel.grid.minor  = ggplot2::element_blank(),
+      panel.grid.major  = ggplot2::element_line(colour = "grey90", linewidth = 0.3),
+      axis.title        = ggplot2::element_text(size = base_size - 1),
+      axis.text         = ggplot2::element_text(size = base_size - 2)
+    )
+}
+
+# ?????? main function ??????
+create_pet_seasonal_trends <- function(
+    df          = basin_avg_monthly,
+    out_dir_loc = out_dir,
+    basin_label = "Nechako River Basin",
+    year_start  = 1950L,
+    year_end    = 2025L
+) {
+  cat("\n?????? Function 15: PET seasonal trends plots (PM, ERA5, combined) ??????\n")
+  
+  if (is.null(df) || !"date" %in% names(df)) {
+    cat("  \u26a0 Basin monthly data not available \u2014 skipping PET seasonal trends.\n")
+    return(invisible(NULL))
+  }
+  
+  df_dt      <- data.table::as.data.table(df)
+  has_pm     <- "pet_mm_month"     %in% names(df_dt)
+  has_era5_15 <- "pet_era5_mm_month" %in% names(df_dt)
+  
+  if (!has_pm) {
+    cat("  \u26a0 pet_mm_month not found \u2014 skipping Function 15.\n")
+    return(invisible(NULL))
+  }
+  
+  # ?????? 15a: PET-PM (original plot, unchanged filenames) ????????????????????????????????????????????????????????????????????????
+  cat("  15a: PET-PM seasonal trends...\n")
+  res_pm       <- .pet_seas_means(df_dt, "pet_mm_month", year_start, year_end)
+  label_pm     <- .pet_trend_label(res_pm$seas_means, res_pm$SEASON_LEVELS)
+  p_pm <- .pet_seas_ggplot(
+    seas_means    = res_pm$seas_means,
+    SEASON_LEVELS = res_pm$SEASON_LEVELS,
+    title_str     = sprintf("Seasonal PET-PM Trends \u2014 %s (%d\u2013%d)",
+                            basin_label, year_start, year_end),
+    subtitle_str  = paste0("Annual seasonal means with OLS trend lines (dashed).  * p < 0.05\n",
+                           label_pm),
+    ylab_str      = "Seasonal mean PET-PM (mm/season)",
+    year_start    = year_start, year_end = year_end
+  )
+  out_png <- file.path(out_dir_loc, "FigS_PET_Seasonal_Trends.png")
+  out_pdf <- file.path(out_dir_loc, "FigS_PET_Seasonal_Trends.pdf")
+  tryCatch({ ggplot2::ggsave(out_png, p_pm, width = 14, height = 7, units = "in", dpi = 300)
+    cat(sprintf("  \u2713 15a PNG saved: %s\n", basename(out_png))) },
+    error = function(e) cat(sprintf("  \u26a0 15a PNG: %s\n", e$message)))
+  tryCatch({ ggplot2::ggsave(out_pdf, p_pm, width = 14, height = 7, units = "in", device = "pdf")
+    cat(sprintf("  \u2713 15a PDF saved: %s\n", basename(out_pdf))) },
+    error = function(e) cat(sprintf("  \u26a0 15a PDF: %s\n", e$message)))
+  
+  # ?????? 15b: PET-ERA5 (new standalone plot) ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  p_era5 <- NULL
+  if (!has_era5_15) {
+    cat("  \u26a0 pet_era5_mm_month not found \u2014 skipping 15b (PET-ERA5 seasonal trends).\n")
+  } else {
+    cat("  15b: PET-ERA5 seasonal trends...\n")
+    res_era5   <- .pet_seas_means(df_dt, "pet_era5_mm_month", year_start, year_end)
+    label_era5 <- .pet_trend_label(res_era5$seas_means, res_era5$SEASON_LEVELS)
+    p_era5 <- .pet_seas_ggplot(
+      seas_means    = res_era5$seas_means,
+      SEASON_LEVELS = res_era5$SEASON_LEVELS,
+      title_str     = sprintf("Seasonal PET-ERA5 Trends \u2014 %s (%d\u2013%d)",
+                              basin_label, year_start, year_end),
+      subtitle_str  = paste0("Annual seasonal means with OLS trend lines (dashed).  * p < 0.05\n",
+                             label_era5),
+      ylab_str      = "Seasonal mean PET-ERA5 (mm/season)",
+      year_start    = year_start, year_end = year_end
+    )
+    out_era5_png <- file.path(out_dir_loc, "FigS_PET_ERA5_Seasonal_Trends.png")
+    out_era5_pdf <- file.path(out_dir_loc, "FigS_PET_ERA5_Seasonal_Trends.pdf")
+    tryCatch({ ggplot2::ggsave(out_era5_png, p_era5, width = 14, height = 7, units = "in", dpi = 300)
+      cat(sprintf("  \u2713 15b PNG saved: %s\n", basename(out_era5_png))) },
+      error = function(e) cat(sprintf("  \u26a0 15b PNG: %s\n", e$message)))
+    tryCatch({ ggplot2::ggsave(out_era5_pdf, p_era5, width = 14, height = 7, units = "in", device = "pdf")
+      cat(sprintf("  \u2713 15b PDF saved: %s\n", basename(out_era5_pdf))) },
+      error = function(e) cat(sprintf("  \u26a0 15b PDF: %s\n", e$message)))
+  }
+  
+  # ?????? 15c: single-panel difference figure (PET_ERA5 ??? PET_PM) ???????????????????????????????????????????????????
+  if (!is.null(p_era5)) {
+    cat("  15c: PET difference (ERA5 \u2212 PM) single-panel figure...\n")
+    
+    # Merge the two seasonal-means tables on (season_year, season)
+    sm_pm  <- data.table::copy(res_pm$seas_means)
+    sm_era5 <- data.table::copy(res_era5$seas_means)
+    data.table::setnames(sm_pm,  "pet_mean", "pet_pm")
+    data.table::setnames(sm_era5, "pet_mean", "pet_era5")
+    sm_diff <- merge(sm_pm, sm_era5, by = c("season_year", "season"))
+    sm_diff[, diff_mean := pet_era5 - pet_pm]
+    
+    # Drop winter (DJF) ??? keep only MAM, JJA, SON
+    sm_diff <- sm_diff[season != "DJF (Dec\u2013Feb)"]
+    
+    # OLS trend label for the difference series (3 non-winter seasons)
+    SEASON_LEVELS <- c("MAM (Mar\u2013May)", "JJA (Jun\u2013Aug)", "SON (Sep\u2013Nov)")
+    sm_diff[, season := factor(season, levels = SEASON_LEVELS)]
+    trend_diff <- sm_diff[, {
+      fit <- lm(diff_mean ~ season_year)
+      list(
+        slope   = coef(fit)[["season_year"]],
+        p_value = summary(fit)$coefficients["season_year", "Pr(>|t|)"]
+      )
+    }, by = season]
+    label_diff <- paste(
+      sapply(SEASON_LEVELS, function(s) {
+        row <- trend_diff[season == s]
+        sig <- if (!is.na(row$p_value) && row$p_value < 0.05) " *" else ""
+        sprintf("%s: %+.4f mm/yr%s", sub(" \\(.*", "", s), row$slope, sig)
+      }),
+      collapse = "   |   "
+    )
+    
+    season_colours <- c(
+      "MAM (Mar\u2013May)" = "#70AD47",
+      "JJA (Jun\u2013Aug)" = "#C00000",
+      "SON (Sep\u2013Nov)" = "#ED7D31"
+    )
+    
+    p_both <- ggplot2::ggplot(
+      sm_diff,
+      ggplot2::aes(x = season_year, y = diff_mean,
+                   colour = season, group = season)
+    ) +
+      ggplot2::geom_line(linewidth = 0.6, alpha = 0.85) +
+      ggplot2::geom_point(size = 1.2, alpha = 0.75) +
+      ggplot2::geom_smooth(method = "lm", formula = y ~ x,
+                           se = FALSE, linetype = "dashed", linewidth = 1.6) +
+      ggplot2::geom_hline(yintercept = 0, linetype = "solid",
+                          colour = "grey60", linewidth = 0.3) +
+      ggplot2::scale_colour_manual(
+        values = season_colours, name = NULL,
+        guide  = ggplot2::guide_legend(
+          direction = "horizontal", nrow = 1,
+          override.aes = list(linewidth = 1.4, size = 2)
+        )
+      ) +
+      ggplot2::scale_x_continuous(
+        breaks = seq(year_start, year_end, by = 10),
+        expand = ggplot2::expansion(mult = 0.01)
+      ) +
+      ggplot2::scale_y_continuous(
+        minor_breaks = scales::breaks_width(2)
+      ) +
+      ggplot2::labs(
+        title    = sprintf(
+          "Seasonal PET Difference (ERA5-Land PEV \u2212 Penman\u2013Monteith) \u2014 %s (%d\u2013%d)",
+          basin_label, year_start, year_end),
+        subtitle = paste0(
+          "Seasonal annual means of PET\u2009ERA5 \u2212 PET\u2009PM with OLS trend lines (dashed).  * p < 0.05\n",
+          label_diff),
+        x = "Year",
+        y = "PET\u2009ERA5 \u2212 PET\u2009PM (mm\u2009season\u207b\u00b9)"
+      ) +
+      ggplot2::theme_bw(base_size = 16) +
+      ggplot2::theme(
+        plot.title    = ggplot2::element_text(face = "bold", size = 17, hjust = 0.5,
+                                              margin = ggplot2::margin(b = 2)),
+        plot.subtitle = ggplot2::element_text(size = 13, colour = "grey30",
+                                              margin = ggplot2::margin(b = 8)),
+        legend.position  = "top",
+        legend.text      = ggplot2::element_text(size = 14),
+        legend.key.width = ggplot2::unit(1.6, "cm"),
+        panel.grid.minor   = ggplot2::element_blank(),
+        panel.grid.major.x = ggplot2::element_line(colour = "grey82", linewidth = 0.35),
+        panel.grid.major.y = ggplot2::element_line(colour = "grey82", linewidth = 0.45),
+        panel.grid.minor.y = ggplot2::element_line(colour = "grey92", linewidth = 0.25),
+        panel.grid.minor.x = ggplot2::element_blank(),
+        axis.title       = ggplot2::element_text(size = 15),
+        axis.text        = ggplot2::element_text(size = 14)
+      )
+    
+    out_both_png <- file.path(out_dir_loc, "FigS_PET_Both_Seasonal_Trends.png")
+    out_both_pdf <- file.path(out_dir_loc, "FigS_PET_Both_Seasonal_Trends.pdf")
+    tryCatch({ ggplot2::ggsave(out_both_png, p_both, width = 14, height = 7, units = "in", dpi = 300)
+      cat(sprintf("  \u2713 15c PNG saved: %s\n", basename(out_both_png))) },
+      error = function(e) cat(sprintf("  \u26a0 15c PNG: %s\n", e$message)))
+    tryCatch({ ggplot2::ggsave(out_both_pdf, p_both, width = 14, height = 7, units = "in", device = "pdf")
+      cat(sprintf("  \u2713 15c PDF saved: %s\n", basename(out_both_pdf))) },
+      error = function(e) cat(sprintf("  \u26a0 15c PDF: %s\n", e$message)))
+  }
+  
+  cat("\u2500\u2500 Function 15 complete.\n")
+  invisible(list(p_pm = p_pm, p_era5 = p_era5))
+}
+####################################################################################
+# FUNCTION: Seasonal Climatology P vs PET (Bar Chart Style - Fig3.png)
+####################################################################################
+create_seasonality_p_pet_plot <- function() {
+  cat("\n?????? Creating Seasonality P vs PET plot (FigS_Seasonality_P_PET.png) ??????\n")
+  
+  # 1. Data Preparation
+  df <- data.frame(
+    date = basin_avg_monthly$date,
+    P = basin_avg_monthly$precip_mm_month,
+    PET_PM = basin_avg_monthly$pet_mm_month
+  )
+  df$Month <- factor(month.abb[as.integer(format(df$date, "%m"))], levels=month.abb)
+  
+  # Calculate Statistics
+  stats_p <- aggregate(P ~ Month, data=df, FUN=function(x) c(mean=mean(x, na.rm=TRUE), sd=sd(x, na.rm=TRUE)))
+  stats_pet <- aggregate(PET_PM ~ Month, data=df, FUN=function(x) c(mean=mean(x, na.rm=TRUE), sd=sd(x, na.rm=TRUE)))
+  
+  # Combine into a long format for plotting
+  clim_df <- data.frame(
+    Month = stats_p$Month,
+    P_Mean = stats_p$P[, "mean"],
+    P_SD = stats_p$P[, "sd"],
+    PET_Mean = stats_pet$PET_PM[, "mean"],
+    PET_SD = stats_pet$PET_PM[, "sd"],
+    stringsAsFactors = FALSE
+  )
+  clim_df$Month <- factor(clim_df$Month, levels=month.abb)
+  
+  # Water Balance
+  clim_df$Balance <- clim_df$P_Mean - clim_df$PET_Mean
+  
+  # Annual totals for subtitle
+  ann_P <- sum(clim_df$P_Mean)
+  ann_PET <- sum(clim_df$PET_Mean)
+  subtitle_txt <- sprintf("Each bar = mean of 76 years (1950???2025). Annual totals: P = %.0f mm; PET(PM) = %.0f mm; aridity index (PET/P) = %.2f.",
+                          ann_P, ann_PET, ann_PET/ann_P)
+  
+  # Long format for Panel (a)
+  plot_data_a <- data.frame(
+    Month = rep(clim_df$Month, 2),
+    Variable = rep(c("Precipitation (P)", "PET(PM)"), each=nrow(clim_df)),
+    Mean = c(clim_df$P_Mean, clim_df$PET_Mean),
+    SD = c(clim_df$P_SD, clim_df$PET_SD)
+  )
+  plot_data_a$Variable <- factor(plot_data_a$Variable, levels=c("Precipitation (P)", "PET(PM)"))
+  
+  # 2. Panel (a)
+  p_a <- ggplot(plot_data_a, aes(x=Month, y=Mean, fill=Variable)) +
+    geom_col(position=position_dodge(0.8), width=0.7, color="white", linewidth=0.2) +
+    geom_errorbar(aes(ymin=Mean-SD, ymax=Mean+SD),
+                  position=position_dodge(0.8), width=0.2, linewidth=0.6) +
+    scale_fill_manual(values=c("Precipitation (P)"="#4575b4", "PET(PM)"="#d73027")) +
+    labs(y="mm month?????",
+         title="(a) Mean monthly precipitation and PET(PM)",
+         subtitle="76-year mean (1950???2025) | Error bars = ??1 SD") +
+    theme_classic(base_size=12) +
+    theme(
+      plot.title = element_text(face="bold", size=11, hjust=0),
+      plot.subtitle = element_text(size=8, color="grey40", hjust=0),
+      axis.title.x = element_blank(),
+      axis.text.x = element_text(angle=0, hjust=0.5),
+      legend.position = "top",
+      legend.justification = "right",
+      panel.grid.major.y = element_line(color="grey90")
+    )
+  
+  # 3. Panel (b)
+  # Color logic for balance
+  clim_df$BalanceCol <- ifelse(clim_df$Balance > 0, "#4575b4", "#d73027")
+  
+  p_b <- ggplot(clim_df, aes(x=Month, y=Balance, fill=BalanceCol)) +
+    geom_col(width=0.7, color="white", linewidth=0.2, show.legend=FALSE) +
+    geom_hline(yintercept=0, linewidth=0.5, color="grey50") +
+    scale_fill_identity() +
+    labs(x="Calendar month", y="P ??? PET(PM) (mm month?????)",
+         title="(b) Climatic water balance P ??? PET(PM)",
+         subtitle="Blue = monthly surplus (P > PET); red = monthly deficit (PET > P)") +
+    theme_classic(base_size=12) +
+    theme(
+      plot.title = element_text(face="bold", size=11, hjust=0),
+      plot.subtitle = element_text(size=8, color="grey40", hjust=0),
+      axis.text.x = element_text(angle=0, hjust=0.5),
+      panel.grid.major.y = element_line(color="grey90")
+    )
+  
+  # Annotation for P surplus (if applicable)
+  p_b <- p_b + annotate("text", x=6.5, y=max(clim_df$Balance, na.rm=TRUE)*0.8,
+                        label="P surplus", color="#4575b4", size=4, fontface="italic")
+  
+  # 4. Combine and Save
+  combined <- (p_a / p_b) +
+    plot_annotation(
+      title = "Nechako River Basin ??? Seasonal cycle of precipitation and PET(PM)",
+      subtitle = subtitle_txt,
+      theme = theme(plot.title = element_text(face="bold", size=14, hjust=0),
+                    plot.subtitle = element_text(size=10, color="grey40", hjust=0))
+    )
+  
+  out_path <- file.path(out_dir, "FigS_Seasonality_P_PET.png")
+  ggsave(out_path, combined, width=10, height=9, dpi=300)
+  cat("??? Saved:", out_path, "\n")
+}
+####################################################################################
+# FUNCTION 9???11: Specific-point plots (updated for 4 variables)
+####################################################################################
+create_point_timeseries_plots <- function() {
+  if (is.null(point_monthly_ts)) {
+    cat("?????? point_monthly_timeseries.csv not available ??? skipping.\n"); return(NULL)
+  }
+  cat("???? Creating specific-point time series plots...\n")
+  point_monthly_ts[, date := as.Date(date)]
+  for (pid in unique(point_monthly_ts$point_id)) {
+    sub <- point_monthly_ts[point_id == pid]
+    lon <- round(sub$lon_wgs84[1], 4); lat <- round(sub$lat_wgs84[1], 4)
+    title_str <- sprintf("Point #%d (%.4f??N, %.4f??W)", pid, lat, abs(lon))
+    make_var_panel <- function(var_name, y_label, color_line, color_smooth) {
+      df <- sub[variable == var_name]
+      if (!nrow(df)) return(ggplot() +
+                              annotate("text",x=0.5,y=0.5,label=paste(var_name, "not available")) +
+                              theme_void())
+      df <- df[order(date)]
+      df[, smooth := rollmean(value, k=min(12,nrow(df)), fill=NA, align="center")]
+      ggplot(df, aes(x=date, y=value)) +
+        geom_line(color=color_line, alpha=0.45, linewidth=0.5) +
+        geom_line(aes(y=smooth), color=color_smooth, linewidth=1.1, na.rm=TRUE) +
+        labs(title=var_name, x=NULL, y=y_label) +
+        theme_minimal(base_size=10) +
+        theme(plot.title=element_text(face="bold"), panel.grid.minor=element_blank(),
+              axis.text.x=element_text(angle=30, hjust=1))
+    }
+    panels <- list(
+      make_var_panel("Precipitation", "mm/month", "steelblue", "blue"),
+      make_var_panel("PET", "mm/month", "tomato", "red3"),
+      make_var_panel("PET_ERA5", "mm/month", "orange", "#e08214"),
+      make_var_panel("Temperature", "??C", "orchid", "purple4")
+    )
+    combined <- (panels[[1]] / panels[[2]] / panels[[3]] / panels[[4]]) +
+      plot_annotation(
+        title = title_str,
+        subtitle = "ERA5-Land monthly | coloured line = 12-month rolling mean",
+        theme = theme(
+          plot.title = element_text(size=12, face="bold", hjust=0.5),
+          plot.subtitle = element_text(size=9, colour="grey30", hjust=0.5)))
+    out_path <- file.path(out_dir,
+                          sprintf("point_%d_%.4fN_%.4fW_ts_pr_pet_temp.png",
+                                  pid, lat, abs(lon)))
+    ggsave(out_path, combined, width=12, height=13, dpi=150)
+    cat(sprintf(" Saved: %s\n", basename(out_path)))
+  }
+  invisible(NULL)
+}
+create_point_monthly_trend_plots <- function() {
+  if (is.null(point_trend_stats)) {
+    cat("?????? point_trend_stats.csv not available ??? skipping.\n"); return(NULL)
+  }
+  cat("???? Creating specific-point monthly trend bar charts...\n")
+  var_units <- c(Precipitation="Sen slope (mm/yr per month)",
+                 PET="Sen slope (mm/yr per month)",
+                 PET_ERA5="Sen slope (mm/yr per month)",
+                 Temperature="Sen slope (??C/yr)")
+  var_colors <- c(Precipitation="#4575b4", PET="#d73027",
+                  PET_ERA5="#e08214", Temperature="#7b2d8b")
+  for (pid in unique(point_trend_stats$point_id)) {
+    sub <- point_trend_stats[point_id == pid & period == "monthly"]
+    if (!nrow(sub)) next
+    lon <- round(sub$lon_wgs84[1], 4); lat <- round(sub$lat_wgs84[1], 4)
+    sub[, month_abb := factor(month_abb, levels=month.abb)]
+    sub[, sig_label := ifelse(!is.na(sig_vc) & sig_vc, "*", "")]
+    sub[, label_y := sl_vc + ifelse(!is.na(sl_vc) & sl_vc >=0,
+                                    0.03*max(abs(sl_vc),na.rm=TRUE),
+                                    -0.03*max(abs(sl_vc),na.rm=TRUE))]
+    panels <- lapply(c("Precipitation", "PET", "PET_ERA5", "Temperature"), function(var) {
+      d <- sub[variable == var]
+      if (!nrow(d)) return(ggplot()+theme_void()+labs(title=paste(var, "??? no data")))
+      ggplot(d, aes(x=month_abb, y=sl_vc)) +
+        geom_bar(stat="identity", colour="black", linewidth=0.3, width=0.7,
+                 fill=var_colors[var]) +
+        geom_hline(yintercept=0, linewidth=0.5) +
+        geom_text(aes(y=label_y, label=sig_label), size=4.5, fontface="bold") +
+        scale_x_discrete(labels=substr(month.abb,1,1)) +
+        labs(title=var, x="Month", y=var_units[var]) +
+        theme_classic(base_size=10) +
+        theme(plot.title=element_text(face="bold",hjust=0.5))
+    })
+    combined <- (panels[[1]] | panels[[2]] | panels[[3]] | panels[[4]]) +
+      plot_annotation(
+        title = sprintf("Per-Month Sen's Slope ??? Point #%d (%.4f??N, %.4f??W)",
+                        pid, lat, abs(lon)),
+        subtitle = "* = significant by VC Mann-Kendall (p < 0.05)",
+        theme = theme(
+          plot.title = element_text(size=12, face="bold", hjust=0.5),
+          plot.subtitle = element_text(size=9, colour="grey30", hjust=0.5)))
+    out_path <- file.path(out_dir,
+                          sprintf("point_%d_%.4fN_%.4fW_monthly_slopes.png",
+                                  pid, lat, abs(lon)))
+    ggsave(out_path, combined, width=16, height=5, dpi=150)
+    cat(sprintf(" Saved: %s\n", basename(out_path)))
+  }
+  invisible(NULL)
+}
+create_point_summary_table <- function() {
+  if (is.null(point_trend_stats)) {
+    cat("?????? point_trend_stats.csv not available.\n"); return(NULL)
+  }
+  cat("\n??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????\n")
+  cat(" SPECIFIC POINT TREND STATISTICS SUMMARY\n")
+  cat("??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????\n")
+  annual <- point_trend_stats[period == "annual"]
+  if (nrow(annual)) {
+    cat("Annual trends:\n")
+    print(as.data.frame(annual[, .(
+      point_id, lat_wgs84, lon_wgs84, variable,
+      n_obs, year_min, year_max,
+      tau_vc=round(tau_vc,3), p_vc=round(p_value_vc,4), sig_vc,
+      slope_vc=round(sl_vc,5),
+      tau_tfpw=round(tau_tfpw,3), p_tfpw=round(p_value_tfpw,4), sig_tfpw,
+      changepoint_yr=first_changepoint_year
+    )]))
+  }
+  sig_monthly <- point_trend_stats[period=="monthly" & !is.na(sig_vc) & sig_vc==TRUE]
+  if (nrow(sig_monthly)) {
+    cat("\nSignificant monthly trends (VC-MK p < 0.05):\n")
+    print(as.data.frame(sig_monthly[, .(
+      point_id, variable, month_abb,
+      tau_vc=round(tau_vc,3), p_vc=round(p_value_vc,4),
+      slope_vc=round(sl_vc,5), sig_tfpw
+    )]))
+  } else {
+    cat("\n (No significant monthly trends at any specific point)\n")
+  }
+  invisible(annual)
+}
+####################################################################################
+# FUNCTION 12: Temperature dedicated analysis (unchanged from original)
+####################################################################################
+create_temperature_dedicated_plots <- function() {
+  if (!"tair_degC_month" %in% names(basin_avg_monthly)) {
+    cat("\u26a0\ufe0f basin_avg_monthly$tair_degC_month not found ??? skipping Function 12.\n")
+    return(invisible(NULL))
+  }
+  tair <- basin_avg_monthly$tair_degC_month
+  dates <- basin_avg_monthly$date
+  yr <- as.integer(format(dates, "%Y"))
+  mo <- as.integer(format(dates, "%m"))
+  yr_frac <- yr + (mo - 0.5) / 12
+  .ols <- function(x, y) {
+    keep <- !is.na(x) & !is.na(y); if (sum(keep) < 5) return(NULL)
+    lm(y[keep] ~ x[keep])
+  }
+  theme_tair <- ggplot2::theme_classic(base_size=10) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(face="bold", size=11, hjust=0),
+      plot.subtitle = ggplot2::element_text(size=8.5, colour="grey40", hjust=0),
+      panel.grid.major = ggplot2::element_line(colour="grey94", linewidth=0.3),
+      panel.grid.minor = ggplot2::element_blank(),
+      plot.margin = ggplot2::margin(4, 8, 4, 4))
+  cat("\n\u2500\u2500 Function 12: Temperature dedicated plots \u2500\u2500\n")
+  tair_roll <- zoo::rollmean(tair, k=12, fill=NA, align="center")
+  fit_all <- .ols(yr_frac, tair)
+  pred_df <- NULL; ann_slope <- "trend not available"
+  if (!is.null(fit_all)) {
+    pred_df <- data.frame(date=dates[!is.na(tair)],
+                          tfit=coef(fit_all)[1]+coef(fit_all)[2]*yr_frac[!is.na(tair)])
+    ann_slope <- sprintf("%+.4f \u00b0C/yr (%+.3f \u00b0C/decade)",
+                         coef(fit_all)[2], coef(fit_all)[2]*10)
+  }
+  ann_df <- NULL
+  if (!is.null(basin_avg_annual) && "tair_degC_year" %in% names(basin_avg_annual))
+    ann_df <- data.frame(date=as.Date(paste0(basin_avg_annual$year, "-07-01")),
+                         tair=basin_avg_annual$tair_degC_year)
+  df_ts <- data.frame(date=dates, tair=tair, troll=tair_roll)
+  p12a <- ggplot2::ggplot(df_ts, ggplot2::aes(x=date)) +
+    ggplot2::geom_line(ggplot2::aes(y=tair), colour=rgb(0.6,0.2,0.6,0.3), linewidth=0.45, na.rm=TRUE) +
+    ggplot2::geom_line(ggplot2::aes(y=troll), colour="purple", linewidth=1.6, na.rm=TRUE)
+  if (!is.null(ann_df))
+    p12a <- p12a + ggplot2::geom_point(data=ann_df, ggplot2::aes(x=date,y=tair),
+                                       colour=rgb(0.4,0,0.4,0.8), size=1.4, shape=19)
+  if (!is.null(pred_df))
+    p12a <- p12a + ggplot2::geom_line(data=pred_df, ggplot2::aes(x=date,y=tfit),
+                                      colour="#d73027", linewidth=1.2, linetype="dashed")
+  p12a <- p12a +
+    ggplot2::geom_hline(yintercept=0, colour="grey50", linetype="dotted", linewidth=0.5) +
+    ggplot2::scale_x_date(date_breaks="10 years", date_labels="%Y",
+                          expand=ggplot2::expansion(mult=c(0.01,0.01))) +
+    ggplot2::labs(title="Basin-Mean 2-m Air Temperature ??? Nechako River Basin (1950\u20132025)",
+                  subtitle=paste0("Monthly (faded), 12-mo mean (purple), annual mean (dots), OLS (red dashed)\n",
+                                  "OLS slope: ", ann_slope),
+                  x="Year", y="Temperature (\u00b0C)") + theme_tair
+  tryCatch(ggplot2::ggsave(file.path(out_dir, "temperature_basin_timeseries.pdf"),
+                           p12a, width=10, height=5, units="in", device="pdf"),
+           error=function(e) cat(" \u26a0 12a PDF: ", e$message, "\n"))
+  tryCatch(ggplot2::ggsave(file.path(out_dir, "temperature_basin_timeseries.png"),
+                           p12a, width=10, height=5, units="in", dpi=300, device="png"),
+           error=function(e) cat(" \u26a0 12a PNG: ", e$message, "\n"))
+  cat(" \u2713 12a saved\n")
+  ann_tair <- tapply(tair, yr, mean, na.rm=TRUE)
+  ann_years <- as.integer(names(ann_tair)); ann_tair <- as.numeric(ann_tair)
+  clim_idx <- ann_years >=1991 & ann_years <=2020
+  clim_mean <- if (sum(clim_idx) >0) mean(ann_tair[clim_idx], na.rm=TRUE) else mean(ann_tair, na.rm=TRUE)
+  df_anom <- data.frame(year=ann_years, anomaly=ann_tair - clim_mean)
+  df_anom$sign <- ifelse(df_anom$anomaly >=0, "Warm", "Cool")
+  df_anom$run10 <- zoo::rollmean(df_anom$anomaly, k=10, fill=NA, align="center")
+  fit_anom <- .ols(df_anom$year, df_anom$anomaly)
+  anom_str <- if (!is.null(fit_anom)) sprintf("OLS: %+.4f \u00b0C/yr", coef(fit_anom)[2]) else ""
+  p12b <- ggplot2::ggplot(df_anom, ggplot2::aes(x=year, y=anomaly, fill=sign)) +
+    ggplot2::geom_bar(stat="identity", width=0.85, colour="white", linewidth=0.1) +
+    #ggplot2::geom_line(ggplot2::aes(y=run10), colour="#1f78b4", linewidth=1.2, linetype="dashed", na.rm=TRUE) +
+    ggplot2::scale_fill_manual(values=c(Warm="#d73027", Cool="#4575b4"), name=NULL) +
+    ggplot2::geom_hline(yintercept=0, colour="grey50", linetype="dotted", linewidth=0.5) +
+    ggplot2::scale_x_continuous(breaks=seq(1950,2025,by=10)) +
+    ggplot2::labs(title="Annual Temperature Anomaly ??? Nechako River Basin",
+                  subtitle=sprintf("Baseline: WMO 1991\u20132020 (%.2f??C). Blue dashed = 10-yr mean. %s",
+                                   clim_mean, anom_str),
+                  x="Year", y="Temperature anomaly (\u00b0C)") + theme_tair +
+    ggplot2::theme(legend.position="top")
+  p12b <- p12b 
+  # + ggplot2::annotate("text", x=min(df_anom$year)+2, y=max(df_anom$anomaly)*0.85,
+  # label="10-yr rolling mean", colour="#1f78b4", hjust=0, size=3, fontface="italic")
+  tryCatch(ggplot2::ggsave(file.path(out_dir, "temperature_annual_anomaly.pdf"),
+                           p12b, width=10, height=5, units="in", device="pdf"),
+           error=function(e) cat(" \u26a0 12b PDF: ", e$message, "\n"))
+  tryCatch(ggplot2::ggsave(file.path(out_dir, "temperature_annual_anomaly.png"),
+                           p12b, width=10, height=5, units="in", dpi=300, device="png"),
+           error=function(e) cat(" \u26a0 12b PNG: ", e$message, "\n"))
+  cat(" \u2713 12b saved\n")
+  cat("\u2500\u2500 Function 12 complete (12a, 12b).\n")
+  invisible(NULL)
+}
+####################################################################################
+# ?????? GENERATE ALL OUTPUTS
+####################################################################################
+cat("\n========================================\n")
+cat("\U0001f3a8 CREATING VISUALIZATIONS\n")
+cat("========================================\n\n")
+for (var in c("Precipitation","PET","PET_ERA5","Temperature")) {
+  for (meth in c("vc","tfpw")) create_publication_figure(var, meth)
+}
+create_supp_hydroclimatic_trend_figure()
+create_comparison_figure()
+create_regime_shift_maps()
+create_spectral_analysis_maps()
+create_spatial_pattern_analysis()
+create_method_comparison()
+create_statistics_table()
+create_basin_timeseries_plot()
+create_all_calmonth_temporal_changes()
+create_pet_comparison_plots()
+create_pet_seasonal_trends()
+create_seasonality_p_pet_plot()
+create_temperature_dedicated_plots()
+create_point_timeseries_plots()
+create_point_monthly_trend_plots()
+create_point_summary_table()
+####################################################################################
+# 4pr_precip_seasonal_trends_Fig16.r
+# ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+# FUNCTION 16: Precipitation Seasonal Trends Plot
+#   Mirrors Function 15 (FigS_PET_Seasonal_Trends) but for Precipitation.
+#
+# OUTPUTS
+#   FigS_Precip_Seasonal_Trends.png   ??? main figure (300 dpi, 14 ?? 7 in)
+#   FigS_Precip_Seasonal_Trends.pdf   ??? vector version
+#
+# HOW TO USE
+#   Option A ??? append to 4pr_pet_trends_visualization.r
+#     Just paste this file after all existing code (the helper functions
+#     .pet_seas_means / .pet_trend_label / .pet_seas_ggplot from Function 15
+#     will already be in the environment).
+#
+#   Option B ??? run as a standalone script
+#     The script self-contains all helpers and will load the metadata .rds
+#     produced by 4pr_pet_trends.r from `out_dir`.
+#     Adjust `setwd()` and `out_dir` at the top if needed.
+#
+# NOTES
+#   ??? The seasonal mean is computed as: mean(monthly value over the 3 months in
+#     the season) ?? 3 ??? identical to how PET seasonal means are built ??? giving
+#     an approximate seasonal total in mm/season.
+#   ??? DJF season-year is assigned to the *following* calendar year (December
+#     of year Y counts towards the DJF season of year Y+1), matching the PET
+#     treatment.
+####################################################################################
+
+# ?????? 0. STANDALONE PREAMBLE (skip if appending to the visualisation script) ??????????????????
+
+if (!exists("basin_avg_monthly")) {            # only run when standalone
+  library(data.table)
+  library(ggplot2)
+  
+  setwd("D:/Nechako_Drought/Nechako/")         # ??? adjust if needed
+  out_dir <- "trend_analysis_pr_pet"
+  
+  metadata         <- readRDS(file.path(out_dir, "analysis_metadata.rds"))
+  basin_avg_monthly <- metadata$basin_avg_monthly
+  names(basin_avg_monthly) <- trimws(names(basin_avg_monthly))
+}
+
+# ?????? 1. HELPER FUNCTIONS (self-contained copies; already present in vis. script) ??????
+
+# Build seasonal-means data.table from a named monthly column
+.seas_means_generic <- function(df_dt, value_col, year_start, year_end) {
+  SEASON_LEVELS <- c(
+    "DJF (Dec\u2013Feb)", "MAM (Mar\u2013May)",
+    "JJA (Jun\u2013Aug)", "SON (Sep\u2013Nov)"
+  )
+  raw <- df_dt[, .(date = as.Date(date), val = as.numeric(get(value_col)))]
+  raw <- raw[!is.na(val)]
+  raw[, year  := as.integer(format(date, "%Y"))]
+  raw[, month := as.integer(format(date, "%m"))]
+  raw <- raw[year >= year_start & year <= year_end]
+  raw[, season := data.table::fcase(
+    month %in% c(12L, 1L, 2L), "DJF (Dec\u2013Feb)",
+    month %in% c(3L, 4L, 5L),  "MAM (Mar\u2013May)",
+    month %in% c(6L, 7L, 8L),  "JJA (Jun\u2013Aug)",
+    month %in% c(9L, 10L, 11L), "SON (Sep\u2013Nov)"
+  )]
+  # December of year Y rolls into DJF of year Y+1
+  raw[, season_year := data.table::fifelse(month == 12L, year + 1L, year)]
+  # mean of the 3 monthly values ?? 3 ??? seasonal total (mm/season)
+  sm <- raw[, .(seas_mean = mean(val, na.rm = TRUE) * 3L),
+            by = .(season_year, season)]
+  sm <- sm[season_year >= year_start & season_year <= year_end]
+  sm[, season := factor(season, levels = SEASON_LEVELS)]
+  list(seas_means = sm, SEASON_LEVELS = SEASON_LEVELS)
+}
+
+# OLS trend label: "DJF: +0.0060 mm/yr  |  MAM: +0.xxxx mm/yr *  | ???"
+.seas_trend_label <- function(seas_means, SEASON_LEVELS) {
+  trend_stats <- seas_means[, {
+    fit <- lm(seas_mean ~ season_year)
+    list(
+      slope   = coef(fit)[["season_year"]],
+      p_value = summary(fit)$coefficients["season_year", "Pr(>|t|)"]
+    )
+  }, by = season]
+  paste(
+    sapply(SEASON_LEVELS, function(s) {
+      row <- trend_stats[season == s]
+      sig <- if (!is.na(row$p_value) && row$p_value < 0.05) " *" else ""
+      sprintf("%s: %+.4f mm/yr%s", sub(" \\(.*", "", s), row$slope, sig)
+    }),
+    collapse = "   |   "
+  )
+}
+
+# Build ggplot panel for seasonal trends
+.seas_ggplot <- function(seas_means, SEASON_LEVELS,
+                         title_str, subtitle_str, ylab_str,
+                         year_start, year_end,
+                         base_size = 22) {
+  season_colours <- c(
+    "DJF (Dec\u2013Feb)" = "#4472C4",
+    "MAM (Mar\u2013May)" = "#70AD47",
+    "JJA (Jun\u2013Aug)" = "#C00000",
+    "SON (Sep\u2013Nov)" = "#ED7D31"
+  )
+  ggplot2::ggplot(
+    seas_means,
+    ggplot2::aes(x = season_year, y = seas_mean,
+                 colour = season, group = season)
+  ) +
+    ggplot2::geom_line(linewidth = 0.6, alpha = 0.85) +
+    ggplot2::geom_point(size = 1.2, alpha = 0.75) +
+    ggplot2::geom_smooth(method = "lm", formula = y ~ x,
+                         se = FALSE, linetype = "dashed", linewidth = 1.6) +
+    ggplot2::geom_hline(yintercept = 0, linetype = "dotted",
+                        colour = "grey50", linewidth = 0.4) +
+    ggplot2::scale_colour_manual(
+      values = season_colours, name = NULL,
+      guide  = ggplot2::guide_legend(
+        direction = "horizontal", nrow = 1,
+        override.aes = list(linewidth = 1.4, size = 2)
+      )
+    ) +
+    ggplot2::scale_x_continuous(
+      breaks = seq(year_start, year_end, by = 10),
+      expand = ggplot2::expansion(mult = 0.01)
+    ) +
+    ggplot2::labs(title    = title_str,
+                  subtitle = subtitle_str,
+                  x = "Year", y = ylab_str) +
+    ggplot2::theme_bw(base_size = base_size) +
+    ggplot2::theme(
+      plot.title    = ggplot2::element_text(face = "bold", size = base_size + 4,
+                                            margin = ggplot2::margin(b = 4)),
+      plot.subtitle = ggplot2::element_text(size  = base_size - 1,
+                                            colour = "grey30",
+                                            margin = ggplot2::margin(b = 10)),
+      legend.position  = "top",
+      legend.text      = ggplot2::element_text(size = base_size),
+      legend.key.width = ggplot2::unit(1.6, "cm"),
+      panel.grid.minor = ggplot2::element_blank(),
+      panel.grid.major = ggplot2::element_line(colour = "grey90", linewidth = 0.3),
+      axis.title       = ggplot2::element_text(size = base_size + 2),
+      axis.text        = ggplot2::element_text(size = base_size)
+    )
+}
+
+# ?????? 2. MAIN FUNCTION ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+
+create_precip_seasonal_trends <- function(
+    df          = basin_avg_monthly,    # data.frame/data.table with columns:
+    #   date (Date or character), precip_mm_month
+    out_dir_loc = out_dir,
+    basin_label = "Nechako River Basin",
+    year_start  = 1950L,
+    year_end    = 2025L
+) {
+  cat("\n\u2500\u2500 Function 16: Precipitation seasonal trends plot \u2500\u2500\n")
+  
+  # ?????? guards ?????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  if (is.null(df) || !"date" %in% names(df)) {
+    cat("  \u26a0 Basin monthly data not available \u2014 skipping Function 16.\n")
+    return(invisible(NULL))
+  }
+  df_dt <- data.table::as.data.table(df)
+  if (!"precip_mm_month" %in% names(df_dt)) {
+    cat("  \u26a0 Column 'precip_mm_month' not found in basin_avg_monthly",
+        "\u2014 skipping Function 16.\n")
+    cat("    Available columns:", paste(names(df_dt), collapse = ", "), "\n")
+    return(invisible(NULL))
+  }
+  
+  # ?????? build seasonal means ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  cat("  Computing seasonal means for Precipitation...\n")
+  res_pr <- .seas_means_generic(df_dt, "precip_mm_month", year_start, year_end)
+  
+  if (nrow(res_pr$seas_means) == 0) {
+    cat("  \u26a0 No seasonal data within", year_start, "\u2013", year_end,
+        "\u2014 skipping.\n")
+    return(invisible(NULL))
+  }
+  
+  # quick sanity check: print per-season N and mean
+  check <- res_pr$seas_means[, .(n = .N, mean_mm = round(mean(seas_mean, na.rm = TRUE), 1)),
+                             by = season]
+  cat("  Seasonal check (n obs, mean mm/season):\n")
+  print(as.data.frame(check))
+  
+  # ?????? OLS trend labels for subtitle ?????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  label_pr <- .seas_trend_label(res_pr$seas_means, res_pr$SEASON_LEVELS)
+  
+  # ?????? build ggplot ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  p_pr <- .seas_ggplot(
+    seas_means    = res_pr$seas_means,
+    SEASON_LEVELS = res_pr$SEASON_LEVELS,
+    title_str     = sprintf(
+      "Seasonal Precipitation Trends \u2014 %s (%d\u2013%d)",
+      basin_label, year_start, year_end
+    ),
+    subtitle_str  = paste0(
+      "Annual seasonal means with OLS trend lines (dashed).  * p < 0.05\n",
+      label_pr
+    ),
+    ylab_str      = "Seasonal mean Precipitation (mm/season)",
+    year_start    = year_start,
+    year_end      = year_end
+  )
+  
+  # ?????? save PNG ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  out_png <- file.path(out_dir_loc, "FigS_Precip_Seasonal_Trends.png")
+  tryCatch({
+    ggplot2::ggsave(out_png, p_pr, width = 14, height = 7,
+                    units = "in", dpi = 300)
+    cat(sprintf("  \u2713 PNG saved: %s\n", basename(out_png)))
+  }, error = function(e) cat(sprintf("  \u26a0 PNG error: %s\n", e$message)))
+  
+  # ?????? save PDF ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  out_pdf <- file.path(out_dir_loc, "FigS_Precip_Seasonal_Trends.pdf")
+  tryCatch({
+    ggplot2::ggsave(out_pdf, p_pr, width = 14, height = 7,
+                    units = "in", device = "pdf")
+    cat(sprintf("  \u2713 PDF saved: %s\n", basename(out_pdf)))
+  }, error = function(e) cat(sprintf("  \u26a0 PDF error: %s\n", e$message)))
+  
+  invisible(p_pr)
+}
+
+# ?????? 3. CALL ?????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+create_precip_seasonal_trends()
+cat("\n========================================\n")
+cat("\u2705 ALL VISUALIZATIONS CREATED\n")
+cat("========================================\n")
+cat(sprintf("Output directory: %s\n", normalizePath(out_dir)))
+cat("\n[NEW] CALENDAR-MONTHLY TEMPORAL CHANGE OUTPUTS:\n")
+cat(" calmonth_temporal_Precipitation.pdf/.png ??? 12-panel: Jan???Dec Pr time series\n")
+cat(" calmonth_temporal_PET_PM.pdf/.png ??? 12-panel: Jan???Dec PET (PM)\n")
+cat(" calmonth_temporal_PET_ERA5.pdf/.png ??? 12-panel: Jan???Dec PET (ERA5)\n")
+cat(" calmonth_temporal_Temperature.pdf/.png ??? 12-panel: Jan???Dec Tair\n")
+cat(" calmonth_slope_profile_all_vars.pdf/.png ??? combined per-month slope profile\n")
+cat(" calmonth_ols_slope_profiles.csv ??? slope + significance table\n")
+cat("\n[NEW] PET COMPARISON OUTPUTS:\n")
+cat(" pet_comparison_14a_timeseries.pdf/.png ??? PM vs ERA5 monthly time series\n")
+cat(" pet_comparison_14b_monthly_slopes.pdf/.png ??? per-month slope bar chart\n")
+cat(" pet_comparison_14c_trendsmap.pdf ??? side-by-side Sen's slope maps\n")
+cat(" pet_comparison_14d_monthly_bias.pdf/.png ??? monthly bias (PM ??? ERA5)\n")
+cat(" pet_comparison_14e_scatter.pdf/.png ??? per-month PM vs ERA5 scatter\n")
+cat("\n[NEW] SEASONALITY OUTPUT:\n")
+cat(" FigS_Seasonality_P_PET.png ??? seasonal cycle P vs PET (two-panel bar chart)\n")
+cat("\nPET SEASONAL TRENDS (Function 15):\n")
+cat(" FigS_PET_Seasonal_Trends.png/.pdf      ??? 15a: PET-PM seasonal trends (original)\n")
+cat(" FigS_PET_ERA5_Seasonal_Trends.png/.pdf  ??? 15b: PET-ERA5 seasonal trends (new)\n")
+cat(" FigS_PET_Both_Seasonal_Trends.png/.pdf ??? 15c: single-panel seasonal difference (PET_ERA5 ??? PET_PM)\n")
+cat("\nSPATIAL MAPS: all 4 variables (Pr, PET_PM, PET_ERA5, Temperature)\n")
+cat("SPECIFIC-POINT: 4-panel TS + 4-panel slope bars at each point\n")
+####################################################################################
+# FUNCTION 17: Temperature Seasonal Trends Plot
+# ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+# Mirrors Function 16 (Precipitation) and Function 15 (PET) but for Temperature.
+# Produces a single-panel figure showing the inter-annual time series of seasonal
+# mean temperature (DJF, MAM, JJA, SON) with OLS trend lines and significance
+# annotations ??? matching the style of temperature_seasonal_trends.png.
+#
+# OUTPUTS
+#   FigS_Temp_Seasonal_Trends.png   ??? main figure (300 dpi, 14 ?? 7 in)
+#   FigS_Temp_Seasonal_Trends.pdf   ??? vector version
+#
+# KEY DIFFERENCES FROM FUNCTION 16 (Precipitation)
+#   ??? Source column : tair_degC_month  (??C, not mm)
+#   ??? Seasonal mean : mean(val) over 3 months ??? NOT multiplied by 3
+#     (temperature is an average quantity, not a total)
+#   ??? y-axis label  : "Seasonal mean temperature (??C)"
+#   ??? Slope label   : "??C/yr" instead of "mm/yr"
+####################################################################################
+
+# ?????? 0. STANDALONE PREAMBLE (skip if appending to the visualisation script) ??????????????????
+
+if (!exists("basin_avg_monthly")) {
+  library(data.table)
+  library(ggplot2)
+  
+  setwd("D:/Nechako_Drought/Nechako/")          # ??? adjust if needed
+  out_dir <- "trend_analysis_pr_pet"
+  
+  metadata          <- readRDS(file.path(out_dir, "analysis_metadata.rds"))
+  basin_avg_monthly <- metadata$basin_avg_monthly
+  names(basin_avg_monthly) <- trimws(names(basin_avg_monthly))
+}
+
+# ?????? 1. TEMPERATURE-SPECIFIC HELPER ?????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+# Builds seasonal-means data.table for a temperature-like column (mean, not total).
+# Reuses the SEASON_LEVELS / DJF roll-forward logic from .seas_means_generic but
+# skips the ??3 multiplication that is appropriate only for accumulation variables.
+
+.temp_seas_means <- function(df_dt, value_col, year_start, year_end) {
+  SEASON_LEVELS <- c(
+    "DJF (Dec\u2013Feb)", "MAM (Mar\u2013May)",
+    "JJA (Jun\u2013Aug)", "SON (Sep\u2013Nov)"
+  )
+  raw <- df_dt[, .(date = as.Date(date), val = as.numeric(get(value_col)))]
+  raw <- raw[!is.na(val)]
+  raw[, year  := as.integer(format(date, "%Y"))]
+  raw[, month := as.integer(format(date, "%m"))]
+  raw <- raw[year >= year_start & year <= year_end]
+  raw[, season := data.table::fcase(
+    month %in% c(12L, 1L, 2L),  "DJF (Dec\u2013Feb)",
+    month %in% c(3L, 4L, 5L),  "MAM (Mar\u2013May)",
+    month %in% c(6L, 7L, 8L),  "JJA (Jun\u2013Aug)",
+    month %in% c(9L, 10L, 11L), "SON (Sep\u2013Nov)"
+  )]
+  # December of year Y rolls into DJF of year Y+1 (consistent with other functions)
+  raw[, season_year := data.table::fifelse(month == 12L, year + 1L, year)]
+  # seasonal MEAN (not total) ??? appropriate for temperature
+  sm <- raw[, .(seas_mean = mean(val, na.rm = TRUE)),
+            by = .(season_year, season)]
+  sm <- sm[season_year >= year_start & season_year <= year_end]
+  sm[, season := factor(season, levels = SEASON_LEVELS)]
+  list(seas_means = sm, SEASON_LEVELS = SEASON_LEVELS)
+}
+
+# OLS trend label in ??C/yr
+.temp_trend_label <- function(seas_means, SEASON_LEVELS) {
+  trend_stats <- seas_means[, {
+    fit <- lm(seas_mean ~ season_year)
+    list(
+      slope   = coef(fit)[["season_year"]],
+      p_value = summary(fit)$coefficients["season_year", "Pr(>|t|)"]
+    )
+  }, by = season]
+  paste(
+    sapply(SEASON_LEVELS, function(s) {
+      row <- trend_stats[season == s]
+      sig <- if (!is.na(row$p_value) && row$p_value < 0.05) " *" else ""
+      sprintf("%s: %+.4f \u00b0C/yr%s", sub(" \\(.*", "", s), row$slope, sig)
+    }),
+    collapse = "   |   "
+  )
+}
+
+# ?????? 2. MAIN FUNCTION ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+
+create_temp_seasonal_trends <- function(
+    df          = basin_avg_monthly,
+    out_dir_loc = out_dir,
+    basin_label = "Nechako River Basin",
+    year_start  = 1950L,
+    year_end    = 2025L,
+    base_size   = 22
+) {
+  cat("\n\u2500\u2500 Function 17: Temperature seasonal trends plot \u2500\u2500\n")
+  
+  # ?????? guards ?????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  if (is.null(df) || !"date" %in% names(df)) {
+    cat("  \u26a0 Basin monthly data not available \u2014 skipping Function 17.\n")
+    return(invisible(NULL))
+  }
+  df_dt <- data.table::as.data.table(df)
+  if (!"tair_degC_month" %in% names(df_dt)) {
+    cat("  \u26a0 Column 'tair_degC_month' not found in basin_avg_monthly",
+        "\u2014 skipping Function 17.\n")
+    cat("    Available columns:", paste(names(df_dt), collapse = ", "), "\n")
+    return(invisible(NULL))
+  }
+  
+  # ?????? build seasonal means ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  cat("  Computing seasonal means for Temperature...\n")
+  res_t <- .temp_seas_means(df_dt, "tair_degC_month", year_start, year_end)
+  
+  if (nrow(res_t$seas_means) == 0) {
+    cat("  \u26a0 No seasonal data within", year_start, "\u2013", year_end,
+        "\u2014 skipping.\n")
+    return(invisible(NULL))
+  }
+  
+  check <- res_t$seas_means[, .(n = .N,
+                                mean_degC = round(mean(seas_mean, na.rm = TRUE), 2)),
+                            by = season]
+  cat("  Seasonal check (n obs, mean \u00b0C/season):\n")
+  print(as.data.frame(check))
+  
+  # ?????? OLS trend labels for subtitle ?????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  label_t <- .temp_trend_label(res_t$seas_means, res_t$SEASON_LEVELS)
+  
+  # ?????? colour palette (matches the reference figure) ????????????????????????????????????????????????????????????????????????????????????
+  season_colours <- c(
+    "DJF (Dec\u2013Feb)" = "#4472C4",   # blue
+    "MAM (Mar\u2013May)" = "#70AD47",   # green
+    "JJA (Jun\u2013Aug)" = "#C00000",   # dark red
+    "SON (Sep\u2013Nov)" = "#ED7D31"    # orange
+  )
+  
+  # ?????? build ggplot ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  p_t <- ggplot2::ggplot(
+    res_t$seas_means,
+    ggplot2::aes(x = season_year, y = seas_mean,
+                 colour = season, group = season)
+  ) +
+    ggplot2::geom_line(linewidth = 0.6, alpha = 0.85) +
+    ggplot2::geom_point(size = 1.2, alpha = 0.75) +
+    ggplot2::geom_smooth(method = "lm", formula = y ~ x,
+                         se = FALSE, linetype = "dashed", linewidth = 1.6) +
+    ggplot2::geom_hline(yintercept = 0, linetype = "dotted",
+                        colour = "grey50", linewidth = 0.4) +
+    ggplot2::scale_colour_manual(
+      values = season_colours, name = NULL,
+      guide  = ggplot2::guide_legend(
+        direction = "horizontal", nrow = 1,
+        override.aes = list(linewidth = 1.4, size = 2)
+      )
+    ) +
+    ggplot2::scale_x_continuous(
+      breaks = seq(year_start, year_end, by = 10),
+      expand = ggplot2::expansion(mult = 0.01)
+    ) +
+    ggplot2::labs(
+      title    = sprintf(
+        "Seasonal Temperature Trends \u2014 %s (%d\u2013%d)",
+        basin_label, year_start, year_end
+      ),
+      subtitle = paste0(
+        "Annual seasonal means with OLS trend lines (dashed).  * p < 0.05\n",
+        label_t
+      ),
+      x = "Year",
+      y = "Seasonal mean temperature (\u00b0C)"
+    ) +
+    ggplot2::theme_bw(base_size = base_size) +
+    ggplot2::theme(
+      plot.title    = ggplot2::element_text(face = "bold", size = base_size + 4,
+                                            margin = ggplot2::margin(b = 4)),
+      plot.subtitle = ggplot2::element_text(size   = base_size - 1,
+                                            colour = "grey30",
+                                            margin = ggplot2::margin(b = 10)),
+      legend.position  = "top",
+      legend.text      = ggplot2::element_text(size = base_size),
+      legend.key.width = ggplot2::unit(1.6, "cm"),
+      panel.grid.minor = ggplot2::element_blank(),
+      panel.grid.major = ggplot2::element_line(colour = "grey90", linewidth = 0.3),
+      axis.title       = ggplot2::element_text(size = base_size + 2),
+      axis.text        = ggplot2::element_text(size = base_size)
+    )
+  
+  # ?????? save PNG ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  out_png <- file.path(out_dir_loc, "FigS_Temp_Seasonal_Trends.png")
+  tryCatch({
+    ggplot2::ggsave(out_png, p_t, width = 14, height = 7,
+                    units = "in", dpi = 300)
+    cat(sprintf("  \u2713 PNG saved: %s\n", basename(out_png)))
+  }, error = function(e) cat(sprintf("  \u26a0 PNG error: %s\n", e$message)))
+  
+  # ?????? save PDF ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  out_pdf <- file.path(out_dir_loc, "FigS_Temp_Seasonal_Trends.pdf")
+  tryCatch({
+    ggplot2::ggsave(out_pdf, p_t, width = 14, height = 7,
+                    units = "in", device = "pdf")
+    cat(sprintf("  \u2713 PDF saved: %s\n", basename(out_pdf)))
+  }, error = function(e) cat(sprintf("  \u26a0 PDF error: %s\n", e$message)))
+  
+  invisible(p_t)
+}
+
+# ?????? 3. CALL ?????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+create_temp_seasonal_trends()
