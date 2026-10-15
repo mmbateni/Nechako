@@ -5,21 +5,15 @@ library(jsonlite)    # JSON parsing
 library(purrr)       # map_dfr etc.
 
 # --- 0 Setup output folder --------------------------------------------------
-# Set working directory to the script's location
-if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {
-  setwd(dirname(rstudioapi::getSourceEditorContext()$path))
-} else {
-  args <- commandArgs(trailingOnly = FALSE)
-  script_path <- sub("--file=", "", args[grep("--file=", args)])
-  if (length(script_path) > 0) setwd(dirname(script_path))
-}
 output_dir <- "data_downloads_geomet_api"
 if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
 message("WSC GeoMet API Data will be saved in: ", output_dir)
 message("-------------------------------------------------------")
 
 # --- 1 Read stations list and filter ACTIVE --------------------------------
-stations_df <- read_csv("Stations.csv", show_col_types = FALSE)
+stations_file <- if (file.exists("Stations.csv")) "Stations.csv" else "stations.csv"
+if (!file.exists(stations_file)) stop("Could not find Stations.csv or stations.csv in the working directory.")
+stations_df <- read_csv(stations_file, show_col_types = FALSE)
 
 active_stations_data <- stations_df %>%
   filter(HYD_STATUS == "ACTIVE") %>%
@@ -144,3 +138,120 @@ pwalk(active_stations_data, download_api_data)
 
 message("-------------------------------------------------------")
 message("✅ Historical data download via WSC GeoMet API complete.")
+
+# --- 7 Build basin-wide daily Excel matrices ---------------------------------
+# These exports use the CSV files written above. Each row is one calendar day;
+# each gauge is a separate column. Missing observations remain blank in Excel.
+# Requires openxlsx: install.packages("openxlsx") if not already installed.
+if (!requireNamespace("openxlsx", quietly = TRUE)) {
+  stop("Package 'openxlsx' is required for Excel export. Install it with install.packages('openxlsx').")
+}
+
+build_daily_wide_matrix <- function(parameter = c("DISCHARGE", "LEVEL")) {
+  parameter <- match.arg(parameter)
+  suffix <- if (parameter == "DISCHARGE") "DISCHARGE" else "LEVEL"
+  value_column <- if (parameter == "DISCHARGE") "Discharge_cms" else "Level_m"
+  files <- list.files(
+    output_dir,
+    pattern = paste0("_WSC_", suffix, "\\.csv$"),
+    full.names = TRUE
+  )
+
+  if (length(files) == 0L) {
+    warning("No downloaded ", parameter, " CSV files found in: ", output_dir)
+    return(NULL)
+  }
+
+  station_lookup <- stations_df %>%
+    dplyr::distinct(STATION_NUMBER, STATION_NAME) %>%
+    dplyr::mutate(StationColumn = paste0(STATION_NUMBER, " - ", STATION_NAME))
+
+  long_data <- purrr::map_dfr(files, function(file) {
+    station_no <- sub(paste0("_WSC_", suffix, "\\.csv$"), "", basename(file))
+    dat <- readr::read_csv(file, show_col_types = FALSE, col_types = readr::cols())
+
+    if (!all(c("Date") %in% names(dat))) {
+      warning("Skipping file without a Date column: ", file)
+      return(tibble::tibble())
+    }
+
+    actual_value_column <- if (value_column %in% names(dat)) value_column else
+      if ("Value" %in% names(dat)) "Value" else NA_character_
+    if (is.na(actual_value_column)) {
+      warning("Skipping file without a recognised value column: ", file)
+      return(tibble::tibble())
+    }
+
+    station_name <- station_lookup$STATION_NAME[match(station_no, station_lookup$STATION_NUMBER)]
+    if (length(station_name) == 0L || is.na(station_name)) station_name <- station_no
+
+    dat %>%
+      dplyr::transmute(
+        Date = as.Date(Date),
+        StationColumn = paste0(station_no, " - ", station_name),
+        Value = suppressWarnings(as.numeric(.data[[actual_value_column]]))
+      ) %>%
+      dplyr::filter(!is.na(Date)) %>%
+      dplyr::group_by(Date, StationColumn) %>%
+      dplyr::summarise(Value = dplyr::last(Value[!is.na(Value)], default = NA_real_),
+                       .groups = "drop")
+  })
+
+  if (nrow(long_data) == 0L) {
+    warning("No valid daily ", parameter, " observations available for Excel export.")
+    return(NULL)
+  }
+
+  # Continuous daily calendar spanning the actual earliest and latest observations.
+  date_grid <- tibble::tibble(Date = seq(min(long_data$Date), max(long_data$Date), by = "day"))
+  station_columns <- station_lookup$StationColumn[
+    station_lookup$STATION_NUMBER %in% sub(" - .*", "", unique(long_data$StationColumn))
+  ]
+  station_columns <- unique(c(station_columns, unique(long_data$StationColumn)))
+
+  wide <- date_grid %>%
+    dplyr::left_join(
+      long_data %>% tidyr::pivot_wider(names_from = StationColumn, values_from = Value),
+      by = "Date"
+    )
+
+  missing_columns <- setdiff(station_columns, names(wide))
+  for (nm in missing_columns) wide[[nm]] <- NA_real_
+  wide <- wide %>% dplyr::select(Date, dplyr::all_of(station_columns)) %>% dplyr::arrange(Date)
+
+  output_file <- file.path(
+    output_dir,
+    if (parameter == "DISCHARGE") "Nechako_Daily_Discharge.xlsx" else "Nechako_Daily_Heights.xlsx"
+  )
+
+  wb <- openxlsx::createWorkbook()
+  openxlsx::addWorksheet(wb, "Daily data")
+  openxlsx::writeData(wb, "Daily data", wide, withFilter = TRUE)
+  openxlsx::freezePane(wb, "Daily data", firstRow = TRUE, firstCol = TRUE)
+  openxlsx::addStyle(
+    wb, "Daily data",
+    style = openxlsx::createStyle(numFmt = "yyyy-mm-dd"),
+    rows = 2:(nrow(wide) + 1L), cols = 1L, gridExpand = TRUE, stack = TRUE
+  )
+  openxlsx::setColWidths(wb, "Daily data", cols = 1L, widths = 13)
+  if (ncol(wide) > 1L) openxlsx::setColWidths(wb, "Daily data", cols = 2:ncol(wide), widths = 22)
+  openxlsx::saveWorkbook(wb, output_file, overwrite = TRUE)
+
+  message(sprintf(
+    "Excel matrix saved: %s | %s to %s | %s daily rows | %s gauges",
+    output_file, min(wide$Date), max(wide$Date), nrow(wide), ncol(wide) - 1L
+  ))
+  invisible(wide)
+}
+
+message("\nCreating daily wide Excel workbooks...")
+discharge_wide <- build_daily_wide_matrix("DISCHARGE")
+heights_wide <- build_daily_wide_matrix("LEVEL")
+message("Daily wide Excel export complete.")
+
+# Complexity: for N downloaded observations and G gauges, reshaping is O(N)
+# expected time plus O(D * G) output memory, where D is the number of calendar
+# days from the global earliest to latest observation. Excel's worksheet limit
+# is 1,048,576 rows and 16,384 columns; this daily layout is below those limits
+# for ordinary hydrometric record spans, but exceptionally long/wide datasets
+# should be checked before writing.
