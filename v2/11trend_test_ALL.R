@@ -3,7 +3,9 @@
 #   SPATIAL TREND, EVENT AND HOMOGENEITY ANALYSIS FOR ALL DROUGHT INDICES
 # ==============================================================================
 # INDICES : SPI, SPEI-PM, SPEI-ERA5 and SRI (1, 3, 6, 12, 24, 36 months), SWEI-3,
-#           SSPI-1, and SDI (hydrological-year periods k1-k4, Oct start).
+#           SSPI-1, SDI (hydrological-year periods k1-k4, Oct start), and the
+#           soil-moisture indices SSMI and SSI-SM (1, 2, 3 months; layer
+#           SOIL_LAYER, written by 8_SSI_SSMI_ERALand.R).
 #
 # GRID CONTRACT (unchanged): every index x scale uses the native grid of its own
 # NetCDF files; the Nechako polygon is rasterized on that grid; fractional coverage
@@ -18,23 +20,23 @@
 #      but its AR(1) prewhitening mis-specifies the MA(k-1) dependence for k >= 3
 #      (sensitivity only). Basin series: moving-block-bootstrap MK, block =
 #      max(12, 2k) months, as an assumption-light check.
-#   B. Calendar-month series (n ~ 76 per month) = Script 8's (8pr_pet_trends.r) monthly analysis:
+#   B. Calendar-month series (n ~ 76 per month) = Script 9's (9pr_pet_trends.r) monthly analysis:
 #      VC-MK + TFPW-MK per pixel, BH-FDR within index x scale x month.
-#   C. Annual drought-month fraction (months < DROUGHT_ONSET per year) = Script 8's
+#   C. Annual drought-month fraction (months < DROUGHT_ONSET per year) = Script 9's
 #      annual-aggregate analogue: VC-MK per pixel.
 #   D. Events: ONE framework-wide definition from DROUGHT_ANALYSIS_utils.R
 #      (hysteresis run method, onset < DROUGHT_ONSET, termination >= DROUGHT_END,
 #      scale-dependent minimum duration EVENT_MIN_DURATION_BY_SCALE). PELT, runs
 #      test, red-noise spectra and basin drought extent use the same events.
 #   E. Basin and regional series: A + B (no gap splicing).
-#   F. Homogeneity battery from Script 8 (Pettitt, SNHT, Buishand range, Welch at
+#   F. Homogeneity battery from Script 9 (Pettitt, SNHT, Buishand range, Welch at
 #      the a-priori step year, AR(1)-GLS trend vs trend+step, sub-period trends,
 #      pixel Pettitt scans with BH-FDR) ONLY on non-overlapping annual-resolution
 #      series (HOMOG_SPECS): these tests assume independent observations.
-#   G. Series QA (Script 8 rules): too few values, internal gaps, constant,
+#   G. Series QA (Script 9 rules): too few values, internal gaps, constant,
 #      ties (largest tied group > TIE_MODE_MAX). Filtered series: NA statistics +
 #      reason code. SWEI summer gaps are never spliced.
-#   H. Point trends at Script 8's specific points.
+#   H. Point trends at Script 9's specific points.
 #
 # OUTPUTS (TREND_DIR)
 #   {idx}_{sc}_results.csv                 full-series pixel results (+ events, QA, dfreq)
@@ -44,7 +46,7 @@
 #   duration-class CSVs, D13+ NetCDFs, basin_extent/, script6_run_status.csv,
 #   script6_analysis_config.rds
 #
-# EXECUTION ORDER: index scripts 1, 2b, 3, 4, 5 (and 6, 7) -> 11 (this script) -> 12 -> 13 -> 14
+# EXECUTION ORDER: index scripts 1, 2b, 3, 4, 5, 8 (and 6, 7) -> 11 (this script) -> 12 -> 13 -> 14
 # ==============================================================================
 
 
@@ -96,7 +98,7 @@ for (d in c(TREND_DIR, BASIN_TREND_DIR, REGIONAL_TREND_DIR, REGIONAL_INDEX_DIR, 
             file.path(HOMOG_DIR, "pixel"), POINT_DIR, QA_DIR))
   dir.create(d, showWarnings = FALSE, recursive = TRUE)
 
-# Step year and specific points are taken from Script 8 so both pipelines agree.
+# Step year and specific points are taken from Script 9 so both pipelines agree.
 S4_META_FILE <- file.path(WD_PATH, "trend_analysis_pr_pet", "analysis_metadata.rds")
 S4_META <- if (file.exists(S4_META_FILE)) tryCatch(readRDS(S4_META_FILE), error = function(e) NULL) else NULL
 STEP_YEAR <- local({
@@ -209,10 +211,25 @@ SSPI_SEAS_DIR      <- file.path(WD_PATH, "sspi_results_seasonal")
 SRI_SEAS_DIR       <- file.path(WD_PATH, "sri_results_seasonal", "runoff")   # total runoff (ro)
 SDI_DIR            <- file.path(WD_PATH, "sdi_results", "runoff")
 
+# Soil-moisture indices from 8_SSI_SSMI_ERALand.R. Index key "ssi_sm" (not "ssi")
+# because "ssi" is the streamflow index of Script 6 / Script 12.
+RUN_SOIL_MOISTURE <- TRUE
+SOIL_LAYER        <- "L1_3"          # "L1_3" (0-100 cm) or "L1_4" (0-289 cm)
+SSMI_SEAS_DIR     <- file.path(WD_PATH, "ssmi_results_seasonal", SOIL_LAYER)
+SSI_SM_SEAS_DIR   <- file.path(WD_PATH, "ssi_sm_results_seasonal", SOIL_LAYER)
+# Scales without a framework minimum event duration (EVENT_MIN_DURATION_BY_SCALE)
+# are dropped here rather than failing inside process_index().
+.soil_scale_ok <- function(s) !is.null(tryCatch(get_event_min_duration(s), error = function(e) NULL))
+SSMI_SCALES <- SSI_SM_SCALES <- Filter(.soil_scale_ok, c(1L, 2L, 3L))
+if (RUN_SOIL_MOISTURE && !identical(SSMI_SCALES, c(1L, 2L, 3L)))
+  cat("  NOTE: soil-moisture scales limited to", paste(SSMI_SCALES, collapse = ", "),
+      "(no EVENT_MIN_DURATION_BY_SCALE entry for the others)\n")
+
 INDEX_LABEL  <- c(spi = "SPI", spei = "SPEI-PM", spei_era5 = "SPEI-ERA5", swei = "SWEI",
-                  sspi = "SSPI", sri = "SRI", sdi = "SDI")
+                  sspi = "SSPI", sri = "SRI", sdi = "SDI", ssmi = "SSMI", ssi_sm = "SSI-SM")
 INDEX_FAMILY <- c(spi = "meteorological", spei = "meteorological", spei_era5 = "meteorological",
-                  swei = "snow", sspi = "snow", sri = "runoff", sdi = "runoff")
+                  swei = "snow", sspi = "snow", sri = "runoff", sdi = "runoff",
+                  ssmi = "soil_moisture", ssi_sm = "soil_moisture")
 
 # Non-overlapping annual-resolution series for the homogeneity battery.
 .hs <- function(idx, sc, months, suffix, desc)
@@ -506,7 +523,7 @@ compute_basin_extent_and_event_catalog <- function(ts_matrix, n_years, index_lab
 
 
 # ==============================================================================
-#   6. HOMOGENEITY BATTERY (Script 8 equivalent, annual-resolution series only)
+#   6. HOMOGENEITY BATTERY (Script 9 equivalent, annual-resolution series only)
 # ==============================================================================
 .season_matrix <- function(mat, dates, months) {
   yr <- as.integer(format(dates, "%Y")); mo <- as.integer(format(dates, "%m"))
@@ -828,7 +845,8 @@ process_index <- function(index_type, sc, find_fn, seas_dir) {
   # ---- [8/9] basin CSVs, extent, points -------------------------------------------------------
   cat("[8/9] Basin CSVs, extent, specific points...\n")
   seas_dir_map <- list(spi = SPI_SEAS_DIR, spei = SPEI_SEAS_DIR, spei_era5 = SPEI_ERA5_SEAS_DIR,
-                       swei = SWEI_SEAS_DIR, sspi = SSPI_SEAS_DIR, sri = SRI_SEAS_DIR)
+                       swei = SWEI_SEAS_DIR, sspi = SSPI_SEAS_DIR, sri = SRI_SEAS_DIR,
+                       ssmi = SSMI_SEAS_DIR, ssi_sm = SSI_SM_SEAS_DIR)
   basin_csv_dir <- seas_dir_map[[idx]]
   if (is.null(basin_csv_dir) || !nzchar(basin_csv_dir)) basin_csv_dir <- file.path(WD_PATH, paste0(idx, "_results_seasonal"))
   dir.create(basin_csv_dir, showWarnings = FALSE, recursive = TRUE)
@@ -981,7 +999,9 @@ process_sdi <- function(P) {
 # ==============================================================================
 #   10. RUN ALL INDICES
 # ==============================================================================
-cat("\n  Indices : SPI, SPEI-PM, SPEI-ERA5, SRI (", paste(SPI_SCALES, collapse = ", "), "), SWEI-3, SSPI-1, SDI k1-k4\n", sep = "")
+cat("\n  Indices : SPI, SPEI-PM, SPEI-ERA5, SRI (", paste(SPI_SCALES, collapse = ", "), "), SWEI-3, SSPI-1, SDI k1-k4",
+    if (RUN_SOIL_MOISTURE) sprintf(", SSMI / SSI-SM %s (%s)", paste(SSMI_SCALES, collapse = ", "), SOIL_LAYER) else "",
+    "\n", sep = "")
 cat(sprintf("  Events  : onset < %.2f, termination >= %.2f, min duration (months) by scale: %s\n",
             DROUGHT_ONSET, DROUGHT_END,
             paste(sprintf("%s=%d", names(EVENT_MIN_DURATION_BY_SCALE), EVENT_MIN_DURATION_BY_SCALE), collapse = ", ")))
@@ -1027,6 +1047,14 @@ if (dir.exists(SDI_DIR)) {
     .status("sdi", P, ok, msg)
   }
 } else .missing_dir("sdi", SDI_PERIODS, SDI_DIR, "run 5SRI_SDI_ERALand.R")
+if (RUN_SOIL_MOISTURE) {
+  if (dir.exists(SSMI_SEAS_DIR)) { cat("\n── SSMI (soil moisture, ", SOIL_LAYER, ") ──\n", sep = "")
+    run_index_safe("ssmi", SSMI_SCALES, find_seasonal_nc_files, SSMI_SEAS_DIR)
+  } else .missing_dir("ssmi", SSMI_SCALES, SSMI_SEAS_DIR, "run 8_SSI_SSMI_ERALand.R")
+  if (dir.exists(SSI_SM_SEAS_DIR)) { cat("\n── SSI-SM (soil moisture, ", SOIL_LAYER, ") ──\n", sep = "")
+    run_index_safe("ssi_sm", SSI_SM_SCALES, find_seasonal_nc_files, SSI_SM_SEAS_DIR)
+  } else .missing_dir("ssi_sm", SSI_SM_SCALES, SSI_SM_SEAS_DIR, "run 8_SSI_SSMI_ERALand.R")
+}
 
 
 # ==============================================================================
@@ -1080,7 +1108,9 @@ expected_runs <- data.table::rbindlist(list(
   data.table::data.table(index_type = "swei", scale = SWEI_SCALES),
   data.table::data.table(index_type = "sspi", scale = SSPI_SCALES),
   data.table::data.table(index_type = "sri", scale = SRI_SCALES),
-  data.table::data.table(index_type = "sdi", scale = SDI_PERIODS)))
+  data.table::data.table(index_type = "sdi", scale = SDI_PERIODS),
+  if (RUN_SOIL_MOISTURE) data.table::data.table(index_type = "ssmi", scale = SSMI_SCALES),
+  if (RUN_SOIL_MOISTURE) data.table::data.table(index_type = "ssi_sm", scale = SSI_SM_SCALES)))
 run_status_path <- file.path(TREND_DIR, "script6_run_status.csv")
 data.table::fwrite(RUN_STATUS, run_status_path)
 missing_runs <- expected_runs[!RUN_STATUS, on = .(index_type, scale)]

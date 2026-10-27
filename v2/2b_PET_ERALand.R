@@ -120,7 +120,7 @@ source(UTILS_FILE)
 
 # OUTPUT LOCATION POLICY
 # -----------------------------------------------------------------------------
-# NetCDF rasters  -> MONTHLY_DIR  (consumed by 3SPEI_ERALand.R and 8pr_pet_trends.r)
+# NetCDF rasters  -> MONTHLY_DIR  (consumed by 3SPEI_ERALand.R and 9pr_pet_trends.r)
 # Summary CSVs    -> MONTHLY_DIR  (consumed by 12basin_timeseries.R Part 4d;
 #                                 also available to external companion analyses
 #                                 that are not part of this framework)
@@ -973,14 +973,14 @@ load_validated_tmax_tmin <- function() {
   tx <- tryCatch(terra::rast(TMAXMIN_FILE, subds = TMAX_VAR), error = function(e) NULL)
   if (is.null(tn) || is.null(tx)) return(reject(sprintf("variables '%s'/'%s' not found", TMIN_VAR, TMAX_VAR)))
   if (terra::nlyr(tn) != terra::nlyr(tx)) return(reject("tmin and tmax have different layer counts"))
-
+  
   # Calendar: same YYYY-MM sequence as T2m (subset/reorder by month, never shift)
   td <- as.Date(format(as.Date(terra::time(tn)), "%Y-%m-01"))
   if (anyNA(td) || anyDuplicated(td)) return(reject("missing or duplicated time stamps"))
   idx <- match(dates, td)
   if (anyNA(idx)) return(reject(sprintf("%d T2m months are missing from the Tmax/Tmin file", sum(is.na(idx)))))
   tn <- tn[[idx]]; tx <- tx[[idx]]
-
+  
   # Units: attribute if present, otherwise magnitude (K vs degC)
   u <- tolower(trimws(c(terra::units(tn)[1], terra::units(tx)[1])))
   mean_raw <- mean(terra::global(tn[[seq_len(min(24L, terra::nlyr(tn)))]], "mean", na.rm = TRUE)[, 1])
@@ -989,10 +989,10 @@ load_validated_tmax_tmin <- function() {
   if (is_kelvin) { tn <- tn - 273.15; tx <- tx - 273.15 }
   log_event(sprintf("  Tmax/Tmin units: %s (%s)", if (is_kelvin) "K -> degC" else "degC",
                     if (all(nzchar(u)) && !anyNA(u)) "metadata" else "inferred from magnitude"))
-
+  
   tn <- align_to_common_grid(tn, "monthly Tmin")
   tx <- align_to_common_grid(tx, "monthly Tmax")
-
+  
   # Physical / statistical validation
   dtr <- tx - tn
   n_neg <- sum(terra::global(dtr < -0.05, "sum", na.rm = TRUE)[, 1], na.rm = TRUE)
@@ -1173,7 +1173,7 @@ write.csv(
 # D3. GRIDDED PM-PET METEOROLOGICAL-CONTROL EXPORTS
 # ------------------------------------------------------------------------------
 # These are the gridded monthly fields actually used by the FAO-56 PM
-# calculation and are exported so Script 8 (8pr_pet_trends.r) can perform pixel-level trend
+# calculation and are exported so Script 9 (9pr_pet_trends.r) can perform pixel-level trend
 # analysis on the physical PM inputs without treating PM-PET itself as a panel.
 # The fields are written on the same native ERA5-Land analysis grid and retain
 # the monthly 1950-01 to 2025-12 time axis.
@@ -1264,15 +1264,15 @@ regional_met_rows <- lapply(names(regional_rw), function(rid) {
     year = as.integer(format(dates, "%Y")),
     month = as.integer(format(dates, "%m")),
     t2m_degC = regional_weighted_mean(terra::values(T_mean, mat = TRUE), rw$weights,
-                                   min_coverage = BASIN_MIN_VALID_AREA_COVERAGE),
+                                      min_coverage = BASIN_MIN_VALID_AREA_COVERAGE),
     rn_MJ_m2_d = regional_weighted_mean(terra::values(Rn, mat = TRUE), rw$weights,
-                                   min_coverage = BASIN_MIN_VALID_AREA_COVERAGE),
+                                        min_coverage = BASIN_MIN_VALID_AREA_COVERAGE),
     vpd_kPa = regional_weighted_mean(terra::values(vpd, mat = TRUE), rw$weights,
-                                   min_coverage = BASIN_MIN_VALID_AREA_COVERAGE),
+                                     min_coverage = BASIN_MIN_VALID_AREA_COVERAGE),
     wind2m_ms = regional_weighted_mean(terra::values(u2, mat = TRUE), rw$weights,
-                                   min_coverage = BASIN_MIN_VALID_AREA_COVERAGE),
+                                       min_coverage = BASIN_MIN_VALID_AREA_COVERAGE),
     pressure_kPa = regional_weighted_mean(terra::values(P_kpa, mat = TRUE), rw$weights,
-                                   min_coverage = BASIN_MIN_VALID_AREA_COVERAGE),
+                                          min_coverage = BASIN_MIN_VALID_AREA_COVERAGE),
     area_m2 = rw$area_m2,
     n_cells = rw$n_cells,
     n_partial_cells = rw$n_partial,
