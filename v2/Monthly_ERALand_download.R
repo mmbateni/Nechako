@@ -1,382 +1,274 @@
 # ==============================================================================
-# ERA5-Land download and low-storage preprocessing pipeline (merged version)
+# Unified ERA5-Land / ERA5 Nechako download pipeline
 #
-# Purpose
-#   Focused copy: download the ERA5-Land monthly snow predictors (snow depth, snow
-#   density, snowfall) plus skin reservoir content, soil water layers 1-4, and
-#   total / sub-surface / surface runoff for the Nechako workflow.
+# One DAILY forcing workflow ONLY: CDS ERA5-Land -> monthly_data_direct/*.nc.
+# No GEE GeoTIFF conversion and no legacy month-by-month hourly alternative.
 #
-#   1) Preserve the existing monthly ERA5-Land state-variable archive and native PEV product.
-#   2) Regenerate the PEV archive safely when requested, without deleting a
-#      potentially locked target file before the replacement has been created.
-#   2) Preserve the optional CDS hourly-download branch for FAO-56 wind/radiation.
-#   3) Convert locally available daily GeoTIFF archives (for example from GEE)
-#      into annual NetCDF forcing files that are digestible by 2b_PET_ERALand.R.
-#   4) Preserve the circulation-context downloader for Z500 and IVT.
+# PHASE 1: monthly ERA5-Land state/hydrological variables, including native PEV.
+# PHASE 2: CDS ERA5-Land wind/solar, batched and resumable, on exact native grid.
+# PHASE 3: optional ERA5 Z500 and IVT circulation context (existing implementation).
 #
-# Local GeoTIFF contract
-#   Expected source files in monthly_data_direct/ (or GEE_DAILY_TIF_DIR):
-#     - u2_mean_daily_YYYY.tif
-#     - Rs_daily_YYYY.tif
-#   Each file must contain one band per day, with date-stamped band descriptions
-#   such as u2_mean_19500101 or Rs_19500101.
+# Daily output location (point 2b_PET_ERALand.R here as well if needed):
+#   monthly_data_direct/u2_mean_daily_YYYY.nc  (u2_mean, m s-1)
+#   monthly_data_direct/Rs_daily_YYYY.nc       (Rs, MJ m-2 day-1)
 #
-# Output contract
-#   daily_eto_forcing/u2_mean_daily_YYYY.nc
-#   daily_eto_forcing/Rs_daily_YYYY.nc
+# u2 = daily mean of sqrt(u10^2 + v10^2) * 4.87/log(67.8*10 - 5.42).
+# Rs(D) = ERA5-Land ssrd at 00 UTC of D+1 / 1e6; first 1950-01-01 00
+# stamp is not used, as it would describe 1949-12-31.
 #
-# These NetCDF files preserve a valid daily time axis and the layer order needed
-# by 2b_PET_ERALand.R. All retained gridded data are NetCDF.
+# Existing annual NetCDFs are never silently labelled as CDS outputs. The
+# optional reuse mode preserves legacy files only after date/grid/variable checks;
+# their actual source and wind calculation cannot be established by those checks.
+# To rebuild all annual files, back up the archive and set OVERWRITE_DAILY <- TRUE.
+# A replacement is validated before the previous file is moved.
+#
+# Run from the project root (folder containing .env).
 # ==============================================================================
 
 rm(list = ls())
-
-# ---- Working directory (framework rule) -------------------------------------
-# Run from the project root (set the working directory there BEFORE running).
-# All paths are derived from getwd(); no path is hard-coded.
 WD_PATH <- normalizePath(getwd(), winslash = "/", mustWork = TRUE)
-if (!file.exists(file.path(WD_PATH, ".env")))
-  stop(".env not found in the working directory: ", WD_PATH,
-       "\nSet the working directory to the project root before running this script.")
+if (!file.exists(file.path(WD_PATH, ".env"))) {
+  stop(".env not found in working directory: ", WD_PATH,
+       "\nSet the working directory to the project root before running.")
+}
 
 library(ecmwfr)
 library(terra)
 library(lubridate)
 library(ncdf4)
 library(dotenv)
+if (!requireNamespace("curl", quietly = TRUE))
+  stop("Package 'curl' is required for CDS connectivity checking.")
 
 dotenv::load_dot_env(file.path(WD_PATH, ".env"))
-
-# ============================== CONFIGURATION ================================
-
-wf_set_key(
-  user = Sys.getenv("CDS_USER"),
-  key  = Sys.getenv("CDS_KEY")
-)
-
 cds_user <- Sys.getenv("CDS_USER")
-if (!nzchar(cds_user)) {
-  stop("CDS_USER is missing from .env")
-}
+cds_key  <- Sys.getenv("CDS_KEY")
+if (!nzchar(cds_user) || !nzchar(cds_key))
+  stop("CDS_USER and/or CDS_KEY is missing from .env")
+wf_set_key(user = cds_user, key = cds_key)
 
-# British Columbia / Nechako-region bounding box
-# c(xmin, ymin, xmax, ymax)
-bbox <- c(-127.8, 52.9, -122.7, 56.2)
+# ============================= CONFIGURATION =================================
+RUN_MONTHLY     <- TRUE
+RUN_DAILY       <- TRUE
+RUN_CIRCULATION <- FALSE   # TRUE to also run the preserved ERA5 Z500/IVT phase
+REGENERATE_PEV  <- FALSE   # TRUE explicitly refreshes existing, verified PEV
 
+# Both daily forcing and monthly products are stored in monthly_data_direct/.
+# Keep existing annual files unchanged by default; generate only missing years.
+# Legacy annual files may have no CDS provenance attributes. Setting TRUE allows
+# their reuse ONLY if variable name, complete daily dates and grid are validated.
+# A reused legacy file is *not* certified as CDS-derived or methodologically
+# identical to new outputs. Set FALSE to enforce strict CDS-only provenance.
+REUSE_EXISTING_UNVERIFIED_DAILY <- TRUE
+# Set TRUE only after backing up your existing archive: rebuilds all years.
+OVERWRITE_DAILY <- FALSE
+CLEAN_RAW_AFTER_SUCCESS <- TRUE
+
+bbox <- c(-127.8, 52.9, -122.7, 56.2)  # xmin, ymin, xmax, ymax
 start_date <- as.Date("1950-01-01")
 end_date   <- as.Date("2025-12-31")
+YEARS <- seq.int(as.integer(format(start_date, "%Y")),
+                 as.integer(format(end_date, "%Y")))
+if (format(start_date, "%m-%d") != "01-01" ||
+    format(end_date, "%m-%d") != "12-31")
+  stop("Daily CDS annual workflow requires complete calendar years.")
 
-# Existing monthly state variables retained for basin-memory / climate analyses.
-# Wind components are intentionally omitted from the monthly archive because the
-# FAO-56 forcing branch now derives them from daily products before PET uses them.
 monthly_variables <- c(
-  "snow_depth",
-  "snow_density",
-  "snowfall",
-  "skin_reservoir_content",
-  "volumetric_soil_water_layer_1",
-  "volumetric_soil_water_layer_2",
-  "volumetric_soil_water_layer_3",
-  "volumetric_soil_water_layer_4",
-  "runoff",
-  "sub_surface_runoff",
-  "surface_runoff",
-  "total_evaporation"
+  "snow_depth", "snow_density", "snowfall", "skin_reservoir_content",
+  "volumetric_soil_water_layer_1", "volumetric_soil_water_layer_2",
+  "volumetric_soil_water_layer_3", "volumetric_soil_water_layer_4",
+  "runoff", "sub_surface_runoff", "surface_runoff",
+  "total_evaporation", "potential_evaporation"
 )
-
-# Accumulated hydrological variables. These are requested from the corrected
-# `monthly_averaged_reanalysis_by_hour_of_day` product (00 UTC) for the whole
-# record; see the note inside download_monthly_variable(). The Copernicus
-# "Known issues" table for reanalysis-era5-land-monthly-means (detected 2024-01,
-# ongoing, period from September 2022) lists runoff, sub-surface runoff,
-# surface runoff and snowfall among the affected variables in the standard
-# monthly product, so they are handled the same way as PEV and total evaporation.
 runoff_variables <- c("runoff", "sub_surface_runoff", "surface_runoff")
 corrected_accumulation_variables <- c(
-  "total_evaporation",
-  "potential_evaporation",
-  "snowfall",
-  runoff_variables
+  "total_evaporation", "potential_evaporation", "snowfall", runoff_variables
 )
 
-# Minimum hourly forcing set required by the FAO-56 framework.
-hourly_variables <- c(
-  "10m_u_component_of_wind",
-  "10m_v_component_of_wind",
-  "surface_solar_radiation_downwards"
-)
-
-# 10-m -> 2-m FAO-56 logarithmic wind-height conversion factor.
+# Wind is a sampled scalar mean, NOT the magnitude of the mean wind vector.
+WORKERS <- 8L                    # lower to 4 if CDS rejects batched submissions
+WIND_HOUR_STEP <- 3L             # 1 = exact hourly mean, 3/6 = sampled daily mean
+WIND_MONTHS_CANDIDATES <- c(12L, 6L, 3L, 1L)
+SSRD_YEARS_PER_REQUEST <- 10L
+MAX_ATTEMPTS_PER_GROUP <- 5L
+MAX_WAIT_MIN <- 180
+WIND_METHOD <- "mean_hourly_speed"
+stopifnot(WIND_METHOD %in% c("mean_hourly_speed", "vector_mean"),
+          WIND_HOUR_STEP %in% c(1L, 2L, 3L, 4L, 6L, 8L, 12L, 24L),
+          24L %% WIND_HOUR_STEP == 0L,
+          all(12L %% WIND_MONTHS_CANDIDATES == 0L), WORKERS >= 1L)
+WIND_HOURS <- seq.int(0L, 23L, by = WIND_HOUR_STEP)
 wind_10m_to_2m_factor <- 4.87 / log(67.8 * 10 - 5.42)
-
-# Output locations.
-monthly_dir  <- "monthly_data_direct"
-daily_dir    <- "daily_eto_forcing"
-download_dir <- "downloads"
-carry_dir    <- file.path(download_dir, "carry")
-gee_tif_dir  <- normalizePath(
-  Sys.getenv("GEE_DAILY_TIF_DIR", file.path(getwd(), "monthly_data_direct")),
-  winslash = "/", mustWork = FALSE
-)
-
-dir.create(monthly_dir,  showWarnings = FALSE, recursive = TRUE)
-dir.create(daily_dir,    showWarnings = FALSE, recursive = TRUE)
-dir.create(download_dir, showWarnings = FALSE, recursive = TRUE)
-dir.create(carry_dir,    showWarnings = FALSE, recursive = TRUE)
-
-# NetCDF compression level for retained files.
 nc_compression <- 9L
 
-# ================================ UTILITIES ==================================
+# Optional quality comparison is read-only; this is NOT another forcing source.
+RUN_COMPARISON <- FALSE
+COMPARISON_YEAR <- 2020L
+REFERENCE_DIR <- file.path(WD_PATH, "daily_eto_forcing_gee_reference")
 
+monthly_dir <- file.path(WD_PATH, "monthly_data_direct")
+daily_dir <- monthly_dir  # IMPORTANT: annual Rs/u2 outputs live alongside monthly NetCDFs
+download_dir <- file.path(WD_PATH, "downloads")
+RAW_DIR <- file.path(download_dir, "raw_cds_daily")
+for (d in c(monthly_dir, daily_dir, download_dir))
+  dir.create(d, showWarnings = FALSE, recursive = TRUE)
+
+# =============================== SHARED HELPERS ==============================
 month_sequence <- function(start_date, end_date) {
-  seq(
-    floor_date(start_date, unit = "month"),
-    floor_date(end_date, unit = "month"),
-    by = "month"
-  )
+  seq(lubridate::floor_date(start_date, "month"),
+      lubridate::floor_date(end_date, "month"), by = "month")
 }
-
-month_days <- function(month_date) {
-  sprintf("%02d", seq_len(days_in_month(month_date)))
-}
-
-all_hours <- sprintf("%02d:00", 0:23)
 
 safe_remove <- function(path) {
   if (length(path) == 1L && !is.na(path) && file.exists(path)) {
-    ok <- file.remove(path)
-    if (!ok) warning("Could not delete temporary file: ", path)
+    if (!file.remove(path)) warning("Could not delete file: ", path)
   }
   invisible(TRUE)
 }
 
 check_time_axis <- function(x, label) {
-  tt <- time(x)
-  if (is.null(tt) || length(tt) != nlyr(x) || anyNA(tt)) {
+  tt <- terra::time(x)
+  if (is.null(tt) || length(tt) != terra::nlyr(x) || anyNA(tt))
     stop("Missing/invalid NetCDF time axis for ", label)
-  }
   as.POSIXct(tt, tz = "UTC")
 }
 
 report_na <- function(x, label) {
-  cat("\n  --- NA Check:", label, "---\n")
-  na_by_layer <- global(is.na(x), "sum", na.rm = TRUE)
+  cat("\n  --- NA Check: ", label, " ---\n", sep = "")
+  na_by_layer <- terra::global(is.na(x), "sum", na.rm = TRUE)
   total_na <- sum(na_by_layer[, 1], na.rm = TRUE)
-  total_cells <- as.double(ncell(x)) * nlyr(x)
-  na_percent <- if (total_cells > 0) 100 * total_na / total_cells else NA_real_
-  cat(sprintf("  Total cells: %.0f\n", total_cells))
-  cat(sprintf("  Total NAs:   %.0f\n", total_na))
-  cat(sprintf("  NA percent:  %.6f%%\n", na_percent))
+  total_cells <- as.double(terra::ncell(x)) * terra::nlyr(x)
+  cat(sprintf("  Total cells: %.0f\n  Total NAs: %.0f\n  NA percent: %.6f%%\n",
+              total_cells, total_na, 100 * total_na / total_cells))
   if (total_na > 0) warning(label, " contains missing values.")
   invisible(total_na)
 }
 
-# Robustly extract a variable from a NetCDF that may expose variables either as
-# subdatasets or as a single raster with variable-prefixed layer names.
 read_nc_variable <- function(nc_file, candidates) {
   candidates <- unique(tolower(candidates))
-  
-  s <- try(sds(nc_file), silent = TRUE)
+  s <- try(terra::sds(nc_file), silent = TRUE)
   if (!inherits(s, "try-error") && length(s) > 0L) {
     s_names <- tolower(names(s))
-    idx <- which(s_names %in% candidates)
-    if (length(idx) == 0L) {
-      idx <- which(vapply(
-        s_names,
-        function(z) any(vapply(candidates, function(cn) grepl(cn, z, fixed = TRUE), logical(1))),
-        logical(1)
-      ))
-    }
-    if (length(idx) > 0L) return(s[[idx[1]]])
+    idx <- which(vapply(s_names, function(z)
+      any(vapply(candidates, function(cn) grepl(cn, z, fixed = TRUE), logical(1))),
+      logical(1)))
+    if (length(idx)) return(s[[idx[1]]])
+    if (length(s) == 1L) return(s[[1]])
   }
-  
-  r <- rast(nc_file)
-  layer_names <- tolower(names(r))
-  idx <- which(vapply(
-    layer_names,
-    function(z) any(vapply(candidates, function(cn) grepl(cn, z, fixed = TRUE), logical(1))),
-    logical(1)
-  ))
-  
-  if (length(idx) == 0L) {
-    stop(
-      "Could not identify variable in NetCDF. Candidates: ",
-      paste(candidates, collapse = ", "),
-      ". Available layers/subdatasets should be inspected in: ", nc_file
-    )
-  }
-  
-  r[[idx]]
+  r <- terra::rast(nc_file)
+  nms <- tolower(names(r))
+  idx <- which(vapply(nms, function(z)
+    any(vapply(candidates, function(cn) grepl(cn, z, fixed = TRUE), logical(1))),
+    logical(1)))
+  if (length(idx)) return(r[[idx]])
+  stop("Could not identify variable ", paste(candidates, collapse = "/"),
+       " in ", nc_file)
 }
-
-# Append a SpatRaster to an annual NetCDF by rewriting the compact daily annual
-# file. At this study-domain size, the annual daily product is small; this avoids
-# retaining any hourly data and keeps the implementation robust in terra.
-nc_time_origin <- as.POSIXct("1970-01-01 00:00:00", tz = "UTC")
 
 spatraster_to_nc_array <- function(x) {
-  nr <- nrow(x)
-  nc <- ncol(x)
-  nl <- nlyr(x)
-  
-  if (nr <= 0L || nc <= 0L || nl <= 0L) {
-    stop("Cannot write an empty SpatRaster to NetCDF.")
-  }
-  
-  values_mat <- terra::values(x, mat = TRUE)
-  if (is.null(dim(values_mat))) {
-    values_mat <- matrix(values_mat, ncol = 1L)
-  }
-  
-  if (nrow(values_mat) != nr * nc) {
-    stop("Unexpected raster value matrix shape while preparing NetCDF output.")
-  }
-  
-  arr <- array(NA_real_, dim = c(nc, nr, nl))
-  for (k in seq_len(nl)) {
-    layer_mat <- matrix(values_mat[, k], nrow = nr, ncol = nc, byrow = TRUE)
-    arr[, , k] <- t(layer_mat)
-  }
-  
-  arr
+  nr <- terra::nrow(x); nc <- terra::ncol(x); nl <- terra::nlyr(x)
+  if (nr < 1L || nc < 1L || nl < 1L) stop("Cannot write empty SpatRaster.")
+  m <- terra::values(x, mat = TRUE)
+  if (is.null(dim(m))) m <- matrix(m, ncol = 1L)
+  if (nrow(m) != nr * nc || ncol(m) != nl) stop("Unexpected raster matrix shape")
+  a <- array(NA_real_, dim = c(nc, nr, nl))
+  for (k in seq_len(nl))
+    a[, , k] <- t(matrix(m[, k], nrow = nr, ncol = nc, byrow = TRUE))
+  a
 }
 
+nc_time_origin <- as.POSIXct("1970-01-01 00:00:00", tz = "UTC")
+
+# Annual writer: staged NetCDF -> validate -> install. Never remove an old output
+# until the replacement is complete. A locked old file is left untouched.
 write_daily_netcdf_from_spatraster <- function(x, dates, out_file, variable_name,
-                                               long_name, units, overwrite = TRUE) {
-  if (nlyr(x) != length(dates)) {
-    stop("Layer/date mismatch while writing ", variable_name)
-  }
-  if (nlyr(x) == 0L) return(invisible(NULL))
-  
+                                               long_name, units, overwrite = FALSE) {
   dates <- as.Date(dates)
-  if (anyNA(dates)) {
-    stop("Invalid dates while writing ", variable_name)
-  }
-  
-  dir.create(dirname(out_file), showWarnings = FALSE, recursive = TRUE)
-  
-  tmp_file <- paste0(out_file, ".tmp.nc")
-  if (file.exists(tmp_file)) {
-    safe_remove(tmp_file)
-  }
-  
-  if (overwrite && file.exists(out_file)) {
-    safe_remove(out_file)
-  }
-  
-  nr <- nrow(x)
-  nc <- ncol(x)
-  xext <- terra::ext(x)
-  xres <- (xext[2] - xext[1]) / nc
-  yres <- (xext[4] - xext[3]) / nr
-  
-  lon <- seq(xext[1] + xres / 2, xext[2] - xres / 2, by = xres)
-  lat <- seq(xext[4] - yres / 2, xext[3] + yres / 2, by = -yres)
-  time_vals <- as.numeric(difftime(as.POSIXct(dates, tz = "UTC"), nc_time_origin,
-                                   units = "days"))
-  
-  data_arr <- spatraster_to_nc_array(x)
-  fill_value <- -9999.0
-  data_arr[is.na(data_arr)] <- fill_value
-  
-  lon_dim <- ncdim_def("lon", "degrees_east", lon, create_dimvar = TRUE)
-  lat_dim <- ncdim_def("lat", "degrees_north", lat, create_dimvar = TRUE)
-  time_dim <- ncdim_def(
-    "time",
-    paste0("days since ", format(nc_time_origin, "%Y-%m-%d %H:%M:%S")),
-    time_vals,
-    create_dimvar = TRUE,
-    unlim = FALSE
-  )
-  
-  var_def <- ncvar_def(
-    variable_name,
-    units,
-    list(lon_dim, lat_dim, time_dim),
-    missval = fill_value,
-    longname = long_name,
-    prec = "float",
-    compression = nc_compression
-  )
-  
-  nc <- nc_create(tmp_file, vars = list(var_def), force_v4 = TRUE)
+  if (terra::nlyr(x) != length(dates) || anyNA(dates) ||
+      anyDuplicated(dates) || is.unsorted(dates))
+    stop("Invalid date/layer mapping for ", variable_name)
+  if (!overwrite && file.exists(out_file))
+    stop("Output exists and overwrite=FALSE: ", out_file)
+  if (!terra::is.lonlat(x)) stop("Expected longitude/latitude NetCDF grid: ", out_file)
+  dir.create(dirname(out_file), recursive = TRUE, showWarnings = FALSE)
+  stage <- paste0(out_file, ".staging.nc")
+  backup <- paste0(out_file, ".replacement-backup.nc")
+  if (file.exists(stage) || file.exists(backup))
+    stop("Staging/backup file already exists; inspect before retry: ", out_file)
+  cleanup_stage <- TRUE
+  nc_is_open <- FALSE
   on.exit({
-    try(nc_close(nc), silent = TRUE)
-    if (file.exists(tmp_file)) {
-      file.remove(tmp_file)
-    }
+    if (nc_is_open) try(ncdf4::nc_close(nc), silent = TRUE)
+    if (cleanup_stage && file.exists(stage)) safe_remove(stage)
   }, add = TRUE)
   
-  ncvar_put(nc, var_def, data_arr)
-  ncatt_put(nc, 0, "Conventions", "CF-1.8")
-  ncatt_put(nc, 0, "title", long_name)
-  ncatt_put(nc, 0, "source", "Monthly_ERALand_download.R")
-  ncatt_put(nc, 0, "history", paste("Created", format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")))
-  ncatt_put(nc, "lon", "axis", "X")
-  ncatt_put(nc, "lon", "long_name", "longitude")
-  ncatt_put(nc, "lat", "axis", "Y")
-  ncatt_put(nc, "lat", "long_name", "latitude")
-  ncatt_put(nc, "time", "axis", "T")
-  ncatt_put(nc, "time", "calendar", "standard")
-  ncatt_put(nc, "time", "long_name", "time")
-  
-  nc_close(nc)
-  on.exit(NULL, add = TRUE)
-  
-  if (!file.rename(tmp_file, out_file)) {
-    stop("Failed to finalize annual NetCDF: ", out_file)
+  nr <- terra::nrow(x); ncol_x <- terra::ncol(x)
+  e <- as.vector(terra::ext(x)) # xmin, xmax, ymin, ymax
+  xres <- (e[2] - e[1]) / ncol_x
+  yres <- (e[4] - e[3]) / nr
+  lon <- e[1] + (seq_len(ncol_x) - 0.5) * xres
+  lat <- e[4] - (seq_len(nr) - 0.5) * yres
+  time_vals <- as.numeric(difftime(as.POSIXct(dates, tz = "UTC"),
+                                   nc_time_origin, units = "days"))
+  arr <- spatraster_to_nc_array(x)
+  fill_value <- -9999.0
+  arr[!is.finite(arr)] <- fill_value
+  lon_dim <- ncdf4::ncdim_def("lon", "degrees_east", lon)
+  lat_dim <- ncdf4::ncdim_def("lat", "degrees_north", lat)
+  time_dim <- ncdf4::ncdim_def("time", "days since 1970-01-01 00:00:00",
+                               time_vals, unlim = FALSE)
+  var_def <- ncdf4::ncvar_def(variable_name, units,
+                              list(lon_dim, lat_dim, time_dim),
+                              missval = fill_value, longname = long_name,
+                              prec = "float", compression = nc_compression)
+  nc <- ncdf4::nc_create(stage, vars = list(var_def), force_v4 = TRUE)
+  nc_is_open <- TRUE
+  ncdf4::ncvar_put(nc, var_def, arr)
+  ncdf4::ncatt_put(nc, 0, "Conventions", "CF-1.8")
+  ncdf4::ncatt_put(nc, 0, "title", long_name)
+  ncdf4::ncatt_put(nc, 0, "source", "ERA5-Land CDS unified daily forcing pipeline")
+  ncdf4::ncatt_put(nc, 0, "source_dataset", "reanalysis-era5-land")
+  ncdf4::ncatt_put(nc, 0, "source_workflow", "cds_daily_v5_unified")
+  ncdf4::ncatt_put(nc, 0, "history", paste("Created", format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")))
+  ncdf4::ncatt_put(nc, "lon", "axis", "X")
+  ncdf4::ncatt_put(nc, "lat", "axis", "Y")
+  ncdf4::ncatt_put(nc, "time", "axis", "T")
+  ncdf4::ncatt_put(nc, "time", "calendar", "standard")
+  if (identical(variable_name, "u2_mean")) {
+    ncdf4::ncatt_put(nc, 0, "wind_method", WIND_METHOD)
+    ncdf4::ncatt_put(nc, 0, "wind_hour_step", as.integer(WIND_HOUR_STEP))
+  } else if (identical(variable_name, "Rs")) {
+    ncdf4::ncatt_put(nc, 0, "radiation_daily_alignment", "D+1 00:00 UTC accumulation for day D")
   }
+  ncdf4::nc_close(nc)
+  nc_is_open <- FALSE
   
-  invisible(out_file)
-}
-
-append_daily_to_year <- function(x, dates, variable_name, long_name, units) {
-  if (nlyr(x) != length(dates)) {
-    stop("Layer/date mismatch while writing ", variable_name)
-  }
-  if (nlyr(x) == 0L) return(invisible(NULL))
-  
-  years <- unique(year(dates))
-  
-  for (yy in years) {
-    keep <- which(year(dates) == yy)
-    x_new <- x[[keep]]
-    d_new <- as.Date(dates[keep])
-    out_file <- file.path(daily_dir, sprintf("%s_daily_%04d.nc", variable_name, yy))
-    
-    if (file.exists(out_file)) {
-      x_old <- rast(out_file)
-      t_old <- check_time_axis(x_old, out_file)
-      d_old <- as.Date(t_old, tz = "UTC")
-      
-      x_all <- c(x_old, x_new)
-      d_all <- c(d_old, d_new)
-      
-      keep_unique <- !duplicated(d_all, fromLast = TRUE)
-      x_all <- x_all[[keep_unique]]
-      d_all <- d_all[keep_unique]
-      
-      ord <- order(d_all)
-      x_all <- x_all[[ord]]
-      d_all <- d_all[ord]
-    } else {
-      x_all <- x_new
-      d_all <- d_new
+  check <- ncdf4::nc_open(stage)
+  stage_valid <- tryCatch({
+    identical(as.integer(check$dim$time$len), as.integer(length(dates))) &&
+      identical(as.numeric(check$dim$time$vals), time_vals) &&
+      variable_name %in% names(check$var) &&
+      identical(as.integer(check$dim$lon$len), as.integer(ncol_x)) &&
+      identical(as.integer(check$dim$lat$len), as.integer(nr))
+  }, error = function(e) FALSE)
+  ncdf4::nc_close(check)
+  if (!stage_valid) stop("Staged NetCDF failed time/grid/variable validation: ", stage)
+  cleanup_stage <- FALSE  # validated replacement should survive a Windows lock
+  if (file.exists(out_file)) {
+    if (!overwrite) stop("Output exists: ", out_file)
+    if (!file.rename(out_file, backup))
+      stop("Cannot replace locked output: ", out_file,
+           "\nValidated replacement remains at ", stage)
+    if (!file.rename(stage, out_file)) {
+      if (!file.rename(backup, out_file))
+        stop("Failed installation AND rollback. Restore backup at ", backup)
+      stop("Replacement install failed; old output restored. New file at ", stage)
     }
-    
-    write_daily_netcdf_from_spatraster(
-      x_all,
-      d_all,
-      out_file,
-      variable_name = variable_name,
-      long_name = long_name,
-      units = units,
-      overwrite = TRUE
-    )
+    if (!file.remove(backup)) warning("Old-file backup retained: ", backup)
+  } else if (!file.rename(stage, out_file)) {
+    stop("Failed to install validated NetCDF: ", stage)
   }
-  
-  invisible(NULL)
+  invisible(out_file)
 }
 
 # ========================== MONTHLY STATE DOWNLOAD ============================
@@ -495,27 +387,26 @@ install_monthly_product <- function(result, output_file, variable) {
   rm(check, replacement_time, expected_time)
   gc(verbose = FALSE)
   
-  # If the existing target is present, test whether it can be removed. We do
-  # this only AFTER the replacement has been successfully created.
+  # Install safely: NEVER delete the old file before the new one is in place.
+  # On any installation failure, restore the old file from its backup.
+  backup <- paste0(output_file, ".replacement-backup.nc")
   if (file.exists(output_file)) {
-    removed <- tryCatch(file.remove(output_file), error = function(e) FALSE)
-    if (!isTRUE(removed)) {
-      stop(
-        "Cannot replace existing monthly NetCDF because it is locked or not writable: ",
-        output_file,
-        "\nClose the file in QGIS/Panoply/ArcGIS (or any other program using it) " ,
-        "and rerun this script.\n",
-        "The validated replacement has been retained at: ", tmp_output
-      )
+    if (file.exists(backup))
+      stop("Monthly replacement backup already exists; inspect before retry: ", backup)
+    if (!file.rename(output_file, backup))
+      stop("Cannot move existing monthly NetCDF to a safety backup (possibly locked): ",
+           output_file, "\nValidated replacement remains at: ", tmp_output)
+    if (!file.rename(tmp_output, output_file)) {
+      if (!file.rename(backup, output_file))
+        stop("Monthly installation and rollback both failed. Restore: ", backup,
+             "\nValidated replacement remains at: ", tmp_output)
+      stop("Monthly installation failed; old file restored: ", output_file,
+           "\nValidated replacement remains at: ", tmp_output)
     }
-  }
-  
-  if (!file.rename(tmp_output, output_file)) {
-    # Never silently lose the validated replacement.
-    stop(
-      "Failed to finalize replacement NetCDF: ", output_file,
-      "\nValidated replacement remains at: ", tmp_output
-    )
+    if (!file.remove(backup)) warning("Old monthly backup retained: ", backup)
+  } else if (!file.rename(tmp_output, output_file)) {
+    stop("Failed to install monthly NetCDF: ", output_file,
+         "\nValidated output remains at: ", tmp_output)
   }
   
   cat("  Saved:", output_file, "\n")
@@ -556,7 +447,9 @@ add_accumulation_source_metadata <- function(output_file, variable) {
   )
   ncdf4::ncatt_put(
     nc, 0, "native_units_interpretation",
-    "signed metres of water equivalent per 24-hour accumulation"
+    if (variable %in% c("potential_evaporation", "total_evaporation"))
+      "signed metres of water equivalent per 24-hour accumulation"
+    else "non-negative metres of water equivalent per 24-hour accumulation"
   )
   
   if (identical(variable, "potential_evaporation")) {
@@ -607,7 +500,9 @@ add_accumulation_source_metadata <- function(output_file, variable) {
 has_provenance <- function(f) {
   nc <- ncdf4::nc_open(f)
   on.exit(ncdf4::nc_close(nc), add = TRUE)
-  isTRUE(ncdf4::ncatt_get(nc, 0, "source_product")$hasatt)
+  attr <- ncdf4::ncatt_get(nc, 0, "source_product")
+  isTRUE(attr$hasatt) &&
+    identical(as.character(attr$value), "monthly_averaged_reanalysis_by_hour_of_day")
 }
 
 process_monthly_state_variables <- function() {
@@ -620,18 +515,21 @@ process_monthly_state_variables <- function() {
   
   for (var in monthly_variables) {
     output_file <- file.path(monthly_dir, paste0(var, "_monthly.nc"))
-    force_regenerate <- identical(var, "potential_evaporation")
+    force_regenerate <- (identical(var, "potential_evaporation") && REGENERATE_PEV) ||
+      (file.exists(output_file) && var %in% corrected_accumulation_variables &&
+         !has_provenance(output_file))
     
     if (file.exists(output_file) && !force_regenerate) {
-      if (var %in% corrected_accumulation_variables && !has_provenance(output_file)) {
-        cat("Backfilling provenance metadata on existing file:", output_file, "\n")
-        add_accumulation_source_metadata(output_file, var)
-      } else {
-        cat("Skipping existing monthly file:", output_file, "\n")
-      }
+      cat("Skipping verified/existing monthly file:", output_file, "\n")
       next
     }
-    if (force_regenerate && file.exists(output_file)) {
+    if (force_regenerate && file.exists(output_file) &&
+        var %in% corrected_accumulation_variables && !has_provenance(output_file)) {
+      cat("Unverified monthly accumulation will be regenerated from CDS: ",
+          output_file, "\n", sep = "")
+    }
+    if (force_regenerate && file.exists(output_file) &&
+        identical(var, "potential_evaporation")) {
       cat(
         "\nRegenerating existing PEV file using corrected synoptic product: ",
         output_file, "\n", sep = ""
@@ -713,540 +611,559 @@ process_monthly_state_variables <- function() {
   }
 }
 
-# ============================ HOURLY DOWNLOAD ================================
 
-download_hourly_month <- function(month_date) {
-  request <- list(
+# ==================== PHASE 2: ONE CDS DAILY FORCING PATH =====================
+# The CDS workflow below supersedes both the older hourly-month loop and the
+# GEE GeoTIFF conversion path; it writes ONLY daily_dir/ annual NetCDF files.
+# ---- REQUEST BUILDERS -------------------------------------------------------
+mk_request <- function(vars, years, months, days, hours, target) {
+  list(
     dataset_short_name = "reanalysis-era5-land",
-    variable = hourly_variables,
-    year = format(month_date, "%Y"),
-    month = format(month_date, "%m"),
-    day = month_days(month_date),
-    time = all_hours,
-    data_format = "netcdf",
-    download_format = "unarchived",
-    area = c(bbox[4], bbox[1], bbox[2], bbox[3])
-  )
-  
-  wf_request(
-    user = cds_user,
-    request = request,
-    transfer = TRUE,
-    path = download_dir,
-    time_out = 7200
+    variable           = vars,
+    year               = as.character(years),
+    month              = sprintf("%02d", months),
+    day                = sprintf("%02d", days),
+    time               = sprintf("%02d:00", hours),
+    data_format        = "netcdf",
+    download_format    = "unarchived",
+    area               = AREA,
+    target             = target
   )
 }
 
-# ============================== DAILY WIND ===================================
+make_chunks <- function(years, n) unname(split(years, ceiling(seq_along(years) / n)))
+ssrd_chunks <- make_chunks(YEARS, SSRD_YEARS_PER_REQUEST)
 
-process_daily_wind <- function(nc_file, month_date) {
-  u10 <- read_nc_variable(
-    nc_file,
-    c("10m_u_component_of_wind", "u10", "10u")
-  )
-  v10 <- read_nc_variable(
-    nc_file,
-    c("10m_v_component_of_wind", "v10", "10v")
-  )
-  
-  tu <- check_time_axis(u10, "u10")
-  tv <- check_time_axis(v10, "v10")
-  
-  if (length(tu) != length(tv) || any(tu != tv)) {
-    stop("u10 and v10 time axes are not identical for ", format(month_date, "%Y-%m"))
-  }
-  
-  # Hourly scalar wind magnitude MUST be calculated before temporal averaging.
-  ws10 <- sqrt(u10^2 + v10^2)
-  u2_hourly <- ws10 * wind_10m_to_2m_factor
-  dates_hourly <- as.Date(tu, tz = "UTC")
-  
-  u2_daily <- tapp(u2_hourly, index = dates_hourly, fun = mean, na.rm = TRUE)
-  daily_dates <- sort(unique(dates_hourly))
-  
-  # Respect user-requested overall date interval.
-  keep <- daily_dates >= start_date & daily_dates <= end_date
-  u2_daily <- u2_daily[[which(keep)]]
-  daily_dates <- daily_dates[keep]
-  
-  report_na(u2_daily, paste0("u2 daily ", format(month_date, "%Y-%m")))
-  
-  append_daily_to_year(
-    u2_daily,
-    daily_dates,
-    variable_name = "u2_mean",
-    long_name = "Daily mean 2-m wind speed derived from hourly ERA5-Land 10-m u/v components",
-    units = "m s-1"
-  )
-  
-  rm(u10, v10, ws10, u2_hourly, u2_daily)
-  gc(verbose = FALSE)
+wind_blocks <- function(k) {
+  starts <- seq(1, 12, by = k)
+  unlist(lapply(YEARS, function(y) lapply(starts, function(m0)
+    list(year = y, months = m0:(m0 + k - 1)))), recursive = FALSE)
+}
+wind_file <- function(b) file.path(RAW_DIR, sprintf("u10v10_h%02d_%04d_%02d-%02d.nc",
+                                                    WIND_HOUR_STEP, b$year, min(b$months), max(b$months)))
+ssrd_file <- function(ch) file.path(RAW_DIR, sprintf("ssrd00_%04d_%04d.nc", min(ch), max(ch)))
+SSRD_FINAL_FILE <- file.path(RAW_DIR, sprintf("ssrd00_%04d_jan01.nc", max(YEARS) + 1L))
+SSRD_VAR <- "surface_solar_radiation_downwards"
+
+ssrd_requests <- function() c(
+  lapply(ssrd_chunks, function(ch)
+    mk_request(SSRD_VAR, ch, 1:12, 1:31, 0, basename(ssrd_file(ch)))),
+  list(mk_request(SSRD_VAR, max(YEARS) + 1L, 1, 1, 0, basename(SSRD_FINAL_FILE)))
+)
+wind_requests <- function(k) lapply(wind_blocks(k), function(b)
+  mk_request(c("10m_u_component_of_wind", "10m_v_component_of_wind"),
+             b$year, b$months, 1:31, WIND_HOURS, basename(wind_file(b))))
+
+WIND_K <- NA_integer_  # discovered once in process_daily_cds_forcing()
+
+# ---- TIME AXIS FROM THE REQUEST ---------------------------------------------
+SMOKE_REQ <- NULL   # initialized after TEMPLATE and AREA are loaded
+ALL_REQS  <- list()
+register_requests <- function(reqs) {
+  names(reqs) <- vapply(reqs, `[[`, "", "target")
+  ALL_REQS <<- c(ALL_REQS[setdiff(names(ALL_REQS), names(reqs))], reqs)
+}
+# Requests are registered only inside process_daily_cds_forcing(), after AREA
+# is initialized from the actual project template.
+
+# ERA5-Land starts on 1950-01-01 and CDS omits some stamps on that first day
+# (00:00 for accumulated ssrd, and also for the 10-m wind). Missing stamps are
+# tolerated ONLY before this instant; a gap anywhere else still stops the script.
+ERA5L_TOLERANCE_END <- as.POSIXct("1950-01-02 00:00:00", tz = "UTC")
+
+expected_stamps <- function(req) {
+  yrs <- as.integer(req$year); mos <- as.integer(req$month); dys <- as.integer(req$day)
+  hrs <- as.integer(substr(req$time, 1, 2))
+  d <- seq(as.Date(sprintf("%04d-01-01", min(yrs))), as.Date(sprintf("%04d-12-31", max(yrs))), by = "day")
+  d <- d[as.integer(format(d, "%Y")) %in% yrs & as.integer(format(d, "%m")) %in% mos &
+           as.integer(format(d, "%d")) %in% dys]
+  as.POSIXct(paste(rep(format(d, "%Y-%m-%d"), each = length(hrs)),
+                   sprintf("%02d:00:00", rep(hrs, times = length(d)))), tz = "UTC")
 }
 
-# ============================= DAILY SOLAR ===================================
-
-# Save the current month's final daily Rs temporarily because its required
-# accumulation appears at 00 UTC on the first day of the NEXT month.
-save_rs_carry <- function(x, date_value) {
-  carry_file <- file.path(carry_dir, sprintf("Rs_carry_%s.nc", format(date_value, "%Y%m%d")))
-  write_daily_netcdf_from_spatraster(
-    x,
-    as.Date(date_value),
-    carry_file,
-    variable_name = "Rs",
-    long_name = "Daily incoming solar radiation",
-    units = "MJ m-2 day-1",
-    overwrite = TRUE
-  )
-  carry_file
-}
-
-flush_previous_rs_carry <- function(ssrd, ssrd_times, month_date) {
-  # The first 00 UTC layer of this month is the 24-h accumulation for the final
-  # UTC day of the previous month.
-  first_midnight <- as.POSIXct(floor_date(month_date, "month"), tz = "UTC")
-  idx <- which(ssrd_times == first_midnight)
-  
-  if (length(idx) != 1L) {
-    stop("Expected exactly one 00 UTC radiation layer at ", first_midnight)
-  }
-  
-  previous_date <- as.Date(first_midnight, tz = "UTC") - 1L
-  
-  if (previous_date < start_date || previous_date > end_date) {
-    return(invisible(NULL))
-  }
-  
-  # J m-2 accumulated over the previous UTC day -> MJ m-2 day-1.
-  rs_prev <- ssrd[[idx]] / 1e6
-  
-  append_daily_to_year(
-    rs_prev,
-    previous_date,
-    variable_name = "Rs",
-    long_name = "Daily incoming solar radiation from ERA5-Land SSRD",
-    units = "MJ m-2 day-1"
-  )
-  
-  # If an earlier carry marker exists, it is now complete and can be removed.
-  old_carry <- file.path(carry_dir, sprintf("Rs_carry_%s.nc", format(previous_date, "%Y%m%d")))
-  safe_remove(old_carry)
-  
-  rm(rs_prev)
-  gc(verbose = FALSE)
-  invisible(NULL)
-}
-
-process_daily_radiation <- function(nc_file, month_date) {
-  ssrd <- read_nc_variable(
-    nc_file,
-    c("surface_solar_radiation_downwards", "ssrd")
-  )
-  tt <- check_time_axis(ssrd, "ssrd")
-  
-  # First complete the previous month's final day using this month's 00 UTC.
-  flush_previous_rs_carry(ssrd, tt, month_date)
-  
-  # For dates within this month, timestamp D 00:00 belongs to D-1. Therefore,
-  # 00 UTC values on days 2..last provide daily totals for days 1..last-1.
-  is_midnight <- format(tt, "%H:%M:%S", tz = "UTC") == "00:00:00"
-  idx_midnight <- which(is_midnight)
-  
-  if (length(idx_midnight) == 0L) {
-    stop("No 00 UTC SSRD layers found for ", format(month_date, "%Y-%m"))
-  }
-  
-  rs_dates <- as.Date(tt[idx_midnight], tz = "UTC") - 1L
-  in_current_month <- floor_date(rs_dates, "month") == floor_date(month_date, "month")
-  
-  idx_use <- idx_midnight[in_current_month]
-  rs_dates <- rs_dates[in_current_month]
-  
-  if (length(idx_use) > 0L) {
-    rs_daily <- ssrd[[idx_use]] / 1e6
-    
-    keep <- rs_dates >= start_date & rs_dates <= end_date
-    if (any(keep)) {
-      rs_daily <- rs_daily[[which(keep)]]
-      rs_dates_keep <- rs_dates[keep]
-      
-      report_na(rs_daily, paste0("Rs daily ", format(month_date, "%Y-%m")))
-      
-      append_daily_to_year(
-        rs_daily,
-        rs_dates_keep,
-        variable_name = "Rs",
-        long_name = "Daily incoming solar radiation from ERA5-Land SSRD",
-        units = "MJ m-2 day-1"
-      )
-    }
-    
-    rm(rs_daily)
-  }
-  
-  # Create a tiny marker/carry file for the month's final day. The actual value
-  # will be supplied by next month's first 00 UTC layer. This file is deliberately
-  # small and makes interrupted runs explicit/recoverable.
-  last_date <- ceiling_date(month_date, "month") - days(1)
-  if (last_date >= start_date && last_date <= end_date) {
-    template <- ssrd[[1]]
-    values(template) <- NA_real_
-    save_rs_carry(template, as.Date(last_date))
-    rm(template)
-  }
-  
-  rm(ssrd)
-  gc(verbose = FALSE)
-}
-
-# Final study day needs the next day's 00 UTC accumulation. Download only one
-# radiation time step after end_date, rather than an entire additional month.
-finalize_last_rs_day <- function() {
-  if (end_date >= Sys.Date()) {
-    warning("end_date is not safely historical; final SSRD accumulation may be unavailable.")
-  }
-  
-  carry_file <- file.path(carry_dir, sprintf("Rs_carry_%s.nc", format(end_date, "%Y%m%d")))
-  if (!file.exists(carry_file)) return(invisible(NULL))
-  
-  next_day <- end_date + 1L
-  cat("\nFinalizing Rs for", as.character(end_date), "using", as.character(next_day), "00 UTC...\n")
-  
-  request <- list(
-    dataset_short_name = "reanalysis-era5-land",
-    variable = "surface_solar_radiation_downwards",
-    year = format(next_day, "%Y"),
-    month = format(next_day, "%m"),
-    day = format(next_day, "%d"),
-    time = "00:00",
-    data_format = "netcdf",
-    download_format = "unarchived",
-    area = c(bbox[4], bbox[1], bbox[2], bbox[3])
-  )
-  
-  nc_file <- wf_request(
-    user = cds_user,
-    request = request,
-    transfer = TRUE,
-    path = download_dir,
-    time_out = 7200
-  )
-  
-  ssrd <- read_nc_variable(nc_file, c("surface_solar_radiation_downwards", "ssrd"))
-  tt <- check_time_axis(ssrd, "final ssrd")
-  
-  expected <- as.POSIXct(next_day, tz = "UTC")
-  idx <- which(tt == expected)
-  if (length(idx) != 1L) stop("Could not identify final 00 UTC SSRD layer.")
-  
-  rs_last <- ssrd[[idx]] / 1e6
-  
-  append_daily_to_year(
-    rs_last,
-    end_date,
-    variable_name = "Rs",
-    long_name = "Daily incoming solar radiation from ERA5-Land SSRD",
-    units = "MJ m-2 day-1"
-  )
-  
-  safe_remove(carry_file)
-  safe_remove(nc_file)
-  rm(ssrd, rs_last)
-  gc(verbose = FALSE)
-}
-
-# ========================= HOURLY -> DAILY DRIVER =============================
-
-
-process_hourly_forcing <- function() {
-  months <- month_sequence(start_date, end_date)
-  
-  cat("\n============================================================\n")
-  cat("PHASE 2: Hourly u10/v10/SSRD -> daily u2/Rs\n")
-  cat("============================================================\n")
-  cat(sprintf("10-m -> 2-m wind factor: %.8f\n", wind_10m_to_2m_factor))
-  
-  for (month_date in months) {
-    label <- format(month_date, "%Y-%m")
-    cat("\n------------------------------------------------------------\n")
-    cat("Processing hourly month:", label, "\n")
-    
-    nc_file <- NULL
-    
-    tryCatch({
-      nc_file <- download_hourly_month(month_date)
-      cat("  Downloaded:", nc_file, "\n")
-      
-      process_daily_wind(nc_file, month_date)
-      process_daily_radiation(nc_file, month_date)
-      
-      # Delete hourly NetCDF ONLY after both daily products succeed.
-      safe_remove(nc_file)
-      nc_file <- NULL
-      gc(verbose = FALSE)
-      
-      cat("  Completed:", label, "\n")
-    }, error = function(e) {
-      cat("\nERROR while processing ", label, ": ", conditionMessage(e), "\n", sep = "")
-      if (!is.null(nc_file) && file.exists(nc_file)) {
-        cat("Temporary NetCDF retained for debugging:", nc_file, "\n")
-      }
-      stop(e)
-    })
-  }
-  
-  finalize_last_rs_day()
-}
-
-
-# ==================== LOCAL GEE DAILY TIFF -> NETCDF ===========================
-# This branch converts annual daily GeoTIFF stacks (for example GEE exports)
-# into annual NetCDF files with a proper daily time axis.  It is the preferred
-# path when locally exported daily GeoTIFFs already exist in monthly_data_direct/.
-# ==============================================================================
-is_leap_year <- function(yr) {
-  (yr %% 4L == 0L) & ((yr %% 100L) != 0L | (yr %% 400L) == 0L)
-}
-
-find_local_daily_tifs <- function(variable_name, source_dir = gee_tif_dir) {
-  if (!dir.exists(source_dir)) return(character(0))
-  pat <- paste0("^", variable_name, "_daily_[0-9]{4}\\.tif(f)?$")
-  list.files(source_dir, pattern = pat, full.names = TRUE)
-}
-
-# ------------------------------------------------------------------------------
-# Determine whether the complete local GeoTIFF archive already exists.
-# If TRUE, the hourly ERA5-Land download branch can be skipped safely.
-# ------------------------------------------------------------------------------
-has_complete_local_daily_tifs <- function(source_dir = gee_tif_dir,
-                                          start_year = year(start_date),
-                                          end_year   = year(end_date)) {
-  
-  yrs <- start_year:end_year
-  
-  u_expected <- file.path(
-    source_dir,
-    sprintf("u2_mean_daily_%04d.tif", yrs)
-  )
-  
-  r_expected <- file.path(
-    source_dir,
-    sprintf("Rs_daily_%04d.tif", yrs)
-  )
-  
-  missing_u <- u_expected[!file.exists(u_expected)]
-  missing_r <- r_expected[!file.exists(r_expected)]
-  
-  if (length(missing_u) == 0 && length(missing_r) == 0) {
-    message("\nUsing local daily GeoTIFF archive.")
-    message("Hourly ERA5-Land download will be skipped.")
-    return(TRUE)
-  }
-  
-  message("\nLocal GeoTIFF archive is incomplete.")
-  if (length(missing_u))
-    message("Missing u2 files: ", length(missing_u))
-  if (length(missing_r))
-    message("Missing Rs files: ", length(missing_r))
-  
-  FALSE
-}
-extract_dates_from_band_names <- function(r, tif_file, variable_name) {
-  band_names <- names(r)
-  if (is.null(band_names) || !length(band_names)) {
-    stop("No layer names found in GeoTIFF: ", tif_file)
-  }
-  
-  # Prefer date tokens embedded in band descriptions/names.
-  date_tokens <- regmatches(band_names, regexpr("(19|20)[0-9]{6}", band_names))
-  has_dates <- lengths(date_tokens) > 0L
-  if (!all(has_dates)) {
-    stop(
-      "Could not extract YYYYMMDD dates from all band names in: ", tif_file,
-      "\nExample band names: ", paste(head(band_names, 3), collapse = ", ")
-    )
-  }
-  
-  dates <- as.Date(vapply(date_tokens, `[`, character(1), 1L, USE.NAMES = FALSE), format = "%Y%m%d")
-  if (anyNA(dates)) {
-    stop("Unparseable band dates in GeoTIFF: ", tif_file)
-  }
-  
-  # Sort defensively in case layer order is not chronological.
-  ord <- order(dates)
-  r <- r[[ord]]
-  dates <- dates[ord]
-  
-  # Enforce a single calendar year per archive.
-  tif_year <- suppressWarnings(as.integer(sub(".*_daily_([0-9]{4})\\.tif(f)?$", "\\1", basename(tif_file))))
-  if (is.na(tif_year)) {
-    stop("Could not parse year from filename: ", basename(tif_file))
-  }
-  if (length(unique(as.integer(format(dates, "%Y")))) != 1L ||
-      unique(as.integer(format(dates, "%Y"))) != tif_year) {
-    stop("Band dates do not match file year for: ", basename(tif_file))
-  }
-  
-  expected <- seq(
-    as.Date(sprintf("%04d-01-01", tif_year)),
-    as.Date(sprintf("%04d-12-31", tif_year)),
-    by = "day"
-  )
-  # Compare by numeric value (days since epoch) rather than identical(): Date
-  # vectors built via seq.Date() vs. as.Date(character) are not guaranteed to
-  # share the same internal storage mode (integer vs. double) across R
-  # versions/platforms, which makes identical() an unreliable equality check
-  # here even when every date genuinely matches.
-  if (length(dates) != length(expected) ||
-      !isTRUE(all(as.numeric(dates) == as.numeric(expected)))) {
-    missing_dates <- setdiff(expected, dates)
-    extra_dates <- setdiff(dates, expected)
-    stop(
-      "Daily GeoTIFF does not contain exactly the expected daily calendar for ",
-      tif_year, ".\nMissing: ",
-      paste(head(missing_dates, 10), collapse = ", "),
-      if (length(extra_dates)) paste0("\nExtra: ", paste(head(extra_dates, 10), collapse = ", ")) else ""
-    )
-  }
-  
-  list(raster = r, dates = dates, year = tif_year)
-}
-
-write_daily_tif_archive_to_nc <- function(tif_file, variable_name, long_name, units,
-                                          output_dir = daily_dir) {
-  cat("\nConverting local GeoTIFF -> NetCDF:\n  ", basename(tif_file), "\n", sep = "")
-  
-  x <- rast(tif_file)
-  parsed <- extract_dates_from_band_names(x, tif_file, variable_name)
-  x <- parsed$raster
-  dates <- parsed$dates
-  tif_year <- parsed$year
-  
-  out_file <- file.path(output_dir, sprintf("%s_daily_%04d.nc", variable_name, tif_year))
-  
-  if (file.exists(out_file)) {
-    cat("Skipping existing NetCDF:", basename(out_file), "\n")
-    return(invisible(out_file))
-  }
-  
-  write_daily_netcdf_from_spatraster(
-    x,
-    dates,
-    out_file,
-    variable_name = variable_name,
-    long_name = long_name,
-    units = units,
-    overwrite = TRUE
-  )
-  
-  # Validate immediately after write.
-  x_out <- rast(out_file)
-  tt <- check_time_axis(x_out, out_file)
-  dd <- as.Date(tt, tz = "UTC")
-  if (!identical(dd, dates)) {
-    stop(
-      "Written NetCDF time axis mismatch for ", basename(out_file),
-      "\nExpected first/last dates: ", as.character(min(dates)), " / ", as.character(max(dates)),
-      "\nObserved first/last dates: ", as.character(min(dd)), " / ", as.character(max(dd))
-    )
-  }
-  
-  cat("  Saved:", out_file, "\n")
-  invisible(out_file)
-}
-
-process_local_daily_tifs <- function(source_dir = gee_tif_dir) {
-  
-  cat("\n============================================================\n")
-  cat("PHASE 2: Local daily GeoTIFF archives -> annual NetCDF forcing\n")
-  cat("============================================================\n")
-  cat("GeoTIFF source directory:", source_dir, "\n")
-  
-  u_files <- find_local_daily_tifs("u2_mean", source_dir)
-  r_files <- find_local_daily_tifs("Rs", source_dir)
-  
-  if (!length(u_files) && !length(r_files)) {
-    stop(
-      "No local daily GeoTIFFs found in: ", source_dir,
-      "\nExpected files such as u2_mean_daily_1950.tif and Rs_daily_1950.tif."
-    )
-  }
-  
-  if (length(u_files)) {
-    cat("\n-- Processing daily wind archives --\n")
-    for (f in sort(u_files)) {
-      write_daily_tif_archive_to_nc(
-        f,
-        variable_name = "u2_mean",
-        long_name = "Daily mean 2-m wind speed derived from local GeoTIFF archive",
-        units = "m s-1"
-      )
-    }
+# Read the time coordinate straight from the NetCDF (CDS uses "valid_time"; older files "time").
+# Independent of terra, which returns NA times for these subdatasets.
+nc_time_axis <- function(f) {
+  nc <- ncdf4::nc_open(f)
+  on.exit(ncdf4::nc_close(nc))
+  nm <- intersect(c("valid_time", "time"), c(names(nc$dim), names(nc$var)))
+  if (!length(nm)) return(NULL)
+  nm <- nm[1]
+  if (nm %in% names(nc$dim) && length(nc$dim[[nm]]$vals) > 0L) {
+    vals  <- as.numeric(nc$dim[[nm]]$vals)
+    units <- nc$dim[[nm]]$units
   } else {
-    warning("No u2_mean_daily_YYYY.tif files found in ", source_dir)
+    vals  <- as.numeric(ncdf4::ncvar_get(nc, nm))
+    units <- ncdf4::ncatt_get(nc, nm, "units")$value
   }
-  
-  if (length(r_files)) {
-    cat("\n-- Processing daily radiation archives --\n")
-    for (f in sort(r_files)) {
-      write_daily_tif_archive_to_nc(
-        f,
-        variable_name = "Rs",
-        long_name = "Daily incoming solar radiation derived from local GeoTIFF archive",
-        units = "MJ m-2 day-1"
-      )
-    }
-  } else {
-    warning("No Rs_daily_YYYY.tif files found in ", source_dir)
+  m <- regmatches(units, regexec("^\\s*(seconds|minutes|hours|days)\\s+since\\s+(.+)$",
+                                 units, ignore.case = TRUE))[[1]]
+  if (length(m) != 3L) return(NULL)
+  mult   <- c(seconds = 1, minutes = 60, hours = 3600, days = 86400)[[tolower(m[2])]]
+  origin <- as.POSIXct(substr(trimws(m[3]), 1, 19), tz = "UTC",
+                       tryFormats = c("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"))
+  as.POSIXct(round(as.numeric(origin) + vals * mult), origin = "1970-01-01", tz = "UTC")
+}
+
+get_axis <- function(r, f) {
+  req <- ALL_REQS[[basename(f)]]
+  if (is.null(req)) stop("No registered CDS request for ", basename(f))
+  expected <- expected_stamps(req)
+  observed <- tryCatch(nc_time_axis(f), error = function(e) NULL)
+  if (is.null(observed) || length(observed) != terra::nlyr(r) || anyNA(observed))
+    stop(basename(f), ": missing/invalid NetCDF time axis.")
+  if (is.unsorted(observed) || anyDuplicated(observed))
+    stop(basename(f), ": timestamps are duplicated or not sorted.")
+  exp_s <- round(as.numeric(expected))
+  obs_s <- round(as.numeric(observed))
+  missing <- expected[!(exp_s %in% obs_s)]
+  extra <- observed[!(obs_s %in% exp_s)]
+  if (length(extra) || any(missing >= ERA5L_TOLERANCE_END))
+    stop(basename(f), ": time axis differs from request. Missing: ",
+         paste(format(head(missing, 5), "%Y-%m-%d %H:%M"), collapse = ", "),
+         " | Unexpected: ", paste(format(head(extra, 5)), collapse = ", "))
+  if (length(missing))
+    message(basename(f), ": tolerated ", length(missing),
+            " unavailable ERA5-Land stamp(s) on 1950-01-01.")
+  observed
+}
+
+# ---- NETWORK HELPERS --------------------------------------------------------
+cds_reachable <- function() {
+  ip <- tryCatch(curl::nslookup("cds.climate.copernicus.eu", error = FALSE),
+                 error = function(e) NULL)
+  !is.null(ip)
+}
+wait_for_cds <- function(max_wait_min = MAX_WAIT_MIN) {
+  t0 <- Sys.time()
+  while (!cds_reachable()) {
+    if (as.numeric(difftime(Sys.time(), t0, units = "mins")) > max_wait_min)
+      stop("No connection to CDS for ", max_wait_min,
+           " min. Fix the network and re-run (finished files are kept).", call. = FALSE)
+    message(format(Sys.time(), "%H:%M:%S"), "  CDS unreachable; retrying in 60 s...")
+    Sys.sleep(60)
   }
-  
   invisible(TRUE)
 }
 
-# Preserve the original CDS hourly branch as a fallback / legacy option.
-# The local GeoTIFF conversion branch is the preferred path for the current
-# workflow because 2b_PET_ERALand.R consumes annual daily NetCDF forcing.
-# ==============================================================================
-# ============================== VALIDATION ===================================
+# ---- 0. SMOKE TEST ----------------------------------------------------------
+smoke_test <- function() {
+  f <- file.path(RAW_DIR, "_smoke_ssrd_2020-01.nc")
+  if (!raw_request_valid(SMOKE_REQ)) {
+    wait_for_cds()
+    message("Smoke test: one small CDS request (31 fields)...")
+    res <- tryCatch(
+      wf_request(user = cds_user, request = mk_request(SSRD_VAR, 2020, 1, 1:31, 0, basename(f)),
+                 transfer = TRUE, path = RAW_DIR, time_out = 1800),
+      error = function(e) e)
+    if (inherits(res, "error"))
+      stop("CDS smoke test failed: ", conditionMessage(res),
+           if (grepl("licen|terms|403", conditionMessage(res), ignore.case = TRUE))
+             "\nAccept the ERA5-Land licence on the dataset page of the CDS website, then re-run." else "",
+           call. = FALSE)
+    got <- as.character(unlist(res))[1]
+    if (!file.exists(f) && !is.na(got) && file.exists(got)) file.rename(got, f)
+    if (!file.exists(f)) stop("CDS smoke test: no file returned.", call. = FALSE)
+  }
+  r  <- read_nc_variable(f, c(SSRD_VAR, "ssrd"))
+  invisible(get_axis(r, f))
+  if (nlyr(r) != 31L) stop("Smoke test: expected 31 layers, got ", nlyr(r), call. = FALSE)
+  if (!isTRUE(terra::compareGeom(r[[1]], TEMPLATE, stopOnError = FALSE, crs = FALSE,
+                                 ext = TRUE, rowcol = TRUE, res = TRUE)))
+    stop("Smoke test: CDS subset grid differs from the project template (",
+         nrow(r), " x ", ncol(r), " vs ", nrow(TEMPLATE), " x ", ncol(TEMPLATE), ").", call. = FALSE)
+  message("Smoke test passed: credentials, licence, variable name, time axis and grid are OK.")
+}
+# ---- 1. DOWNLOAD (with connectivity wait + retry) ----------------------------
+# Check completed raw files by their actual CDS time coordinates. This prevents
+# a partial/interrupted NetCDF from masquerading as a successful download.
+raw_request_valid <- function(req) {
+  f <- file.path(RAW_DIR, req$target)
+  if (!file.exists(f)) return(FALSE)
+  tt <- tryCatch(nc_time_axis(f), error = function(e) NULL)
+  expected <- expected_stamps(req)
+  good <- !is.null(tt) && length(tt) > 0L && !anyNA(tt) &&
+    !is.unsorted(tt) && !anyDuplicated(tt) &&
+    all(round(as.numeric(tt)) %in% round(as.numeric(expected))) &&
+    !any(expected[!(round(as.numeric(expected)) %in% round(as.numeric(tt)))] >=
+           ERA5L_TOLERANCE_END)
+  if (!good) {
+    warning("Partial/invalid raw CDS NetCDF will be retried: ", f)
+    if (!file.remove(f)) stop("Could not remove invalid raw NetCDF: ", f)
+    return(FALSE)
+  }
+  TRUE
+}
 
-validate_daily_archive <- function(variable_name) {
-  files <- list.files(
-    daily_dir,
-    pattern = paste0("^", variable_name, "_daily_[0-9]{4}\\.nc$"),
-    full.names = TRUE
-  )
+run_requests <- function(reqs) {
+  pending <- function(g) Filter(function(r) !raw_request_valid(r), g)
+  todo <- pending(reqs)
+  if (!length(todo)) return(invisible(character(0)))
+  groups <- split(todo, ceiling(seq_along(todo) / WORKERS))
+  message(sprintf("Submitting %d CDS request(s) in %d group(s) of up to %d...",
+                  length(todo), length(groups), WORKERS))
+  for (gi in seq_along(groups)) {
+    g <- groups[[gi]]
+    for (attempt in seq_len(MAX_ATTEMPTS_PER_GROUP)) {
+      g <- pending(g)
+      if (!length(g)) break
+      wait_for_cds()
+      message(sprintf("Group %d/%d, attempt %d: %d request(s)",
+                      gi, length(groups), attempt, length(g)))
+      res <- tryCatch(
+        wf_request_batch(g, workers = length(g), user = cds_user, path = RAW_DIR,
+                         time_out = 6 * 3600),
+        error = function(e) { message("Group reported: ", conditionMessage(e)); NULL })
+      tg  <- vapply(g, `[[`, "", "target")
+      got <- if (is.null(res)) character(0) else as.character(unlist(res))
+      if (length(got) == length(tg))
+        for (i in seq_along(tg))
+          if (!file.exists(file.path(RAW_DIR, tg[i])) && file.exists(got[i]))
+            file.rename(got[i], file.path(RAW_DIR, tg[i]))
+      if (!length(pending(g))) break
+      Sys.sleep(30)
+    }
+  }
+  tg_all <- vapply(todo, `[[`, "", "target")
+  is_good <- vapply(todo, raw_request_valid, logical(1))
+  invisible(tg_all[!is_good])
+}
+
+# 1a. Largest wind request CDS accepts (remembered in a small text file)
+WIND_K_FILE <- file.path(RAW_DIR, sprintf("_wind_months_per_request_h%02d.txt", WIND_HOUR_STEP))
+probe_wind_size <- function() {
+  for (k in WIND_MONTHS_CANDIDATES) {
+    wait_for_cds()
+    res <- tryCatch(wf_request(user = cds_user, request = wind_requests(k)[[1]],
+                               transfer = FALSE, path = RAW_DIR),
+                    error = function(e) e)
+    if (!inherits(res, "error")) {
+      try(res$delete(), silent = TRUE)
+      message(sprintf("Wind requests of %d month(s) are accepted by CDS.", k))
+      return(k)
+    }
+    msg <- conditionMessage(res)
+    if (grepl("too large|cost limit", msg, ignore.case = TRUE)) {
+      message(sprintf("Wind requests of %d month(s) exceed the CDS cost limit; trying a smaller size...", k))
+      next
+    }
+    stop("Wind probe request failed for a reason other than size: ", msg, call. = FALSE)
+  }
+  stop("Even the smallest wind request exceeds the CDS cost limit. Increase WIND_HOUR_STEP (e.g. 6).",
+       call. = FALSE)
+}
+# ---- 2. BUILD ANNUAL NetCDFs --------------------------------------------------
+read_checked <- function(f, cands) {
+  r <- read_nc_variable(f, cands)
+  stamps <- get_axis(r, f)
+  if (!isTRUE(terra::compareGeom(r[[1]], TEMPLATE, stopOnError = FALSE, crs = FALSE,
+                                 ext = TRUE, rowcol = TRUE, res = TRUE)))
+    stop(basename(f), ": grid differs from the project template.", call. = FALSE)
+  list(r = r, stamps = stamps)
+}
+
+# Daily 2-m wind for one year (all blocks of that year), for a given method
+daily_wind_year <- function(year, method = WIND_METHOD) {
+  blocks <- Filter(function(b) b$year == year, wind_blocks(WIND_K))
+  out <- lapply(blocks, function(b) {
+    f <- wind_file(b)
+    if (!file.exists(f)) stop("Missing raw wind file: ", basename(f), call. = FALSE)
+    u <- read_checked(f, c("u10", "10m_u_component_of_wind"))
+    v <- read_checked(f, c("v10", "10m_v_component_of_wind"))
+    if (nlyr(u$r) != nlyr(v$r) || any(u$stamps != v$stamps))
+      stop(basename(f), ": u10 and v10 time axes differ.", call. = FALSE)
+    day <- format(u$stamps, "%Y-%m-%d")
+    idx <- as.integer(factor(day))
+    d <- if (method == "mean_hourly_speed") {
+      terra::tapp(sqrt(u$r^2 + v$r^2), idx, "mean")
+    } else {
+      sqrt(terra::tapp(u$r, idx, "mean")^2 + terra::tapp(v$r, idx, "mean")^2)
+    }
+    list(r = d * wind_10m_to_2m_factor, dates = as.Date(sort(unique(day))))
+  })
+  r     <- do.call(c, lapply(out, `[[`, "r"))
+  dates <- do.call(c, lapply(out, `[[`, "dates"))
+  n_exp <- as.integer(as.Date(sprintf("%d-12-31", year)) - as.Date(sprintf("%d-01-01", year))) + 1L
+  if (length(dates) != n_exp || nlyr(r) != n_exp)
+    stop("Year ", year, ": expected ", n_exp, " daily wind layers, got ", nlyr(r), call. = FALSE)
+  list(r = r, dates = dates)
+}
+
+build_u2 <- function(year) {
+  f_out <- file.path(daily_dir, sprintf("u2_mean_daily_%d.nc", year))
+  w <- daily_wind_year(year)
+  expected <- seq(as.Date(sprintf("%04d-01-01", year)),
+                  as.Date(sprintf("%04d-12-31", year)), by = "day")
+  if (!identical(as.numeric(w$dates), as.numeric(expected)))
+    stop("Year ", year, ": wind dates do not match the full calendar.")
+  write_daily_netcdf_from_spatraster(
+    w$r, w$dates, f_out, "u2_mean",
+    sprintf("Daily mean 2-m wind speed (%s; every %d hour(s))",
+            WIND_METHOD, WIND_HOUR_STEP),
+    "m s-1", overwrite = OVERWRITE_DAILY)
+  invisible("written")
+}
+
+# Read only one calendar year's required 00 UTC SSRD stamps rather than holding
+# the entire 1950-2026 raster in memory. CDS files may span 10 years.
+ssrd_requests_for_year <- function(year) {
+  required_years <- c(year, year + 1L)
+  reqs <- ssrd_requests()
+  Filter(function(r) any(as.integer(r$year) %in% required_years), reqs)
+}
+
+build_rs <- function(year) {
+  f_out <- file.path(daily_dir, sprintf("Rs_daily_%d.nc", year))
+  days <- seq(as.Date(sprintf("%04d-01-01", year)),
+              as.Date(sprintf("%04d-12-31", year)), by = "day")
+  want <- as.numeric(as.POSIXct(paste(format(days + 1L), "00:00:00"), tz = "UTC"))
+  reqs <- ssrd_requests_for_year(year)
+  files <- vapply(reqs, function(r) file.path(RAW_DIR, r$target), character(1))
+  parts <- lapply(files, function(f) read_checked(f, c(SSRD_VAR, "ssrd")))
+  stamps <- unlist(lapply(parts, function(p) as.numeric(p$stamps)), use.names = FALSE)
+  idx <- match(want, stamps)
+  if (anyNA(idx))
+    stop("Year ", year, ": missing required D+1 00:00 UTC SSRD stamps: ",
+         paste(format(head(days[is.na(idx)], 5)), collapse = ", "))
+  r <- do.call(c, lapply(parts, `[[`, "r"))
+  rs <- terra::clamp(r[[idx]] / 1e6, lower = 0, values = TRUE)
+  write_daily_netcdf_from_spatraster(
+    rs, days, f_out, "Rs",
+    "Daily surface solar radiation downwards (D+1 00 UTC, ERA5-Land)",
+    "MJ m-2 day-1", overwrite = OVERWRITE_DAILY)
+  invisible("written")
+}
+
+# ---- 3. VALIDATION, SAFE RESUME AND SINGLE DRIVER -----------------------------
+# All existing outputs require complete dates and an exact grid. A file lacking
+# CDS provenance can be retained only by the explicit REUSE_EXISTING_UNVERIFIED_DAILY
+# option, and its original source/methodology remains unknown.
+inspect_daily_output <- function(year, variable, ignore_overwrite = FALSE) {
+  f <- file.path(daily_dir, sprintf("%s_daily_%d.nc", variable, year))
+  if (!file.exists(f)) return(FALSE)
+  validate <- tryCatch({
+    nc <- ncdf4::nc_open(f)
+    on.exit(ncdf4::nc_close(nc), add = TRUE)
+    workflow_att <- ncdf4::ncatt_get(nc, 0, "source_workflow")
+    is_cds_workflow <- isTRUE(workflow_att$hasatt) &&
+      identical(as.character(workflow_att$value), "cds_daily_v5_unified")
+    if (!is_cds_workflow && !REUSE_EXISTING_UNVERIFIED_DAILY)
+      stop("unverified source_workflow (possibly an older GEE output)")
+    if (!variable %in% names(nc$var)) stop("missing ", variable, " data variable")
+    # Only unified CDS products have comparable wind_method metadata. Existing
+    # legacy wind products are kept as-is; their calculation is not certified.
+    if (identical(variable, "u2_mean") && is_cds_workflow) {
+      method <- ncdf4::ncatt_get(nc, 0, "wind_method")
+      step <- ncdf4::ncatt_get(nc, 0, "wind_hour_step")
+      if (!isTRUE(method$hasatt) || !identical(as.character(method$value), WIND_METHOD) ||
+          !isTRUE(step$hasatt) || as.integer(step$value) != WIND_HOUR_STEP)
+        stop("wind method or sample interval has changed")
+    }
+    expected <- seq(as.Date(sprintf("%04d-01-01", year)),
+                    as.Date(sprintf("%04d-12-31", year)), by = "day")
+    tt <- nc_time_axis(f)
+    if (is.null(tt) || length(tt) != length(expected) || anyNA(tt) ||
+        !identical(as.numeric(as.Date(tt, tz = "UTC")), as.numeric(expected)))
+      stop("incomplete or invalid daily time axis")
+    r <- read_nc_variable(f, variable)
+    if (terra::nlyr(r) != length(expected) ||
+        !isTRUE(terra::compareGeom(r[[1]], TEMPLATE,
+                                   stopOnError = FALSE, crs = FALSE,
+                                   ext = TRUE, rowcol = TRUE, res = TRUE)))
+      stop("layer count or grid does not match template")
+    TRUE
+  }, error = function(e) {
+    structure(FALSE, reason = conditionMessage(e))
+  })
+  if (!isTRUE(validate) && (!OVERWRITE_DAILY || ignore_overwrite))
+    stop("Existing daily forcing is not valid for safe reuse: ", f,
+         "\nReason: ", attr(validate, "reason"),
+         "\nBack up or move that file and rerun to regenerate it from CDS.",
+         call. = FALSE)
+  isTRUE(validate) && (!OVERWRITE_DAILY || ignore_overwrite)
+}
+
+check_outputs <- function() {
+  for (y in YEARS) {
+    for (variable in c("u2_mean", "Rs")) {
+      f <- file.path(daily_dir, sprintf("%s_daily_%d.nc", variable, y))
+      if (!file.exists(f)) stop("Missing daily forcing: ", f)
+      # Post-write verification, independent of OVERWRITE_DAILY.
+      ok <- inspect_daily_output(y, variable, ignore_overwrite = TRUE)
+      if (!ok) stop("Daily output failed validation: ", f)
+    }
+  }
+  message("Validated daily dates, variables and native grid for ", length(YEARS),
+          " annual u2 and ", length(YEARS), " annual Rs files.")
+  if (REUSE_EXISTING_UNVERIFIED_DAILY)
+    message("Provenance note: any reused legacy files remain unverified as CDS-derived ",
+            "and have NOT been relabelled.")
+  invisible(TRUE)
+}
+
+process_daily_cds_forcing <- function() {
+  cat("\n============================================================\n")
+  cat("PHASE 2: CDS ERA5-Land -> annual u2/Rs (single daily workflow)\n")
+  cat("============================================================\n")
+  template_file <- file.path(monthly_dir, "total_precipitation_monthly.nc")
+  if (!file.exists(template_file))
+    stop("Daily forcing requires the project grid template: ", template_file,
+         "\nCreate/provide the existing total_precipitation_monthly.nc first.")
+  TEMPLATE <<- terra::rast(template_file)[[1]]
+  e <- as.vector(terra::ext(TEMPLATE))  # xmin, xmax, ymin, ymax
+  AREA <<- round(c(e[4], e[1], e[3], e[2]), 4)  # N W S E
+  message(sprintf("Template %d x %d | CDS area (N,W,S,E) = %s",
+                  terra::nrow(TEMPLATE), terra::ncol(TEMPLATE),
+                  paste(AREA, collapse = ", ")))
+  SMOKE_REQ <<- mk_request(SSRD_VAR, 2020, 1, 1:31, 0, "_smoke_ssrd_2020-01.nc")
+  ALL_REQS <<- list()
+  register_requests(c(ssrd_requests(), list(SMOKE_REQ)))
   
-  if (length(files) == 0L) {
-    stop("No daily output files found for ", variable_name)
+  # Preflight before ANY large CDS request, to detect a legacy archive safely.
+  if (!OVERWRITE_DAILY) {
+    status_u <- vapply(YEARS, inspect_daily_output, logical(1), variable = "u2_mean")
+    status_r <- vapply(YEARS, inspect_daily_output, logical(1), variable = "Rs")
+  } else {
+    status_u <- status_r <- rep(FALSE, length(YEARS))
+  }
+  if (all(status_u) && all(status_r)) {
+    message("Daily forcing archive is structurally complete. No download needed; ",
+            "existing legacy files, if any, remain unverified as CDS outputs.")
+    check_outputs()
+    if (RUN_COMPARISON) compare_to_gee_reference()
+    return(invisible(TRUE))
   }
   
-  all_dates <- do.call(c, lapply(files, function(f) {
-    x <- rast(f)
-    as.Date(check_time_axis(x, f), tz = "UTC")
-  }))
-  
-  all_dates <- sort(unique(all_dates))
-  expected <- seq(start_date, end_date, by = "day")
-  missing_dates <- setdiff(expected, all_dates)
-  extra_dates <- setdiff(all_dates, expected)
-  
-  cat("\nValidation:", variable_name, "\n")
-  cat("  Expected days:", length(expected), "\n")
-  cat("  Stored days:  ", length(all_dates), "\n")
-  cat("  Missing days: ", length(missing_dates), "\n")
-  cat("  Extra days:   ", length(extra_dates), "\n")
-  
-  if (length(missing_dates) > 0L) {
-    warning(
-      variable_name, " has missing dates. First missing dates: ",
-      paste(head(missing_dates, 10), collapse = ", ")
-    )
+  dir.create(RAW_DIR, showWarnings = FALSE, recursive = TRUE)
+  smoke_test()
+  if (file.exists(WIND_K_FILE)) {
+    previous_k <- suppressWarnings(as.integer(readLines(WIND_K_FILE, n = 1L)))
+    if (length(previous_k) != 1L || is.na(previous_k) ||
+        !(previous_k %in% WIND_MONTHS_CANDIDATES))
+      stop("Invalid saved wind chunk size: ", WIND_K_FILE)
+    WIND_K <<- previous_k
+  } else {
+    WIND_K <<- probe_wind_size()
+    writeLines(as.character(WIND_K), WIND_K_FILE)
   }
-  if (length(extra_dates) > 0L) {
-    warning(variable_name, " has dates outside requested interval.")
-  }
+  register_requests(wind_requests(WIND_K))
+  message("Wind chunks: ", WIND_K, " month(s); wind sampling: every ",
+          WIND_HOUR_STEP, " hour(s).")
   
-  invisible(list(missing = missing_dates, extra = extra_dates))
+  for (i in seq_along(YEARS)) {
+    year <- YEARS[i]
+    if (status_u[i] && status_r[i]) {
+      message(year, ": existing daily products validated for reuse; skipping")
+      next
+    }
+    reqs <- list()
+    if (!status_u[i]) {
+      reqs <- c(reqs, Filter(function(b) b$year == year, wind_requests(WIND_K)))
+    }
+    if (!status_r[i]) reqs <- c(reqs, ssrd_requests_for_year(year))
+    # Deduplicate multi-year SSRD chunks selected for adjacent years.
+    names(reqs) <- vapply(reqs, `[[`, "", "target")
+    reqs <- reqs[!duplicated(names(reqs))]
+    missing <- run_requests(reqs)
+    if (length(missing))
+      stop("CDS downloads incomplete for year ", year, ": ",
+           paste(missing, collapse = ", "),
+           "\nRerun to resume; completed request files were kept.")
+    if (!status_u[i]) build_u2(year)
+    if (!status_r[i]) build_rs(year)
+    # Require both products to be valid before cleaning any per-year wind raw.
+    if (!all(vapply(c("u2_mean", "Rs"), function(v) {
+      f <- file.path(daily_dir, sprintf("%s_daily_%d.nc", v, year))
+      file.exists(f)
+    }, logical(1)))) stop("Missing annual output after year ", year)
+    if (CLEAN_RAW_AFTER_SUCCESS && !status_u[i]) {
+      for (b in Filter(function(b) b$year == year, wind_blocks(WIND_K)))
+        safe_remove(wind_file(b))
+    }
+    message(year, ": CDS daily forcing completed")
+    invisible(gc(verbose = FALSE))
+  }
+  check_outputs()
+  if (RUN_COMPARISON) compare_to_gee_reference()
+  if (CLEAN_RAW_AFTER_SUCCESS) {
+    for (req in c(ssrd_requests(), wind_requests(WIND_K), list(SMOKE_REQ)))
+      safe_remove(file.path(RAW_DIR, req$target))
+    message("Successfully cleaned temporary CDS raw files; annual NetCDFs retained.")
+  }
+  cat("CDS daily output: ", normalizePath(daily_dir, winslash = "/"), "\n", sep = "")
+  invisible(TRUE)
+}
+
+
+# ---- OPTIONAL READ-ONLY COMPARISON WITH GEE REFERENCE ARCHIVE ------------------------------------
+find_old_file <- function(year, key_regex) {
+  if (!dir.exists(REFERENCE_DIR)) return(NA_character_)
+  f <- list.files(REFERENCE_DIR, pattern = sprintf("%d.*\\.(nc|tif)$", year), full.names = TRUE)
+  f <- f[grepl(key_regex, basename(f), ignore.case = TRUE)]
+  if (length(f)) f[1] else NA_character_
+}
+
+read_old <- function(f, cands) {
+  if (grepl("\\.nc$", f, ignore.case = TRUE))
+    tryCatch(read_nc_variable(f, cands), error = function(e) terra::rast(f))
+  else terra::rast(f)
+}
+
+compare_var <- function(label, f_new, new_cands, f_old, old_cands) {
+  rn <- read_nc_variable(f_new, new_cands)
+  ro <- read_old(f_old, old_cands)
+  if (nlyr(rn) != nlyr(ro)) {
+    message(sprintf("%s: layer counts differ (CDS %d vs GEE %d); comparison skipped.",
+                    label, nlyr(rn), nlyr(ro)))
+    return(invisible(NULL))
+  }
+  if (!nzchar(terra::crs(rn))) terra::crs(rn) <- "EPSG:4326"
+  if (!nzchar(terra::crs(ro))) terra::crs(ro) <- "EPSG:4326"
+  if (!isTRUE(terra::compareGeom(rn, ro, stopOnError = FALSE, crs = FALSE)))
+    ro <- terra::resample(ro, rn, method = "bilinear")
+  
+  a <- as.vector(terra::values(rn)); b <- as.vector(terra::values(ro))
+  ok <- is.finite(a) & is.finite(b)
+  a <- a[ok]; b <- b[ok]
+  
+  # Domain-mean daily series: correlation at lags -1, 0, +1 day exposes date offsets
+  sa <- terra::global(rn, "mean", na.rm = TRUE)[, 1]
+  sb <- terra::global(ro, "mean", na.rm = TRUE)[, 1]
+  n  <- length(sa)
+  lag_cor <- c(
+    "-1" = cor(sa[-1], sb[-n], use = "complete.obs"),
+    "0"  = cor(sa, sb, use = "complete.obs"),
+    "+1" = cor(sa[-n], sb[-1], use = "complete.obs"))
+  
+  message(sprintf(
+    "%s %d | mean CDS %.3f, GEE %.3f | bias %.3f | RMSE %.3f | r %.4f | ratio %.3f",
+    label, COMPARISON_YEAR, mean(a), mean(b), mean(a - b), sqrt(mean((a - b)^2)),
+    cor(a, b), mean(a) / mean(b)))
+  message(sprintf("   domain-mean series correlation by lag (days, CDS vs GEE): %s",
+                  paste(sprintf("%s: %.4f", names(lag_cor), lag_cor), collapse = " | ")))
+  if (which.max(lag_cor) != 2L)
+    message("   NOTE: best correlation is not at lag 0; the two archives may define days differently.")
+  invisible(list(bias = mean(a - b), rmse = sqrt(mean((a - b)^2)), r = cor(a, b), lag_cor = lag_cor))
+}
+
+
+compare_to_gee_reference <- function() {
+  if (normalizePath(REFERENCE_DIR, mustWork = FALSE) ==
+      normalizePath(daily_dir, mustWork = FALSE))
+    stop("REFERENCE_DIR must differ from daily_dir to avoid comparing an archive to itself.")
+  if (!dir.exists(REFERENCE_DIR)) {
+    warning("Optional GEE reference directory does not exist: ", REFERENCE_DIR)
+    return(invisible(FALSE))
+  }
+  y <- COMPARISON_YEAR
+  f_old_u2 <- find_old_file(y, "u2|wind")
+  f_old_rs <- find_old_file(y, "^rs|_rs|rad|ssrd")
+  if (is.na(f_old_u2)) message("Comparison: no old u2 file for ", y, " in ", REFERENCE_DIR, "; skipped.")
+  else compare_var("u2 (m s-1)", file.path(daily_dir, sprintf("u2_mean_daily_%d.nc", y)), "u2_mean",
+                   f_old_u2, c("u2_mean", "u2", "wind"))
+  if (is.na(f_old_rs)) message("Comparison: no old Rs file for ", y, " in ", REFERENCE_DIR, "; skipped.")
+  else compare_var("Rs (MJ m-2 d-1)", file.path(daily_dir, sprintf("Rs_daily_%d.nc", y)), "Rs",
+                   f_old_rs, c("rs", "ssrd", "radiation"))
 }
 
 # ======================= PHASE 3: CIRCULATION-CONTEXT FIELDS ==================
@@ -2027,22 +1944,49 @@ process_circulation_context_fields <- function() {
   invisible(TRUE)
 }
 
-# ================================ MAIN =======================================
-# NOTE: PEV is deliberately regenerated on every run of this script. The
-# validated replacement is created first; an existing locked target is never
-# deleted prematurely. If Windows reports a lock, close the NetCDF in any
-# external viewer and rerun.
-# The local GeoTIFF/hourly decision affects only the FAO-56 daily forcing branch.
-# Phase 3 is independent and is explicitly enabled below.
-process_monthly_state_variables()
 
-cat("\n============================================================\n")
-cat("Requested ERA5-Land monthly variables downloaded successfully.\n")
-cat("  snow_depth                    : m\n")
-cat("  snow_density                  : kg m-3\n")
-cat("  snowfall                      : m water equivalent per 24-h accumulation\n")
-cat("  skin_reservoir_content        : m water equivalent\n")
-cat("  volumetric_soil_water_layer_1-4: m3 m-3\n")
-cat("  runoff / sub_surface_runoff / surface_runoff : m per 24-h accumulation\n")
-cat("Output directory: ", normalizePath(monthly_dir, winslash = "/", mustWork = FALSE), "\n", sep = "")
-cat("============================================================\n")
+# =================================== MAIN =====================================
+# Preflight before downloading: inspect the archive in monthly_data_direct/.
+# Reuse is explicitly opt-in above, and never adds CDS provenance metadata.
+preflight_legacy_daily_archive <- function() {
+  if (!RUN_DAILY || OVERWRITE_DAILY) return(invisible(TRUE))
+  f <- list.files(daily_dir,
+                  pattern = "^(u2_mean|Rs)_daily_[0-9]{4}\\.nc$",
+                  full.names = TRUE)
+  unverified <- character(0)
+  for (p in f) {
+    verified <- tryCatch({
+      n <- ncdf4::nc_open(p)
+      a <- ncdf4::ncatt_get(n, 0, "source_workflow")
+      ncdf4::nc_close(n)
+      isTRUE(a$hasatt) &&
+        identical(as.character(a$value), "cds_daily_v5_unified")
+    }, error = function(e) FALSE)
+    if (!verified) unverified <- c(unverified, p)
+  }
+  if (length(unverified)) {
+    if (!REUSE_EXISTING_UNVERIFIED_DAILY)
+      stop(length(unverified), " existing daily file(s) lack CDS provenance, first: ",
+           unverified[1],
+           "\nBack up legacy files and set OVERWRITE_DAILY <- TRUE to rebuild, ",
+           "or explicitly set REUSE_EXISTING_UNVERIFIED_DAILY <- TRUE for ",
+           "date/grid/variable-validated reuse.")
+    warning(length(unverified), " daily NetCDF(s) in monthly_data_direct/ lack ",
+            "unified CDS provenance (first: ", basename(unverified[1]), "). ",
+            "Existing files will be preserved IF date/variable/grid checks pass. ",
+            "Their provenance and calculation method are NOT verified.")
+  }
+  message("Daily output directory: ", normalizePath(daily_dir, winslash = "/"))
+  invisible(TRUE)
+}
+preflight_legacy_daily_archive()
+if (RUN_DAILY && OVERWRITE_DAILY)
+  message("OVERWRITE_DAILY=TRUE: existing annual files will be replaced only after staging and validation.")
+
+# Only a single CDS-based daily workflow is runnable from this script.
+# Existing monthly/circulation workflows are distinct scientific products,
+# not competing ways of generating the daily u2/Rs archive.
+if (RUN_MONTHLY) process_monthly_state_variables()
+if (RUN_DAILY) process_daily_cds_forcing()
+if (RUN_CIRCULATION) process_circulation_context_fields()
+cat("\nPipeline finished.\n")

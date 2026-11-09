@@ -9,6 +9,10 @@
 #
 # This script computes the two observed SPEI branches only.
 # The detrended/counterfactual PET branch has been removed.
+# Variance-aware fitting (each pixel, calendar month, and accumulation scale):
+#   1 = parametric GLO/PE3/GEV; 2 = near-zero variance (SPEI = 0);
+#   3 = Gringorten empirical fallback if all parametric fits fail.
+# Missing/insufficient data remain NA; probability clamp remains 1e-6.
 ##############################################
 
 
@@ -33,8 +37,8 @@ library(lmomco)
 library(parallel)
 
 # ---- Paths ----
-out_dir     <- "spei_results_seasonal"
-out_dir_era5 <- "spei_results_seasonal_era5land"
+out_dir      <- file.path(WD_PATH, "spei_results_seasonal")
+out_dir_era5 <- file.path(WD_PATH, "spei_results_seasonal_era5land")
 source(UTILS_FILE)
 
 if (!dir.exists(out_dir))     dir.create(out_dir,     recursive = TRUE)
@@ -441,7 +445,7 @@ cat("=================================================\n\n")
 # ==============================================================================
 
 # ==============================================================================
-#   PARAMETRIC FITTING HELPER
+#   PARAMETRIC FITTING AND EMPIRICAL FALLBACK HELPERS
 # ==============================================================================
 # Candidate 3-parameter distributions (lmomco type codes). GLO is listed first
 # (the standard SPEI choice) so it wins exact ties.
@@ -453,8 +457,15 @@ SPEI_CANDIDATE_DISTS <- c("glo", "pe3", "gev")
 # is the discriminating ratio. If the winner's CDF is not finite for every
 # value, the next-ranked candidate is used; NULL if none works.
 try_parametric <- function(values_m) {
-  rk <- lmom_rank_distributions(values_m, SPEI_CANDIDATE_DISTS)
+  # Invalid L-moments or an unsuccessful ranking must trigger the same empirical
+  # fallback as a failed candidate CDF, rather than aborting a worker.
+  rk <- tryCatch(
+    lmom_rank_distributions(values_m, SPEI_CANDIDATE_DISTS),
+    error = function(e) NULL
+  )
+  if (is.null(rk) || nrow(rk) == 0L) return(NULL)
   fits <- attr(rk, "fits")
+  if (is.null(fits)) return(NULL)
   for (k in seq_len(nrow(rk))) {
     if (!is.finite(rk$distance[k])) next
     par <- fits[[rk$dist[k]]]
@@ -463,6 +474,16 @@ try_parametric <- function(values_m) {
       return(p_fitted)
   }
   NULL
+}
+
+# Gringorten empirical plotting positions with average ranks for ties.
+# Fitted values are standardized against the same calendar-month sample used
+# for parametric fitting (no random jitter, no additional reference period).
+# Returns probabilities; variance_aware_spei() applies the existing z-clamp.
+spei_gringorten_prob <- function(values_m) {
+  n <- length(values_m)
+  if (n < 3L || any(!is.finite(values_m))) return(rep(NA_real_, n))
+  (rank(values_m, ties.method = "average") - 0.44) / (n + 0.12)
 }
 
 # ==============================================================================
@@ -476,7 +497,7 @@ variance_aware_spei <- function(x, month_numbers, scale = 1) {
   
   n      <- length(x_agg)
   z      <- rep(NA_real_, n)
-  method <- rep(NA_integer_, n)   # 1=Parametric  2=ZeroVar  NA=Failed
+  method <- rep(NA_integer_, n)   # 1=Parametric  2=ZeroVar  3=Empirical  NA=insufficient/missing
   
   for (m in 1:12) {
     idx <- which(month_numbers == m & is.finite(x_agg))
@@ -489,12 +510,14 @@ variance_aware_spei <- function(x, month_numbers, scale = 1) {
     }
     p <- try_parametric(values_m)
     if (is.null(p)) {
-      # L-moments invalid or all distributions failed ??? return NA
-      method[idx] <- NA_integer_
+      # All GLO/PE3/GEV fits failed: do not discard otherwise valid months.
+      p <- spei_gringorten_prob(values_m)
+      method[idx] <- 3L
     } else {
-      method[idx] <- 1
+      method[idx] <- 1L
     }
-    if (!is.null(p)) z[idx] <- qnorm(pmax(pmin(p, 1 - 1e-6), 1e-6))
+    # Preserve the original 1e-6 probability clamp (about +/-4.75 z).
+    z[idx] <- qnorm(pmax(pmin(p, 1 - 1e-6), 1e-6))
   }
   list(z = z, method = method)
 }
@@ -577,7 +600,9 @@ run_spei_loop <- function(wb_input, target_dir, pet_label,
     
     na_rate_basin <- 100 * mean(is.na(res_basin[basin_mask, , drop = FALSE]))
     cat(sprintf("NA rate (basin pixels): %.3f%%\n", na_rate_basin))
-    cat("Variance threshold: v < 2.2e-16 -> SPEI=0; v >= 2.2e-16 -> Parametric (GLO/PE3/GEV, smallest L-moment-ratio tau4 distance)\n")
+    cat("Variance threshold: v < 2.2e-16 -> SPEI=0; v >= 2.2e-16 -> GLO/PE3/GEV, then Gringorten empirical fallback if all fits fail\n")
+    cat(sprintf("  Empirical fallback observations (pixel-months): %d\n",
+                sum(method_basin[basin_mask, , drop = FALSE] == 3L, na.rm = TRUE)))
     
     # Parametric fit diagnostic (first valid basin pixel)
     cat("  Parametric fit check (representative basin pixel):\n")
@@ -588,58 +613,40 @@ run_spei_loop <- function(wb_input, target_dir, pet_label,
     } else {
       x_rep <- wb_input[representative_pixel, ]
       
+      # Use the SAME right-aligned accumulation and finite-month selection
+      # as variance_aware_spei(), so diagnostics match the computed method.
+      x_rep_agg <- if (scale > 1) {
+        zoo::rollapply(x_rep, scale, sum, align = "right", fill = NA,
+                       na.rm = FALSE)
+      } else x_rep
+      
       for (m_d in 1:12) {
-        idx_d <- which(month_numbers == m_d & is.finite(x_rep))
-        if (length(idx_d) < 5) next
-        
-        vals_d <- if (scale > 1) {
-          xa <- zoo::rollapply(
-            x_rep,
-            scale,
-            sum,
-            align = "right",
-            fill = NA,
-            na.rm = FALSE
-          )
-          xa <- xa[idx_d]
-        } else {
-          x_rep[idx_d]
-        }
-        
-        vals_d <- vals_d[is.finite(vals_d)]
-        if (length(vals_d) < 5) next
-        
-        v_d <- var(vals_d, na.rm = TRUE)
+        idx_d <- which(month_numbers == m_d & is.finite(x_rep_agg))
+        if (length(idx_d) < 5L) next
+        vals_d <- x_rep_agg[idx_d]
+        v_d <- var(vals_d)
         
         if (!is.finite(v_d) || v_d < .Machine$double.eps) {
-          cat(sprintf(
-            "    %s: zero variance -> SPEI=0\n",
-            month_names[m_d]
-          ))
+          cat(sprintf("    %s: zero variance -> SPEI=0\n", month_names[m_d]))
+          next
+        }
+        if (is.null(try_parametric(vals_d))) {
+          cat(sprintf("    %s: parametric fits failed -> empirical Gringorten\n",
+                      month_names[m_d]))
           next
         }
         
-        lmom_d <- tryCatch(
-          lmoms(vals_d, nmom = 4),
-          error = function(e) NULL
-        )
-        
-        if (is.null(lmom_d) || !are.lmom.valid(lmom_d)) {
+        rk_d <- tryCatch(lmom_rank_distributions(vals_d, SPEI_CANDIDATE_DISTS),
+                         error = function(e) NULL)
+        if (is.null(rk_d) || nrow(rk_d) == 0L) {
+          cat(sprintf("    %s: parametric fit succeeded\n", month_names[m_d]))
+        } else {
           cat(sprintf(
-            "    %s: L-moments invalid -> NA\n",
-            month_names[m_d]
+            "    %s: parametric (candidate |dtau4| ranking: %s)\n",
+            month_names[m_d],
+            paste(sprintf("%s %.4f", toupper(rk_d$dist), rk_d$distance), collapse = ", ")
           ))
-          next
         }
-        
-        rk_d <- lmom_rank_distributions(vals_d, SPEI_CANDIDATE_DISTS)
-        
-        cat(sprintf(
-          "    %s: %s (|dtau4| = %s) parametric\n",
-          month_names[m_d],
-          toupper(rk_d$dist[1]),
-          paste(sprintf("%s %.4f", toupper(rk_d$dist), rk_d$distance), collapse = ", ")
-        ))
       }
     }
     
@@ -647,7 +654,9 @@ run_spei_loop <- function(wb_input, target_dir, pet_label,
     # every cell of the masked precipitation grid. Cells outside the basin
     # remain NA throughout the calculation.
     res_full <- res_basin
-    
+    write_basin_series(res_full, dates, wb_template,
+                       index = if (identical(pet_label, "_PM")) "spei" else "spei_era5",
+                       scale = scale, out_dir = target_dir, producer = "3SPEI_ERALand.R")
     # Spatial method map: most frequent method across valid months for each
     # raster cell. Outside-basin cells remain NA.
     method_full <- apply(
@@ -704,21 +713,21 @@ run_spei_loop <- function(wb_input, target_dir, pet_label,
     cat("  -> Creating distribution map...\n")
     spei_dist_raster <- rast(wb_template)
     values(spei_dist_raster) <- method_full
-    mapping <- data.frame(code  = c(1, 2),
-                          name  = c("Parametric", "Zero Var"),
-                          color = c("#4575b4", "#91bfdb"),
+    mapping <- data.frame(code  = c(1, 2, 3),
+                          name  = c("Parametric", "Zero Var", "Empirical"),
+                          color = c("#4575b4", "#91bfdb", "#fdae61"),
                           stringsAsFactors = FALSE)
     png_file <- file.path(target_dir,
                           sprintf("spei_%02d_distribution_map.png", scale))
     png(png_file, width = 1200, height = 800, res = 150)
-    plot(spei_dist_raster, col = mapping$color, breaks = c(0.5, 1.5, 2.5),
+    plot(spei_dist_raster, col = mapping$color, breaks = c(0.5, 1.5, 2.5, 3.5),
          legend = FALSE,
-         main = sprintf("SPEI%s-%d: Parametric Method (GLO/PE3/GEV)", pet_label, scale),
+         main = sprintf("SPEI%s-%d: Modal fitting method", pet_label, scale),
          axes = FALSE, box = FALSE)
     if (!is.null(basin)) plot(basin, add = TRUE, border = "darkgray", lwd = 1.5)
-    valid_pixels <- sum(!is.na(method_full))
-    dist_counts  <- table(factor(method_full[!is.na(method_full)],
-                                 levels = 1:2, labels = mapping$name))
+    valid_pixels <- sum(!is.na(method_full[basin_mask]))
+    dist_counts  <- table(factor(method_full[basin_mask],
+                                 levels = 1:3, labels = mapping$name))
     legend("bottomright",
            legend = sprintf("%s (%d)", names(dist_counts), dist_counts),
            fill = mapping$color, title = "Method", cex = 0.85,
@@ -743,22 +752,29 @@ run_spei_loop <- function(wb_input, target_dir, pet_label,
                   min(dates), max(dates), length(dates)))
       cat("\nVariance Handling:\n")
       cat("  Case 1 zero var  (v < 2.2e-16): SPEI = 0\n")
-      cat("  Case 2 suff var  (v >= 2.2e-16): Parametric (GLO/PE3/GEV, smallest L-moment-ratio tau4 distance); NA if fitting fails\n")
+      cat("  Case 2 suff var  (v >= 2.2e-16): Parametric (GLO/PE3/GEV, smallest L-moment-ratio tau4 distance)\n")
+      cat("  Case 3 fit fails: Gringorten empirical fallback (average ranks for ties)\n")
+      cat("  NA remains for missing input or fewer than 5 finite values per calendar month.\n")
+      cat("  Both fitted and empirical probabilities are clamped to [1e-6, 1-1e-6].\n")
       cat(sprintf("\nNA rate (basin): %.3f%%  ", na_rate_basin))
       cat(ifelse(na_rate_basin < 0.5, "[MSPEI-ready]\n", "[CAUTION: >0.5% NAs]\n"))
       cat(sprintf("\nMethod distribution:\n"))
-      cat(sprintf("  Parametric:  %d (%.1f%%)\n",
-                  sum(method_full == 1, na.rm = TRUE),
-                  100 * sum(method_full == 1, na.rm = TRUE) / valid_pixels))
-      cat(sprintf("  Zero var:    %d (%.1f%%)\n",
-                  sum(method_full == 2, na.rm = TRUE),
-                  100 * sum(method_full == 2, na.rm = TRUE) / valid_pixels))
+      # This is a modal method PER PIXEL, not a count of fallback months.
+      # Percentages use basin pixels as the common denominator.
+      n_basin_pixels <- sum(basin_mask)
+      for (code in mapping$code) {
+        count <- sum(method_full[basin_mask] == code, na.rm = TRUE)
+        cat(sprintf("  %-11s %d (%.1f%%)\n",
+                    paste0(mapping$name[code], ":"), count,
+                    100 * count / n_basin_pixels))
+      }
+      no_method <- sum(is.na(method_full[basin_mask]))
       cat(sprintf("  Failed/NA:   %d (%.1f%%)\n",
-                  sum(is.na(method_full[basin_mask])),
-                  100 * sum(is.na(method_full[basin_mask])) / valid_pixels))
+                  no_method, 100 * no_method / n_basin_pixels))
       cat("\nCase counts by calendar month (basin pixels):\n")
-      cat(sprintf("  %-5s  %8s  %6s  %8s  %6s\n",
-                  "Month", "Param(n)", "Par(%)", "ZeroVar(n)", "ZV(%)"))
+      cat(sprintf("  %-5s  %8s  %6s  %8s  %6s  %8s  %6s\n",
+                  "Month", "Param(n)", "Par(%)", "ZeroVar(n)", "ZV(%)",
+                  "Emp(n)", "Emp(%)"))
       for (mm in 1:12) {
         idx_mm   <- which(month_numbers == mm)
         meth_mm  <- as.integer(
@@ -772,9 +788,10 @@ run_spei_loop <- function(wb_input, target_dir, pet_label,
         if (n_tot == 0) next
         n1 <- sum(meth_mm == 1L, na.rm = TRUE)
         n2 <- sum(meth_mm == 2L, na.rm = TRUE)
-        cat(sprintf("  %-5s  %8d  %5.1f%%  %8d  %5.1f%%\n",
+        n3 <- sum(meth_mm == 3L, na.rm = TRUE)
+        cat(sprintf("  %-5s  %8d  %5.1f%%  %8d  %5.1f%%  %8d  %5.1f%%\n",
                     month_names[mm],
-                    n1, 100*n1/n_tot, n2, 100*n2/n_tot))
+                    n1, 100*n1/n_tot, n2, 100*n2/n_tot, n3, 100*n3/n_tot))
       }
       representative_pixel <- which(basin_mask)[1L]
       first_idx <- head(which(!is.na(res_full[representative_pixel, ])), 12)
@@ -914,6 +931,7 @@ cat(sprintf("  Temp dir redirected to: %s\n", .new_tmpdir))
 cl <- makeCluster(n_cores, outfile = "")
 
 clusterExport(cl, varlist = c("variance_aware_spei", "try_parametric",
+                              "spei_gringorten_prob",
                               "lmom_rank_distributions", "lmom_ratio_distance",
                               "LMOM_TAU3_TOLERANCE", "SPEI_CANDIDATE_DISTS",
                               "month_numbers"),
@@ -980,114 +998,3 @@ cat(sprintf("SPEI_ERA5  output : %s\n", normalizePath(out_dir_era5)))
 
 # ==============================================================================
 # ------------------------------------------------------------------------------
-# Basin-average CSV export for the observed SPEI branches
-# These files are consumed by downstream observed-framework analyses.
-# ------------------------------------------------------------------------------
-
-## ?????? Helper: read all 12 per-month CSVs for one scale ?? directory and ??????????????????????????????
-## assemble a chronological data.frame(date, value) of basin-mean SPEI values.
-##
-## Arguments:
-##   scale    : integer 1, 3, 6, 12, 24 or 36
-##   dir      : path to the directory written by run_spei_loop()
-##   mn_names : character(12) ??? month abbreviations matching file naming
-##   all_dates: Date vector for the full record (length = total months)
-##
-## Returns a data.frame(date, value) sorted chronologically, one row per month.
-assemble_basin_avg <- function(scale, dir, mn_names, all_dates) {
-  
-  # Pre-allocate output aligned to all_dates
-  out_value <- rep(NA_real_, length(all_dates))
-  
-  for (m in seq_len(12L)) {
-    csv_f <- file.path(dir,
-                       sprintf("spei_%02d_month%02d_%s.csv", scale, m, mn_names[m]))
-    if (!file.exists(csv_f)) {
-      cat(sprintf("    WARNING: missing %s ??? skipping month %d\n",
-                  basename(csv_f), m))
-      next
-    }
-    df_m <- tryCatch(read.csv(csv_f, stringsAsFactors = FALSE, check.names = FALSE),
-                     error = function(e) {
-                       cat(sprintf("    ERROR reading %s: %s\n",
-                                   basename(csv_f), e$message))
-                       NULL
-                     })
-    if (is.null(df_m)) next
-    
-    # Identify year columns (4-digit numeric names, exclude lon/lat)
-    yr_cols <- names(df_m)[grepl("^[0-9]{4}$", names(df_m))]
-    if (!length(yr_cols)) next
-    
-    # Fractional-coverage area-weighted basin mean (shared 0.20 coverage rule).
-    # run_spei_loop() writes one row per native raster cell in cell order; if a
-    # file does not follow that layout, rows are mapped to cells via lon/lat.
-    pixel_mat <- as.matrix(df_m[, yr_cols, drop = FALSE])
-    row_w <- if (nrow(pixel_mat) == length(basin_bw$weights)) {
-      basin_bw$weights
-    } else {
-      basin_weights_for_xy(df_m$lon, df_m$lat, analysis_template, basin_bw)
-    }
-    basin_means <- regional_weighted_mean(pixel_mat, row_w,
-                                          min_coverage = BASIN_MIN_VALID_AREA_COVERAGE,
-                                          total_weight = basin_bw$area_m2)
-    names(basin_means) <- yr_cols
-    
-    # Map to all_dates positions (month == m)
-    idx_m   <- which(format(all_dates, "%m") == sprintf("%02d", m))
-    yr_here <- as.integer(format(all_dates[idx_m], "%Y"))
-    
-    for (k in seq_along(idx_m)) {
-      yr_k <- as.character(yr_here[k])
-      if (yr_k %in% names(basin_means)) {
-        out_value[idx_m[k]] <- basin_means[[yr_k]]
-      }
-    }
-  }
-  
-  data.frame(date  = format(all_dates, "%Y-%m-%d"),
-             value = round(out_value, 6L),
-             stringsAsFactors = FALSE)
-}
-
-## ?????? (A + B) Assemble and (C) write basin-average CSVs for scales 1,3,6,12,24,36 ???????????????????????????
-
-EXPORT_SCALES <- c(1, 3, 6, 12, 24, 36)
-
-# Output directory for the new ERA5 basin-average CSVs (same folder as the
-# per-month CSVs so everything related to SPEI_ERA5 lives in one place; the
-# files are also copied to the working directory so 12basin_timeseries.R can
-# find them without path changes).
-era5_avg_dir <- out_dir_era5   # "spei_results_seasonal_era5land"
-
-basin_avg_pm   <- list()   # PM   basin-average data.frames (one per scale)
-basin_avg_era5 <- list()   # ERA5 basin-average data.frames (one per scale)
-
-for (sc in EXPORT_SCALES) {
-  
-  cat(sprintf("\n  Scale %d: assembling ERA5 basin-average series...\n", sc))
-  
-  # --- ERA5 ---
-  df_era5 <- assemble_basin_avg(sc, out_dir_era5, month_names, dates)
-  basin_avg_era5[[as.character(sc)]] <- df_era5
-  
-  out_csv_era5 <- file.path(era5_avg_dir,
-                            sprintf("spei_era5_%02d_basin_average.csv", sc))
-  write.csv(df_era5, out_csv_era5, row.names = FALSE, quote = FALSE)
-  cat(sprintf("    Written: %s\n", out_csv_era5))
-  
-  # --- PM ---
-  cat(sprintf("  Scale %d: assembling PM  basin-average series...\n", sc))
-  df_pm <- assemble_basin_avg(sc, out_dir, month_names, dates)
-  basin_avg_pm[[as.character(sc)]] <- df_pm
-  
-  out_csv_pm <- file.path(out_dir, sprintf("spei_pm_%02d_basin_average.csv", sc))
-  write.csv(df_pm, out_csv_pm, row.names = FALSE, quote = FALSE)
-  cat(sprintf("    Written: %s\n", out_csv_pm))
-}
-
-cat("\n  All SPEI_PM and SPEI_ERA5 basin-average CSVs written.\n")
-
-cat("\nObserved-framework outputs complete.\n")
-cat("Basin-average CSVs written for SPEI_PM and SPEI_ERA5.\n")
-cat("============================================================\n")

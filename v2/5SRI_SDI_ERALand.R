@@ -6,6 +6,9 @@
 #         monthly mean of daily accumulations), as written by the project
 #         downloader into monthly_data_direct/.
 # Shared-path version aligned with 1SPI_ERALand.R
+# Basin INDEX outputs use ONLY the fractional-area-weighted mean of the
+# pixel-standardized indices (the same values as the canonical wide CSVs).
+# Basin runoff/volume columns, where retained, are unstandardized diagnostics.
 ##############################################################################
 
 # ---- Libraries ----
@@ -30,6 +33,10 @@ library(parallel)
 
 # ---- Paths / shared utilities ----
 source(UTILS_FILE)
+# Authoritative aggregation/writer from DROUGHT_ANALYSIS_utils.R.
+# All basin SRI/SDI indices below are taken from this writer's pixel-index means.
+if (!exists("write_basin_series", mode = "function"))
+  stop("DROUGHT_ANALYSIS_utils.R must define write_basin_series().")
 
 data_dir <- file.path(WD_PATH, "monthly_data_direct")
 sri_root <- file.path(WD_PATH, "sri_results_seasonal")
@@ -136,11 +143,6 @@ runoff_unit_mode <- function(u) {
   NA_character_
 }
 
-days_in_month_vec <- function(d) {
-  nxt <- seq(d[1L], by = "month", length.out = length(d) + 1L)[-1L]
-  as.integer(nxt - d)
-}
-
 # Matrix is cells x time; conversion is applied column-wise (unambiguous).
 to_mm_month <- function(mat, mode, dim_vec) {
   switch(mode,
@@ -227,6 +229,19 @@ compute_sdi <- function(x, hyi, cfg) {
   list(V = V, z = Z, method = M)
 }
 
+# Raw hydrological-year volumes are DESCRIPTIVE diagnostics only.
+# No basin-aggregated runoff or volume is passed through standardize_monthly()
+# or compute_sdi(); basin INDEX values are instead averaged from pixel indices.
+hydro_period_volume_totals <- function(monthly_vol_hm3, hyi) {
+  H <- matrix(NA_real_, hyi$n, 12L)
+  ok <- which(!is.na(hyi$row))
+  H[cbind(hyi$row[ok], hyi$pos[ok])] <- monthly_vol_hm3[ok]
+  V <- matrix(NA_real_, nrow = hyi$n, ncol = length(hyi$periods))
+  for (k in seq_along(hyi$periods))
+    V[, k] <- rowSums(H[, seq_len(hyi$periods[k]), drop = FALSE])
+  V
+}
+
 process_pixel <- function(x, month_vec, hyi, cfg) {
   sri <- lapply(cfg$timescales, function(sc)
     standardize_monthly(roll_sum_right(x, sc), month_vec, cfg))
@@ -272,9 +287,21 @@ plot_method_map <- function(meth, template, valid_cells, basin, file, title, emp
         side = 1, line = 0.5, cex = 0.75, col = "gray30")
 }
 
+# SDI five-class scheme (retain existing output labels for compatibility).
+# Match the framework's inclusive dry thresholds: z <= -2 (Extreme),
+# -2 < z <= -1.5 (Severe), -1.5 < z <= -1 (Moderate).
+# SDI-specific remaining classes: -1 < z < 0 (Mild), z >= 0 (Non-drought).
+# A single cut(right = TRUE/FALSE) cannot express both the inclusive dry
+# thresholds AND a zero value belonging to Non-drought; use explicit tests.
 classify_sdi <- function(z) {
-  as.character(cut(z, breaks = c(-Inf, -2, -1.5, -1, 0, Inf), right = FALSE,
-                   labels = c("Extreme", "Severe", "Moderate", "Mild", "Non-drought")))
+  out <- rep(NA_character_, length(z))
+  valid <- is.finite(z)
+  out[valid] <- "Non-drought"
+  out[valid & z < 0] <- "Mild"
+  out[valid & z <= -1] <- "Moderate"
+  out[valid & z <= -1.5] <- "Severe"
+  out[valid & z <= -2] <- "Extreme"
+  out
 }
 
 period_end_dates <- function(years, start_month, P) {
@@ -337,7 +364,8 @@ process_runoff_product <- function(label, file_name, cl) {
   
   sri_dir <- file.path(sri_root, label); dir.create(sri_dir, recursive = TRUE, showWarnings = FALSE)
   sdi_dir <- file.path(sdi_root, label); dir.create(sdi_dir, recursive = TRUE, showWarnings = FALSE)
-  
+  sri_key <- switch(label, runoff = "sri", surface_runoff = "sri_sro", sub_surface_runoff = "sri_ssro")
+  sdi_key <- switch(label,runoff  = "sdi",surface_runoff     = "sdi_sro",sub_surface_runoff = "sdi_ssro")
   prod      <- read_runoff_product(file.path(data_dir, file_name))
   dates     <- normalise_monthly_dates(prod$dates)
   month_vec <- as.integer(format(dates, "%m"))
@@ -426,9 +454,19 @@ process_runoff_product <- function(label, file_name, cl) {
   sdi_m <- lapply(seq_along(sdi_periods), function(k) do.call(rbind, lapply(res, function(p) p$sdi$method[, k])))
   rm(res); gc()
   
-  basin_sri <- lapply(sri_timescales, function(sc)
-    standardize_monthly(roll_sum_right(basin_depth_mm, sc), month_vec, cfg))
-  basin_sdi <- compute_sdi(basin_vol_hm3, hyi, cfg)
+  # SINGLE SOURCE OF TRUTH for basin indices:
+  # write_basin_series() aggregates the PIXEL-standardized matrices using
+  # fractional basin coverage x cell area, with the framework's minimum
+  # valid-area threshold. Capture its actual output rather than independently
+  # standardizing the basin runoff/volume or recalculating basin means.
+  basin_sri <- vector("list", length(sri_timescales))
+  basin_sri_cov <- vector("list", length(sri_timescales))
+  basin_sdi <- matrix(NA_real_, nrow = hyi$n, ncol = length(sdi_periods))
+  basin_sdi_cov <- basin_sdi
+  
+  # Preserve the former raw volume columns for contextual reporting only;
+  # these volumes DO NOT enter any basin SDI calculation or classification.
+  basin_sdi_volume <- hydro_period_volume_totals(basin_vol_hm3, hyi)
   
   coords <- terra::xyFromCell(template, valid_cells)
   
@@ -454,21 +492,36 @@ process_runoff_product <- function(label, file_name, cl) {
     plot_method_map(meth, template, valid_cells, basin,
                     file.path(sri_dir, sprintf("sri_%02d_distribution_map.png", sc)),
                     sprintf("SRI-%d (%s)", sc, label), pct(meth, 2))
+    # This shared utility both WRITES the standard basin CSV and RETURNS the
+    # identical area-weighted mean of standardized pixel indices. No re-fit.
+    written <- write_basin_series(z, dates, template, sri_key, sc, sri_dir,
+                                  cells = valid_cells, producer = "5SRI_SDI_ERALand.R")
+    if (length(written$basin$value) != ncol(z) ||
+        length(written$basin$coverage) != ncol(z))
+      stop("Unexpected write_basin_series() result length for SRI-", sc)
+    basin_sri[[s]] <- written$basin$value
+    basin_sri_cov[[s]] <- written$basin$coverage
   }
   
-  basin_sri_df <- data.frame(date = dates, runoff_mm_month = basin_depth_mm, volume_hm3 = basin_vol_hm3,
+  # The 'valid_area_coverage_fraction' column here describes RAW runoff;
+  # each SRI scale has its own (possibly different) pixel-index coverage.
+  basin_sri_df <- data.frame(date = dates, runoff_mm_month = basin_depth_mm,
+                             volume_hm3 = basin_vol_hm3,
                              valid_area_coverage_fraction = basin_cov_frac)
-  for (s in seq_along(sri_timescales))
-    basin_sri_df[[sprintf("SRI_%d", sri_timescales[s])]] <- basin_sri[[s]]$z
+  for (s in seq_along(sri_timescales)) {
+    key <- sprintf("SRI_%d", sri_timescales[s])
+    basin_sri_df[[key]] <- basin_sri[[s]]
+    basin_sri_df[[paste0(key, "_valid_area_coverage_fraction")]] <- basin_sri_cov[[s]]
+  }
   write.csv(basin_sri_df, file.path(sri_dir, "sri_basin_timeseries.csv"), row.names = FALSE)
   
   png(file.path(sri_dir, "sri_basin_timeseries.png"), width = 1800, height = 1400, res = 150)
   op <- par(mfrow = c(ceiling(length(sri_timescales) / 2), 2), mar = c(3, 4, 2.5, 1))
   for (s in seq_along(sri_timescales)) {
-    z <- basin_sri[[s]]$z
+    z <- basin_sri[[s]]
     plot(dates, z, type = "h", col = ifelse(!is.na(z) & z < 0, "#d73027", "#4575b4"),
          ylim = range(c(-3, 3, z), na.rm = TRUE), xlab = "", ylab = "SRI",
-         main = sprintf("Basin SRI-%d (%s)", sri_timescales[s], label))
+         main = sprintf("Basin pixel-mean SRI-%d (%s)", sri_timescales[s], label))
     abline(h = c(-1, -1.5, -2), lty = 2, col = "gray50"); abline(h = 0)
   }
   par(op); dev.off()
@@ -489,14 +542,29 @@ process_runoff_product <- function(label, file_name, cl) {
                      template, valid_cells,
                      file.path(sdi_dir, sprintf("sdi_k%d_%s.nc", k, period_lab[k])), "sdi",
                      sprintf("Streamflow Drought Index k%d (%s), ERA5-Land %s", k, period_lab[k], label))
+    # Always write the COMPLETE hydrological-year calendar: all-NA pixel years
+    # yield NA basin means, and stale standard files cannot survive a re-run.
+    # NetCDF writing above still omits layers with no finite pixel values.
+    # Use the same shared writer for SDI as for SRI. Its return values are the
+    # only basin SDI series used in combined tables, classes, summaries and plots.
+    written <- write_basin_series(z,
+                                  period_end_dates(hyi$years, sdi_start_month, sdi_periods[k]),
+                                  template, sdi_key, sdi_periods[k], sdi_dir, cells = valid_cells,
+                                  resolution = "annual", producer = "5SRI_SDI_ERALand.R")
+    if (length(written$basin$value) != ncol(z) ||
+        length(written$basin$coverage) != ncol(z))
+      stop("Unexpected write_basin_series() result length for SDI period ", k)
+    basin_sdi[, k] <- written$basin$value
+    basin_sdi_cov[, k] <- written$basin$coverage
   }
   
   basin_sdi_df <- data.frame(hydro_year = hy_lab, start_year = hyi$years)
   for (k in seq_along(sdi_periods)) {
     tag <- sprintf("k%d_%s", k, period_lab[k])
-    basin_sdi_df[[paste0("volume_hm3_", tag)]] <- basin_sdi$V[, k]
-    basin_sdi_df[[paste0("SDI_", tag)]]        <- basin_sdi$z[, k]
-    basin_sdi_df[[paste0("class_", tag)]]      <- classify_sdi(basin_sdi$z[, k])
+    basin_sdi_df[[paste0("volume_hm3_", tag)]] <- basin_sdi_volume[, k]
+    basin_sdi_df[[paste0("SDI_", tag)]] <- basin_sdi[, k]
+    basin_sdi_df[[paste0("class_", tag)]] <- classify_sdi(basin_sdi[, k])
+    basin_sdi_df[[paste0("SDI_", tag, "_valid_area_coverage_fraction")]] <- basin_sdi_cov[, k]
   }
   write.csv(basin_sdi_df, file.path(sdi_dir, "sdi_basin_timeseries.csv"), row.names = FALSE)
   sdi_excel[["basin"]] <- basin_sdi_df
@@ -507,10 +575,10 @@ process_runoff_product <- function(label, file_name, cl) {
   png(file.path(sdi_dir, "sdi_basin_timeseries.png"), width = 1800, height = 1200, res = 150)
   op <- par(mfrow = c(2, 2), mar = c(4.5, 4, 2.5, 1))
   for (k in seq_along(sdi_periods)) {
-    z <- basin_sdi$z[, k]
+    z <- basin_sdi[, k]
     barplot(z, names.arg = hyi$years, col = ifelse(is.na(z) | z >= 0, "#4575b4", "#d73027"),
             border = NA, las = 2, cex.names = 0.5, ylab = "SDI",
-            main = sprintf("Basin SDI k%d (%s) - %s", k, period_lab[k], label))
+            main = sprintf("Basin pixel-mean SDI k%d (%s) - %s", k, period_lab[k], label))
     abline(h = c(-1, -1.5, -2), lty = 2, col = "gray50"); abline(h = 0)
   }
   par(op); dev.off()
@@ -529,6 +597,10 @@ process_runoff_product <- function(label, file_name, cl) {
   add("Grid                : %d x %d | valid basin pixels %d", ncol(template), nrow(template), n_pix)
   add("Basin area          : %.1f km2 (cell area x fractional coverage, 7-subbasin union)", basin_area_m2 / 1e6)
   add("Basin mean rule     : fractional-coverage area weights, min valid coverage %.2f", BASIN_MIN_VALID_AREA_COVERAGE)
+  add("Basin INDEX method  : area-weighted mean of pixel-standardized SRI / SDI (no basin re-fit)")
+  add("Index values match  : standard basin_averaged_by_month/year CSVs and plots")
+  add("Index means may have SD < 1; no additional basin normalisation is applied")
+  add("Runoff/volume fields: unstandardized descriptive diagnostics only")
   add("SRI distribution    : %s | zero handling: %s", sri_distribution, zero_prob_method)
   add("Basin runoff climatology (mm/month): %s",
       paste(sprintf("%s=%.1f", month.abb, clim), collapse = " "))
@@ -561,16 +633,18 @@ process_runoff_product <- function(label, file_name, cl) {
   
   add(""); add("---------- SDI (hydrological year starts %s, transform = %s) ----------",
                month.abb[sdi_start_month], sdi_transform)
+  add("  Class bounds: Extreme <= -2; Severe (-2,-1.5]; Moderate (-1.5,-1]; Mild (-1,0); Non-drought >= 0")
   for (k in seq_along(sdi_periods)) {
     z <- sdi_z[[k]]; m <- sdi_m[[k]]
     add("SDI k%d (%s): hydro-years=%d | parametric=%.1f%% empirical=%.1f%% zero-var=%.1f%%",
         k, period_lab[k], sum(colSums(is.finite(z)) > 0), pct(m, 1), pct(m, 2), pct(m, 3))
-    tab <- table(factor(classify_sdi(basin_sdi$z[, k]),
+    tab <- table(factor(classify_sdi(basin_sdi[, k]),
                         levels = c("Non-drought", "Mild", "Moderate", "Severe", "Extreme")))
-    add("  Basin classes: %s", paste(sprintf("%s=%d", names(tab), as.integer(tab)), collapse = ", "))
-    w <- which.min(basin_sdi$z[, k])
-    if (length(w)) add("  Driest basin hydro-year: %s (SDI = %.2f, volume = %.0f hm3)",
-                       hy_lab[w], basin_sdi$z[w, k], basin_sdi$V[w, k])
+    add("  Basin classes (pixel-index weighted mean): %s",
+        paste(sprintf("%s=%d", names(tab), as.integer(tab)), collapse = ", "))
+    w <- which.min(basin_sdi[, k])
+    if (length(w)) add("  Driest basin hydro-year: %s (mean pixel SDI = %.2f, raw volume = %.0f hm3)",
+                       hy_lab[w], basin_sdi[w, k], basin_sdi_volume[w, k])
   }
   
   summ_name <- sprintf("sri_sdi_%s_summary.txt", label)

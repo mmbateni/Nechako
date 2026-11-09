@@ -17,7 +17,6 @@ if (!file.exists(UTILS_FILE))
        "\nSet the working directory to the project root before running this script.")
 
 library(terra)
-library(SPEI)
 library(ncdf4)
 library(zoo)
 library(writexl)
@@ -66,6 +65,7 @@ extract_time_dimension <- function(raster_obj, file_path) {
 }
 
 dates <- extract_time_dimension(full_raster, precip_file)
+dates <- as.Date(format(dates, "%Y-%m-01"))
 if (length(dates) != nlyr(full_raster)) stop("Time mismatch")
 
 precip <- full_raster
@@ -146,6 +146,15 @@ cat(sprintf("Example basin mean (layer 1, fractional-coverage weighted): %.2f mm
 
 # ---- Prepare matrix: process only cells with valid basin precipitation ----
 precip_values_all <- terra::values(precip, mat = TRUE)
+precip_summary <- data.frame(
+  date  = format(dates, "%Y-%m"),
+  year  = as.integer(format(dates, "%Y")),
+  month = as.integer(format(dates, "%m")),
+  mean_precip_mm_month         = basin_weighted_mean(precip_values_all, spi_basin_bw),
+  valid_area_coverage_fraction = basin_valid_coverage(precip_values_all, spi_basin_bw))
+utils::write.csv(precip_summary,
+                 file.path(WD_PATH, "monthly_data_direct", "ERA5Land_Nechako_precip_monthly_summary.csv"),
+                 row.names = FALSE)
 valid_cells <- which(!is.na(terra::values(precip[[1]])))
 if (!length(valid_cells))
   stop("No valid basin pixels available for SPI calculation.")
@@ -248,12 +257,42 @@ on.exit(try(stopCluster(cl), silent = TRUE), add = TRUE)
 eps_clip <- 1e-6
 
 
-# Export data and functions needed by worker processes
+# Each PSOCK worker runs in a separate R session. Exporting the two known
+# utilities alone is insufficient if they call other functions defined in the
+# shared utilities script. Source that entire script on EACH worker, just as
+# it was sourced in the main session, so its helper-function dependencies are
+# available too. This project uses a shared working-directory structure.
+clusterExport(cl, varlist = c("WD_PATH", "UTILS_FILE"), envir = environment())
+invisible(clusterEvalQ(cl, {
+  if (!file.exists(UTILS_FILE)) {
+    stop("Shared utilities file is not accessible to this worker: ", UTILS_FILE)
+  }
+  setwd(WD_PATH)  # Also supports relative paths used within the utilities file.
+  suppressPackageStartupMessages({
+    library(zoo)
+    library(lmomco)
+  })
+  source(UTILS_FILE, local = .GlobalEnv)
+  
+  # Fail during worker setup, rather than returning NA for every affected pixel.
+  required_utils <- c("zero_inflated_gamma_prob", "stagge_zero_probabilities")
+  missing_utils <- required_utils[!vapply(
+    required_utils, exists, logical(1), envir = .GlobalEnv,
+    mode = "function", inherits = FALSE
+  )]
+  if (length(missing_utils)) {
+    stop("Required SPI utility functions missing on worker: ",
+         paste(missing_utils, collapse = ", "))
+  }
+  TRUE
+}))
+
+# Export the SPI-specific functions and data after each worker has loaded all
+# shared utility helpers. The utility functions themselves need no export.
 clusterExport(cl, varlist = c("variance_aware_spi", "roll_sum_right", "clip_prob",
-                              "zero_inflated_gamma_prob", "stagge_zero_probabilities",
                               "precip_matrix", "dates", "eps_clip"),
               envir = environment())
-clusterEvalQ(cl, { library(zoo); library(lmomco) })
+cat("Shared utilities sourced and checked on all parallel workers.\n")
 month_names <- c("Jan", "Feb", "Mar", "Apr", "May", "Jun", 
                  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
@@ -312,7 +351,8 @@ for (sc in timescales) {
   z <- spi_indices
   z[!is.finite(z)] <- NA_real_
   spi_indices <- z
-  
+  write_basin_series(spi_indices, dates, precip[[1]], "spi", sc, out_dir,
+                     cells = valid_cells, producer = "1SPI_ERALand.R")
   # Diagnostics
   clipped_low  <- sum(z <= -4.75, na.rm = TRUE)
   clipped_high <- sum(z >=  4.75, na.rm = TRUE)

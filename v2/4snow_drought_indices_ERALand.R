@@ -472,20 +472,18 @@ by_month_wide <- function(v) {
   wide
 }
 
-# Whole-basin Year x month CSV for one coverage case. The valid-area-coverage CSV
-# does not depend on the threshold, so it is written once (primary case only).
-write_basin_average <- function(mat, index_name, index_dir, min_coverage,
-                                suffix = "", write_coverage = (suffix == "")) {
+# Whole-basin Year x month CSV for the zero-coverage sensitivity case only.
+# write_basin_series() writes the primary (custom) averages and the single,
+# threshold-independent valid-area-coverage CSV.
+write_basin_average_cov0 <- function(mat, index_name, index_dir) {
   rw <- region_weights[[NECHAKO_REGION_BASIN_ID]]
-  value <- regional_weighted_mean_covered(mat, rw$weights, min_coverage)
+  value <- regional_weighted_mean_covered(mat, rw$weights,
+                                          COVERAGE_CASES$zero$min_coverage)
   coverage <- regional_valid_coverage(mat, rw$weights)
   utils::write.csv(by_month_wide(value),
-                   file.path(index_dir, sprintf("%s_basin_averaged_by_month%s.csv", index_name, suffix)),
+                   file.path(index_dir, sprintf("%s_basin_averaged_by_month%s.csv",
+                                                index_name, COVERAGE_CASES$zero$suffix)),
                    row.names = FALSE, na = "")
-  if (write_coverage)
-    utils::write.csv(by_month_wide(coverage),
-                     file.path(index_dir, sprintf("%s_basin_valid_area_coverage_by_month.csv", index_name)),
-                     row.names = FALSE, na = "")
   invisible(data.frame(date = dates, value = value, valid_area_coverage_fraction = coverage))
 }
 
@@ -508,12 +506,13 @@ regional_average_table <- function(mat, index_name, scale, min_coverage) {
   }), use.names = TRUE)
 }
 
-# Writes: (a) the original-format regional CSV for each case, and (b) one
-# comparison CSV with both cases side by side. Returns a list of the two tables.
+# The primary (custom) regional CSV is written by write_basin_series().
+# Here we write the zero-case regional CSV and the side-by-side comparison,
+# returning both case tables for the regional summary.
 write_regional_average <- function(mat, index_name, scale) {
   tabs <- lapply(COVERAGE_CASES, function(cs)
     regional_average_table(mat, index_name, scale, cs$min_coverage))
-  for (cn in names(COVERAGE_CASES))
+  for (cn in setdiff(names(COVERAGE_CASES), "custom")) 
     data.table::fwrite(tabs[[cn]],
                        file.path(REGIONAL_DIR, sprintf("%s_%02d_regional_averaged_by_month%s.csv",
                                                        index_name, scale, COVERAGE_CASES[[cn]]$suffix)),
@@ -531,10 +530,16 @@ write_regional_average <- function(mat, index_name, scale) {
   invisible(tabs)
 }
 
-basin_swei <- write_basin_average(SWEI, swei_name, SWEI_DIR, COVERAGE_CASES$custom$min_coverage, "")
-basin_sspi <- write_basin_average(SSPI, sspi_name, SSPI_DIR, COVERAGE_CASES$custom$min_coverage, "")
-basin_swei_cov0 <- write_basin_average(SWEI, swei_name, SWEI_DIR, COVERAGE_CASES$zero$min_coverage, "_mincov0")
-basin_sspi_cov0 <- write_basin_average(SSPI, sspi_name, SSPI_DIR, COVERAGE_CASES$zero$min_coverage, "_mincov0")
+bs_swei <- write_basin_series(SWEI, dates, analysis_template, "swei", SWEI_SCALE, SWEI_DIR,
+                              producer = "4snow_drought_indices_ERALand.R")
+bs_sspi <- write_basin_series(SSPI, dates, analysis_template, "sspi", SSPI_SCALE, SSPI_DIR,
+                              producer = "4snow_drought_indices_ERALand.R")
+basin_swei <- data.frame(date = dates, value = bs_swei$basin$value,
+                         valid_area_coverage_fraction = bs_swei$basin$coverage)
+basin_sspi <- data.frame(date = dates, value = bs_sspi$basin$value,
+                         valid_area_coverage_fraction = bs_sspi$basin$coverage)
+basin_swei_cov0 <- write_basin_average_cov0(SWEI, swei_name, SWEI_DIR)
+basin_sspi_cov0 <- write_basin_average_cov0(SSPI, sspi_name, SSPI_DIR)
 regional_swei <- write_regional_average(SWEI, "swei", SWEI_SCALE)
 regional_sspi <- write_regional_average(SSPI, "sspi", SSPI_SCALE)
 
